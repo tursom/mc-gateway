@@ -153,12 +153,6 @@ jobs:
           - goos: solaris
             goarch: amd64
             name: solaris-amd64
-          - goos: js
-            goarch: wasm
-            name: js-wasm
-          - goos: wasip1
-            goarch: wasm
-            name: wasip1-wasm
 
     steps:
     - uses: actions/checkout@v4

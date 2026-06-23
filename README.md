@@ -25,6 +25,20 @@
 
 hosts 使用期望的 host 做 key，转发的目的地址为 value。参考`config.example.toml`。默认的 fallback host 配置 key 为 `default`。
 
+#### upstream
+
+host 支持多种协议的上游服务器，包括 tcp、kcp、quic、websocket 等。只需要在原始地址前加对应的协议名称即可，如 `quic://127.0.0.1:8080`。支持的列表如下：
+
+| 协议名称 | 前缀       | 备注                          |
+| -------- | ---------- | ----------------------------- |
+| tcp      | 无         | 原始的tcp连接                 |
+| kcp      | kcp://     | 使用 kcp 协议连接到服务器     |
+| quic     | quic://    | 使用 quic 协议连接到服务器    |
+| haproxy  | haproxy:// | 使用 HAProxy 协议连接到服务器 |
+
+> HAProxy 协议头会保存客户端的真实 ip，大部分支持 HAProxy 的 mod（或插件）都支持从协议头获取真实 ip，
+> 这样服务端就能够获取到真实的客户端 ip了，以此兼容现有的 ban ip 或者统计等插件。
+
 ### log
 
 | 配置  | 类型   | 备注     |

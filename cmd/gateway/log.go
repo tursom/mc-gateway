@@ -9,6 +9,10 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+var (
+	currentLogFile string
+)
+
 func loadLogger() error {
 	if len(config.Log.Level) == 0 {
 		config.Log.Level = "info"

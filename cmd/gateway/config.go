@@ -17,7 +17,6 @@ var (
 	configFile = "config.toml"
 
 	config         Config
-	currentLogFile string
 	configLoadLock sync.Mutex
 )
 
