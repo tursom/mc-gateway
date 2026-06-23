@@ -39,7 +39,7 @@ func runTcp(wg *sync.WaitGroup) {
 }
 
 func upstreamTcp(host string) net.Conn {
-	conn, err := net.Dial("tcp", host)
+	conn, err := tcpDialer.Dial("tcp", host)
 	if err != nil {
 		log.Err(err).Str("host", host).Msg("Error dialing upstream")
 		return nil
@@ -47,6 +47,11 @@ func upstreamTcp(host string) net.Conn {
 	setSocketOptions(conn)
 	return conn
 
+}
+
+var tcpDialer = net.Dialer{
+	Timeout:   3 * time.Second,
+	KeepAlive: 30 * time.Second,
 }
 
 func setSocketOptions(conn net.Conn) {

@@ -14,11 +14,12 @@ func haProxyUpstream(source net.Conn, host string) net.Conn {
 		return nil
 	}
 
-	conn, err := net.DialTCP("tcp", nil, target)
+	conn, err := tcpDialer.Dial("tcp", target.String())
 	if err != nil {
 		log.Err(err).Msg("failed to dial TCP")
 		return nil
 	}
+	setSocketOptions(conn)
 
 	sourceAddr, err := net.ResolveTCPAddr(
 		source.RemoteAddr().Network(),
@@ -26,6 +27,7 @@ func haProxyUpstream(source net.Conn, host string) net.Conn {
 	)
 	if err != nil {
 		log.Err(err).Msg("failed to resolve TCP address")
+		conn.Close()
 		return nil
 	}
 
@@ -45,6 +47,7 @@ func haProxyUpstream(source net.Conn, host string) net.Conn {
 	_, err = header.WriteTo(conn)
 	if err != nil {
 		log.Err(err).Msg("failed to write proxy header")
+		conn.Close()
 		return nil
 	}
 

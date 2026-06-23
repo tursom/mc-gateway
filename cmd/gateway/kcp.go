@@ -31,11 +31,11 @@ func runKcp(wg *sync.WaitGroup) {
 				Msg("Failed to accept KCP connection")
 			continue
 		}
-		log.Info().
+		log.Debug().
 			Str("remote_addr", conn.RemoteAddr().String()).
 			Msg("Accepted KCP connection")
 
-		conn.SetACKNoDelay(true)
+		tuneKcpConn(conn)
 
 		go handleRequest(conn)
 	}
@@ -46,9 +46,17 @@ func upstreamKcp(host string) net.Conn {
 	if err != nil {
 		log.Error().Err(err).
 			Msg("Failed to dial KCP server")
+		return nil
 	}
-	defer conn.Close()
 
-	conn.SetACKNoDelay(true)
+	tuneKcpConn(conn)
 	return conn
+}
+
+func tuneKcpConn(conn *kcp.UDPSession) {
+	conn.SetStreamMode(true)
+	conn.SetWriteDelay(false)
+	conn.SetNoDelay(1, 10, 2, 1)
+	conn.SetWindowSize(256, 256)
+	conn.SetACKNoDelay(true)
 }

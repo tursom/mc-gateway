@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -21,7 +23,7 @@ type (
 	// WebSocket 连接适配器，实现 net.Conn 接口
 	webSocketConn struct {
 		*websocket.Conn
-		messageRemain []byte // 用于存储未处理的消息
+		reader io.Reader
 	}
 )
 
@@ -39,38 +41,56 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 }
 
 func (w *webSocketConn) Read(b []byte) (n int, err error) {
-	// 如果有未处理的消息，直接从 messageRemain 中读取
-	if len(w.messageRemain) > 0 {
-		copied := copy(b, w.messageRemain)
-		if copied < len(w.messageRemain) {
-			w.messageRemain = w.messageRemain[copied:]
-		} else {
-			w.messageRemain = nil // 清空已处理的消息
+	for {
+		if w.reader != nil {
+			n, err = w.reader.Read(b)
+			if errors.Is(err, io.EOF) {
+				w.reader = nil
+				if n > 0 {
+					return n, nil
+				}
+				continue
+			}
+			return n, err
 		}
-		return copied, nil
-	}
 
-	// 读取新消息
-	_, message, err := w.ReadMessage()
-	if err != nil {
-		return 0, err
+		messageType, reader, err := w.NextReader()
+		if err != nil {
+			return 0, err
+		}
+		if messageType != websocket.BinaryMessage && messageType != websocket.TextMessage {
+			continue
+		}
+		w.reader = reader
 	}
-	copied := copy(b, message)
-	if copied < len(message) {
-		w.messageRemain = message[copied:]
-	}
-	return copied, nil
 }
 
 func (w *webSocketConn) Write(b []byte) (n int, err error) {
-	if err = w.WriteMessage(websocket.BinaryMessage, b); err != nil {
+	writer, err := w.NextWriter(websocket.BinaryMessage)
+	if err != nil {
 		return 0, err
 	}
-	return len(b), nil
+
+	n, err = writer.Write(b)
+	closeErr := writer.Close()
+	if err != nil {
+		return n, err
+	}
+	if closeErr != nil {
+		return n, closeErr
+	}
+	if n != len(b) {
+		return n, io.ErrShortWrite
+	}
+
+	return n, nil
 }
 
 func (w *webSocketConn) SetDeadline(t time.Time) error {
-	return w.SetReadDeadline(t)
+	if err := w.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return w.SetWriteDeadline(t)
 }
 
 // 启动 WebSocket 服务器

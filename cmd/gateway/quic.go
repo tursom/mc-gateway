@@ -54,7 +54,7 @@ func runQuic(wg *sync.WaitGroup) {
 			continue
 		}
 
-		log.Info().
+		log.Debug().
 			Str("client", conn.RemoteAddr().String()).
 			Msg("Accepted QUIC connection")
 		go handleQuicRequest(conn)
@@ -79,9 +79,10 @@ func upstreamQuic(host string) net.Conn {
 	stream, err := conn.OpenStream()
 	if err != nil {
 		log.Err(err).Str("host", host).Msg("Failed to open stream")
+		conn.CloseWithError(0, "failed to open stream")
 		return nil
 	}
-	log.Info().Str("host", host).Msg("QUIC stream opened")
+	log.Debug().Str("host", host).Msg("QUIC stream opened")
 
 	return quicConn{
 		Connection: conn,
@@ -164,8 +165,15 @@ func getQuicNextProtos() []string {
 }
 
 func (c quicConn) Close() error {
-	if err := c.Stream.Close(); err != nil {
-		log.Err(err).Msg("Failed to close QUIC stream")
-	}
+	_ = c.Stream.Close()
 	return c.Connection.CloseWithError(0, "Closing QUIC connection")
+}
+
+func (c quicConn) CloseWrite() error {
+	return c.Stream.Close()
+}
+
+func (c quicConn) CloseRead() error {
+	c.Stream.CancelRead(0)
+	return nil
 }

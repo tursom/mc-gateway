@@ -1,12 +1,9 @@
 package main
 
 import (
-	"io"
 	"net"
 	"strings"
-	"sync"
 
-	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/tursom/mc-gateway/plugin/api"
 	"github.com/tursom/mc-gateway/protocol"
@@ -66,19 +63,13 @@ func handleRequest(conn net.Conn) {
 	}
 	defer client.Close()
 
-	var wg sync.WaitGroup
-
-	wg.Add(1)
-	go copyData(client, conn, &wg)
-	copyData(conn, client, nil)
-
-	// 等待所有读写操作完成
-	// 不放在 defer 中，以防报错时无法关闭连接
-	wg.Wait()
+	proxyConnections(conn, client)
 }
 
 func mapToHost(conn net.Conn) net.Conn {
-	buf := make([]byte, 1024)
+	buf := getProxyBuffer()
+	defer putProxyBuffer(buf)
+
 	n, err := conn.Read(buf)
 	if err != nil {
 		log.Err(err).
@@ -113,7 +104,7 @@ func mapToHost(conn net.Conn) net.Conn {
 		return nil
 	}
 
-	log.Info().
+	log.Debug().
 		Str("client", conn.RemoteAddr().String()).
 		Str("host", mc_host).
 		Str("mc", host).
@@ -146,32 +137,15 @@ func mapToHost(conn net.Conn) net.Conn {
 		return nil
 	}
 
-	client.Write(buf[:n])
+	if err := writeAll(client, buf[:n]); err != nil {
+		log.Err(err).
+			Str("client", conn.RemoteAddr().String()).
+			Str("host", mc_host).
+			Str("mc", host).
+			Msg("failed to write initial packet to upstream")
+		client.Close()
+		return nil
+	}
 
 	return client
-}
-
-func copyData(dst io.Writer, src io.Reader, wg *sync.WaitGroup) {
-	defer func() {
-		if r := recover(); r != nil {
-			var event *zerolog.Event
-			if err, ok := r.(error); ok {
-				event = log.Err(err)
-			} else if str, ok := r.(string); ok {
-				event = log.Error().Str("panic", str)
-			} else {
-				event = log.Error().Any("panic", r)
-			}
-			event.Msg("Panic in copyData")
-		}
-	}()
-
-	if wg != nil {
-		defer wg.Done()
-	}
-
-	_, err := io.Copy(dst, src)
-	if err != nil && err != io.EOF {
-		log.Err(err).Msg("Error copying data")
-	}
 }
