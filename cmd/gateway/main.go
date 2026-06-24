@@ -3,6 +3,7 @@ package main
 import (
 	"net"
 	"strings"
+	"sync"
 
 	"github.com/rs/zerolog/log"
 	"github.com/tursom/mc-gateway/plugin/api"
@@ -26,14 +27,33 @@ func main() {
 
 	defer exitWaitGroup.Wait()
 
+	startEnabledServices()
+}
+
+func startEnabledServices() {
+	if tcpWebPortReuseEnabled() {
+		startService(runTcpWebPortReuse)
+		if config.Kcp.Enable {
+			startService(runKcp)
+		}
+		if config.Quic.Enable {
+			startService(runQuic)
+		}
+		return
+	}
+
 	for _, service := range services {
 		if !*service.enable {
 			continue
 		}
 
-		exitWaitGroup.Add(1)
-		go service.run(&exitWaitGroup)
+		startService(service.run)
 	}
+}
+
+func startService(run func(wg *sync.WaitGroup)) {
+	exitWaitGroup.Add(1)
+	go run(&exitWaitGroup)
 }
 
 func handleRequest(conn net.Conn) {

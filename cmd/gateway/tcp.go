@@ -14,15 +14,16 @@ func runTcp(wg *sync.WaitGroup) {
 		defer wg.Done()
 	}
 
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", config.Tcp.Port))
+	port := normalizedTCPPort()
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		log.Fatal().Err(err).
-			Int("port", config.Tcp.Port).
+			Int("port", port).
 			Msg("Failed to listen on port")
 	}
 	defer listener.Close()
 	log.Info().
-		Int("port", config.Tcp.Port).
+		Int("port", port).
 		Msg("Listening for TCP connections")
 
 	for {

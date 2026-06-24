@@ -93,25 +93,24 @@ func (w *webSocketConn) SetDeadline(t time.Time) error {
 	return w.SetWriteDeadline(t)
 }
 
+func newWebSocketHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc(normalizedWebSocketPath(), handleWebSocket)
+	return mux
+}
+
 // 启动 WebSocket 服务器
 func runWebSocket(wg *sync.WaitGroup) {
 	if wg != nil {
 		defer wg.Done()
 	}
 
-	path := config.WebSocket.Path
-	if path == "" {
-		path = "/" // 默认路径，全部处理
-	}
-	http.HandleFunc(path, handleWebSocket)
-
-	port := config.WebSocket.Port
-	if port == 0 {
-		port = 25566 // 默认端口
-	}
+	port := normalizedWebSocketPort()
+	path := normalizedWebSocketPath()
 
 	log.Info().Int("port", port).Str("path", path).Msg("Starting WebSocket server")
-	if err := http.ListenAndServe(fmt.Sprintf(":%d", port), nil); err != nil {
+	server := &http.Server{Addr: fmt.Sprintf(":%d", port), Handler: newWebSocketHandler()}
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatal().Err(err).Msg("Failed to start WebSocket server")
 	}
 }
