@@ -11,6 +11,10 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"github.com/tursom/mc-gateway/internal/adminconfig"
+	"github.com/tursom/mc-gateway/internal/adminsession"
+	"github.com/tursom/mc-gateway/internal/gatewayconfig"
+	"github.com/tursom/mc-gateway/internal/gatewaymetrics"
 	"github.com/tursom/mc-gateway/plugin/api"
 )
 
@@ -18,10 +22,15 @@ func saveGatewayState(t *testing.T) func() {
 	t.Helper()
 
 	oldConfig := config
-	oldConfigFile := configFile
 	oldCurrentPidFile := currentPidFile
 	oldCurrentLogFile := currentLogFile
 	oldLogger := log.Logger
+	oldAdminStartup := adminStartup
+	oldAdminDB := adminDB
+	oldAdminDBPath := adminDBPath
+	oldAdminSessionManager := adminSessionManager
+	oldRouteSnapshot := routeSnapshot.Clone()
+	oldGatewayMetrics := gatewayMetrics
 
 	pluginLock.Lock()
 	oldPlugins := plugins
@@ -30,21 +39,40 @@ func saveGatewayState(t *testing.T) func() {
 	hooks = make(map[string]map[string]any)
 	pluginLock.Unlock()
 
-	config = Config{}
-	configFile = "config.toml"
+	config = gatewayconfig.Config{}
 	currentPidFile = ""
 	currentLogFile = ""
+	adminStartup = adminconfig.Config{
+		DBPath:         defaultAdminDBPath,
+		TCPAdminPort:   defaultTCPPort,
+		AdminPath:      defaultAdminPath,
+		AdminAPIPrefix: defaultAdminAPIPrefix,
+		SessionTTL:     defaultAdminSessionTTL,
+	}
+	adminDB = nil
+	adminDBPath = ""
+	adminSessionManager = adminsession.NewManager()
+	publishRouteSnapshot(nil)
+	gatewayMetrics = gatewaymetrics.New()
 	log.Logger = zerolog.New(io.Discard)
 
 	return func() {
+		if adminDB != nil && adminDB != oldAdminDB {
+			_ = adminDB.Close()
+		}
 		if currentPidFile != "" && currentPidFile != oldCurrentPidFile {
 			_ = os.Remove(currentPidFile)
 		}
 
 		config = oldConfig
-		configFile = oldConfigFile
 		currentPidFile = oldCurrentPidFile
 		currentLogFile = oldCurrentLogFile
+		adminStartup = oldAdminStartup
+		adminDB = oldAdminDB
+		adminDBPath = oldAdminDBPath
+		adminSessionManager = oldAdminSessionManager
+		publishRouteSnapshot(oldRouteSnapshot)
+		gatewayMetrics = oldGatewayMetrics
 		log.Logger = oldLogger
 
 		pluginLock.Lock()
@@ -52,6 +80,10 @@ func saveGatewayState(t *testing.T) func() {
 		hooks = oldHooks
 		pluginLock.Unlock()
 	}
+}
+
+func setGatewayTestRoutes(routes map[string]string) {
+	publishRouteSnapshot(routes)
 }
 
 func gatewayTestPacket(host string, tail ...byte) []byte {

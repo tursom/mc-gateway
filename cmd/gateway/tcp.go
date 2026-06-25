@@ -35,6 +35,7 @@ func runTcp(wg *sync.WaitGroup) {
 		}
 		setSocketOptions(conn)
 		// 处理连接
+		gatewayMetrics.TCPConnectionStarted()
 		go handleRequest(conn)
 	}
 }
@@ -42,6 +43,7 @@ func runTcp(wg *sync.WaitGroup) {
 func upstreamTcp(host string) net.Conn {
 	conn, err := tcpDialer.Dial("tcp", host)
 	if err != nil {
+		gatewayMetrics.UpstreamDialError()
 		log.Err(err).Str("host", host).Msg("Error dialing upstream")
 		return nil
 	}

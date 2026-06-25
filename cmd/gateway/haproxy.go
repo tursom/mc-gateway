@@ -10,12 +10,14 @@ import (
 func haProxyUpstream(source net.Conn, host string) net.Conn {
 	target, err := net.ResolveTCPAddr("tcp", host)
 	if err != nil {
+		gatewayMetrics.UpstreamDialError()
 		log.Err(err).Msg("failed to resolve TCP address")
 		return nil
 	}
 
 	conn, err := tcpDialer.Dial("tcp", target.String())
 	if err != nil {
+		gatewayMetrics.UpstreamDialError()
 		log.Err(err).Msg("failed to dial TCP")
 		return nil
 	}

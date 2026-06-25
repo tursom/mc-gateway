@@ -72,12 +72,14 @@ func upstreamQuic(host string) net.Conn {
 
 	conn, err := quic.DialAddr(ctx, host, tlsConf, nil)
 	if err != nil {
+		gatewayMetrics.UpstreamDialError()
 		log.Err(err).Str("host", host).Msg("Failed to dial QUIC")
 		return nil
 	}
 
 	stream, err := conn.OpenStream()
 	if err != nil {
+		gatewayMetrics.UpstreamDialError()
 		log.Err(err).Str("host", host).Msg("Failed to open stream")
 		conn.CloseWithError(0, "failed to open stream")
 		return nil

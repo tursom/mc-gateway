@@ -72,6 +72,8 @@ func BenchmarkMapToHostInitialPacket(b *testing.B) {
 	packet := benchmarkHandshakePacket(hostName)
 	source := newBenchmarkConn(benchmarkAddr("client:25565"))
 	upstream := newBenchmarkConn(benchmarkAddr("upstream:25565"))
+	publishRouteSnapshot(map[string]string{hostName: upstreamHost})
+	defer publishRouteSnapshot(nil)
 
 	restore := installBenchmarkUpstreamHook(b, hostName, upstreamHost, upstream)
 	defer restore()
@@ -190,10 +192,6 @@ func installBenchmarkUpstreamHook(b *testing.B, hostName, upstreamHost string, u
 
 	previousConfig := config
 	previousHooks := hooks
-
-	config.Hosts = map[string]string{
-		hostName: upstreamHost,
-	}
 
 	pluginLock.Lock()
 	hooks = map[string]map[string]any{

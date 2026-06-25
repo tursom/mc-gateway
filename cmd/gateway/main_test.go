@@ -13,9 +13,9 @@ func TestMapToHostRoutesThroughHookAndForwardsInitialPacket(t *testing.T) {
 	packet := gatewayTestPacket("play.example", 0x63, 0x00)
 	source := newGatewayTestConn(packet)
 	upstream := newGatewayTestConn(nil)
-	config.Hosts = map[string]string{
+	setGatewayTestRoutes(map[string]string{
 		"play.example": "backend.example:25565",
-	}
+	})
 
 	var gotSource net.Conn
 	var gotHost string
@@ -52,9 +52,9 @@ func TestMapToHostUsesDefaultRoute(t *testing.T) {
 	packet := gatewayTestPacket("unknown.example")
 	source := newGatewayTestConn(packet)
 	upstream := newGatewayTestConn(nil)
-	config.Hosts = map[string]string{
+	setGatewayTestRoutes(map[string]string{
 		"default": "fallback.example:25565",
-	}
+	})
 
 	registerGatewayUpstreamHook(
 		t,
@@ -105,7 +105,7 @@ func TestMapToHostRejectsInvalidOrUnroutedPackets(t *testing.T) {
 			if tt.packet == nil {
 				source.readErr = errors.New("read failed")
 			}
-			config.Hosts = tt.hosts
+			setGatewayTestRoutes(tt.hosts)
 
 			if got := mapToHost(source); got != nil {
 				t.Fatalf("mapToHost() = %v, want nil", got)
@@ -118,9 +118,9 @@ func TestMapToHostReturnsNilWhenHookFails(t *testing.T) {
 	defer saveGatewayState(t)()
 
 	source := newGatewayTestConn(gatewayTestPacket("play.example"))
-	config.Hosts = map[string]string{
+	setGatewayTestRoutes(map[string]string{
 		"play.example": "backend.example:25565",
-	}
+	})
 	wantErr := errors.New("hook failed")
 
 	registerGatewayUpstreamHook(
@@ -142,9 +142,9 @@ func TestMapToHostClosesUpstreamWhenInitialWriteFails(t *testing.T) {
 	source := newGatewayTestConn(gatewayTestPacket("play.example"))
 	upstream := newGatewayTestConn(nil)
 	upstream.writeErr = errors.New("write failed")
-	config.Hosts = map[string]string{
+	setGatewayTestRoutes(map[string]string{
 		"play.example": "backend.example:25565",
-	}
+	})
 
 	registerGatewayUpstreamHook(
 		t,

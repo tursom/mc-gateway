@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mc-gateway admin</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body data-api-prefix="__ADMIN_API_PREFIX__">
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <h1>mc-gateway</h1>
+        <p id="subtitle">Admin</p>
+      </div>
+      <div class="session">
+        <span id="sessionUser"></span>
+        <button id="logoutBtn" class="ghost hidden" type="button">Logout</button>
+      </div>
+    </header>
+
+    <section id="alert" class="alert hidden"></section>
+
+    <section id="setupView" class="auth-view hidden">
+      <form id="setupForm" class="panel compact">
+        <h2>Initial admin</h2>
+        <label>
+          Username
+          <input name="username" autocomplete="username" value="admin">
+        </label>
+        <label>
+          Password
+          <input name="password" autocomplete="new-password" type="password" required>
+        </label>
+        <button type="submit">Create admin</button>
+      </form>
+    </section>
+
+    <section id="loginView" class="auth-view hidden">
+      <form id="loginForm" class="panel compact">
+        <h2>Login</h2>
+        <label>
+          Username
+          <input name="username" autocomplete="username" required>
+        </label>
+        <label>
+          Password
+          <input name="password" autocomplete="current-password" type="password" required>
+        </label>
+        <button type="submit">Login</button>
+      </form>
+    </section>
+
+    <section id="appView" class="hidden">
+      <section id="statusGrid" class="status-grid"></section>
+
+      <nav class="tabs">
+        <button data-tab="routes" class="active" type="button">Routes</button>
+        <button data-tab="services" type="button">Services</button>
+        <button data-tab="users" type="button">Users</button>
+        <button data-tab="metrics" type="button">Metrics</button>
+        <button data-tab="audit" type="button">Audit</button>
+      </nav>
+
+      <section id="routesTab" class="tab-panel">
+        <div class="toolbar">
+          <input id="routeSearch" placeholder="Search host, upstream, note">
+          <button id="newRouteBtn" type="button">New route</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Host</th>
+                <th>Upstream</th>
+                <th>Enabled</th>
+                <th>Note</th>
+                <th class="actions">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="routesBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="servicesTab" class="tab-panel hidden">
+        <div id="servicesGrid" class="service-grid"></div>
+      </section>
+
+      <section id="usersTab" class="tab-panel hidden">
+        <div class="toolbar">
+          <button id="newUserBtn" type="button">New user</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Username</th>
+                <th>Role</th>
+                <th>Disabled</th>
+                <th class="actions">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="usersBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="metricsTab" class="tab-panel hidden">
+        <div id="metricsGrid" class="status-grid"></div>
+        <div class="panel">
+          <h2>Route hits</h2>
+          <div id="routeHits" class="chips"></div>
+        </div>
+      </section>
+
+      <section id="auditTab" class="tab-panel hidden">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Actor</th>
+                <th>Action</th>
+                <th>Target</th>
+                <th>Result</th>
+                <th>Message</th>
+              </tr>
+            </thead>
+            <tbody id="auditBody"></tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <dialog id="routeDialog">
+    <form id="routeForm" method="dialog">
+      <h2>Route</h2>
+      <label>
+        Host
+        <input name="host" required>
+      </label>
+      <label>
+        Upstream
+        <input name="upstream" required placeholder="127.0.0.1:25565">
+      </label>
+      <label class="inline">
+        <input name="enabled" type="checkbox" checked>
+        Enabled
+      </label>
+      <label>
+        Note
+        <input name="note">
+      </label>
+      <div class="dialog-actions">
+        <button type="button" data-close>Cancel</button>
+        <button type="submit">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="userDialog">
+    <form id="userForm" method="dialog">
+      <h2>User</h2>
+      <label>
+        Username
+        <input name="username" required>
+      </label>
+      <label>
+        Role
+        <select name="role">
+          <option value="admin">Admin</option>
+          <option value="member">Member</option>
+          <option value="guest">Guest</option>
+        </select>
+      </label>
+      <label>
+        Password
+        <input name="password" type="password">
+      </label>
+      <label class="inline">
+        <input name="disabled" type="checkbox">
+        Disabled
+      </label>
+      <div class="dialog-actions">
+        <button type="button" data-close>Cancel</button>
+        <button type="submit">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>

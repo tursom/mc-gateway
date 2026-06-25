@@ -2,10 +2,10 @@ package main
 
 import (
 	"net"
-	"strings"
 	"sync"
 
 	"github.com/rs/zerolog/log"
+	"github.com/tursom/mc-gateway/internal/upstreamtarget"
 	"github.com/tursom/mc-gateway/plugin/api"
 	"github.com/tursom/mc-gateway/protocol"
 )
@@ -19,9 +19,7 @@ func main() {
 		log.Err(err).Msg("Failed to write PID file")
 	}
 	defer removePIDFile()
-
-	watcher := watchConfig()
-	defer watcher.Close()
+	defer closeGatewayRuntime()
 
 	go handleLogRotate()
 
@@ -31,23 +29,16 @@ func main() {
 }
 
 func startEnabledServices() {
-	if tcpWebPortReuseEnabled() {
-		startService(runTcpWebPortReuse)
-		if config.Kcp.Enable {
-			startService(runKcp)
-		}
-		if config.Quic.Enable {
-			startService(runQuic)
-		}
-		return
+	startService(runTcpWebPortReuse)
+
+	if config.Kcp.Enable {
+		startService(runKcp)
 	}
-
-	for _, service := range services {
-		if !*service.enable {
-			continue
-		}
-
-		startService(service.run)
+	if config.Quic.Enable {
+		startService(runQuic)
+	}
+	if config.WebSocket.Enable && normalizedWebSocketPort() != normalizedTCPPort() {
+		startService(runWebSocket)
 	}
 }
 
@@ -57,6 +48,9 @@ func startService(run func(wg *sync.WaitGroup)) {
 }
 
 func handleRequest(conn net.Conn) {
+	gatewayMetrics.ConnectionStarted()
+	defer gatewayMetrics.ConnectionFinished()
+
 	defer func() {
 		rec := recover()
 		if rec == nil {
@@ -104,29 +98,30 @@ func mapToHost(conn net.Conn) net.Conn {
 		return nil
 	}
 
-	mc_host := protocol.GetMcHost(buf[:n])
-	if mc_host == "" {
+	mcHost := protocol.GetMcHost(buf[:n])
+	if mcHost == "" {
 		log.Err(errEmptyBuffer).
 			Str("client", conn.RemoteAddr().String()).
 			Msg("failed to parse mc host from buffer")
 		return nil
 	}
 
-	host, ok := config.Hosts[mc_host]
-	if !ok {
-		host = config.Hosts["default"]
-	}
+	host, ok := lookupRoute(mcHost)
 	if host == "" {
+		gatewayMetrics.RouteMiss()
 		log.Err(errEmptyBuffer).
 			Str("client", conn.RemoteAddr().String()).
-			Str("host", mc_host).
+			Str("host", mcHost).
 			Msg("failed to route host")
 		return nil
+	}
+	if ok {
+		gatewayMetrics.RouteHit(mcHost)
 	}
 
 	log.Debug().
 		Str("client", conn.RemoteAddr().String()).
-		Str("host", mc_host).
+		Str("host", mcHost).
 		Str("mc", host).
 		Msg("map to host")
 
@@ -143,14 +138,16 @@ func mapToHost(conn net.Conn) net.Conn {
 	}
 
 	if !ok {
-		if host, ok := strings.CutPrefix(host, "quic://"); ok {
-			client = upstreamQuic(host)
-		} else if host, ok := strings.CutPrefix(host, "kcp://"); ok {
-			client = upstreamKcp(host)
-		} else if host, ok := strings.CutPrefix(host, "haproxy://"); ok {
-			client = haProxyUpstream(conn, host)
-		} else {
-			client = upstreamTcp(host)
+		target := upstreamtarget.Parse(host)
+		switch target.Protocol {
+		case upstreamtarget.ProtocolQUIC:
+			client = upstreamQuic(target.Address)
+		case upstreamtarget.ProtocolKCP:
+			client = upstreamKcp(target.Address)
+		case upstreamtarget.ProtocolHAProxy:
+			client = haProxyUpstream(conn, target.Address)
+		default:
+			client = upstreamTcp(target.Address)
 		}
 	}
 	if client == nil {
@@ -160,7 +157,7 @@ func mapToHost(conn net.Conn) net.Conn {
 	if err := writeAll(client, buf[:n]); err != nil {
 		log.Err(err).
 			Str("client", conn.RemoteAddr().String()).
-			Str("host", mc_host).
+			Str("host", mcHost).
 			Str("mc", host).
 			Msg("failed to write initial packet to upstream")
 		client.Close()

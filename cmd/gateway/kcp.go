@@ -44,6 +44,7 @@ func runKcp(wg *sync.WaitGroup) {
 func upstreamKcp(host string) net.Conn {
 	conn, err := kcp.DialWithOptions(host, nil, config.Kcp.DataShards, config.Kcp.ParityShards)
 	if err != nil {
+		gatewayMetrics.UpstreamDialError()
 		log.Error().Err(err).
 			Msg("Failed to dial KCP server")
 		return nil

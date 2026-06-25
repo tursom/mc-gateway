@@ -14,9 +14,9 @@ func TestHandleRequestProxiesAndClosesConnections(t *testing.T) {
 	packet := gatewayTestPacket("play.example")
 	source := newGatewayTestConn(packet)
 	upstream := newGatewayTestConn([]byte("reply"))
-	config.Hosts = map[string]string{
+	setGatewayTestRoutes(map[string]string{
 		"play.example": "backend.example:25565",
-	}
+	})
 
 	registerGatewayUpstreamHook(
 		t,

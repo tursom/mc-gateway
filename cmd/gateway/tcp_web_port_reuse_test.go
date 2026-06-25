@@ -1,60 +1,58 @@
 package main
 
 import (
-	"bytes"
 	"errors"
-	"io"
 	"net"
 	"net/http"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/tursom/mc-gateway/internal/gatewayconfig"
 	"github.com/tursom/mc-gateway/protocol"
 )
 
 func TestTCPWebPortReuseEnabledUsesNormalizedPorts(t *testing.T) {
 	tests := []struct {
 		name      string
-		tcp       ProtocolConfig
-		websocket WebSocketConfig
+		tcp       gatewayconfig.ProtocolConfig
+		websocket gatewayconfig.WebSocketConfig
 		want      bool
 	}{
 		{
 			name:      "explicit same port",
-			tcp:       ProtocolConfig{Enable: true, Port: 25565},
-			websocket: WebSocketConfig{Enable: true, Port: 25565},
+			tcp:       gatewayconfig.ProtocolConfig{Enable: true, Port: 25565},
+			websocket: gatewayconfig.WebSocketConfig{Enable: true, Port: 25565},
 			want:      true,
 		},
 		{
 			name:      "websocket default port",
-			tcp:       ProtocolConfig{Enable: true, Port: defaultWebSocketPort},
-			websocket: WebSocketConfig{Enable: true},
+			tcp:       gatewayconfig.ProtocolConfig{Enable: true, Port: defaultWebSocketPort},
+			websocket: gatewayconfig.WebSocketConfig{Enable: true},
 			want:      true,
 		},
 		{
 			name:      "tcp default port",
-			tcp:       ProtocolConfig{Enable: true},
-			websocket: WebSocketConfig{Enable: true, Port: defaultTCPPort},
+			tcp:       gatewayconfig.ProtocolConfig{Enable: true},
+			websocket: gatewayconfig.WebSocketConfig{Enable: true, Port: defaultTCPPort},
 			want:      true,
 		},
 		{
 			name:      "different ports",
-			tcp:       ProtocolConfig{Enable: true, Port: 25565},
-			websocket: WebSocketConfig{Enable: true, Port: 25566},
+			tcp:       gatewayconfig.ProtocolConfig{Enable: true, Port: 25565},
+			websocket: gatewayconfig.WebSocketConfig{Enable: true, Port: 25566},
 			want:      false,
 		},
 		{
 			name:      "tcp disabled",
-			tcp:       ProtocolConfig{Enable: false, Port: 25565},
-			websocket: WebSocketConfig{Enable: true, Port: 25565},
+			tcp:       gatewayconfig.ProtocolConfig{Enable: false, Port: 25565},
+			websocket: gatewayconfig.WebSocketConfig{Enable: true, Port: 25565},
 			want:      false,
 		},
 		{
 			name:      "websocket disabled",
-			tcp:       ProtocolConfig{Enable: true, Port: 25565},
-			websocket: WebSocketConfig{Enable: false, Port: 25565},
+			tcp:       gatewayconfig.ProtocolConfig{Enable: true, Port: 25565},
+			websocket: gatewayconfig.WebSocketConfig{Enable: false, Port: 25565},
 			want:      false,
 		},
 	}
@@ -70,156 +68,6 @@ func TestTCPWebPortReuseEnabledUsesNormalizedPorts(t *testing.T) {
 				t.Fatalf("tcpWebPortReuseEnabled() = %v, want %v", got, tt.want)
 			}
 		})
-	}
-}
-
-func TestHTTPInitialPacketRecognition(t *testing.T) {
-	for _, method := range []string{
-		"GET ",
-		"POST ",
-		"HEAD ",
-		"PUT ",
-		"PATCH ",
-		"DELETE ",
-		"OPTIONS ",
-		"CONNECT ",
-		"TRACE ",
-	} {
-		t.Run(strings.TrimSpace(method), func(t *testing.T) {
-			if !isHTTPInitialPacket([]byte(method + "/gateway HTTP/1.1\r\n")) {
-				t.Fatalf("isHTTPInitialPacket(%q) = false, want true", method)
-			}
-		})
-	}
-
-	if isHTTPInitialPacket(gatewayTestPacket("play.example")) {
-		t.Fatal("Minecraft handshake was recognized as HTTP")
-	}
-	if isHTTPInitialPacket([]byte("GE")) {
-		t.Fatal("partial HTTP method was recognized as complete HTTP")
-	}
-	if !isPotentialHTTPInitialPacket([]byte("GE")) {
-		t.Fatal("partial HTTP method was not recognized as a possible HTTP prefix")
-	}
-	if isPotentialHTTPInitialPacket([]byte("GOT ")) {
-		t.Fatal("invalid HTTP method was recognized as a possible HTTP prefix")
-	}
-}
-
-func TestReplayConnReadsPeekedBytesBeforeUnderlyingConn(t *testing.T) {
-	base := newGatewayTestConn([]byte("rest"))
-	conn := newReplayConn(base, []byte("peek-"))
-
-	got, err := io.ReadAll(conn)
-	if err != nil {
-		t.Fatalf("ReadAll() error = %v", err)
-	}
-	if string(got) != "peek-rest" {
-		t.Fatalf("replayed data = %q, want peek-rest", got)
-	}
-}
-
-func TestChanListenerAcceptCloseAndDeliver(t *testing.T) {
-	listener := newChanListener(benchmarkAddr("listener"))
-	conn := newGatewayTestConn(nil)
-
-	if !listener.deliver(conn) {
-		t.Fatal("deliver() = false, want true")
-	}
-
-	got, err := listener.Accept()
-	if err != nil {
-		t.Fatalf("Accept() error = %v", err)
-	}
-	if got != conn {
-		t.Fatalf("Accept() = %v, want delivered conn", got)
-	}
-
-	if err := listener.Close(); err != nil {
-		t.Fatalf("Close() error = %v", err)
-	}
-	if listener.deliver(newGatewayTestConn(nil)) {
-		t.Fatal("deliver() after Close = true, want false")
-	}
-
-	_, err = listener.Accept()
-	if !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("Accept() error = %v, want %v", err, net.ErrClosed)
-	}
-}
-
-func TestHandleTcpWebPortReuseConnRoutesHTTP(t *testing.T) {
-	defer saveGatewayState(t)()
-
-	listener := newChanListener(benchmarkAddr("listener"))
-	source := newGatewayTestConn([]byte("GET / HTTP/1.1\r\n\r\n"))
-	tcpCalled := false
-
-	handleTcpWebPortReuseConn(source, listener, func(net.Conn) {
-		tcpCalled = true
-	}, time.Second)
-
-	if tcpCalled {
-		t.Fatal("TCP handler was called for HTTP request")
-	}
-
-	conn, err := listener.Accept()
-	if err != nil {
-		t.Fatalf("Accept() error = %v", err)
-	}
-	got, err := io.ReadAll(conn)
-	if err != nil {
-		t.Fatalf("ReadAll() error = %v", err)
-	}
-	if string(got) != "GET / HTTP/1.1\r\n\r\n" {
-		t.Fatalf("HTTP replay = %q", got)
-	}
-}
-
-func TestHandleTcpWebPortReuseConnRoutesMinecraft(t *testing.T) {
-	defer saveGatewayState(t)()
-
-	packet := gatewayTestPacket("play.example")
-	listener := newChanListener(benchmarkAddr("listener"))
-	source := newGatewayTestConn(packet)
-
-	var got []byte
-	handleTcpWebPortReuseConn(source, listener, func(conn net.Conn) {
-		var err error
-		got, err = io.ReadAll(conn)
-		if err != nil {
-			t.Fatalf("ReadAll() error = %v", err)
-		}
-	}, time.Second)
-
-	if !bytes.Equal(got, packet) {
-		t.Fatalf("Minecraft replay = %v, want %v", got, packet)
-	}
-}
-
-func TestHandleTcpWebPortReuseConnTimeoutClosesConn(t *testing.T) {
-	defer saveGatewayState(t)()
-
-	client, server := net.Pipe()
-	defer client.Close()
-
-	listener := newChanListener(benchmarkAddr("listener"))
-	done := make(chan struct{})
-	go func() {
-		handleTcpWebPortReuseConn(server, listener, func(net.Conn) {
-			t.Error("TCP handler was called after timeout")
-		}, 10*time.Millisecond)
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for initial packet timeout")
-	}
-
-	if _, err := client.Write([]byte("x")); err == nil {
-		t.Fatal("client Write() error = nil, want closed connection error")
 	}
 }
 

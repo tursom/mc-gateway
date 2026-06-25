@@ -1,52 +1,70 @@
 # mc-gateway
 
-一个简易的 Minecraft 网关，通过 host 将客户端的流量转发到对应的后端 Minecraft 服务器。
+一个简易的 Minecraft 网关，通过客户端握手里的 host 将流量转发到对应的后端 Minecraft 服务器。
 
-## 配置
+## 启动
 
-目前 mc-gateway 只支持读取当前目录的 `config.toml` 作为配置。在 `config.toml` 被修改时，可以自动加载并更新部分配置，以达到不停机修改配置的效果。支持热加载的配置有：
+mc-gateway 默认不依赖配置文件。直接启动后会在 `25565` 端口同时提供 Minecraft TCP 转发入口和后台管理入口：
 
-- hosts
-- log
-- KCP 的 data_shards 和 parity_Shards
-- QUIC 的 application_protocols
-- pid_file
+- Admin 页面：`/admin/`
+- Admin API：`/admin/api`
+- SQLite 数据库：`mc-gateway.sqlite3`
 
-### 顶层配置
+首次启动时，如果用户表为空，可以通过 Admin 页面初始化管理员账号。也可以用 `MC_GATEWAY_ADMIN_PASSWORD` 在启动时创建默认管理员用户 `admin`。
 
-| 配置     | 类型   | 备注     |
-| -------- | ------ | -------- |
-| pid_file | string | pid 文件 |
+### 启动期环境变量
 
-> pid_file 在非 windows 平台默认会写入 /var/run/mc-gateway.pid，
-> 在 windows 平台默认不会写入任何文件
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `MC_GATEWAY_TCP_ADMIN_PORT` | `25565` | TCP/Admin 共享监听端口 |
+| `MC_GATEWAY_ADMIN_PATH` | `/admin/` | Admin 页面路径 |
+| `MC_GATEWAY_ADMIN_API_PREFIX` | `/admin/api` | Admin API 前缀 |
+| `MC_GATEWAY_DB` | `mc-gateway.sqlite3` | SQLite 数据库路径 |
+| `MC_GATEWAY_ADMIN_PASSWORD` | 空 | 首次启动时创建默认管理员密码 |
 
-### hosts
+服务启停、KCP/QUIC/WebSocket 参数、用户、权限和路由都通过后台管理写入 SQLite，不再使用 `config.toml` 作为启动配置或路由来源。
 
-hosts 使用期望的 host 做 key，转发的目的地址为 value。参考`config.example.toml`。默认的 fallback host 配置 key 为 `default`。
+## 权限
 
-#### upstream
+后台管理内置三类角色：
 
-host 支持多种协议的上游服务器，包括 tcp、kcp、quic、websocket 等。只需要在原始地址前加对应的协议名称即可，如 `quic://127.0.0.1:8080`。支持的列表如下：
+| 角色 | 能力 |
+| --- | --- |
+| 管理员 | 管理用户、服务、路由和审计日志 |
+| 成员 | 查看状态，管理路由 |
+| 游客 | 查看当前路由 |
 
-| 协议名称 | 前缀       | 备注                          |
-| -------- | ---------- | ----------------------------- |
-| tcp      | 无         | 原始的tcp连接                 |
-| kcp      | kcp://     | 使用 kcp 协议连接到服务器     |
-| quic     | quic://    | 使用 quic 协议连接到服务器    |
-| haproxy  | haproxy:// | 使用 HAProxy 协议连接到服务器 |
+## 路由
 
-> HAProxy 协议头会保存客户端的真实 ip，大部分支持 HAProxy 的 mod（或插件）都支持从协议头获取真实 ip，
-> 这样服务端就能够获取到真实的客户端 ip了，以此兼容现有的 ban ip 或者统计等插件。
+路由记录存储在 SQLite 中，后台修改后会刷新内存快照。默认 fallback 路由的 host 为 `default`。
 
-### log
+### upstream
 
-| 配置  | 类型   | 备注     |
-| ----- | ------ | -------- |
-| level | Level  | 日志等级 |
-| file  | string | 日志文件 |
+路由上游支持多种协议。TCP 上游直接填写地址，其他协议在地址前加协议前缀：
 
-> 日志适配 logrotate，可以使用 logrotate 进行日志分片、压缩等日常运维操作，参考配置：
+| 协议 | 前缀 | 说明 |
+| --- | --- | --- |
+| tcp | 无 | 原始 TCP 连接 |
+| kcp | `kcp://` | 使用 KCP 协议连接到服务器 |
+| quic | `quic://` | 使用 QUIC 协议连接到服务器 |
+| haproxy | `haproxy://` | 使用 HAProxy 协议连接到服务器 |
+
+HAProxy 协议头会保存客户端真实 IP，适合需要在后端服务端获取真实客户端 IP 的场景。
+
+## 可选服务
+
+TCP/Admin listener 是基础入口，默认启用。KCP、QUIC、WebSocket 默认禁用，可以在后台管理中启用并配置端口和参数；配置修改后第一版按重启后生效处理。
+
+| 服务 | 默认端口 | 说明 |
+| --- | --- | --- |
+| TCP/Admin | `25565` | Minecraft TCP 转发和后台管理共享入口 |
+| KCP | `25565` | 可选 KCP 入口 |
+| QUIC | `25565` | 可选 QUIC 入口 |
+| WebSocket | `25566` | 可选 WebSocket 入口 |
+
+## 日志
+
+默认日志级别为 `info`，输出到标准输出。日志文件重开逻辑支持 logrotate 场景：
 
 ```logrotate
 /var/log/mc-gateway.log {
@@ -63,52 +81,9 @@ host 支持多种协议的上游服务器，包括 tcp、kcp、quic、websocket 
     delaycompress
     dateext
     postrotate
-        # 向程序发送 SIGHUP 信号
-        # mc-gateway 默认会将当前进程的 pid 写入 /var/run/mc-gateway.pid
-        if [ -f /var/run/mc-gateway.pid ]; then
-            kill -SIGHUP $(cat /var/run/mc-gateway.pid)
+        if [ -f /dev/shm/mc-gateway.pid ]; then
+            kill -SIGHUP $(cat /dev/shm/mc-gateway.pid)
         fi
     endscript
 }
 ```
-
-### tcp
-
-| 配置   | 类型 | 备注     |
-| ------ | ---- | -------- |
-| enable | bool | 是否启用 |
-| port   | int  | 端口     |
-
-> 默认端口为 25565，与 Minecraft 服务端保持一致
-
-### kcp
-
-| 配置          | 类型 | 备注     |
-| ------------- | ---- | -------- |
-| enable        | bool | 是否启用 |
-| port          | int  | 端口     |
-| data_shards   | int  | 数据分片 |
-| parity_Shards | int  | 校验分片 |
-
-### quic
-
-| 配置                  | 类型     | 备注         |
-| --------------------- | -------- | ------------ |
-| enable                | bool     | 是否启用     |
-| port                  | int      | 端口         |
-| application_protocols | []string | 应用协议列表 |
-
-> application_protocols 只要客户端与服务端有一个能够对应上就可以成功连接
-> 默认值为 ["minecraft", "quic", "raw", "h3"]
-
-### websocket
-
-| 配置   | 类型 | 备注     |
-| ------ | ---- | -------- |
-| enable | bool | 是否启用 |
-| port   | int  | 端口     |
-| path   | str  | 接口路径 |
-
-> path 默认为 "/"，会对所有路径的请求进行处理
->
-> port 默认为 25566

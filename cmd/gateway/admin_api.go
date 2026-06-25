@@ -1,0 +1,32 @@
+package main
+
+import (
+	"net/http"
+
+	"github.com/tursom/mc-gateway/internal/adminhttp"
+)
+
+func newAdminAPIHandler() http.HandlerFunc {
+	return adminhttp.NewAPIHandler(adminStartup.AdminAPIPrefix, adminhttp.APIHandlers{
+		SetupStatus: handleAdminSetupStatus,
+		Setup:       handleAdminSetup,
+		Login:       handleAdminLogin,
+		Logout:      handleAdminLogout,
+		Me:          handleAdminMe,
+		Status:      handleAdminStatus,
+
+		RoutesList: handleAdminRoutesList,
+		RouteItem:  handleAdminRouteItem,
+
+		ServicesList: handleAdminServicesList,
+		ServiceItem:  handleAdminServiceItem,
+
+		Metrics: handleAdminMetrics,
+
+		UsersList:   handleAdminUsersList,
+		UsersCreate: handleAdminUsersCreate,
+		UserItem:    handleAdminUserItem,
+
+		AuditLogs: handleAdminAuditLogs,
+	})
+}

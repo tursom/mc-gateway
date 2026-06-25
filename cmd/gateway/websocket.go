@@ -37,6 +37,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
+	gatewayMetrics.WebSocketConnectionStarted()
 	handleRequest(&webSocketConn{Conn: conn})
 }
 
