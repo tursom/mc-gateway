@@ -1,21 +1,24 @@
 package adminhttp
 
 import (
-	"io/fs"
 	"net/http"
+	"os"
+	"path"
+	"path/filepath"
+	"strconv"
 	"strings"
 )
 
 const (
-	staticIndexFile = "admin_static/index.html"
-	staticCSSFile   = "admin_static/app.css"
-	staticJSFile    = "admin_static/app.js"
+	defaultStaticDir = "cmd/gateway/admin_static"
+	staticConfigFile = "config.js"
+	staticIndexFile  = "index.html"
 )
 
 type GatewayHandlerOptions struct {
 	AdminPath        string
 	AdminAPIPrefix   string
-	Assets           fs.FS
+	StaticDir        string
 	APIHandler       http.HandlerFunc
 	WebSocketEnabled bool
 	WebSocketPath    string
@@ -68,40 +71,67 @@ func serveAdminStatic(w http.ResponseWriter, r *http.Request, opts GatewayHandle
 	}
 
 	if r.URL.Path == opts.AdminPath {
-		serveAdminIndex(w, opts)
+		serveAdminFile(w, r, opts, staticIndexFile)
 		return
 	}
 
 	rel := strings.TrimPrefix(r.URL.Path, opts.AdminPath)
-	switch rel {
-	case "app.css":
-		serveAdminFile(w, r, opts.Assets, staticCSSFile, "text/css; charset=utf-8")
-	case "app.js":
-		serveAdminFile(w, r, opts.Assets, staticJSFile, "application/javascript; charset=utf-8")
-	default:
-		http.NotFound(w, r)
-	}
-}
-
-func serveAdminIndex(w http.ResponseWriter, opts GatewayHandlerOptions) {
-	data, err := fs.ReadFile(opts.Assets, staticIndexFile)
-	if err != nil {
-		WriteAPIError(w, http.StatusInternalServerError, err.Error())
+	if rel == staticConfigFile {
+		serveAdminConfig(w, opts)
 		return
 	}
-	html := strings.ReplaceAll(string(data), "__ADMIN_API_PREFIX__", opts.AdminAPIPrefix)
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	_, _ = w.Write([]byte(html))
+	serveAdminFile(w, r, opts, rel)
 }
 
-func serveAdminFile(w http.ResponseWriter, r *http.Request, assets fs.FS, name, contentType string) {
-	data, err := fs.ReadFile(assets, name)
-	if err != nil {
+func serveAdminConfig(w http.ResponseWriter, opts GatewayHandlerOptions) {
+	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write([]byte(`window.MCGatewayAdmin={"apiPrefix":` + strconv.Quote(opts.AdminAPIPrefix) + `};`))
+}
+
+func serveAdminFile(w http.ResponseWriter, r *http.Request, opts GatewayHandlerOptions, rel string) {
+	name, ok := cleanStaticPath(rel)
+	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	w.Header().Set("Content-Type", contentType)
+	file := filepath.Join(staticDir(opts), name)
+	info, err := os.Stat(file)
+	if err != nil || info.IsDir() {
+		http.NotFound(w, r)
+		return
+	}
 	w.Header().Set("Cache-Control", "no-store")
-	_, _ = w.Write(data)
+	http.ServeFile(w, r, file)
+}
+
+func cleanStaticPath(rel string) (string, bool) {
+	if rel == "" {
+		return "", false
+	}
+	cleaned := path.Clean("/" + rel)
+	if cleaned == "/" || strings.HasPrefix(cleaned, "/../") {
+		return "", false
+	}
+	name := strings.TrimPrefix(cleaned, "/")
+	if name == staticConfigFile {
+		return "", false
+	}
+	return name, true
+}
+
+func staticDir(opts GatewayHandlerOptions) string {
+	if strings.TrimSpace(opts.StaticDir) != "" {
+		return opts.StaticDir
+	}
+	if value := strings.TrimSpace(os.Getenv("MC_GATEWAY_ADMIN_STATIC_DIR")); value != "" {
+		return value
+	}
+	if _, err := os.Stat(defaultStaticDir); err == nil {
+		return defaultStaticDir
+	}
+	if _, err := os.Stat("admin_static"); err == nil {
+		return "admin_static"
+	}
+	return defaultStaticDir
 }

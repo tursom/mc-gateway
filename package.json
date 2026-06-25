@@ -1,0 +1,9 @@
+{
+  "scripts": {
+    "build:admin": "tsc -p tsconfig.admin.json",
+    "check:admin": "tsc -p tsconfig.admin.json --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "6.0.3"
+  }
+}

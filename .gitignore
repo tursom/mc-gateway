@@ -1,4 +1,6 @@
 .vscode
+node_modules/
+cmd/gateway/admin_static/js/
 
 config.toml
 /gateway*

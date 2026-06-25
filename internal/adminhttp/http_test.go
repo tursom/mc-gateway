@@ -4,9 +4,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
-	"testing/fstest"
 )
 
 func TestDecodeJSONRequest(t *testing.T) {
@@ -117,16 +118,16 @@ func TestRequestSourceIP(t *testing.T) {
 }
 
 func TestNewGatewayHandlerServesAdminAndAPI(t *testing.T) {
-	assets := fstest.MapFS{
-		staticIndexFile: {Data: []byte(`<html data-api-prefix="__ADMIN_API_PREFIX__"></html>`)},
-		staticCSSFile:   {Data: []byte(`body{color:red}`)},
-		staticJSFile:    {Data: []byte(`console.log("admin")`)},
-	}
+	staticDir := writeTestAdminStatic(t, map[string]string{
+		"index.html": "<html><script src=\"config.js\"></script></html>",
+		"app.css":    "body{color:red}",
+		"js/main.js": `console.log("admin")`,
+	})
 	apiCalled := false
 	handler := NewGatewayHandler(GatewayHandlerOptions{
 		AdminPath:      "/ops/",
 		AdminAPIPrefix: "/ops/api",
-		Assets:         assets,
+		StaticDir:      staticDir,
 		APIHandler: func(w http.ResponseWriter, r *http.Request) {
 			apiCalled = true
 			w.WriteHeader(http.StatusNoContent)
@@ -149,11 +150,8 @@ func TestNewGatewayHandlerServesAdminAndAPI(t *testing.T) {
 	if resp.Code != http.StatusOK {
 		t.Fatalf("admin page status = %d, body=%s", resp.Code, resp.Body.String())
 	}
-	if !strings.Contains(resp.Body.String(), `data-api-prefix="/ops/api"`) {
-		t.Fatalf("admin page = %q, want API prefix", resp.Body.String())
-	}
-	if got := resp.Header().Get("Cache-Control"); got != "no-store" {
-		t.Fatalf("admin page Cache-Control = %q, want no-store", got)
+	if !strings.Contains(resp.Body.String(), `script src="config.js"`) {
+		t.Fatalf("admin page = %q, want static index", resp.Body.String())
 	}
 
 	resp = httptest.NewRecorder()
@@ -161,6 +159,33 @@ func TestNewGatewayHandlerServesAdminAndAPI(t *testing.T) {
 	handler.ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK || strings.TrimSpace(resp.Body.String()) != `body{color:red}` {
 		t.Fatalf("css response status=%d body=%q", resp.Code, resp.Body.String())
+	}
+
+	resp = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/ops/js/main.js", nil)
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), `console.log("admin")`) {
+		t.Fatalf("js response status=%d body=%q", resp.Code, resp.Body.String())
+	}
+	if got := resp.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("js Cache-Control = %q, want no-store", got)
+	}
+
+	resp = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/ops/js/", nil)
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("js directory status=%d, want %d", resp.Code, http.StatusNotFound)
+	}
+
+	resp = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/ops/config.js", nil)
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK || strings.TrimSpace(resp.Body.String()) != `window.MCGatewayAdmin={"apiPrefix":"/ops/api"};` {
+		t.Fatalf("config response status=%d body=%q", resp.Code, resp.Body.String())
+	}
+	if got := resp.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("config Cache-Control = %q, want no-store", got)
 	}
 
 	resp = httptest.NewRecorder()
@@ -182,13 +207,11 @@ func TestNewGatewayHandlerServesAdminAndAPI(t *testing.T) {
 }
 
 func TestNewGatewayHandlerRegistersWebSocketWhenPathDoesNotConflict(t *testing.T) {
-	assets := fstest.MapFS{
-		staticIndexFile: {Data: []byte(``)},
-	}
+	staticDir := writeTestAdminStatic(t, map[string]string{"index.html": ""})
 	handler := NewGatewayHandler(GatewayHandlerOptions{
 		AdminPath:        "/admin/",
 		AdminAPIPrefix:   "/admin/api",
-		Assets:           assets,
+		StaticDir:        staticDir,
 		APIHandler:       func(w http.ResponseWriter, r *http.Request) {},
 		WebSocketEnabled: true,
 		WebSocketPath:    "/ws",
@@ -203,6 +226,21 @@ func TestNewGatewayHandlerRegistersWebSocketWhenPathDoesNotConflict(t *testing.T
 	if resp.Code != http.StatusAccepted {
 		t.Fatalf("websocket path status = %d, want %d", resp.Code, http.StatusAccepted)
 	}
+}
+
+func writeTestAdminStatic(t *testing.T, files map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	for name, data := range files {
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("MkdirAll(%q) error = %v", filepath.Dir(path), err)
+		}
+		if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+			t.Fatalf("WriteFile(%q) error = %v", path, err)
+		}
+	}
+	return dir
 }
 
 func TestWebSocketPathConflictsWithAdmin(t *testing.T) {

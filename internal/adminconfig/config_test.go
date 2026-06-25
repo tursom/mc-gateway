@@ -60,8 +60,12 @@ func TestParseReturnsErrors(t *testing.T) {
 			},
 		},
 		{
-			name: "api prefix under asset path",
-			env:  map[string]string{EnvAPIPrefix: "/admin/app.js/api"},
+			name: "api prefix under js asset path",
+			env:  map[string]string{EnvAPIPrefix: "/admin/js/api"},
+		},
+		{
+			name: "api prefix under config asset path",
+			env:  map[string]string{EnvAPIPrefix: "/admin/config.js/api"},
 		},
 	}
 

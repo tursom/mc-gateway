@@ -1,5 +1,17 @@
 # syntax=docker/dockerfile:1
 
+FROM --platform=$BUILDPLATFORM node:24.11.1-alpine AS admin-frontend
+
+WORKDIR /src
+
+COPY package.json package-lock.json tsconfig.admin.json ./
+RUN --mount=type=cache,id=mc-gateway-npm,target=/root/.npm,sharing=locked \
+    npm ci
+
+COPY cmd/gateway/admin_frontend ./cmd/gateway/admin_frontend
+COPY cmd/gateway/admin_static/index.html cmd/gateway/admin_static/app.css ./cmd/gateway/admin_static/
+RUN npm run build:admin
+
 FROM --platform=$BUILDPLATFORM golang:1.24.4-alpine AS build
 
 ARG TARGETOS
@@ -12,6 +24,7 @@ RUN --mount=type=cache,id=mc-gateway-go-mod,target=/go/pkg/mod,sharing=locked \
     go mod download
 
 COPY . .
+
 RUN --mount=type=cache,id=mc-gateway-go-mod,target=/go/pkg/mod,sharing=locked \
     --mount=type=cache,id=mc-gateway-go-build-${TARGETOS}-${TARGETARCH},target=/root/.cache/go-build,sharing=locked \
     mkdir -p /out \
@@ -22,8 +35,10 @@ FROM alpine:3.22
 WORKDIR /data
 
 COPY --from=build /out/mc-gateway /usr/local/bin/mc-gateway
+COPY --from=admin-frontend /src/cmd/gateway/admin_static /usr/share/mc-gateway/admin_static
 
 ENV MC_GATEWAY_DB=/data/mc-gateway.sqlite3
+ENV MC_GATEWAY_ADMIN_STATIC_DIR=/usr/share/mc-gateway/admin_static
 
 EXPOSE 25565/tcp
 

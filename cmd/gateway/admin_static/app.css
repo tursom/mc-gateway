@@ -126,6 +126,18 @@ label.inline input {
   color: var(--muted);
 }
 
+.language-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.language-field select {
+  width: auto;
+  min-width: 104px;
+}
+
 .auth-view {
   min-height: calc(100vh - 120px);
   display: grid;
@@ -353,6 +365,10 @@ dialog h2 {
   .toolbar {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .session {
+    flex-wrap: wrap;
   }
 
   .toolbar input {

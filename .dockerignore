@@ -3,6 +3,8 @@
 .codex
 .omc
 .vscode
+node_modules
+cmd/gateway/admin_static/js
 
 logs
 data

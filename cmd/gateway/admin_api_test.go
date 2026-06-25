@@ -122,8 +122,16 @@ func TestAdminCustomPathAndAPIPrefixFromEnv(t *testing.T) {
 	if resp.Code != http.StatusOK {
 		t.Fatalf("custom admin page status = %d, body=%s", resp.Code, resp.Body.String())
 	}
-	if !strings.Contains(resp.Body.String(), `data-api-prefix="/ops/api"`) {
-		t.Fatalf("custom admin page does not contain API prefix: %s", resp.Body.String())
+	if !strings.Contains(resp.Body.String(), `script src="config.js"`) {
+		t.Fatalf("custom admin page does not reference runtime config: %s", resp.Body.String())
+	}
+
+	resp = adminTestRequest(t, handler, http.MethodGet, "/ops/config.js", "", nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("custom admin config status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if strings.TrimSpace(resp.Body.String()) != `window.MCGatewayAdmin={"apiPrefix":"/ops/api"};` {
+		t.Fatalf("custom admin config body = %q", resp.Body.String())
 	}
 
 	resp = adminTestRequest(t, handler, http.MethodGet, "/ops/api/setup", "", nil)

@@ -132,7 +132,7 @@ func validateAdminPaths(adminPath, apiPrefix string) error {
 		return errors.New("admin API prefix cannot equal admin page path")
 	}
 
-	for _, asset := range []string{"app.css", "app.js"} {
+	for _, asset := range []string{"app.css", "config.js", "js"} {
 		assetPath := strings.TrimRight(adminPath, "/") + "/" + asset
 		if apiPrefix == assetPath || strings.HasPrefix(apiPrefix+"/", assetPath+"/") {
 			return errors.New("admin API prefix cannot be under static asset path")

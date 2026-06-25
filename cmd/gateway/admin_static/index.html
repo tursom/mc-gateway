@@ -6,7 +6,7 @@
   <title>mc-gateway admin</title>
   <link rel="stylesheet" href="app.css">
 </head>
-<body data-api-prefix="__ADMIN_API_PREFIX__">
+<body>
   <main class="shell">
     <header class="topbar">
       <div>
@@ -14,8 +14,15 @@
         <p id="subtitle">Admin</p>
       </div>
       <div class="session">
+        <label class="language-field">
+          <span data-i18n="language">Language</span>
+          <select id="languageSelect" aria-label="Language">
+            <option value="en" data-i18n="languageEnglish">English</option>
+            <option value="zh" data-i18n="languageChinese">中文</option>
+          </select>
+        </label>
         <span id="sessionUser"></span>
-        <button id="logoutBtn" class="ghost hidden" type="button">Logout</button>
+        <button id="logoutBtn" class="ghost hidden" type="button" data-i18n="logout">Logout</button>
       </div>
     </header>
 
@@ -23,31 +30,31 @@
 
     <section id="setupView" class="auth-view hidden">
       <form id="setupForm" class="panel compact">
-        <h2>Initial admin</h2>
+        <h2 data-i18n="initialAdmin">Initial admin</h2>
         <label>
-          Username
+          <span data-i18n="username">Username</span>
           <input name="username" autocomplete="username" value="admin">
         </label>
         <label>
-          Password
+          <span data-i18n="password">Password</span>
           <input name="password" autocomplete="new-password" type="password" required>
         </label>
-        <button type="submit">Create admin</button>
+        <button type="submit" data-i18n="createAdmin">Create admin</button>
       </form>
     </section>
 
     <section id="loginView" class="auth-view hidden">
       <form id="loginForm" class="panel compact">
-        <h2>Login</h2>
+        <h2 data-i18n="login">Login</h2>
         <label>
-          Username
+          <span data-i18n="username">Username</span>
           <input name="username" autocomplete="username" required>
         </label>
         <label>
-          Password
+          <span data-i18n="password">Password</span>
           <input name="password" autocomplete="current-password" type="password" required>
         </label>
-        <button type="submit">Login</button>
+        <button type="submit" data-i18n="login">Login</button>
       </form>
     </section>
 
@@ -55,27 +62,27 @@
       <section id="statusGrid" class="status-grid"></section>
 
       <nav class="tabs">
-        <button data-tab="routes" class="active" type="button">Routes</button>
-        <button data-tab="services" type="button">Services</button>
-        <button data-tab="users" type="button">Users</button>
-        <button data-tab="metrics" type="button">Metrics</button>
-        <button data-tab="audit" type="button">Audit</button>
+        <button data-tab="routes" class="active" type="button" data-i18n="routes">Routes</button>
+        <button data-tab="services" type="button" data-i18n="services">Services</button>
+        <button data-tab="users" type="button" data-i18n="users">Users</button>
+        <button data-tab="metrics" type="button" data-i18n="metrics">Metrics</button>
+        <button data-tab="audit" type="button" data-i18n="audit">Audit</button>
       </nav>
 
       <section id="routesTab" class="tab-panel">
         <div class="toolbar">
-          <input id="routeSearch" placeholder="Search host, upstream, note">
-          <button id="newRouteBtn" type="button">New route</button>
+          <input id="routeSearch" placeholder="Search host, upstream, note" data-i18n-placeholder="routeSearch">
+          <button id="newRouteBtn" type="button" data-i18n="newRoute">New route</button>
         </div>
         <div class="table-wrap">
           <table>
             <thead>
               <tr>
-                <th>Host</th>
-                <th>Upstream</th>
-                <th>Enabled</th>
-                <th>Note</th>
-                <th class="actions">Actions</th>
+                <th data-i18n="host">Host</th>
+                <th data-i18n="upstream">Upstream</th>
+                <th data-i18n="enabled">Enabled</th>
+                <th data-i18n="note">Note</th>
+                <th class="actions" data-i18n="actions">Actions</th>
               </tr>
             </thead>
             <tbody id="routesBody"></tbody>
@@ -89,16 +96,16 @@
 
       <section id="usersTab" class="tab-panel hidden">
         <div class="toolbar">
-          <button id="newUserBtn" type="button">New user</button>
+          <button id="newUserBtn" type="button" data-i18n="newUser">New user</button>
         </div>
         <div class="table-wrap">
           <table>
             <thead>
               <tr>
-                <th>Username</th>
-                <th>Role</th>
-                <th>Disabled</th>
-                <th class="actions">Actions</th>
+                <th data-i18n="username">Username</th>
+                <th data-i18n="role">Role</th>
+                <th data-i18n="disabled">Disabled</th>
+                <th class="actions" data-i18n="actions">Actions</th>
               </tr>
             </thead>
             <tbody id="usersBody"></tbody>
@@ -109,7 +116,7 @@
       <section id="metricsTab" class="tab-panel hidden">
         <div id="metricsGrid" class="status-grid"></div>
         <div class="panel">
-          <h2>Route hits</h2>
+          <h2 data-i18n="routeHits">Route hits</h2>
           <div id="routeHits" class="chips"></div>
         </div>
       </section>
@@ -119,12 +126,12 @@
           <table>
             <thead>
               <tr>
-                <th>Time</th>
-                <th>Actor</th>
-                <th>Action</th>
-                <th>Target</th>
-                <th>Result</th>
-                <th>Message</th>
+                <th data-i18n="time">Time</th>
+                <th data-i18n="actor">Actor</th>
+                <th data-i18n="action">Action</th>
+                <th data-i18n="target">Target</th>
+                <th data-i18n="result">Result</th>
+                <th data-i18n="message">Message</th>
               </tr>
             </thead>
             <tbody id="auditBody"></tbody>
@@ -136,60 +143,61 @@
 
   <dialog id="routeDialog">
     <form id="routeForm" method="dialog">
-      <h2>Route</h2>
+      <h2 data-i18n="route">Route</h2>
       <label>
-        Host
+        <span data-i18n="host">Host</span>
         <input name="host" required>
       </label>
       <label>
-        Upstream
+        <span data-i18n="upstream">Upstream</span>
         <input name="upstream" required placeholder="127.0.0.1:25565">
       </label>
       <label class="inline">
         <input name="enabled" type="checkbox" checked>
-        Enabled
+        <span data-i18n="enabled">Enabled</span>
       </label>
       <label>
-        Note
+        <span data-i18n="note">Note</span>
         <input name="note">
       </label>
       <div class="dialog-actions">
-        <button type="button" data-close>Cancel</button>
-        <button type="submit">Save</button>
+        <button type="button" data-close data-i18n="cancel">Cancel</button>
+        <button type="submit" data-i18n="save">Save</button>
       </div>
     </form>
   </dialog>
 
   <dialog id="userDialog">
     <form id="userForm" method="dialog">
-      <h2>User</h2>
+      <h2 data-i18n="user">User</h2>
       <label>
-        Username
+        <span data-i18n="username">Username</span>
         <input name="username" required>
       </label>
       <label>
-        Role
+        <span data-i18n="role">Role</span>
         <select name="role">
-          <option value="admin">Admin</option>
-          <option value="member">Member</option>
-          <option value="guest">Guest</option>
+          <option value="admin" data-i18n="roleAdmin">Admin</option>
+          <option value="member" data-i18n="roleMember">Member</option>
+          <option value="guest" data-i18n="roleGuest">Guest</option>
         </select>
       </label>
       <label>
-        Password
+        <span data-i18n="password">Password</span>
         <input name="password" type="password">
       </label>
       <label class="inline">
         <input name="disabled" type="checkbox">
-        Disabled
+        <span data-i18n="disabled">Disabled</span>
       </label>
       <div class="dialog-actions">
-        <button type="button" data-close>Cancel</button>
-        <button type="submit">Save</button>
+        <button type="button" data-close data-i18n="cancel">Cancel</button>
+        <button type="submit" data-i18n="save">Save</button>
       </div>
     </form>
   </dialog>
 
-  <script src="app.js"></script>
+  <script src="config.js"></script>
+  <script type="module" src="js/main.js"></script>
 </body>
 </html>

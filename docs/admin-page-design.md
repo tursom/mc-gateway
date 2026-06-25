@@ -56,6 +56,7 @@
 | TCP/Admin 监听端口 | `25565` | `MC_GATEWAY_TCP_ADMIN_PORT` |
 | Admin 页面路径 | `/admin/` | `MC_GATEWAY_ADMIN_PATH` |
 | Admin API 前缀 | `/admin/api` | `MC_GATEWAY_ADMIN_API_PREFIX` |
+| Admin 静态目录 | `cmd/gateway/admin_static` | `MC_GATEWAY_ADMIN_STATIC_DIR` |
 | KCP | 默认禁用 | 后台配置 |
 | QUIC | 默认禁用 | 后台配置 |
 | WebSocket | 默认禁用 | 后台配置 |
@@ -67,7 +68,8 @@
 - `MC_GATEWAY_TCP_ADMIN_PORT` 只在启动时读取，必须是 `1-65535` 的整数；为空时使用 `25565`。
 - `MC_GATEWAY_ADMIN_PATH` 只在启动时读取，必须以 `/` 开头，规范化为以 `/` 结尾；为空时使用 `/admin/`。
 - `MC_GATEWAY_ADMIN_API_PREFIX` 只在启动时读取，必须以 `/` 开头，规范化为不以 `/` 结尾；为空时使用 `/admin/api`。
-- `MC_GATEWAY_ADMIN_API_PREFIX` 不能等于 `MC_GATEWAY_ADMIN_PATH`，也不能落在静态资源路径下。
+- `MC_GATEWAY_ADMIN_API_PREFIX` 不能等于 `MC_GATEWAY_ADMIN_PATH`，也不能落在静态资源路径下，例如 `config.js` 或 `js/`。
+- `MC_GATEWAY_ADMIN_STATIC_DIR` 指向 Admin 前端构建产物目录；Docker 镜像内使用 `/usr/share/mc-gateway/admin_static`。
 - 环境变量覆盖的是本次进程的 Admin 入口；第一次创建 SQLite 默认服务配置时，应把解析后的 TCP/Admin 端口写入 `services.tcp_admin.port`。
 
 启动流程：
@@ -130,7 +132,7 @@ Accept
 
 ## HTTP 路由与页面
 
-页面使用 Go `embed` 打包到单个二进制，不引入 Node 构建链。
+Admin 前端源码使用 TypeScript 拆分，构建为原生 ES modules。Go 不再 `embed` 前端文件，而是从 `MC_GATEWAY_ADMIN_STATIC_DIR` 指向的目录读取并透传静态响应。运行时 API 前缀通过动态 `config.js` 响应注入。
 
 建议目录：
 
@@ -140,10 +142,11 @@ cmd/gateway/admin_api.go
 cmd/gateway/admin_auth.go
 cmd/gateway/admin_db.go
 cmd/gateway/admin_static.go
+cmd/gateway/admin_frontend/src/
 cmd/gateway/admin_static/
   index.html
   app.css
-  app.js
+  js/
 ```
 
 API 路由：
@@ -152,7 +155,8 @@ API 路由：
 | --- | --- | --- | --- |
 | GET | `/admin/` | 公开页面 | 管理页面入口或首次初始化页面 |
 | GET | `/admin/app.css` | 公开页面 | 页面样式 |
-| GET | `/admin/app.js` | 公开页面 | 页面脚本 |
+| GET | `/admin/config.js` | 公开页面 | 运行时前端配置 |
+| GET | `/admin/js/main.js` | 公开页面 | 页面脚本入口 |
 | POST | `/admin/api/setup` | 仅用户表为空 | 创建第一个管理员 |
 | POST | `/admin/api/auth/login` | 未登录 | 用户名密码登录 |
 | POST | `/admin/api/auth/logout` | 已登录 | 注销当前会话 |
