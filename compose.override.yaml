@@ -1,0 +1,5 @@
+services:
+  mc-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile

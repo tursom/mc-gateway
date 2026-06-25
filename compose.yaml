@@ -1,9 +1,6 @@
 services:
   mc-gateway:
     image: ${MC_GATEWAY_IMAGE:-ghcr.io/tursom/mc-gateway:latest}
-    build:
-      context: .
-      dockerfile: Dockerfile
     network_mode: host
     restart: unless-stopped
     environment:

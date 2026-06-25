@@ -26,10 +26,16 @@ mc-gateway 默认不依赖配置文件。直接启动后会在 `25565` 端口同
 
 ### Docker Compose
 
-可以直接用 Docker Compose 本地构建并启动：
+生产部署只需要 `compose.yaml`，可以直接用 Docker Compose 拉取已发布镜像并启动：
 
 ```sh
-docker compose up -d --build
+docker compose up -d
+```
+
+源码目录中包含 `compose.override.yaml`，Docker Compose 会自动加载它，因此本地构建测试仍然可以直接运行：
+
+```sh
+docker compose build
 ```
 
 默认使用 host network，在宿主机 `25565/tcp` 提供 Minecraft TCP 转发入口和后台管理入口，后台地址为：
