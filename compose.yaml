@@ -1,0 +1,24 @@
+services:
+  mc-gateway:
+    image: ${MC_GATEWAY_IMAGE:-ghcr.io/tursom/mc-gateway:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      MC_GATEWAY_TCP_ADMIN_PORT: "${MC_GATEWAY_TCP_ADMIN_PORT:-25565}"
+      MC_GATEWAY_ADMIN_PATH: "${MC_GATEWAY_ADMIN_PATH:-/admin/}"
+      MC_GATEWAY_ADMIN_API_PREFIX: "${MC_GATEWAY_ADMIN_API_PREFIX:-/admin/api}"
+      MC_GATEWAY_DB: "${MC_GATEWAY_DB:-/data/mc-gateway.sqlite3}"
+      MC_GATEWAY_ADMIN_PASSWORD: "${MC_GATEWAY_ADMIN_PASSWORD:-}"
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -Y off -qO- "http://127.0.0.1:$${MC_GATEWAY_TCP_ADMIN_PORT:-25565}$${MC_GATEWAY_ADMIN_API_PREFIX:-/admin/api}/setup" >/dev/null
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s

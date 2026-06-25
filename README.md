@@ -24,6 +24,41 @@ mc-gateway 默认不依赖配置文件。直接启动后会在 `25565` 端口同
 
 服务启停、KCP/QUIC/WebSocket 参数、用户、权限和路由都通过后台管理写入 SQLite，不再使用 `config.toml` 作为启动配置或路由来源。
 
+### Docker Compose
+
+可以直接用 Docker Compose 本地构建并启动：
+
+```sh
+docker compose up -d --build
+```
+
+默认使用 host network，在宿主机 `25565/tcp` 提供 Minecraft TCP 转发入口和后台管理入口，后台地址为：
+
+```text
+http://<host>:25565/admin/
+```
+
+Compose 使用本地 `./data` 目录持久化 SQLite 数据库和 WAL 文件，不挂载旧 `config.toml`。首次启动可以在后台页面初始化管理员，也可以通过 `.env` 预置默认管理员 `admin` 的密码：
+
+```env
+MC_GATEWAY_ADMIN_PASSWORD=change-me
+```
+
+常用可选项：
+
+```env
+MC_GATEWAY_TCP_ADMIN_PORT=25565
+MC_GATEWAY_ADMIN_PATH=/admin/
+MC_GATEWAY_ADMIN_API_PREFIX=/admin/api
+MC_GATEWAY_DB=/data/mc-gateway.sqlite3
+```
+
+`master` 分支和 `v*` tag 会通过 GitHub Actions 构建并推送 Docker 镜像到 GitHub Container Registry：
+
+```text
+ghcr.io/tursom/mc-gateway:latest
+```
+
 ## 权限
 
 后台管理内置三类角色：
