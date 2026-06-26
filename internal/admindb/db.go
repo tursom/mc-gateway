@@ -194,6 +194,21 @@ CREATE TABLE IF NOT EXISTS plugin_config_snapshots (
     created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS plugin_secrets (
+    plugin_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    current_version INTEGER NOT NULL DEFAULT 1,
+    previous_version INTEGER NOT NULL DEFAULT 0,
+    current_value TEXT NOT NULL DEFAULT '',
+    previous_value TEXT NOT NULL DEFAULT '',
+    reload_required INTEGER NOT NULL DEFAULT 0,
+    hot_reload INTEGER NOT NULL DEFAULT 0,
+    updated_by TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(plugin_id, name)
+);
+
 CREATE INDEX IF NOT EXISTS idx_routes_enabled ON routes(enabled);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_plugin_artifacts_plugin_id ON plugin_artifacts(plugin_id, created_at);
@@ -202,12 +217,22 @@ CREATE INDEX IF NOT EXISTS idx_plugin_operations_plugin_id ON plugin_operations(
 CREATE INDEX IF NOT EXISTS idx_plugin_builds_plugin_id ON plugin_builds(plugin_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_plugin_builds_source_id ON plugin_builds(source_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_plugin_config_snapshots_plugin_id ON plugin_config_snapshots(plugin_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_plugin_secrets_plugin_id ON plugin_secrets(plugin_id, updated_at);
 INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, strftime('%s','now'));
 `
 	if _, err := db.Exec(schema); err != nil {
 		return err
 	}
-	return ensureColumn(db, "audit_logs", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
+	if err := ensureColumn(db, "audit_logs", "metadata_json", "TEXT NOT NULL DEFAULT '{}'"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "plugin_secrets", "reload_required", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "plugin_secrets", "hot_reload", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	return nil
 }
 
 func ensureColumn(db *sql.DB, table, column, definition string) error {

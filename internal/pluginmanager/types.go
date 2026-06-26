@@ -88,6 +88,7 @@ type Manifest struct {
 	Capabilities     json.RawMessage  `json:"capabilities"`
 	RuntimeLimits    RuntimeLimits    `json:"runtime_limits"`
 	ConfigSchema     json.RawMessage  `json:"config_schema"`
+	Secrets          []SecretSpec     `json:"secrets,omitempty"`
 	SupplyChain      json.RawMessage  `json:"supply_chain"`
 }
 
@@ -117,6 +118,20 @@ type ExtensionPoint struct {
 type RuntimeLimits struct {
 	HandlerTimeoutMS      int `json:"handler_timeout_ms"`
 	InitialWriteTimeoutMS int `json:"initial_write_timeout_ms"`
+}
+
+type SecretSpec struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Required    bool           `json:"required"`
+	Type        string         `json:"type,omitempty"`
+	Rotation    SecretRotation `json:"rotation,omitempty"`
+}
+
+type SecretRotation struct {
+	Strategy    string `json:"strategy,omitempty"`
+	GracePeriod string `json:"grace_period,omitempty"`
+	Reload      string `json:"reload,omitempty"`
 }
 
 type CapabilitySummary struct {
@@ -194,6 +209,63 @@ type PluginRecord struct {
 	CreatedAt           int64  `json:"created_at"`
 	UpdatedAt           int64  `json:"updated_at"`
 	UpdatedBy           string `json:"updated_by"`
+}
+
+type ConfigSnapshotRecord struct {
+	ID                int64  `json:"id"`
+	PluginID          string `json:"plugin_id"`
+	ArtifactID        string `json:"artifact_id"`
+	ConfigJSON        string `json:"config_json"`
+	DesiredState      string `json:"desired_state"`
+	Priority          int    `json:"priority"`
+	DesiredGeneration int64  `json:"desired_generation"`
+	CreatedBy         string `json:"created_by"`
+	CreatedAt         int64  `json:"created_at"`
+}
+
+type ConfigDryRunResult struct {
+	OK                 bool     `json:"ok"`
+	PluginID           string   `json:"plugin_id"`
+	ArtifactID         string   `json:"artifact_id"`
+	RestartRequired    bool     `json:"restart_required"`
+	HotReload          bool     `json:"hot_reload"`
+	SensitivePaths     []string `json:"sensitive_paths"`
+	RedactedConfigJSON string   `json:"redacted_config_json"`
+	RedactedDiffJSON   string   `json:"redacted_diff_json"`
+	Error              string   `json:"error,omitempty"`
+}
+
+type ConfigSnapshotDiff struct {
+	SnapshotID         int64    `json:"snapshot_id"`
+	PluginID           string   `json:"plugin_id"`
+	ArtifactID         string   `json:"artifact_id"`
+	SensitivePaths     []string `json:"sensitive_paths"`
+	RedactedDiffJSON   string   `json:"redacted_diff_json"`
+	RestartRequired    bool     `json:"restart_required"`
+	CurrentGeneration  int64    `json:"current_generation"`
+	SnapshotGeneration int64    `json:"snapshot_generation"`
+}
+
+type SecretRecord struct {
+	PluginID        string `json:"plugin_id"`
+	Name            string `json:"name"`
+	CurrentVersion  int64  `json:"current_version"`
+	PreviousVersion int64  `json:"previous_version"`
+	ReloadRequired  bool   `json:"reload_required"`
+	HotReload       bool   `json:"hot_reload"`
+	UpdatedBy       string `json:"updated_by"`
+	CreatedAt       int64  `json:"created_at"`
+	UpdatedAt       int64  `json:"updated_at"`
+}
+
+type ProxyConnectionSummary struct {
+	ID         uint64 `json:"id"`
+	PluginID   string `json:"plugin_id"`
+	ArtifactID string `json:"artifact_id"`
+	HandlerID  string `json:"handler_id"`
+	StartedAt  int64  `json:"started_at"`
+	DurationMS int64  `json:"duration_ms"`
+	Draining   bool   `json:"draining"`
 }
 
 type OperationRecord struct {

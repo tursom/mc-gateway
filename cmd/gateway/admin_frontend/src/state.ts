@@ -1,4 +1,4 @@
-import type { RouteRecord, ServiceRecord, User } from "./types.js";
+import type { PluginArtifact, PluginBuild, PluginView, RouteRecord, ServiceRecord, User } from "./types.js";
 
 export const tokenStorageKey = "mcGatewayAdminToken";
 export const languageStorageKey = "mcGatewayAdminLanguage";
@@ -11,6 +11,11 @@ export interface AppState {
   routes: RouteRecord[];
   services: ServiceRecord[];
   users: User[];
+  plugins: PluginView[];
+  pluginArtifacts: PluginArtifact[];
+  pluginBuilds: PluginBuild[];
+  selectedPluginID: string;
+  selectedArtifactID: string;
 }
 
 export const state: AppState = {
@@ -21,6 +26,11 @@ export const state: AppState = {
   routes: [],
   services: [],
   users: [],
+  plugins: [],
+  pluginArtifacts: [],
+  pluginBuilds: [],
+  selectedPluginID: "",
+  selectedArtifactID: "",
 };
 
 export function setToken(token: string): void {

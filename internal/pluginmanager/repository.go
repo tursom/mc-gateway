@@ -180,6 +180,13 @@ ON CONFLICT(id) DO UPDATE SET
 	return r.Plugin(ctx, pluginID)
 }
 
+func (r Repository) RestoreSnapshot(ctx context.Context, actor string, snapshot ConfigSnapshotRecord) (PluginRecord, error) {
+	if snapshot.PluginID == "" {
+		return PluginRecord{}, errors.New("snapshot plugin_id is required")
+	}
+	return r.UpsertDesired(ctx, actor, snapshot.PluginID, snapshot.ArtifactID, snapshot.DesiredState, snapshot.ConfigJSON, snapshot.Priority)
+}
+
 func (r Repository) Plugin(ctx context.Context, id string) (PluginRecord, error) {
 	row := r.db.QueryRowContext(ctx, `
 SELECT id, desired_artifact_id, active_artifact_id, loaded_artifact_id, desired_state, runtime_state,
@@ -219,6 +226,40 @@ ORDER BY priority ASC, id ASC`)
 		plugins = append(plugins, plugin)
 	}
 	return plugins, rows.Err()
+}
+
+func (r Repository) ListConfigSnapshots(ctx context.Context, pluginID string) ([]ConfigSnapshotRecord, error) {
+	query := `
+SELECT id, plugin_id, artifact_id, config_json, desired_state, priority, desired_generation, created_by, created_at
+FROM plugin_config_snapshots`
+	var args []any
+	if pluginID != "" {
+		query += ` WHERE plugin_id = ?`
+		args = append(args, pluginID)
+	}
+	query += ` ORDER BY created_at DESC, id DESC`
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var snapshots []ConfigSnapshotRecord
+	for rows.Next() {
+		snapshot, err := scanConfigSnapshot(rows)
+		if err != nil {
+			return nil, err
+		}
+		snapshots = append(snapshots, snapshot)
+	}
+	return snapshots, rows.Err()
+}
+
+func (r Repository) ConfigSnapshot(ctx context.Context, id int64) (ConfigSnapshotRecord, error) {
+	row := r.db.QueryRowContext(ctx, `
+SELECT id, plugin_id, artifact_id, config_json, desired_state, priority, desired_generation, created_by, created_at
+FROM plugin_config_snapshots
+WHERE id = ?`, id)
+	return scanConfigSnapshot(row)
 }
 
 func (r Repository) DesiredEnabled(ctx context.Context) ([]PluginRecord, error) {
@@ -471,6 +512,93 @@ WHERE desired_state <> 'deleted'`)
 	return refs, nil
 }
 
+func (r Repository) UpsertSecret(ctx context.Context, actor, pluginID, name, value string, reloadRequired, hotReload bool) (SecretRecord, error) {
+	if pluginID == "" {
+		return SecretRecord{}, errors.New("plugin_id is required")
+	}
+	if !pluginIDPattern.MatchString(pluginID) {
+		return SecretRecord{}, fmt.Errorf("invalid plugin id %q", pluginID)
+	}
+	if !secretNamePattern.MatchString(name) {
+		return SecretRecord{}, fmt.Errorf("invalid secret name %q", name)
+	}
+	if value == "" {
+		return SecretRecord{}, errors.New("secret value is required")
+	}
+	now := r.now().Unix()
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return SecretRecord{}, err
+	}
+	defer tx.Rollback()
+	var currentVersion int64
+	var currentValue string
+	err = tx.QueryRowContext(ctx, `SELECT current_version, current_value FROM plugin_secrets WHERE plugin_id = ? AND name = ?`, pluginID, name).Scan(&currentVersion, &currentValue)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return SecretRecord{}, err
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		_, err = tx.ExecContext(ctx, `
+INSERT INTO plugin_secrets(plugin_id, name, current_version, previous_version, current_value, previous_value, reload_required, hot_reload, updated_by, created_at, updated_at)
+VALUES (?, ?, 1, 0, ?, '', ?, ?, ?, ?, ?)`,
+			pluginID, name, value, boolInt(reloadRequired), boolInt(hotReload), actor, now, now)
+	} else {
+		_, err = tx.ExecContext(ctx, `
+UPDATE plugin_secrets
+SET previous_version = current_version,
+    previous_value = current_value,
+    current_version = current_version + 1,
+    current_value = ?,
+    reload_required = ?,
+    hot_reload = ?,
+    updated_by = ?,
+    updated_at = ?
+WHERE plugin_id = ? AND name = ?`,
+			value, boolInt(reloadRequired), boolInt(hotReload), actor, now, pluginID, name)
+	}
+	if err != nil {
+		return SecretRecord{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return SecretRecord{}, err
+	}
+	return r.Secret(ctx, pluginID, name)
+}
+
+func (r Repository) Secret(ctx context.Context, pluginID, name string) (SecretRecord, error) {
+	row := r.db.QueryRowContext(ctx, `
+SELECT plugin_id, name, current_version, previous_version, reload_required, hot_reload, updated_by, created_at, updated_at
+FROM plugin_secrets
+WHERE plugin_id = ? AND name = ?`, pluginID, name)
+	return scanSecret(row)
+}
+
+func (r Repository) ListSecrets(ctx context.Context, pluginID string) ([]SecretRecord, error) {
+	query := `
+SELECT plugin_id, name, current_version, previous_version, reload_required, hot_reload, updated_by, created_at, updated_at
+FROM plugin_secrets`
+	var args []any
+	if pluginID != "" {
+		query += ` WHERE plugin_id = ?`
+		args = append(args, pluginID)
+	}
+	query += ` ORDER BY plugin_id ASC, name ASC`
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var secrets []SecretRecord
+	for rows.Next() {
+		secret, err := scanSecret(rows)
+		if err != nil {
+			return nil, err
+		}
+		secrets = append(secrets, secret)
+	}
+	return secrets, rows.Err()
+}
+
 func (r Repository) RecordOperation(ctx context.Context, pluginID, artifactID, operation, status, actor, message string, metadata any) error {
 	metadataJSON, err := marshalDefaultObject(metadata)
 	if err != nil {
@@ -525,6 +653,28 @@ func scanPluginRow(row rowScanner, plugin *PluginRecord) error {
 		&plugin.Priority, &plugin.ConfigJSON, &plugin.DesiredGeneration, &plugin.AppliedGeneration, &plugin.LastError,
 		&plugin.RuntimeSummaryJSON, &plugin.DispatchSummaryJSON, &plugin.CreatedAt, &plugin.UpdatedAt, &plugin.UpdatedBy,
 	)
+}
+
+func scanConfigSnapshot(row rowScanner) (ConfigSnapshotRecord, error) {
+	var snapshot ConfigSnapshotRecord
+	err := row.Scan(
+		&snapshot.ID, &snapshot.PluginID, &snapshot.ArtifactID, &snapshot.ConfigJSON, &snapshot.DesiredState,
+		&snapshot.Priority, &snapshot.DesiredGeneration, &snapshot.CreatedBy, &snapshot.CreatedAt,
+	)
+	return snapshot, err
+}
+
+func scanSecret(row rowScanner) (SecretRecord, error) {
+	var secret SecretRecord
+	var reloadRequired int
+	var hotReload int
+	err := row.Scan(
+		&secret.PluginID, &secret.Name, &secret.CurrentVersion, &secret.PreviousVersion,
+		&reloadRequired, &hotReload, &secret.UpdatedBy, &secret.CreatedAt, &secret.UpdatedAt,
+	)
+	secret.ReloadRequired = reloadRequired != 0
+	secret.HotReload = hotReload != 0
+	return secret, err
 }
 
 func scanBuild(row rowScanner) (BuildRecord, error) {

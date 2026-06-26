@@ -40,6 +40,10 @@ func TestNewAPIHandlerRoutesRequests(t *testing.T) {
 		{name: "plugins list", method: http.MethodGet, path: "/admin/api/plugins", wantCall: "plugins_list"},
 		{name: "plugin item", method: http.MethodPut, path: "/admin/api/plugins/upstream-rewrite", wantCall: "plugin_item", wantSegment: "upstream-rewrite"},
 		{name: "plugin action", method: http.MethodPost, path: "/admin/api/plugins/upstream-rewrite/enable", wantCall: "plugin_action", wantSegment: "upstream-rewrite/enable"},
+		{name: "plugin config", method: http.MethodPut, path: "/admin/api/plugins/upstream-rewrite/config", wantCall: "plugin_config", wantSegment: "upstream-rewrite/config"},
+		{name: "plugin config dry-run", method: http.MethodPost, path: "/admin/api/plugins/upstream-rewrite/config/dry-run", wantCall: "plugin_config", wantSegment: "upstream-rewrite/config/dry-run"},
+		{name: "plugin secrets", method: http.MethodGet, path: "/admin/api/plugins/upstream-rewrite/secrets", wantCall: "plugin_secrets", wantSegment: "upstream-rewrite/secrets"},
+		{name: "plugin rollback artifact", method: http.MethodPost, path: "/admin/api/plugins/upstream-rewrite/rollback/artifact", wantCall: "plugin_rollback", wantSegment: "upstream-rewrite/rollback/artifact"},
 		{name: "plugin draining force close", method: http.MethodPost, path: "/admin/api/plugins/mc-auth-proxy/draining/force-close", wantCall: "plugin_draining", wantSegment: "mc-auth-proxy"},
 		{name: "plugin dispatch", method: http.MethodGet, path: "/admin/api/plugins/dispatch-plan", wantCall: "plugin_dispatch"},
 	}
@@ -78,6 +82,9 @@ func TestNewAPIHandlerRoutesRequests(t *testing.T) {
 				PluginsList:     recordCall(&gotCall, "plugins_list"),
 				PluginItem:      recordSegmentCall(&gotCall, &gotSegment, "plugin_item"),
 				PluginAction:    recordSegmentCall(&gotCall, &gotSegment, "plugin_action"),
+				PluginConfig:    recordSegmentCall(&gotCall, &gotSegment, "plugin_config"),
+				PluginSecrets:   recordSegmentCall(&gotCall, &gotSegment, "plugin_secrets"),
+				PluginRollback:  recordSegmentCall(&gotCall, &gotSegment, "plugin_rollback"),
 				PluginDraining:  recordSegmentCall(&gotCall, &gotSegment, "plugin_draining"),
 				PluginDispatch:  recordCall(&gotCall, "plugin_dispatch"),
 			})

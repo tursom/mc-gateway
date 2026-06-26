@@ -82,6 +82,8 @@ func TestPermissions(t *testing.T) {
 		"read_routes":     true,
 		"write_routes":    false,
 		"read_status":     false,
+		"read_plugins":    false,
+		"manage_plugins":  false,
 		"manage_users":    false,
 		"manage_services": false,
 	}
@@ -93,6 +95,8 @@ func TestPermissions(t *testing.T) {
 		"read_routes":     true,
 		"write_routes":    true,
 		"read_status":     true,
+		"read_plugins":    true,
+		"manage_plugins":  true,
 		"manage_users":    true,
 		"manage_services": true,
 	}

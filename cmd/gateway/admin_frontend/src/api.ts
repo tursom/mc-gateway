@@ -3,11 +3,12 @@ import { state } from "./state.js";
 interface APIOptions {
   method?: string;
   body?: unknown;
+  formData?: FormData;
 }
 
 export async function api<T>(path: string, options: APIOptions = {}): Promise<T> {
   const headers: Record<string, string> = { Accept: "application/json" };
-  if (options.body !== undefined) {
+  if (options.body !== undefined && !options.formData) {
     headers["Content-Type"] = "application/json";
   }
   if (state.token) {
@@ -17,7 +18,7 @@ export async function api<T>(path: string, options: APIOptions = {}): Promise<T>
   const res = await fetch(state.apiBase + path, {
     method: options.method || "GET",
     headers,
-    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    body: options.formData || (options.body === undefined ? undefined : JSON.stringify(options.body)),
   });
 
   let data: unknown = {};

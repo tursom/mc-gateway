@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,6 +22,10 @@ import (
 
 type RuntimeAdapter interface {
 	Load(ctx context.Context, artifact ArtifactRecord, pluginRecord PluginRecord, gateway *Gateway) (api.Plugin, error)
+}
+
+type ConfigDryRunAdapter interface {
+	DryRunConfig(ctx context.Context, artifact ArtifactRecord, pluginRecord PluginRecord) error
 }
 
 type GoPluginAdapter struct{}
@@ -58,6 +63,38 @@ func (a GoPluginAdapter) Load(ctx context.Context, artifact ArtifactRecord, plug
 		return nil, err
 	}
 	return instance, nil
+}
+
+func (a GoPluginAdapter) DryRunConfig(ctx context.Context, artifact ArtifactRecord, pluginRecord PluginRecord) error {
+	_ = ctx
+	opened, err := stdplugin.Open(artifact.FilePath)
+	if err != nil {
+		return err
+	}
+	symbolName := "Plugin"
+	var manifest Manifest
+	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err == nil && manifest.Runtime.EntrySymbol != "" {
+		symbolName = manifest.Runtime.EntrySymbol
+	}
+	symbol, err := opened.Lookup(symbolName)
+	if err != nil {
+		return err
+	}
+	factory, ok := symbol.(func() api.Plugin)
+	if !ok {
+		return fmt.Errorf("plugin symbol %q has invalid signature", symbolName)
+	}
+	instance := factory()
+	cfg := instance.NewConfigObj()
+	if cfg != nil && pluginRecord.ConfigJSON != "" && canUnmarshalInto(cfg) {
+		if err := json.Unmarshal([]byte(pluginRecord.ConfigJSON), cfg); err != nil {
+			return fmt.Errorf("decode plugin config: %w", err)
+		}
+	}
+	if err := instance.ReloadConfig(cfg); err != nil {
+		return err
+	}
+	return nil
 }
 
 func canUnmarshalInto(value any) bool {
@@ -397,6 +434,17 @@ func (m *Manager) RunBuild(ctx context.Context, actor string, buildID int64) (Bu
 }
 
 func (m *Manager) SetDesired(ctx context.Context, actor, pluginID, artifactID, desiredState, configJSON string, priority int) (PluginRecord, error) {
+	if desiredState == "" {
+		desiredState = DesiredDisabled
+	}
+	if desiredState != DesiredDeleted {
+		if _, err := m.DryRunConfig(ctx, pluginID, artifactID, configJSON); err != nil {
+			_ = m.repo.RecordOperation(ctx, pluginID, artifactID, "config_dry_run", "failed", actor, err.Error(), map[string]any{
+				"active_changed": false,
+			})
+			return PluginRecord{}, err
+		}
+	}
 	pluginRecord, err := m.repo.UpsertDesired(ctx, actor, pluginID, artifactID, desiredState, configJSON, priority)
 	if err != nil {
 		_ = m.repo.RecordOperation(ctx, pluginID, artifactID, "desired_update", "failed", actor, err.Error(), nil)
@@ -408,6 +456,150 @@ func (m *Manager) SetDesired(ctx context.Context, actor, pluginID, artifactID, d
 		"priority":           pluginRecord.Priority,
 	})
 	return pluginRecord, nil
+}
+
+func (m *Manager) DryRunConfig(ctx context.Context, pluginID, artifactID, configJSON string) (ConfigDryRunResult, error) {
+	result := ConfigDryRunResult{
+		OK:         false,
+		PluginID:   pluginID,
+		ArtifactID: artifactID,
+	}
+	if configJSON == "" {
+		configJSON = "{}"
+	}
+	if !json.Valid([]byte(configJSON)) {
+		err := errors.New("config_json must be valid JSON")
+		result.Error = err.Error()
+		return result, err
+	}
+	artifact, err := m.repo.Artifact(ctx, artifactID)
+	if err != nil {
+		result.Error = err.Error()
+		return result, err
+	}
+	if artifact.PluginID != pluginID {
+		err := errors.New("artifact plugin_id does not match")
+		result.Error = err.Error()
+		return result, err
+	}
+	if err := m.validateArtifactGate(artifact); err != nil {
+		result.Error = err.Error()
+		return result, err
+	}
+	var manifest Manifest
+	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err != nil {
+		result.Error = err.Error()
+		return result, err
+	}
+	if err := validateConfigSchema(manifest.ConfigSchema, configJSON); err != nil {
+		result.Error = err.Error()
+		return result, err
+	}
+	if err := m.validateSecretRefs(ctx, manifest, configJSON); err != nil {
+		result.Error = err.Error()
+		return result, err
+	}
+	pluginRecord, err := m.pluginRecordForDryRun(ctx, pluginID, artifactID, configJSON)
+	if err != nil {
+		result.Error = err.Error()
+		return result, err
+	}
+	if dryRunner, ok := m.adapter.(ConfigDryRunAdapter); ok {
+		if err := dryRunner.DryRunConfig(ctx, artifact, pluginRecord); err != nil {
+			result.Error = err.Error()
+			return result, err
+		}
+	}
+	currentConfig := "{}"
+	if current, err := m.repo.Plugin(ctx, pluginID); err == nil {
+		currentConfig = current.ConfigJSON
+	}
+	sensitivePaths := sensitiveConfigPaths(manifest.ConfigSchema, configJSON)
+	redactedConfig, err := redactJSON(configJSON, sensitivePaths)
+	if err != nil {
+		result.Error = err.Error()
+		return result, err
+	}
+	diff, err := redactedDiffJSON(currentConfig, configJSON, sensitivePaths)
+	if err != nil {
+		result.Error = err.Error()
+		return result, err
+	}
+	result.OK = true
+	result.RestartRequired = m.restartRequired(pluginID, artifactID)
+	result.HotReload = !result.RestartRequired
+	result.SensitivePaths = sensitivePaths
+	result.RedactedConfigJSON = redactedConfig
+	result.RedactedDiffJSON = diff
+	return result, nil
+}
+
+func (m *Manager) RollbackArtifact(ctx context.Context, actor, pluginID, artifactID string) (PluginRecord, error) {
+	current, err := m.repo.Plugin(ctx, pluginID)
+	if err != nil {
+		return PluginRecord{}, err
+	}
+	if _, err := m.DryRunConfig(ctx, pluginID, artifactID, current.ConfigJSON); err != nil {
+		_ = m.repo.RecordOperation(ctx, pluginID, artifactID, "artifact_rollback", "failed", actor, err.Error(), map[string]any{
+			"active_changed": false,
+		})
+		return PluginRecord{}, err
+	}
+	plugin, err := m.repo.UpsertDesired(ctx, actor, pluginID, artifactID, current.DesiredState, current.ConfigJSON, current.Priority)
+	if err != nil {
+		_ = m.repo.RecordOperation(ctx, pluginID, artifactID, "artifact_rollback", "failed", actor, err.Error(), map[string]any{
+			"active_changed": false,
+		})
+		return PluginRecord{}, err
+	}
+	_ = m.repo.RecordOperation(ctx, pluginID, artifactID, "artifact_rollback", "succeeded", actor, "artifact rollback desired state updated", map[string]any{
+		"desired_generation": plugin.DesiredGeneration,
+		"active_changed":     false,
+	})
+	return plugin, nil
+}
+
+func (m *Manager) RollbackConfigSnapshot(ctx context.Context, actor string, snapshotID int64, fullDesired bool) (PluginRecord, error) {
+	snapshot, err := m.repo.ConfigSnapshot(ctx, snapshotID)
+	if err != nil {
+		return PluginRecord{}, err
+	}
+	plugin, err := m.repo.Plugin(ctx, snapshot.PluginID)
+	if err != nil {
+		return PluginRecord{}, err
+	}
+	artifactID := plugin.DesiredArtifactID
+	desiredState := plugin.DesiredState
+	priority := plugin.Priority
+	if fullDesired {
+		artifactID = snapshot.ArtifactID
+		desiredState = snapshot.DesiredState
+		priority = snapshot.Priority
+	}
+	if _, err := m.DryRunConfig(ctx, snapshot.PluginID, artifactID, snapshot.ConfigJSON); err != nil {
+		_ = m.repo.RecordOperation(ctx, snapshot.PluginID, artifactID, "config_rollback", "failed", actor, err.Error(), map[string]any{
+			"snapshot_id":    snapshot.ID,
+			"full_desired":   fullDesired,
+			"active_changed": false,
+		})
+		return PluginRecord{}, err
+	}
+	next, err := m.repo.UpsertDesired(ctx, actor, snapshot.PluginID, artifactID, desiredState, snapshot.ConfigJSON, priority)
+	if err != nil {
+		_ = m.repo.RecordOperation(ctx, snapshot.PluginID, artifactID, "config_rollback", "failed", actor, err.Error(), map[string]any{
+			"snapshot_id":    snapshot.ID,
+			"full_desired":   fullDesired,
+			"active_changed": false,
+		})
+		return PluginRecord{}, err
+	}
+	_ = m.repo.RecordOperation(ctx, snapshot.PluginID, artifactID, "config_rollback", "succeeded", actor, "config snapshot rollback desired state updated", map[string]any{
+		"snapshot_id":        snapshot.ID,
+		"full_desired":       fullDesired,
+		"desired_generation": next.DesiredGeneration,
+		"active_changed":     false,
+	})
+	return next, nil
 }
 
 func (m *Manager) Load(ctx context.Context, actor, pluginID string) (PluginRecord, error) {
@@ -428,19 +620,20 @@ func (m *Manager) Load(ctx context.Context, actor, pluginID string) (PluginRecor
 }
 
 func (m *Manager) Enable(ctx context.Context, actor, pluginID string) (PluginRecord, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	pluginRecord, err := m.repo.Plugin(ctx, pluginID)
 	if err != nil {
 		return PluginRecord{}, err
 	}
 	if pluginRecord.DesiredState != DesiredEnabled {
-		pluginRecord, err = m.repo.UpsertDesired(ctx, actor, pluginRecord.ID, pluginRecord.DesiredArtifactID, DesiredEnabled, pluginRecord.ConfigJSON, pluginRecord.Priority)
+		pluginRecord, err = m.SetDesired(ctx, actor, pluginRecord.ID, pluginRecord.DesiredArtifactID, DesiredEnabled, pluginRecord.ConfigJSON, pluginRecord.Priority)
 		if err != nil {
 			return PluginRecord{}, err
 		}
 	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	loaded, err := m.loadLocked(ctx, pluginRecord)
 	if err != nil {
 		_ = m.repo.RecordOperation(ctx, pluginID, pluginRecord.DesiredArtifactID, "enable", "failed", actor, err.Error(), nil)
@@ -658,6 +851,139 @@ func (m *Manager) Build(ctx context.Context, id int64) (BuildRecord, error) {
 	return m.repo.Build(ctx, id)
 }
 
+func (m *Manager) ListConfigSnapshots(ctx context.Context, pluginID string) ([]ConfigSnapshotRecord, error) {
+	return m.repo.ListConfigSnapshots(ctx, pluginID)
+}
+
+func (m *Manager) ConfigSnapshot(ctx context.Context, id int64) (ConfigSnapshotRecord, error) {
+	return m.repo.ConfigSnapshot(ctx, id)
+}
+
+func (m *Manager) ConfigSnapshotDiff(ctx context.Context, snapshotID int64) (ConfigSnapshotDiff, error) {
+	snapshot, err := m.repo.ConfigSnapshot(ctx, snapshotID)
+	if err != nil {
+		return ConfigSnapshotDiff{}, err
+	}
+	plugin, err := m.repo.Plugin(ctx, snapshot.PluginID)
+	if err != nil {
+		return ConfigSnapshotDiff{}, err
+	}
+	artifactID := snapshot.ArtifactID
+	if artifactID == "" {
+		artifactID = plugin.DesiredArtifactID
+	}
+	artifact, err := m.repo.Artifact(ctx, artifactID)
+	if err != nil {
+		return ConfigSnapshotDiff{}, err
+	}
+	var manifest Manifest
+	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err != nil {
+		return ConfigSnapshotDiff{}, err
+	}
+	paths := sensitiveConfigPaths(manifest.ConfigSchema, snapshot.ConfigJSON)
+	diff, err := redactedDiffJSON(plugin.ConfigJSON, snapshot.ConfigJSON, paths)
+	if err != nil {
+		return ConfigSnapshotDiff{}, err
+	}
+	return ConfigSnapshotDiff{
+		SnapshotID:         snapshot.ID,
+		PluginID:           snapshot.PluginID,
+		ArtifactID:         artifactID,
+		SensitivePaths:     paths,
+		RedactedDiffJSON:   diff,
+		RestartRequired:    m.restartRequired(snapshot.PluginID, artifactID),
+		CurrentGeneration:  plugin.DesiredGeneration,
+		SnapshotGeneration: snapshot.DesiredGeneration,
+	}, nil
+}
+
+func (m *Manager) ListSecrets(ctx context.Context, pluginID string) ([]SecretRecord, error) {
+	return m.repo.ListSecrets(ctx, pluginID)
+}
+
+func (m *Manager) UpsertSecret(ctx context.Context, actor, pluginID, artifactID, name, value string, reloadRequired, hotReload bool) (SecretRecord, error) {
+	if artifactID == "" {
+		plugin, err := m.repo.Plugin(ctx, pluginID)
+		if err != nil {
+			return SecretRecord{}, err
+		}
+		artifactID = plugin.DesiredArtifactID
+	}
+	artifact, err := m.repo.Artifact(ctx, artifactID)
+	if err != nil {
+		return SecretRecord{}, err
+	}
+	if artifact.PluginID != pluginID {
+		return SecretRecord{}, errors.New("artifact plugin_id does not match")
+	}
+	var manifest Manifest
+	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err != nil {
+		return SecretRecord{}, err
+	}
+	if len(manifest.Secrets) > 0 {
+		declared := false
+		for _, spec := range manifest.Secrets {
+			if spec.Name == name {
+				declared = true
+				if !reloadRequired && !hotReload {
+					switch spec.Rotation.Reload {
+					case "hot":
+						hotReload = true
+					case "reload_required", "restart_required", "manual":
+						reloadRequired = true
+					}
+				}
+				break
+			}
+		}
+		if !declared {
+			return SecretRecord{}, fmt.Errorf("secret %q is not declared by manifest", name)
+		}
+	}
+	secret, err := m.repo.UpsertSecret(ctx, actor, pluginID, name, value, reloadRequired, hotReload)
+	if err != nil {
+		_ = m.repo.RecordOperation(ctx, pluginID, "", "secret_update", "failed", actor, "secret update failed", map[string]any{
+			"secret_ref": "plugin://" + pluginID + "/" + name,
+			"error":      redactSecretText(err.Error()),
+		})
+		return SecretRecord{}, err
+	}
+	_ = m.repo.RecordOperation(ctx, pluginID, "", "secret_update", "succeeded", actor, "secret updated", map[string]any{
+		"secret_ref":       "plugin://" + pluginID + "/" + name,
+		"current_version":  secret.CurrentVersion,
+		"previous_version": secret.PreviousVersion,
+		"reload_required":  secret.ReloadRequired,
+		"hot_reload":       secret.HotReload,
+	})
+	return secret, nil
+}
+
+func (m *Manager) ActiveProxyConnections(ctx context.Context, pluginID string) ([]ProxyConnectionSummary, error) {
+	_ = ctx
+	now := time.Now()
+	var summaries []ProxyConnectionSummary
+	m.proxyMu.Lock()
+	defer m.proxyMu.Unlock()
+	for _, conn := range m.proxyConns {
+		if pluginID != "" && conn.pluginID != pluginID {
+			continue
+		}
+		summaries = append(summaries, ProxyConnectionSummary{
+			ID:         conn.id,
+			PluginID:   conn.pluginID,
+			ArtifactID: conn.artifactID,
+			HandlerID:  conn.handlerID,
+			StartedAt:  conn.startedAt.Unix(),
+			DurationMS: now.Sub(conn.startedAt).Milliseconds(),
+			Draining:   conn.draining,
+		})
+	}
+	sort.Slice(summaries, func(i, j int) bool {
+		return summaries[i].StartedAt < summaries[j].StartedAt
+	})
+	return summaries, nil
+}
+
 func (m *Manager) CancelBuild(ctx context.Context, actor string, id int64) (BuildRecord, error) {
 	build, err := m.repo.CancelBuild(ctx, id, actor)
 	if err != nil {
@@ -830,17 +1156,8 @@ func (m *Manager) loadLocked(ctx context.Context, pluginRecord PluginRecord) (*l
 	if err != nil {
 		return nil, err
 	}
-	if artifact.Status == ArtifactStatusDeleted || artifact.Status == ArtifactStatusRejected {
-		return nil, fmt.Errorf("artifact status %q is not loadable", artifact.Status)
-	}
-	if artifact.ArtifactType != ArtifactTypeBinary {
-		return nil, fmt.Errorf("artifact type %q is not loadable", artifact.ArtifactType)
-	}
-	if artifact.GoVersion != runtime.Version() {
-		return nil, fmt.Errorf("artifact go_version %q does not match gateway %q", artifact.GoVersion, runtime.Version())
-	}
-	if artifact.GOOS != runtime.GOOS || artifact.GOARCH != runtime.GOARCH {
-		return nil, fmt.Errorf("artifact target %s/%s does not match gateway %s/%s", artifact.GOOS, artifact.GOARCH, runtime.GOOS, runtime.GOARCH)
+	if err := m.validateArtifactGate(artifact); err != nil {
+		return nil, err
 	}
 
 	gateway := NewGateway(pluginRecord.ID, m.handleConn, m.wg)
@@ -864,6 +1181,50 @@ func (m *Manager) loadLocked(ctx context.Context, pluginRecord PluginRecord) (*l
 		return nil, err
 	}
 	return loaded, nil
+}
+
+func (m *Manager) validateArtifactGate(artifact ArtifactRecord) error {
+	if artifact.Status == ArtifactStatusDeleted || artifact.Status == ArtifactStatusRejected {
+		return fmt.Errorf("artifact status %q is not loadable", artifact.Status)
+	}
+	if artifact.ArtifactType != ArtifactTypeBinary {
+		return errors.New("desired artifact must be a binary artifact")
+	}
+	if artifact.GoVersion != runtime.Version() {
+		return fmt.Errorf("artifact go_version %q does not match gateway %q", artifact.GoVersion, runtime.Version())
+	}
+	if artifact.GOOS != runtime.GOOS || artifact.GOARCH != runtime.GOARCH {
+		return fmt.Errorf("artifact target %s/%s does not match gateway %s/%s", artifact.GOOS, artifact.GOARCH, runtime.GOOS, runtime.GOARCH)
+	}
+	return nil
+}
+
+func (m *Manager) pluginRecordForDryRun(ctx context.Context, pluginID, artifactID, configJSON string) (PluginRecord, error) {
+	pluginRecord, err := m.repo.Plugin(ctx, pluginID)
+	if err != nil {
+		if !errors.Is(err, ErrPluginNotFound) {
+			return PluginRecord{}, err
+		}
+		return PluginRecord{
+			ID:                pluginID,
+			DesiredArtifactID: artifactID,
+			DesiredState:      DesiredDisabled,
+			RuntimeState:      RuntimeDisabled,
+			Priority:          DefaultPriority,
+			ConfigJSON:        configJSON,
+			DesiredGeneration: 1,
+		}, nil
+	}
+	pluginRecord.DesiredArtifactID = artifactID
+	pluginRecord.ConfigJSON = configJSON
+	return pluginRecord, nil
+}
+
+func (m *Manager) restartRequired(pluginID, artifactID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	loaded := m.loaded[pluginID]
+	return loaded != nil && loaded.artifact.ID != artifactID
 }
 
 func (m *Manager) markEnabled(ctx context.Context, loaded *loadedPlugin) error {
@@ -1154,6 +1515,326 @@ func closeRead(conn any) {
 	if closer, ok := conn.(closeReader); ok {
 		_ = closer.CloseRead()
 	}
+}
+
+func validateConfigSchema(schema json.RawMessage, configJSON string) error {
+	if len(strings.TrimSpace(string(schema))) == 0 || string(schema) == "null" {
+		return nil
+	}
+	var root map[string]any
+	if err := json.Unmarshal(schema, &root); err != nil {
+		return fmt.Errorf("invalid config_schema: %w", err)
+	}
+	var config any
+	if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
+		return err
+	}
+	return validateSchemaValue(root, config, "$")
+}
+
+func validateSchemaValue(schema map[string]any, value any, path string) error {
+	if typ, _ := schema["type"].(string); typ != "" {
+		if !jsonTypeMatches(typ, value) {
+			return fmt.Errorf("%s must be %s", path, typ)
+		}
+	}
+	if enumValues, ok := schema["enum"].([]any); ok && len(enumValues) > 0 {
+		found := false
+		for _, allowed := range enumValues {
+			if reflect.DeepEqual(allowed, value) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("%s must match enum", path)
+		}
+	}
+	props, _ := schema["properties"].(map[string]any)
+	obj, _ := value.(map[string]any)
+	if required, ok := schema["required"].([]any); ok {
+		for _, raw := range required {
+			name, _ := raw.(string)
+			if name == "" {
+				continue
+			}
+			if obj == nil {
+				return fmt.Errorf("%s must be object for required %q", path, name)
+			}
+			if _, exists := obj[name]; !exists {
+				return fmt.Errorf("%s.%s is required", path, name)
+			}
+		}
+	}
+	if obj == nil || len(props) == 0 {
+		return nil
+	}
+	for name, propSchema := range props {
+		childSchema, ok := propSchema.(map[string]any)
+		if !ok {
+			continue
+		}
+		childValue, exists := obj[name]
+		if !exists {
+			continue
+		}
+		if err := validateSchemaValue(childSchema, childValue, path+"."+name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func jsonTypeMatches(typ string, value any) bool {
+	switch typ {
+	case "object":
+		_, ok := value.(map[string]any)
+		return ok
+	case "array":
+		_, ok := value.([]any)
+		return ok
+	case "string":
+		_, ok := value.(string)
+		return ok
+	case "number":
+		_, ok := value.(float64)
+		return ok
+	case "integer":
+		n, ok := value.(float64)
+		return ok && n == float64(int64(n))
+	case "boolean":
+		_, ok := value.(bool)
+		return ok
+	case "null":
+		return value == nil
+	default:
+		return true
+	}
+}
+
+func (m *Manager) validateSecretRefs(ctx context.Context, manifest Manifest, configJSON string) error {
+	declared := make(map[string]SecretSpec, len(manifest.Secrets))
+	for _, spec := range manifest.Secrets {
+		if spec.Name != "" {
+			declared[spec.Name] = spec
+		}
+	}
+	configRefs, err := collectConfigSecretRefs(configJSON)
+	if err != nil {
+		return err
+	}
+	for ref := range configRefs {
+		if len(declared) > 0 {
+			if _, ok := declared[ref]; !ok {
+				return fmt.Errorf("secret ref %q is not declared by manifest", ref)
+			}
+		}
+	}
+	for name, spec := range declared {
+		if spec.Required {
+			configRefs[name] = true
+		}
+	}
+	if len(configRefs) == 0 {
+		return nil
+	}
+	secrets, err := m.repo.ListSecrets(ctx, manifest.ID)
+	if err != nil {
+		return err
+	}
+	configured := make(map[string]bool, len(secrets))
+	for _, secret := range secrets {
+		configured[secret.Name] = secret.CurrentVersion > 0
+	}
+	var missing []string
+	for ref := range configRefs {
+		if !configured[ref] {
+			missing = append(missing, ref)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return fmt.Errorf("missing configured secret ref(s): %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+func collectConfigSecretRefs(configJSON string) (map[string]bool, error) {
+	var value any
+	if err := json.Unmarshal([]byte(defaultJSONObject(configJSON)), &value); err != nil {
+		return nil, err
+	}
+	refs := make(map[string]bool)
+	collectSecretRefs(value, refs)
+	return refs, nil
+}
+
+func collectSecretRefs(value any, refs map[string]bool) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for name, child := range typed {
+			if strings.HasSuffix(strings.ToLower(name), "_secret_ref") {
+				if ref, ok := child.(string); ok && ref != "" {
+					refs[ref] = true
+				}
+			}
+			collectSecretRefs(child, refs)
+		}
+	case []any:
+		for _, child := range typed {
+			collectSecretRefs(child, refs)
+		}
+	}
+}
+
+func sensitiveConfigPaths(schema json.RawMessage, configJSON string) []string {
+	paths := map[string]bool{}
+	var root map[string]any
+	if len(schema) > 0 {
+		_ = json.Unmarshal(schema, &root)
+	}
+	collectSensitiveSchemaPaths(root, "$", paths)
+	var config any
+	if err := json.Unmarshal([]byte(configJSON), &config); err == nil {
+		collectSensitiveNamePaths(config, "$", paths)
+	}
+	result := make([]string, 0, len(paths))
+	for path := range paths {
+		result = append(result, path)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func collectSensitiveSchemaPaths(schema map[string]any, path string, paths map[string]bool) {
+	if len(schema) == 0 {
+		return
+	}
+	if isSensitiveSchema(schema) {
+		paths[path] = true
+	}
+	props, _ := schema["properties"].(map[string]any)
+	for name, raw := range props {
+		child, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		collectSensitiveSchemaPaths(child, path+"."+name, paths)
+	}
+}
+
+func isSensitiveSchema(schema map[string]any) bool {
+	for _, key := range []string{"sensitive", "secret", "writeOnly"} {
+		if value, ok := schema[key].(bool); ok && value {
+			return true
+		}
+	}
+	if format, _ := schema["format"].(string); isSensitiveName(format) {
+		return true
+	}
+	return false
+}
+
+func collectSensitiveNamePaths(value any, path string, paths map[string]bool) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for name, child := range typed {
+			childPath := path + "." + name
+			if isSensitiveName(name) {
+				paths[childPath] = true
+			}
+			collectSensitiveNamePaths(child, childPath, paths)
+		}
+	case []any:
+		for idx, child := range typed {
+			collectSensitiveNamePaths(child, fmt.Sprintf("%s[%d]", path, idx), paths)
+		}
+	}
+}
+
+func isSensitiveName(name string) bool {
+	lower := strings.ToLower(name)
+	for _, marker := range []string{"secret", "password", "token", "key", "credential"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func redactJSON(configJSON string, sensitivePaths []string) (string, error) {
+	var value any
+	if err := json.Unmarshal([]byte(configJSON), &value); err != nil {
+		return "", err
+	}
+	pathSet := make(map[string]bool, len(sensitivePaths))
+	for _, path := range sensitivePaths {
+		pathSet[path] = true
+	}
+	value = redactValue(value, "$", pathSet)
+	data, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func redactValue(value any, path string, sensitive map[string]bool) any {
+	if sensitive[path] {
+		return "[REDACTED]"
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		next := make(map[string]any, len(typed))
+		for name, child := range typed {
+			next[name] = redactValue(child, path+"."+name, sensitive)
+		}
+		return next
+	case []any:
+		next := make([]any, len(typed))
+		for idx, child := range typed {
+			next[idx] = redactValue(child, fmt.Sprintf("%s[%d]", path, idx), sensitive)
+		}
+		return next
+	default:
+		return value
+	}
+}
+
+func redactedDiffJSON(oldConfig, newConfig string, sensitivePaths []string) (string, error) {
+	oldRedacted, err := redactJSON(defaultJSONObject(oldConfig), sensitivePaths)
+	if err != nil {
+		return "", err
+	}
+	newRedacted, err := redactJSON(defaultJSONObject(newConfig), sensitivePaths)
+	if err != nil {
+		return "", err
+	}
+	var oldValue any
+	var newValue any
+	if err := json.Unmarshal([]byte(oldRedacted), &oldValue); err != nil {
+		return "", err
+	}
+	if err := json.Unmarshal([]byte(newRedacted), &newValue); err != nil {
+		return "", err
+	}
+	diff := map[string]any{
+		"changed": !reflect.DeepEqual(oldValue, newValue),
+		"before":  oldValue,
+		"after":   newValue,
+	}
+	data, err := json.Marshal(diff)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func redactSecretText(text string) string {
+	if text == "" {
+		return ""
+	}
+	return "[REDACTED]"
 }
 
 func flattenHandlers(byPlugin map[string][]*upstreamHandler) []*upstreamHandler {

@@ -265,7 +265,12 @@ func handleAdminPluginsList(w http.ResponseWriter, r *http.Request) {
 		adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"plugins": plugins})
+	views, err := pluginViews(r, plugins)
+	if err != nil {
+		adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"plugins": views})
 }
 
 func handleAdminPluginItem(w http.ResponseWriter, r *http.Request, rawPluginID string) {
@@ -277,6 +282,11 @@ func handleAdminPluginItem(w http.ResponseWriter, r *http.Request, rawPluginID s
 		adminhttp.WriteAPIError(w, http.StatusServiceUnavailable, "plugin manager is not initialized")
 		return
 	}
+	if strings.HasSuffix(rawPluginID, "/proxy-connections") {
+		handleAdminPluginProxyConnections(w, r, strings.TrimSuffix(rawPluginID, "/proxy-connections"))
+		return
+	}
+
 	pluginID, err := adminhttp.PathSegment(rawPluginID)
 	if err != nil {
 		adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
@@ -290,7 +300,12 @@ func handleAdminPluginItem(w http.ResponseWriter, r *http.Request, rawPluginID s
 			writePluginManagerError(w, err)
 			return
 		}
-		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"plugin": plugin})
+		view, err := pluginView(r, plugin, true)
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"plugin": view})
 	case http.MethodPut:
 		if session.Role != adminRoleAdmin {
 			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
@@ -321,6 +336,242 @@ func handleAdminPluginItem(w http.ResponseWriter, r *http.Request, rawPluginID s
 	default:
 		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+func handleAdminPluginProxyConnections(w http.ResponseWriter, r *http.Request, rawPluginID string) {
+	if r.Method != http.MethodGet {
+		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	pluginID, err := adminhttp.PathSegment(rawPluginID)
+	if err != nil {
+		adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	connections, err := pluginsManager.ActiveProxyConnections(r.Context(), pluginID)
+	if err != nil {
+		adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"proxy_connections": connections})
+}
+
+func handleAdminPluginConfig(w http.ResponseWriter, r *http.Request, rawSegment string) {
+	session, ok := requireRole(w, r, adminRoleMember)
+	if !ok {
+		return
+	}
+	if pluginsManager == nil {
+		adminhttp.WriteAPIError(w, http.StatusServiceUnavailable, "plugin manager is not initialized")
+		return
+	}
+	pluginID, action, ok := splitPluginSubresource(w, rawSegment, "config")
+	if !ok {
+		return
+	}
+	switch {
+	case r.Method == http.MethodGet && action == "snapshots":
+		snapshots, err := pluginsManager.ListConfigSnapshots(r.Context(), pluginID)
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"snapshots": snapshots})
+	case r.Method == http.MethodGet && strings.HasPrefix(action, "snapshots/") && strings.HasSuffix(action, "/diff"):
+		parts := strings.Split(action, "/")
+		if len(parts) != 3 {
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, "invalid snapshot diff path")
+			return
+		}
+		snapshotID, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, "invalid snapshot id")
+			return
+		}
+		diff, err := pluginsManager.ConfigSnapshotDiff(r.Context(), snapshotID)
+		if err != nil {
+			writePluginManagerError(w, err)
+			return
+		}
+		if diff.PluginID != pluginID {
+			adminhttp.WriteAPIError(w, http.StatusNotFound, "snapshot not found")
+			return
+		}
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"diff": diff})
+	case r.Method == http.MethodPost && action == "dry-run":
+		if session.Role != adminRoleAdmin {
+			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		var req adminhttp.PluginConfigRequest
+		if !adminhttp.DecodeJSONRequest(w, r, &req) {
+			return
+		}
+		configJSON, err := pluginConfigRequestJSON(req)
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if req.ArtifactID == "" {
+			plugin, err := pluginsManager.Plugin(r.Context(), pluginID)
+			if err != nil {
+				writePluginManagerError(w, err)
+				return
+			}
+			req.ArtifactID = plugin.DesiredArtifactID
+		}
+		result, err := pluginsManager.DryRunConfig(r.Context(), pluginID, req.ArtifactID, configJSON)
+		if err != nil {
+			recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_config_dry_run", "plugin", pluginID, false, err.Error(), map[string]any{
+				"artifact_id": req.ArtifactID,
+			})
+			writePluginManagerError(w, err)
+			return
+		}
+		recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_config_dry_run", "plugin", pluginID, true, "config dry-run succeeded", map[string]any{
+			"artifact_id":        req.ArtifactID,
+			"restart_required":   result.RestartRequired,
+			"sensitive_paths":    result.SensitivePaths,
+			"redacted_diff_json": result.RedactedDiffJSON,
+		})
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"result": result})
+	case r.Method == http.MethodPut && action == "":
+		if session.Role != adminRoleAdmin {
+			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		var req adminhttp.PluginConfigRequest
+		if !adminhttp.DecodeJSONRequest(w, r, &req) {
+			return
+		}
+		configJSON, err := pluginConfigRequestJSON(req)
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		current, err := pluginsManager.Plugin(r.Context(), pluginID)
+		if err != nil {
+			writePluginManagerError(w, err)
+			return
+		}
+		if req.ArtifactID == "" {
+			req.ArtifactID = current.DesiredArtifactID
+		}
+		if req.DesiredState == "" {
+			req.DesiredState = current.DesiredState
+		}
+		if req.Priority == 0 {
+			req.Priority = current.Priority
+		}
+		plugin, err := pluginsManager.SetDesired(r.Context(), session.Username, pluginID, req.ArtifactID, req.DesiredState, configJSON, req.Priority)
+		if err != nil {
+			recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_config_update", "plugin", pluginID, false, err.Error())
+			writePluginManagerError(w, err)
+			return
+		}
+		recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_config_update", "plugin", pluginID, true, "config desired state updated", map[string]any{
+			"artifact_id":        plugin.DesiredArtifactID,
+			"desired_generation": plugin.DesiredGeneration,
+			"desired_state":      plugin.DesiredState,
+		})
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"plugin": plugin})
+	default:
+		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func handleAdminPluginSecrets(w http.ResponseWriter, r *http.Request, rawSegment string) {
+	session, ok := requireRole(w, r, adminRoleMember)
+	if !ok {
+		return
+	}
+	if pluginsManager == nil {
+		adminhttp.WriteAPIError(w, http.StatusServiceUnavailable, "plugin manager is not initialized")
+		return
+	}
+	pluginID, action, ok := splitPluginSubresource(w, rawSegment, "secrets")
+	if !ok {
+		return
+	}
+	switch {
+	case r.Method == http.MethodGet && action == "":
+		secrets, err := pluginsManager.ListSecrets(r.Context(), pluginID)
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"secrets": secrets})
+	case r.Method == http.MethodPost && action == "":
+		if session.Role != adminRoleAdmin {
+			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		var req adminhttp.PluginSecretRequest
+		if !adminhttp.DecodeJSONRequest(w, r, &req) {
+			return
+		}
+		secret, err := pluginsManager.UpsertSecret(r.Context(), session.Username, pluginID, req.ArtifactID, req.Name, req.Value, req.ReloadRequired, req.HotReload)
+		if err != nil {
+			recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_secret_update", "plugin_secret", "plugin://"+pluginID+"/"+req.Name, false, "secret update failed", map[string]any{
+				"error": err.Error(),
+			})
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_secret_update", "plugin_secret", "plugin://"+pluginID+"/"+secret.Name, true, "secret updated", map[string]any{
+			"current_version":  secret.CurrentVersion,
+			"previous_version": secret.PreviousVersion,
+			"reload_required":  secret.ReloadRequired,
+			"hot_reload":       secret.HotReload,
+		})
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"secret": secret})
+	default:
+		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func handleAdminPluginRollback(w http.ResponseWriter, r *http.Request, rawSegment string) {
+	session, ok := requireRole(w, r, adminRoleAdmin)
+	if !ok {
+		return
+	}
+	if pluginsManager == nil {
+		adminhttp.WriteAPIError(w, http.StatusServiceUnavailable, "plugin manager is not initialized")
+		return
+	}
+	if r.Method != http.MethodPost {
+		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	pluginID, action, ok := splitPluginSubresource(w, rawSegment, "rollback")
+	if !ok {
+		return
+	}
+	var req adminhttp.PluginRollbackRequest
+	if !adminhttp.DecodeJSONRequest(w, r, &req) {
+		return
+	}
+	var plugin pluginmanager.PluginRecord
+	var err error
+	switch action {
+	case "artifact":
+		plugin, err = pluginsManager.RollbackArtifact(r.Context(), session.Username, pluginID, req.ArtifactID)
+	case "config":
+		plugin, err = pluginsManager.RollbackConfigSnapshot(r.Context(), session.Username, req.SnapshotID, req.FullDesired)
+	default:
+		adminhttp.WriteAPIError(w, http.StatusBadRequest, "unknown rollback action")
+		return
+	}
+	if err != nil {
+		recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_rollback_"+action, "plugin", pluginID, false, err.Error())
+		writePluginManagerError(w, err)
+		return
+	}
+	recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_rollback_"+action, "plugin", pluginID, true, "rollback desired state updated", map[string]any{
+		"desired_generation": plugin.DesiredGeneration,
+		"active_changed":     false,
+	})
+	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"plugin": plugin})
 }
 
 func handleAdminPluginAction(w http.ResponseWriter, r *http.Request, rawSegment string) {
@@ -510,6 +761,214 @@ func pluginConfigJSON(req adminhttp.PluginDesiredRequest) (string, error) {
 		return "", err
 	}
 	return string(data), nil
+}
+
+func pluginConfigRequestJSON(req adminhttp.PluginConfigRequest) (string, error) {
+	if strings.TrimSpace(req.ConfigJSON) != "" {
+		if !json.Valid([]byte(req.ConfigJSON)) {
+			return "", errors.New("config_json must be valid JSON")
+		}
+		return req.ConfigJSON, nil
+	}
+	if req.Config == nil {
+		return "{}", nil
+	}
+	data, err := json.Marshal(req.Config)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func splitPluginSubresource(w http.ResponseWriter, rawSegment, resource string) (pluginID, action string, ok bool) {
+	parts := strings.Split(rawSegment, "/")
+	if len(parts) < 2 || parts[1] != resource {
+		adminhttp.WriteAPIError(w, http.StatusBadRequest, "invalid plugin "+resource+" path")
+		return "", "", false
+	}
+	id, err := adminhttp.PathSegment(parts[0])
+	if err != nil {
+		adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+		return "", "", false
+	}
+	if len(parts) > 2 {
+		action = strings.Join(parts[2:], "/")
+	}
+	return id, action, true
+}
+
+func pluginViews(r *http.Request, plugins []pluginmanager.PluginRecord) ([]map[string]any, error) {
+	views := make([]map[string]any, 0, len(plugins))
+	for _, plugin := range plugins {
+		view, err := pluginView(r, plugin, false)
+		if err != nil {
+			return nil, err
+		}
+		views = append(views, view)
+	}
+	return views, nil
+}
+
+func pluginView(r *http.Request, plugin pluginmanager.PluginRecord, detail bool) (map[string]any, error) {
+	artifacts, err := pluginsManager.ListArtifacts(r.Context(), plugin.ID)
+	if err != nil {
+		return nil, err
+	}
+	builds, err := pluginsManager.ListBuilds(r.Context(), plugin.ID)
+	if err != nil {
+		return nil, err
+	}
+	secrets, err := pluginsManager.ListSecrets(r.Context(), plugin.ID)
+	if err != nil {
+		return nil, err
+	}
+	snapshots, err := pluginsManager.ListConfigSnapshots(r.Context(), plugin.ID)
+	if err != nil {
+		return nil, err
+	}
+	artifactByID := make(map[string]pluginmanager.ArtifactRecord, len(artifacts))
+	for _, artifact := range artifacts {
+		artifactByID[artifact.ID] = artifact
+	}
+	desiredArtifact := artifactByID[plugin.DesiredArtifactID]
+	activeArtifact := artifactByID[plugin.ActiveArtifactID]
+	loadedArtifact := artifactByID[plugin.LoadedArtifactID]
+	manifest := pluginManifest(desiredArtifact)
+	view := map[string]any{
+		"id":                   plugin.ID,
+		"name":                 manifest.Name,
+		"version":              desiredArtifact.Version,
+		"artifact_type":        desiredArtifact.ArtifactType,
+		"runtime_type":         desiredArtifact.RuntimeType,
+		"desired_state":        plugin.DesiredState,
+		"runtime_state":        plugin.RuntimeState,
+		"desired_artifact_id":  plugin.DesiredArtifactID,
+		"active_artifact_id":   plugin.ActiveArtifactID,
+		"loaded_artifact_id":   plugin.LoadedArtifactID,
+		"desired_artifact":     desiredArtifact,
+		"active_artifact":      activeArtifact,
+		"loaded_artifact":      loadedArtifact,
+		"extension_points":     jsonArrayString(desiredArtifact.ExtensionPointsJSON),
+		"priority":             plugin.Priority,
+		"scope":                pluginScope(manifest),
+		"rollout":              pluginRollout(manifest),
+		"restart_required":     pluginRestartRequired(plugin),
+		"health":               pluginHealth(plugin),
+		"last_error":           plugin.LastError,
+		"runtime_summary":      jsonObjectString(plugin.RuntimeSummaryJSON),
+		"dispatch_summary":     jsonArrayString(plugin.DispatchSummaryJSON),
+		"capabilities_summary": jsonObjectString(desiredArtifact.CapabilitiesSummaryJSON),
+		"minecraft":            pluginMinecraftSummary(desiredArtifact),
+		"config_json":          plugin.ConfigJSON,
+		"config_schema":        jsonObjectString(manifestConfigSchemaString(manifest)),
+		"secrets":              secrets,
+		"snapshots":            snapshots,
+		"builds":               builds,
+		"artifacts":            artifacts,
+		"updated_at":           plugin.UpdatedAt,
+	}
+	if detail {
+		view["manifest"] = manifest
+		view["operations_path"] = "/plugin-artifacts?plugin_id=" + plugin.ID
+		view["active_proxy_connections"] = activeProxyConnections(plugin)
+		connections, err := pluginsManager.ActiveProxyConnections(r.Context(), plugin.ID)
+		if err != nil {
+			return nil, err
+		}
+		view["proxy_connections"] = connections
+	}
+	return view, nil
+}
+
+func pluginManifest(artifact pluginmanager.ArtifactRecord) pluginmanager.Manifest {
+	var manifest pluginmanager.Manifest
+	_ = json.Unmarshal([]byte(artifact.MetadataJSON), &manifest)
+	return manifest
+}
+
+func manifestConfigSchemaString(manifest pluginmanager.Manifest) string {
+	if len(manifest.ConfigSchema) == 0 {
+		return "{}"
+	}
+	return string(manifest.ConfigSchema)
+}
+
+func pluginScope(manifest pluginmanager.Manifest) any {
+	var caps map[string]any
+	if len(manifest.Capabilities) == 0 || json.Unmarshal(manifest.Capabilities, &caps) != nil {
+		return map[string]any{"type": "global"}
+	}
+	if scope, ok := caps["scope"]; ok {
+		return scope
+	}
+	return map[string]any{"type": "global"}
+}
+
+func pluginRollout(manifest pluginmanager.Manifest) any {
+	var caps map[string]any
+	if len(manifest.Capabilities) == 0 || json.Unmarshal(manifest.Capabilities, &caps) != nil {
+		return map[string]any{"mode": "all"}
+	}
+	if rollout, ok := caps["rollout"]; ok {
+		return rollout
+	}
+	return map[string]any{"mode": "all"}
+}
+
+func pluginHealth(plugin pluginmanager.PluginRecord) string {
+	if plugin.LastError != "" || plugin.RuntimeState == pluginmanager.RuntimeFailed {
+		return "error"
+	}
+	if plugin.RuntimeState == pluginmanager.RuntimeEnabled {
+		return "healthy"
+	}
+	if plugin.RuntimeState == pluginmanager.RuntimeDraining {
+		return "draining"
+	}
+	return "inactive"
+}
+
+func pluginRestartRequired(plugin pluginmanager.PluginRecord) bool {
+	return plugin.LoadedArtifactID != "" && plugin.DesiredArtifactID != "" && plugin.LoadedArtifactID != plugin.DesiredArtifactID
+}
+
+func pluginMinecraftSummary(artifact pluginmanager.ArtifactRecord) any {
+	var summary pluginmanager.CapabilitySummary
+	if json.Unmarshal([]byte(artifact.CapabilitiesSummaryJSON), &summary) != nil || summary.Minecraft == nil {
+		return nil
+	}
+	return summary.Minecraft
+}
+
+func activeProxyConnections(plugin pluginmanager.PluginRecord) int64 {
+	var summary map[string]any
+	if json.Unmarshal([]byte(plugin.RuntimeSummaryJSON), &summary) != nil {
+		return 0
+	}
+	switch value := summary["active_proxy_connections"].(type) {
+	case float64:
+		return int64(value)
+	case int64:
+		return value
+	default:
+		return 0
+	}
+}
+
+func jsonObjectString(raw string) any {
+	var value any
+	if raw == "" || json.Unmarshal([]byte(raw), &value) != nil {
+		return map[string]any{}
+	}
+	return value
+}
+
+func jsonArrayString(raw string) any {
+	var value any
+	if raw == "" || json.Unmarshal([]byte(raw), &value) != nil {
+		return []any{}
+	}
+	return value
 }
 
 func writePluginManagerError(w http.ResponseWriter, err error) {

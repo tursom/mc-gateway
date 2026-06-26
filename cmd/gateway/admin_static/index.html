@@ -63,6 +63,7 @@
 
       <nav class="tabs">
         <button data-tab="routes" class="active" type="button" data-i18n="routes">Routes</button>
+        <button data-tab="plugins" type="button" data-i18n="plugins">Plugins</button>
         <button data-tab="services" type="button" data-i18n="services">Services</button>
         <button data-tab="users" type="button" data-i18n="users">Users</button>
         <button data-tab="metrics" type="button" data-i18n="metrics">Metrics</button>
@@ -88,6 +89,38 @@
             <tbody id="routesBody"></tbody>
           </table>
         </div>
+      </section>
+
+      <section id="pluginsTab" class="tab-panel hidden">
+        <div class="toolbar">
+          <label class="file-button">
+            <span data-i18n="uploadPlugin">Upload plugin</span>
+            <input id="pluginUploadInput" type="file" accept=".mcgp">
+          </label>
+          <button id="refreshPluginsBtn" class="secondary" type="button" data-i18n="refresh">Refresh</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th data-i18n="pluginID">Plugin ID</th>
+                <th data-i18n="name">Name</th>
+                <th data-i18n="version">Version</th>
+                <th data-i18n="artifact">Artifact</th>
+                <th data-i18n="runtime">Runtime</th>
+                <th data-i18n="desired">Desired</th>
+                <th data-i18n="active">Active</th>
+                <th data-i18n="desiredArtifact">Desired artifact</th>
+                <th data-i18n="extensions">Extensions</th>
+                <th data-i18n="priority">Priority</th>
+                <th data-i18n="restart">Restart</th>
+                <th data-i18n="health">Health</th>
+              </tr>
+            </thead>
+            <tbody id="pluginsBody"></tbody>
+          </table>
+        </div>
+        <div id="pluginDetail" class="plugin-detail"></div>
       </section>
 
       <section id="servicesTab" class="tab-panel hidden">

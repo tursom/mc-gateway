@@ -129,6 +129,110 @@ func TestManagerRejectsSourceArtifactLoad(t *testing.T) {
 	}
 }
 
+func TestManagerDryRunRejectsBadConfigWithoutGenerationChange(t *testing.T) {
+	adapter := &fakeAdapter{}
+	manager := newManagerForTest(t, adapter)
+	artifact := uploadTestArtifact(t, manager, "plugin-a")
+	plugin, err := manager.SetDesired(context.Background(), "admin", "plugin-a", artifact.ID, DesiredEnabled, `{"ok":true}`, 10)
+	if err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	adapter.dryRunErrs = map[string]error{"plugin-a": errors.New("bad config")}
+	if _, err := manager.SetDesired(context.Background(), "admin", "plugin-a", artifact.ID, DesiredEnabled, `{"ok":false}`, 10); err == nil || !strings.Contains(err.Error(), "bad config") {
+		t.Fatalf("SetDesired(bad config) error = %v, want bad config", err)
+	}
+	after, err := manager.Plugin(context.Background(), "plugin-a")
+	if err != nil {
+		t.Fatalf("Plugin() error = %v", err)
+	}
+	if after.DesiredGeneration != plugin.DesiredGeneration || after.ConfigJSON != `{"ok":true}` {
+		t.Fatalf("plugin after bad config = %+v, want generation/config unchanged from %+v", after, plugin)
+	}
+}
+
+func TestManagerDryRunRedactsSensitiveDiff(t *testing.T) {
+	manager := newManagerForTest(t, &fakeAdapter{})
+	artifact := uploadTestArtifactWithManifest(t, manager, "plugin-a", func(manifest *Manifest) {
+		manifest.ConfigSchema = json.RawMessage(`{"type":"object","properties":{"token":{"type":"string","sensitive":true},"host":{"type":"string"}}}`)
+	})
+	if _, err := manager.SetDesired(context.Background(), "admin", "plugin-a", artifact.ID, DesiredDisabled, `{"token":"old","host":"a"}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	result, err := manager.DryRunConfig(context.Background(), "plugin-a", artifact.ID, `{"token":"new","host":"b"}`)
+	if err != nil {
+		t.Fatalf("DryRunConfig() error = %v", err)
+	}
+	if strings.Contains(result.RedactedConfigJSON, "new") || strings.Contains(result.RedactedDiffJSON, "old") || strings.Contains(result.RedactedDiffJSON, "new") {
+		t.Fatalf("dry-run leaked secret: %+v", result)
+	}
+	if !strings.Contains(result.RedactedDiffJSON, "[REDACTED]") {
+		t.Fatalf("redacted diff = %s, want redaction marker", result.RedactedDiffJSON)
+	}
+}
+
+func TestManagerSecretVersionsAreSummariesOnly(t *testing.T) {
+	manager := newManagerForTest(t, &fakeAdapter{})
+	artifact := uploadTestArtifactWithManifest(t, manager, "plugin-a", func(manifest *Manifest) {
+		manifest.Secrets = []SecretSpec{{
+			Name:     "api_token",
+			Required: true,
+			Type:     "api_token",
+			Rotation: SecretRotation{Reload: "reload_required"},
+		}}
+	})
+	first, err := manager.UpsertSecret(context.Background(), "admin", "plugin-a", artifact.ID, "api_token", "secret-one", true, false)
+	if err != nil {
+		t.Fatalf("UpsertSecret(first) error = %v", err)
+	}
+	second, err := manager.UpsertSecret(context.Background(), "admin", "plugin-a", artifact.ID, "api_token", "secret-two", false, true)
+	if err != nil {
+		t.Fatalf("UpsertSecret(second) error = %v", err)
+	}
+	if first.CurrentVersion != 1 || second.CurrentVersion != 2 || second.PreviousVersion != 1 || !second.HotReload || second.ReloadRequired {
+		t.Fatalf("secret versions = first %+v second %+v", first, second)
+	}
+	data, _ := json.Marshal(second)
+	if strings.Contains(string(data), "secret-one") || strings.Contains(string(data), "secret-two") {
+		t.Fatalf("secret summary leaked value: %s", data)
+	}
+}
+
+func TestManagerRollbackConfigSnapshotRunsDryRunBeforeChangingDesired(t *testing.T) {
+	adapter := &fakeAdapter{}
+	manager := newManagerForTest(t, adapter)
+	artifact := uploadTestArtifact(t, manager, "plugin-a")
+	if _, err := manager.SetDesired(context.Background(), "admin", "plugin-a", artifact.ID, DesiredEnabled, `{"version":1}`, 10); err != nil {
+		t.Fatalf("SetDesired(v1) error = %v", err)
+	}
+	updated, err := manager.SetDesired(context.Background(), "admin", "plugin-a", artifact.ID, DesiredEnabled, `{"version":2}`, 20)
+	if err != nil {
+		t.Fatalf("SetDesired(v2) error = %v", err)
+	}
+	snapshots, err := manager.ListConfigSnapshots(context.Background(), "plugin-a")
+	if err != nil {
+		t.Fatalf("ListConfigSnapshots() error = %v", err)
+	}
+	if len(snapshots) != 1 {
+		t.Fatalf("snapshots = %d, want 1", len(snapshots))
+	}
+	adapter.dryRunErrs = map[string]error{"plugin-a": errors.New("rollback rejected")}
+	if _, err := manager.RollbackConfigSnapshot(context.Background(), "admin", snapshots[0].ID, false); err == nil {
+		t.Fatal("RollbackConfigSnapshot() error = nil, want dry-run rejection")
+	}
+	afterFail, _ := manager.Plugin(context.Background(), "plugin-a")
+	if afterFail.DesiredGeneration != updated.DesiredGeneration || afterFail.ConfigJSON != `{"version":2}` {
+		t.Fatalf("plugin after failed rollback = %+v, want unchanged %+v", afterFail, updated)
+	}
+	adapter.dryRunErrs = nil
+	rolledBack, err := manager.RollbackConfigSnapshot(context.Background(), "admin", snapshots[0].ID, false)
+	if err != nil {
+		t.Fatalf("RollbackConfigSnapshot(success) error = %v", err)
+	}
+	if rolledBack.ConfigJSON != `{"version":1}` || rolledBack.Priority != 20 {
+		t.Fatalf("rolled back plugin = %+v, want config v1 and current priority 20", rolledBack)
+	}
+}
+
 func TestManagerEnableDisableAndDispatch(t *testing.T) {
 	adapter := &fakeAdapter{}
 	manager := newManagerForTest(t, adapter)
@@ -590,8 +694,26 @@ func uploadTestArtifact(t *testing.T, manager *Manager, pluginID string) Artifac
 
 func uploadTestArtifactWithCapabilities(t *testing.T, manager *Manager, pluginID string, capabilities json.RawMessage) ArtifactRecord {
 	t.Helper()
+	return uploadTestArtifactWithManifest(t, manager, pluginID, func(manifest *Manifest) {
+		manifest.Capabilities = capabilities
+	})
+}
+
+func uploadTestArtifactWithManifest(t *testing.T, manager *Manager, pluginID string, mutate func(*Manifest)) ArtifactRecord {
+	t.Helper()
+	var manifest Manifest
+	if err := json.Unmarshal(testManifestBytesWithCapabilities(t, pluginID, nil), &manifest); err != nil {
+		t.Fatalf("Unmarshal manifest error = %v", err)
+	}
+	if mutate != nil {
+		mutate(&manifest)
+	}
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("Marshal manifest error = %v", err)
+	}
 	packagePath := writeTestMCGP(t, map[string][]byte{
-		"manifest.json": testManifestBytesWithCapabilities(t, pluginID, capabilities),
+		"manifest.json": manifestBytes,
 		"plugin.so":     []byte("fake plugin bytes " + pluginID),
 	})
 	artifact, err := manager.UploadArtifact(context.Background(), ArtifactUpload{
@@ -754,10 +876,12 @@ func waitForPluginManagerTest(t *testing.T, done func() bool) {
 }
 
 type fakeAdapter struct {
-	loads    int
-	handlers map[string]api.UpstreamConnectHandler
-	loadErr  error
-	loadErrs map[string]error
+	loads      int
+	handlers   map[string]api.UpstreamConnectHandler
+	loadErr    error
+	loadErrs   map[string]error
+	dryRunErr  error
+	dryRunErrs map[string]error
 }
 
 func (a *fakeAdapter) Load(_ context.Context, artifact ArtifactRecord, _ PluginRecord, gateway *Gateway) (api.Plugin, error) {
@@ -783,6 +907,16 @@ func (a *fakeAdapter) Load(_ context.Context, artifact ArtifactRecord, _ PluginR
 		return nil, err
 	}
 	return &fakePlugin{}, nil
+}
+
+func (a *fakeAdapter) DryRunConfig(_ context.Context, artifact ArtifactRecord, _ PluginRecord) error {
+	if a.dryRunErr != nil {
+		return a.dryRunErr
+	}
+	if a.dryRunErrs != nil && a.dryRunErrs[artifact.PluginID] != nil {
+		return a.dryRunErrs[artifact.PluginID]
+	}
+	return nil
 }
 
 type fakePlugin struct {

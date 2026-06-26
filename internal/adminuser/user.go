@@ -68,6 +68,8 @@ func Permissions(role string) map[string]bool {
 		"read_routes":     HasRole(role, RoleGuest),
 		"write_routes":    HasRole(role, RoleMember),
 		"read_status":     HasRole(role, RoleMember),
+		"read_plugins":    HasRole(role, RoleMember),
+		"manage_plugins":  HasRole(role, RoleAdmin),
 		"manage_users":    HasRole(role, RoleAdmin),
 		"manage_services": HasRole(role, RoleAdmin),
 	}

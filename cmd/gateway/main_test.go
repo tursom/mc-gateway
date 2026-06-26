@@ -285,16 +285,21 @@ func writeGatewayTestMCGP(t *testing.T, pluginID string) string {
 
 func writeGatewayTestMCGPWithCapabilities(t *testing.T, pluginID string, capabilities string) string {
 	t.Helper()
+	entries := map[string][]byte{
+		"manifest.json": gatewayTestManifestWithCapabilities(t, pluginID, capabilities),
+		"plugin.so":     []byte("fake plugin bytes " + pluginID),
+	}
+	return writeGatewayTestMCGPEntries(t, entries)
+}
+
+func writeGatewayTestMCGPEntries(t *testing.T, entries map[string][]byte) string {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "plugin.mcgp")
 	file, err := os.Create(path)
 	if err != nil {
 		t.Fatalf("Create zip error = %v", err)
 	}
 	writer := zip.NewWriter(file)
-	entries := map[string][]byte{
-		"manifest.json": gatewayTestManifestWithCapabilities(t, pluginID, capabilities),
-		"plugin.so":     []byte("fake plugin bytes " + pluginID),
-	}
 	for name, data := range entries {
 		entry, err := writer.Create(name)
 		if err != nil {

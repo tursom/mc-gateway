@@ -2,12 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/tursom/mc-gateway/internal/pluginmanager"
 )
 
 func TestAdminSetupLoginAndPermissions(t *testing.T) {
@@ -215,6 +219,134 @@ func TestAdminUserPatchInvalidatesExistingSession(t *testing.T) {
 	}
 }
 
+func TestAdminPluginPhase4API(t *testing.T) {
+	handler := newAdminTestHandlerWithAdmin(t)
+	pluginsManager = pluginmanager.New(pluginmanager.Options{
+		DB:           adminDB,
+		ArtifactRoot: filepath.Join(filepath.Dir(adminDBPath), "plugins", "artifacts"),
+		Adapter:      gatewayTestPluginAdapter{},
+	})
+	adminToken := adminTestLogin(t, handler, "admin", "secret")
+	resp := adminTestRequest(t, handler, http.MethodPost, "/admin/api/users", adminToken, map[string]any{
+		"username": "member",
+		"role":     "member",
+		"password": "member-secret",
+	})
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("create member status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	memberToken := adminTestLogin(t, handler, "member", "member-secret")
+
+	artifact := uploadGatewayPhase4Artifact(t, "phase4-plugin")
+	if _, err := pluginsManager.SetDesired(context.Background(), "admin", "phase4-plugin", artifact.ID, pluginmanager.DesiredEnabled, `{"token":"old","host":"a"}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+
+	resp = adminTestRequest(t, handler, http.MethodGet, "/admin/api/plugins", memberToken, nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("member plugins list status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+
+	resp = adminTestRequest(t, handler, http.MethodPost, "/admin/api/plugins/phase4-plugin/secrets", memberToken, map[string]any{
+		"name":  "api_token",
+		"value": "member-secret-value",
+	})
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("member secret write status = %d, want forbidden; body=%s", resp.Code, resp.Body.String())
+	}
+
+	resp = adminTestRequest(t, handler, http.MethodPost, "/admin/api/plugins/phase4-plugin/secrets", adminToken, map[string]any{
+		"artifact_id":     artifact.ID,
+		"name":            "api_token",
+		"value":           "super-secret-value",
+		"reload_required": true,
+	})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("secret write status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if strings.Contains(resp.Body.String(), "super-secret-value") {
+		t.Fatalf("secret response leaked value: %s", resp.Body.String())
+	}
+
+	resp = adminTestRequest(t, handler, http.MethodPost, "/admin/api/plugins/phase4-plugin/config/dry-run", adminToken, map[string]any{
+		"artifact_id": artifact.ID,
+		"config_json": `{"token":"new","host":"b"}`,
+	})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("config dry-run status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if strings.Contains(resp.Body.String(), "new") || strings.Contains(resp.Body.String(), "old") {
+		t.Fatalf("dry-run leaked sensitive value: %s", resp.Body.String())
+	}
+
+	resp = adminTestRequest(t, handler, http.MethodPut, "/admin/api/plugins/phase4-plugin/config", adminToken, map[string]any{
+		"artifact_id": artifact.ID,
+		"config_json": `{"token":"new","host":"b"}`,
+	})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("config update status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	resp = adminTestRequest(t, handler, http.MethodGet, "/admin/api/plugins/phase4-plugin/config/snapshots", adminToken, nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("snapshots status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	snapshotID := firstSnapshotID(t, resp)
+	resp = adminTestRequest(t, handler, http.MethodGet, "/admin/api/plugins/phase4-plugin/config/snapshots/"+strconv.FormatInt(snapshotID, 10)+"/diff", adminToken, nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("snapshot diff status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if strings.Contains(resp.Body.String(), "new") || strings.Contains(resp.Body.String(), "old") {
+		t.Fatalf("snapshot diff leaked sensitive value: %s", resp.Body.String())
+	}
+	resp = adminTestRequest(t, handler, http.MethodPost, "/admin/api/plugins/phase4-plugin/rollback/config", adminToken, map[string]any{
+		"snapshot_id": snapshotID,
+	})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("config rollback status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+
+	resp = adminTestRequest(t, handler, http.MethodGet, "/admin/api/audit-logs", adminToken, nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("audit status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if strings.Contains(resp.Body.String(), "super-secret-value") {
+		t.Fatalf("audit leaked secret value: %s", resp.Body.String())
+	}
+}
+
+func uploadGatewayPhase4Artifact(t *testing.T, pluginID string) pluginmanager.ArtifactRecord {
+	t.Helper()
+	var manifest pluginmanager.Manifest
+	if err := json.Unmarshal(gatewayTestManifest(t, pluginID), &manifest); err != nil {
+		t.Fatalf("Unmarshal manifest error = %v", err)
+	}
+	manifest.ConfigSchema = json.RawMessage(`{"type":"object","properties":{"token":{"type":"string","sensitive":true},"host":{"type":"string"}}}`)
+	manifest.Secrets = []pluginmanager.SecretSpec{{
+		Name:     "api_token",
+		Required: false,
+		Type:     "api_token",
+		Rotation: pluginmanager.SecretRotation{
+			Reload: "reload_required",
+		},
+	}}
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("Marshal manifest error = %v", err)
+	}
+	artifact, err := pluginsManager.UploadArtifact(context.Background(), pluginmanager.ArtifactUpload{
+		SourcePath: writeGatewayTestMCGPEntries(t, map[string][]byte{
+			"manifest.json": manifestBytes,
+			"plugin.so":     []byte("fake plugin bytes " + pluginID),
+		}),
+		FileName: pluginID + ".mcgp",
+		Actor:    "admin",
+	})
+	if err != nil {
+		t.Fatalf("UploadArtifact() error = %v", err)
+	}
+	return artifact
+}
+
 func newAdminTestHandler(t *testing.T) http.Handler {
 	t.Helper()
 	t.Cleanup(saveGatewayState(t))
@@ -286,4 +418,22 @@ func adminTestJSON(t *testing.T, resp *httptest.ResponseRecorder) map[string]any
 		t.Fatalf("Unmarshal(%q) error = %v", resp.Body.String(), err)
 	}
 	return body
+}
+
+func firstSnapshotID(t *testing.T, resp *httptest.ResponseRecorder) int64 {
+	t.Helper()
+	body := adminTestJSON(t, resp)
+	snapshots, ok := body["snapshots"].([]any)
+	if !ok || len(snapshots) == 0 {
+		t.Fatalf("snapshots = %#v, want at least one", body["snapshots"])
+	}
+	first, ok := snapshots[0].(map[string]any)
+	if !ok {
+		t.Fatalf("first snapshot = %#v", snapshots[0])
+	}
+	id, ok := first["id"].(float64)
+	if !ok || id <= 0 {
+		t.Fatalf("snapshot id = %#v", first["id"])
+	}
+	return int64(id)
 }

@@ -8,6 +8,7 @@ import { setToken, state } from "./state.js";
 import type { LoginResponse, SetupStatus, User } from "./types.js";
 import { loadAudit } from "./views/audit.js";
 import { loadMetrics } from "./views/metrics.js";
+import { bindPluginEvents, loadPlugins, renderPluginDetail, renderPlugins } from "./views/plugins.js";
 import { loadRoutes, openRouteDialog, renderRoutes, saveRoute } from "./views/routes.js";
 import { loadServices, renderServices } from "./views/services.js";
 import { loadStatus } from "./views/status.js";
@@ -56,6 +57,7 @@ function bindEvents(): void {
   el("newUserBtn").addEventListener("click", () => openUserDialog());
   el<HTMLFormElement>("routeForm").addEventListener("submit", saveRoute);
   el<HTMLFormElement>("userForm").addEventListener("submit", saveUser);
+  bindPluginEvents();
 
   document.querySelectorAll<HTMLButtonElement>("[data-close]").forEach((button) => {
     button.addEventListener("click", () => button.closest("dialog")?.close());
@@ -132,6 +134,7 @@ async function showApp(): Promise<void> {
     await loadStatus();
     await loadServices();
     await loadMetrics();
+    await loadPlugins();
   }
   if (isAdmin()) {
     await loadUsers();
@@ -145,6 +148,7 @@ function applyRoleVisibility(): void {
   el("statusGrid").classList.toggle("hidden", !member);
   el("newRouteBtn").classList.toggle("hidden", !member);
   toggleTab("services", member);
+  toggleTab("plugins", member);
   toggleTab("metrics", member);
   toggleTab("users", admin);
   toggleTab("audit", admin);
@@ -176,9 +180,12 @@ function rerenderCurrentView(): void {
   renderRoutes();
   renderServices();
   renderUsers();
+  renderPlugins();
+  renderPluginDetail();
   if (isMember()) {
     loadStatus();
     loadMetrics();
+    loadPlugins();
   }
   if (isAdmin()) {
     loadAudit();

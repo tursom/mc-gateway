@@ -18,7 +18,10 @@ import (
 	"time"
 )
 
-var pluginIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
+var (
+	pluginIDPattern   = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
+	secretNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+)
 
 type ArtifactStore struct {
 	Root               string
@@ -463,6 +466,16 @@ func validateManifest(manifest Manifest) error {
 	}
 	if !found {
 		return fmt.Errorf("extension point %q is required", ExtensionUpstreamConnect)
+	}
+	seenSecrets := make(map[string]bool, len(manifest.Secrets))
+	for _, secret := range manifest.Secrets {
+		if !secretNamePattern.MatchString(secret.Name) {
+			return fmt.Errorf("invalid secret name %q", secret.Name)
+		}
+		if seenSecrets[secret.Name] {
+			return fmt.Errorf("duplicate secret name %q", secret.Name)
+		}
+		seenSecrets[secret.Name] = true
 	}
 	return nil
 }

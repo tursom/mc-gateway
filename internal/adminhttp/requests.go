@@ -42,3 +42,25 @@ type PluginDesiredRequest struct {
 	Config       map[string]any `json:"config"`
 	ConfigJSON   string         `json:"config_json"`
 }
+
+type PluginConfigRequest struct {
+	ArtifactID   string         `json:"artifact_id"`
+	DesiredState string         `json:"desired_state"`
+	Priority     int            `json:"priority"`
+	Config       map[string]any `json:"config"`
+	ConfigJSON   string         `json:"config_json"`
+}
+
+type PluginSecretRequest struct {
+	ArtifactID     string `json:"artifact_id"`
+	Name           string `json:"name"`
+	Value          string `json:"value"`
+	ReloadRequired bool   `json:"reload_required"`
+	HotReload      bool   `json:"hot_reload"`
+}
+
+type PluginRollbackRequest struct {
+	ArtifactID  string `json:"artifact_id"`
+	SnapshotID  int64  `json:"snapshot_id"`
+	FullDesired bool   `json:"full_desired"`
+}
