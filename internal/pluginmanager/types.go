@@ -173,11 +173,10 @@ type Manifest struct {
 }
 
 type RuntimeManifest struct {
-	Type           string `json:"type"`
-	Entry          string `json:"entry"`
-	BuildEntry     string `json:"build_entry"`
-	EntrySymbol    string `json:"entry_symbol"`
-	MetadataSymbol string `json:"metadata_symbol"`
+	Type        string `json:"type"`
+	Entry       string `json:"entry"`
+	BuildEntry  string `json:"build_entry"`
+	EntrySymbol string `json:"entry_symbol"`
 }
 
 type BuildManifest struct {

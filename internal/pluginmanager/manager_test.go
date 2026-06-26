@@ -1131,9 +1131,8 @@ func uploadBuildableTestSource(t *testing.T, manager *Manager, pluginID string) 
 		Version:       "0.1.0",
 		ArtifactType:  ArtifactTypeSource,
 		Runtime: RuntimeManifest{
-			Type:           RuntimeGoPlugin,
-			EntrySymbol:    "Plugin",
-			MetadataSymbol: "MCGatewayPluginMetadata",
+			Type:        RuntimeGoPlugin,
+			EntrySymbol: "Plugin",
 		},
 		Build: BuildManifest{
 			Type:           BuildTypeGo,
@@ -1162,9 +1161,7 @@ func uploadBuildableTestSource(t *testing.T, manager *Manager, pluginID string) 
 	mainSource := `package main
 
 import (
-	"encoding/json"
 	"net"
-	"runtime"
 
 	"github.com/tursom/mc-gateway/plugin/api"
 )
@@ -1172,8 +1169,6 @@ import (
 type pluginImpl struct{ api.AbstractPlugin }
 
 func Plugin() api.Plugin { return &pluginImpl{} }
-
-func MCGatewayPluginMetadata() string { return manifestJSON }
 
 func (p *pluginImpl) Init(gateway api.Gateway) error {
 	return api.RegisterHookHandler(
@@ -1186,33 +1181,6 @@ func (p *pluginImpl) Init(gateway api.Gateway) error {
 			return left, nil
 		},
 	)
-}
-
-var manifestJSON = compactJSON(map[string]any{
-	"schema_version": "mc-gateway.plugin/v1",
-	"id": "` + pluginID + `",
-	"name": "Buildable Source",
-	"version": "0.1.0",
-	"artifact_type": "binary",
-	"runtime": map[string]any{
-		"type": "go-plugin",
-		"entry": "plugin.so",
-		"entry_symbol": "Plugin",
-		"metadata_symbol": "MCGatewayPluginMetadata",
-	},
-	"api_version": "plugin-api/v1",
-	"sdk_module": "github.com/tursom/mc-gateway/plugin/api",
-	"sdk_module_version": "v0.1.0",
-	"go_version": runtime.Version(),
-	"go_os": runtime.GOOS,
-	"go_arch": runtime.GOARCH,
-	"extension_points": []map[string]any{{"type": "hook", "key": "upstream.connect/v1"}},
-	"capabilities": map[string]any{"extension_points": []string{"upstream.connect/v1"}},
-})
-
-func compactJSON(value any) string {
-	data, _ := json.Marshal(value)
-	return string(data)
 }
 `
 	packagePath := writeTestMCGP(t, map[string][]byte{

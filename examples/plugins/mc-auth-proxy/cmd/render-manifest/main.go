@@ -7,100 +7,27 @@ import (
 )
 
 func main() {
-	artifactType := os.Getenv("ARTIFACT_TYPE")
-	if artifactType == "" {
-		artifactType = "binary"
+	if err := renderManifest(os.Stdout, os.Getenv("ARTIFACT_TYPE")); err != nil {
+		panic(err)
 	}
-	manifest := map[string]any{
-		"schema_version": "mc-gateway.plugin/v1",
-		"id":             "mc-auth-proxy",
-		"name":           "Minecraft Auth Proxy",
-		"version":        "0.1.0",
-		"description":    "Protocol-proxy example that reads handshake/login start and returns a login disconnect fixture.",
-		"artifact_type":  artifactType,
-		"runtime": map[string]any{
-			"type":            "go-plugin",
-			"entry":           "plugin.so",
-			"entry_symbol":    "Plugin",
-			"metadata_symbol": "MCGatewayPluginMetadata",
-		},
-		"api_version":        "plugin-api/v1",
-		"sdk_module":         "github.com/tursom/mc-gateway/plugin/api",
-		"sdk_module_version": "v0.1.0",
-		"go_version":         runtime.Version(),
-		"go_os":              runtime.GOOS,
-		"go_arch":            runtime.GOARCH,
-		"extension_points": []map[string]any{
-			{"type": "hook", "key": "upstream.connect/v1"},
-		},
-		"capabilities": map[string]any{
-			"extension_points": []string{"upstream.connect/v1"},
-			"upstream_connect": map[string]any{"mode": "protocol-proxy"},
-			"minecraft": map[string]any{
-				"protocol_versions": map[string]any{
-					"min":                760,
-					"max":                767,
-					"tested":             []int{760, 763, 765, 767},
-					"unsupported_policy": "kick",
-				},
-				"states": map[string]any{
-					"status":        "transparent",
-					"login":         "handled",
-					"configuration": "transparent",
-					"play":          "transparent",
-				},
-				"auth_modes": []string{"fixture"},
-				"forwarding": map[string]any{
-					"supported":       []string{"none", "velocity-modern"},
-					"default":         "none",
-					"requires_secret": false,
-				},
-				"unsupported_policy": "kick",
-				"modded": map[string]any{
-					"forge":   "transparent",
-					"fabric":  "transparent",
-					"unknown": "pass",
-				},
-			},
-			"network":    map[string]any{"outbound": []string{"tcp:*:*"}},
-			"filesystem": map[string]any{"read": []string{}, "write": []string{}},
-			"env":        []string{},
-		},
-		"runtime_limits": map[string]any{
-			"handler_timeout_ms":       3000,
-			"initial_write_timeout_ms": 1000,
-		},
-		"events": []map[string]any{
-			{"name": "auth.success", "fields": []string{"result", "mode"}},
-			{"name": "auth.failure", "fields": []string{"result", "mode"}},
-		},
-		"custom_metrics": []map[string]any{
-			{"name": "auth.attempts", "type": "counter", "labels": []string{"result", "mode"}},
-		},
-		"external_dependencies": []map[string]any{
-			{"name": "backend", "endpoint": "tcp://", "purpose": "auth", "required": true, "timeout": "3s", "retry": 0, "fail_policy": "fail_closed", "data_classes": []string{"operational"}},
-		},
-		"background_tasks": []map[string]any{
-			{"id": "profile-cache-gc", "name": "Profile cache GC", "mode": "manual", "manual": true, "timeout": "1s"},
-		},
-		"data_stores": []map[string]any{
-			{"name": "profile-cache", "schema_version": 1, "data_class": "profile_cache", "quota_bytes": 1048576, "retention": "24h", "exportable": false},
-		},
-		"file_stores": []map[string]any{
-			{"namespace": "cache", "data_class": "profile_cache", "quota_bytes": 1048576, "retention": "24h"},
-			{"namespace": "diagnostic", "data_class": "diagnostic", "quota_bytes": 1048576, "retention": "24h"},
-		},
-		"config_schema": map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"match_host":         map[string]any{"type": "string"},
-				"fixture_accept":     map[string]any{"type": "boolean"},
-				"disconnect_message": map[string]any{"type": "string"},
-				"backend":            map[string]any{"type": "string"},
-			},
-		},
+}
+
+func renderManifest(out *os.File, artifactType string) error {
+	data, err := os.ReadFile("manifest.json")
+	if err != nil {
+		return err
 	}
-	if artifactType == "source" {
+	var manifest map[string]any
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return err
+	}
+	if artifactType != "" {
+		manifest["artifact_type"] = artifactType
+	}
+	manifest["go_version"] = runtime.Version()
+	manifest["go_os"] = runtime.GOOS
+	manifest["go_arch"] = runtime.GOARCH
+	if manifest["artifact_type"] == "source" {
 		manifest["build"] = map[string]any{
 			"type":            "go",
 			"entry":           ".",
@@ -111,9 +38,7 @@ func main() {
 			"output":          "plugin.so",
 		}
 	}
-	encoder := json.NewEncoder(os.Stdout)
+	encoder := json.NewEncoder(out)
 	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(manifest); err != nil {
-		panic(err)
-	}
+	return encoder.Encode(manifest)
 }

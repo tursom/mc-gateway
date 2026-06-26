@@ -283,15 +283,8 @@ func validateBuiltSymbols(manifest Manifest, nmLog string) error {
 	if entrySymbol == "" {
 		entrySymbol = "Plugin"
 	}
-	metadataSymbol := manifest.Runtime.MetadataSymbol
-	if metadataSymbol == "" {
-		metadataSymbol = "MCGatewayPluginMetadata"
-	}
 	if !strings.Contains(nmLog, entrySymbol) {
 		return fmt.Errorf("built plugin is missing entry symbol %q", entrySymbol)
-	}
-	if !strings.Contains(nmLog, metadataSymbol) {
-		return fmt.Errorf("built plugin is missing metadata symbol %q", metadataSymbol)
 	}
 	return nil
 }

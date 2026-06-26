@@ -8,11 +8,11 @@
   "runtime": {
     "type": "go-plugin",
     "entry": "plugin.so",
-    "entry_symbol": "Plugin",
-    "metadata_symbol": "MCGatewayPluginMetadata"
+    "entry_symbol": "Plugin"
   },
   "api_version": "plugin-api/v1",
   "sdk_module": "github.com/tursom/mc-gateway/plugin/api",
+  "sdk_module_version": "v0.1.0",
   "go_version": "go1.24.0",
   "go_os": "linux",
   "go_arch": "amd64",

@@ -20,7 +20,7 @@
 - 第一版继续使用 Go `-buildmode=plugin` 的进程内 `.so` 插件。
 - 尽量支持热加载：兼容且未加载过的插件可以不重启加载并启用。
 - 明确热卸载限制：Go plugin 不能真正从进程中卸载，只能逻辑禁用。
-- 提供稳定的元数据 ABI，记录插件 ID、版本、目标平台、构建 Go 版本、SDK/API 版本、声明的 extension point 和配置 schema。
+- 通过 `manifest.json` 记录插件 ID、版本、目标平台、构建 Go 版本、SDK/API 版本、声明的 extension point 和配置 schema。
 - 插件能力采用 Extension Point 模型，Hook 是其中一种；第一版先落 `upstream.connect/v1`。
 - `upstream.connect/v1` 必须支持插件返回自管 `net.Conn`，用于实现完整 stream endpoint/protocol proxy。
 - MC 正版/三方登录、身份映射、forwarding 和登录后的协议处理属于插件业务逻辑，不由 gateway core 拼装。
@@ -35,7 +35,7 @@
 | 插件信任模型 | 第一版只支持可信 native 插件，不把普通插件当不可信代码运行 | 第一版 | Runtime 与权限声明、安全与运维约束 |
 | 插件包格式 | 管理页统一上传 `.mcgp` zip 包，源码/二进制由 `manifest.json` 的 `artifact_type` 决定 | 第一版 | 包格式、源码包构建 |
 | 自定义扩展名 | 不新增源码包扩展名；同一 `.mcgp` 格式承载 binary/source | 第一版 | 包格式 |
-| Go plugin ABI | 使用 `MCGatewayPluginMetadata() string` 稳定元数据 ABI，并记录 Go/API/SDK/ABI fingerprint | 第一版 | 稳定元数据 ABI、Go Plugin ABI Fingerprint |
+| Go plugin ABI | 仅使用 `.mcgp` 内的 `manifest.json` 表示元数据，并记录 Go/API/SDK/ABI fingerprint | 第一版 | Manifest 元数据、Go Plugin ABI Fingerprint |
 | Admin 管理 | 上传、构建、加载、启用、禁用、切换版本、删除、回滚和审计都进入 Admin/SQLite | 第一版 | 数据模型、生命周期、Admin API |
 | 热加载 | 兼容且未加载过的 native artifact 尽量支持热加载 | 第一版 | 生命周期、热加载和热卸载 |
 | 热卸载 | Go plugin 不能真正卸载，只能逻辑禁用，删除已加载 artifact 后提示重启彻底清理 | 第一版 | 生命周期、Runbook |
@@ -63,13 +63,13 @@
 
 | 要求 | 当前覆盖结论 | 证据章节 |
 | --- | --- | --- |
-| 只允许可信插件，用户可按 API/ABI 自行编写 | 第一版仅支持 trusted native `go-plugin`，提供 SDK/API、稳定元数据 ABI 和 conformance | Runtime 与权限声明、稳定元数据 ABI、SDK/API 契约治理 |
+| 只允许可信插件，用户可按 API/ABI 自行编写 | 第一版仅支持 trusted native `go-plugin`，提供 SDK/API、manifest schema 和 conformance | Runtime 与权限声明、Manifest 元数据、SDK/API 契约治理 |
 | 管理页上传、构建、加载、启用/禁用、删除和切换版本 | 全部进入 Admin/SQLite 生命周期，删除已加载 native artifact 后提示重启彻底清理 | 数据模型、生命周期、Admin API、Admin 页面 |
 | 热加载尽量支持，热卸载承认 Go plugin 限制 | 兼容且未加载过 artifact 可热加载；已加载 Go plugin 只能逻辑禁用，不能真正卸载 | 生命周期、热加载和热卸载、Runbook |
 | 多进程模型实现进程级热卸载 | 预留 `go-plugin-process` runtime，主进程只做管理和 fd 编排，子进程负责数据面；通过退出子进程回收 Go plugin | Go Plugin Process Runtime、第一版默认策略 |
 | 插件包不新增源码扩展名 | 统一 `.mcgp` zip，源码/二进制由 `manifest.json.artifact_type` 声明 | 插件包格式 |
 | 支持源码包和构建环境设计 | source `.mcgp` 经受控 builder 生成 `plugin.so`；开发 local-process，生产推荐 container builder 或外部 CI | 源码包构建环境、供应链元数据 |
-| 元数据 ABI 稳定并记录 Go 构建信息 | `MCGatewayPluginMetadata() string` 稳定 ABI，记录 Go/API/SDK/ABI fingerprint、builder 和 provenance | 稳定元数据 ABI、Go Plugin ABI Fingerprint |
+| Manifest 元数据稳定并记录 Go 构建信息 | `manifest.json` 是唯一元数据来源，记录 Go/API/SDK/ABI fingerprint、builder 和 provenance | Manifest 元数据、Go Plugin ABI Fingerprint |
 | Hook 之外的插件技术方案 | 统一 Extension Point 模型，覆盖 hook、middleware、provider、event subscriber、rule/policy；mock/mixin/monkey patch 不作为生产机制 | Extension Point 设计、Mock 和 Mixin 的定位 |
 | 沙箱功能要有未来路线 | 第一版不提供沙箱；预留 sandbox-process、WASM、capability enforcement、stream relay 和 egress 策略 | Sandbox Runtime、Runtime Adapter、第一版默认策略 |
 | Alibaba 非侵入 Go 注入的参考价值 | 作为官方/组织 build-time instrumentation 未来能力，不作为普通运行时插件或热加载机制 | Build-Time Instrumentation |
@@ -328,8 +328,7 @@ upstream-rewrite.mcgp
   "runtime": {
     "type": "go-plugin",
     "entry": "plugin.so",
-    "entry_symbol": "Plugin",
-    "metadata_symbol": "MCGatewayPluginMetadata"
+    "entry_symbol": "Plugin"
   },
   "api_version": "plugin-api/v1",
   "sdk_module": "github.com/tursom/mc-gateway/plugin/api",
@@ -401,8 +400,7 @@ upstream-rewrite.mcgp
   "runtime": {
     "type": "go-plugin",
     "entry": "plugin.so",
-    "entry_symbol": "Plugin",
-    "metadata_symbol": "MCGatewayPluginMetadata"
+    "entry_symbol": "Plugin"
   },
   "build": {
     "type": "go",
@@ -461,9 +459,9 @@ upstream-rewrite.mcgp
 }
 ```
 
-二进制包上传后可以直接登记为 artifact。源码包上传后必须先进入 builder，构建出 `plugin.so` 后再登记为 artifact。加载阶段始终只加载最终产物 `plugin.so`，并读取导出的 metadata 校验它与 manifest 的关键字段一致。
+二进制包上传后可以直接登记为 artifact。源码包上传后必须先进入 builder，构建出 `plugin.so` 后再登记为 artifact。加载阶段始终只加载最终产物 `plugin.so`；元数据以已校验入库的 `manifest.json` 为准。
 
-开发环境可以允许直接上传 raw `.so`，但生产推荐只接受 `.mcgp`。直接上传 `.so` 时，加载前只能展示文件名、大小和 sha256；如果 Go 版本不兼容，可能无法读取导出的 metadata。
+开发环境可以允许直接上传 raw `.so`，但生产推荐只接受 `.mcgp`。直接上传 `.so` 时，加载前只能展示文件名、大小和 sha256；生产路径仍应使用 `.mcgp` 提供 `manifest.json`。
 
 ### 包校验
 
@@ -2009,21 +2007,18 @@ index 规则：
 - 禁止公网 GOPROXY。
 - 不依赖在线签名验证服务。
 
-## 稳定元数据 ABI
+## Manifest 元数据
 
-插件必须导出两个符号：
+插件包的元数据只来自 `.mcgp` 根目录的 `manifest.json`。上传、准入、构建、兼容性检查和 Admin 展示都必须使用这份静态 manifest；gateway 不通过执行插件代码读取元数据。
+
+Go plugin 只需要导出一个 factory 符号：
 
 ```go
-// MCGatewayPluginMetadata 是稳定 ABI，只使用内置类型。
-func MCGatewayPluginMetadata() string
-
 // Plugin 是 SDK API，用于创建插件实例。
 func Plugin() api.Plugin
 ```
 
-`MCGatewayPluginMetadata` 返回 JSON 字符串，内容应与 `manifest.json` 一致。它只使用 `func() string`，不依赖 `plugin/api` 的自定义类型，避免 metadata 读取本身被 SDK 类型变化影响。
-
-`Plugin` 仍然使用 `func() api.Plugin`。只有当以下校验通过后，gateway 才会断言并调用它：
+`Plugin` 使用 `func() api.Plugin`。只有当以下静态校验通过后，gateway 才会 `plugin.Open` 并断言调用它：
 
 - manifest schema 版本受支持。
 - `go_os`、`go_arch` 与当前 gateway 一致。
@@ -2034,7 +2029,6 @@ func Plugin() api.Plugin
 - manifest `features.required` 都被当前 gateway 支持。
 - `abi_fingerprint` 与当前 gateway 支持的 ABI fingerprint 匹配，或处于明确允许的兼容集合。
 - sha256 与上传记录一致。
-- 加载后导出的 metadata 与 manifest 的关键字段一致。
 
 Go 插件实际能否加载仍以 `plugin.Open` 为准。即使 manifest 看起来兼容，Go runtime 仍可能因为依赖包版本、构建标签或 toolchain 差异拒绝加载。
 
@@ -2103,7 +2097,6 @@ fingerprint 规则：
 | Go/API/GOOS/GOARCH 明确不兼容 | load/enable 阻断 |
 | `abi_fingerprint` 不匹配 | 默认阻断，开发模式可 override |
 | `plugin.Open` 失败 | runtime_failed，记录 Go runtime 错误摘要 |
-| metadata 与 manifest 不一致 | 阻断启用，并标记 artifact 可疑 |
 
 Admin 和 CLI 应展示 fingerprint diff，例如 Go patch 版本、CGO、build tag、SDK module 或 shared module 哪一项不同，而不是只显示“ABI 不兼容”。
 
@@ -2163,14 +2156,13 @@ Admin 和 CLI 应展示 fingerprint diff，例如 Go patch 版本、CGO、build 
 
 ## SDK/API 契约治理
 
-插件系统一旦允许用户编写插件，`plugin/api`、manifest schema、metadata ABI 和 extension point request/response 就成为平台契约。契约治理的目标是：gateway、SDK、示例插件和文档一起演进，避免某次 gateway 改动静默破坏已发布插件。
+插件系统一旦允许用户编写插件，`plugin/api`、manifest schema 和 extension point request/response 就成为平台契约。契约治理的目标是：gateway、SDK、示例插件和文档一起演进，避免某次 gateway 改动静默破坏已发布插件。
 
 ### 契约资产
 
 需要把以下内容视为契约资产：
 
 - `manifest.json` schema。
-- `MCGatewayPluginMetadata() string` metadata JSON schema。
 - `plugin/api` public Go interface。
 - extension point key、version、调用模式、request/response 字段和错误语义。
 - config schema UI hint。
@@ -2188,7 +2180,6 @@ Admin 和 CLI 应展示 fingerprint diff，例如 Go patch 版本、CGO、build 
 ```text
 plugin/contracts/
   manifest.schema.json
-  metadata.schema.json
   extension-points/
     upstream.connect.v1.json
     status.ping.v1.json
@@ -2232,7 +2223,7 @@ plugin/contracts/
 conformance suite 应覆盖：
 
 - manifest schema 向后兼容。
-- metadata ABI 读取和错误处理。
+- manifest schema 读取和错误处理。
 - Go/API/GOOS/GOARCH 兼容错误码。
 - required/optional feature 协商和 `ErrFeatureUnavailable`。
 - extension point 注册和未声明 extension point 拒绝。
@@ -3003,7 +2994,7 @@ Admin 上传 .mcgp
   -> builder 获取源码包
   -> 固定命令 go build -buildmode=plugin
   -> 输出 plugin.so、构建日志和构建元数据
-  -> gateway 校验产物 metadata 和 sha256
+  -> gateway 校验产物 manifest 和 sha256
   -> 写入 plugin_artifacts
 ```
 
@@ -3085,7 +3076,7 @@ plugin_build_cache/
   gocache/
 ```
 
-缓存不能作为产物可信来源。最终 artifact 仍以 `plugin.so` sha256 和导出 metadata 校验为准。
+缓存不能作为产物可信来源。最终 artifact 仍以 `plugin.so` sha256 和 `manifest.json` 校验为准。
 
 构建完成后需要保存：
 
@@ -3375,10 +3366,9 @@ generation fence：
 2. 做 manifest preflight 校验。
 3. 校验 ABI fingerprint、Go/API/GOOS/GOARCH、CGO 和 build tags。
 4. 调用 `plugin.Open(file_path)`。
-5. 查找 `MCGatewayPluginMetadata`，读取并校验 JSON。
-6. 查找 `Plugin` factory。
-7. 将 factory 缓存在 Plugin Manager runtime registry。
-8. 更新运行时状态为 loaded。
+5. 查找 `Plugin` factory。
+6. 将 factory 缓存在 Plugin Manager runtime registry。
+7. 更新运行时状态为 loaded。
 
 加载不等于启用。加载后插件代码已经进入进程，但 extension point handler 不生效。
 
@@ -6472,8 +6462,8 @@ CLI 规则：
 | 类别 | 覆盖项 |
 | --- | --- |
 | 包格式 | `.mcgp` manifest、binary/source、zip slip、大小限制、缺失文件 |
-| ABI | Go version、GOOS/GOARCH、GOAMD64/GOARM64、CGO、build tags、ABI fingerprint、API version、metadata symbol、Plugin symbol |
-| 契约 | manifest schema、metadata schema、extension point contract、错误码、CLI 输出 golden |
+| ABI | Go version、GOOS/GOARCH、GOAMD64/GOARM64、CGO、build tags、ABI fingerprint、API version、Plugin symbol |
+| 契约 | manifest schema、extension point contract、错误码、CLI 输出 golden |
 | 生命周期 | upload、build、load、enable、disable、delete、restart reconcile |
 | native instance | factory 新实例、Destroy 幂等、stale generation、package global 风险提示 |
 | 配置 | schema 校验、ReloadConfig dry run、配置迁移、配置快照、sensitive diff |
@@ -6520,10 +6510,10 @@ CLI 规则：
 - required external dependencies 的 secret、endpoint、timeout、fail policy 和 health check 满足启用策略。
 - config schema 校验和 `ReloadConfig()` dry run 成功。
 - 通用 preflight 检查通过；插件实现 `PreflightChecker` 时，结果不得包含 blocking/error。
-- artifact sha256 和 metadata ABI 校验通过。
+- artifact sha256 和 manifest schema 校验通过。
 - artifact 未命中 denylist，准入策略未返回 blocking risk。
 - 当前 artifact/config/scope/runtime limits 组合已有有效 review，或当前策略不要求 review。
-- source package 构建成功，且构建产物 metadata 与 manifest 一致。
+- source package 构建成功，且构建产物 manifest 与 artifact 记录一致。
 - HealthCheck 如果存在，ready 或按策略允许 degraded。
 - 高风险插件或 protocol-proxy 插件至少通过 quick self-test；涉及协议接管时建议通过 protocol-smoke。
 - 高风险或连接路径插件的 benchmark/smoke 结果未超过 runtime limits。
@@ -6567,7 +6557,7 @@ Admin 页面和 API 需要展示足够可操作的错误：
 - builder image 不匹配。
 - 构建失败日志摘要。
 - `plugin.Open` 失败原因。
-- metadata symbol 或 Plugin symbol 缺失。
+- Plugin symbol 缺失。
 - `ReloadConfig()` 失败。
 - `Init()` 失败。
 - handler panic、超时和错误计数。
@@ -7044,7 +7034,7 @@ API 错误响应应包含稳定错误码，便于管理页和 CLI 处理：
 | --- | --- | --- |
 | 恶意或被篡改插件 | 读取 secret、执行任意代码、破坏进程 | 只允许 admin 管理、记录 sha256、展示供应链元数据、预留签名 |
 | 已知恶意 artifact 被再次启用 | 回滚或跨环境导入重新引入风险代码 | denylist、准入策略、撤销审计、阻断 enable/rollback |
-| Go ABI 不兼容 | 加载失败或启动失败 | Go/API/GOOS/GOARCH preflight，metadata ABI 校验 |
+| Go ABI 不兼容 | 加载失败或启动失败 | Go/API/GOOS/GOARCH preflight，manifest schema 校验 |
 | 插件 panic 或阻塞 | 连接路径故障、goroutine 堆积 | panic recover、timeout、并发限制、熔断 |
 | protocol-proxy 插件实现错误 | 玩家无法登录、身份转发错误 | 示例、测试 harness、health check、dry-run 限制 |
 | secret 泄漏 | forwarding secret、外部 API token 泄漏 | SecretStore、日志脱敏、审计不记录明文、诊断包脱敏 |
@@ -7127,7 +7117,7 @@ API 错误响应应包含稳定错误码，便于管理页和 CLI 处理：
 2. Go/API/GOOS/GOARCH 兼容性。
 3. 缺失 dependency 或 secret。
 4. `ReloadConfig()` dry run 错误。
-5. `plugin.Open`、metadata symbol、Plugin symbol 错误。
+5. `plugin.Open`、Plugin symbol 错误。
 6. `Init()` 或 HealthCheck 错误。
 7. extension point 未声明或 handler 签名不匹配。
 
@@ -7356,7 +7346,7 @@ examples/plugins/mc-status-motd/
 - 定义 `.mcgp` 静态校验规则、大小限制和 zip slip 防护。
 - 定义插件 ID、handler ID、task ID、secret name 和 extension point 命名规范。
 - 支持 `artifact_type=binary/source` 和 `runtime.type=go-plugin`。
-- 定义 `MCGatewayPluginMetadata() string`。
+- 确认插件只需要导出 `Plugin` factory，元数据只来自 `manifest.json`。
 - 定义 Go plugin ABI fingerprint schema、计算规则、compat diff 和开发模式 override 语义。
 - 在 `plugin/api` 中补齐 `APIVersion`、extension point metadata、`ErrPass` 等。
 - 把 upstream hook 收敛为 request struct。
@@ -7572,8 +7562,8 @@ examples/plugins/mc-status-motd/
 - 插件 ID、handler ID、task ID、secret name 和 extension point key 有明确命名规范。
 - API 兼容、废弃和降级策略明确，旧 artifact 回滚不会绕过 config_version 检查。
 - required feature 缺失会阻断 enable；optional feature 缺失会进入 warning，并通过 `PluginRuntimeInfo.Features` 和 compat 输出展示。
-- manifest、metadata、extension point、错误码和 CLI 输出有机器可读契约或 golden fixture。
-- conformance suite 能在 release 前验证 manifest、metadata ABI、extension point 语义、Admin API 错误码和 CLI 输出。
+- manifest、extension point、错误码和 CLI 输出有机器可读契约或 golden fixture。
+- conformance suite 能在 release 前验证 manifest、extension point 语义、Admin API 错误码和 CLI 输出。
 - 示例插件是契约测试的一部分；示例插件不能构建或不能通过 compat/conformance 时视为 API 回归。
 - 发布前兼容性报告能列出新增、弃用、移除和破坏性变更；破坏性变更没有新 version 或迁移说明时阻断发布。
 - 加载兼容插件可以不重启完成。

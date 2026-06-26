@@ -91,7 +91,7 @@ source `.mcgp` 必须包含：
 3. 实现 build operation 和取消/重试。
 4. 实现 local-process builder。
 5. 实现 container builder 接口或预留适配。
-6. 构建后执行 metadata ABI 校验。
+6. 构建后执行 manifest ABI 校验。
 7. 构建成功写入 `plugin_artifacts`。
 8. 构建失败保存脱敏日志摘要。
 9. 增加 build API/CLI。
