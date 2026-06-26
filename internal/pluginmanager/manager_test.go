@@ -1,12 +1,16 @@
 package pluginmanager
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/tursom/mc-gateway/internal/admindb"
 	"github.com/tursom/mc-gateway/plugin/api"
@@ -106,6 +110,46 @@ func TestManagerErrPassContinuesToNextHandler(t *testing.T) {
 	}
 	if plan.Handlers[0].PluginID != "plugin-a" || plan.Handlers[1].PluginID != "plugin-b" {
 		t.Fatalf("dispatch order = %+v, want plugin-a then plugin-b", plan.Handlers)
+	}
+}
+
+func TestManagerErrBlockedStopsDispatch(t *testing.T) {
+	adapter := &fakeAdapter{
+		handlers: map[string]api.UpstreamConnectHandler{
+			"plugin-a": func(api.UpstreamConnectRequest) (net.Conn, error) {
+				return nil, api.ErrBlocked
+			},
+			"plugin-b": func(api.UpstreamConnectRequest) (net.Conn, error) {
+				return newMemoryConn(), nil
+			},
+		},
+	}
+	manager := newManagerForTest(t, adapter)
+	artifactA := uploadTestArtifact(t, manager, "plugin-a")
+	artifactB := uploadTestArtifact(t, manager, "plugin-b")
+	if _, err := manager.SetDesired(context.Background(), "admin", "plugin-a", artifactA.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired(a) error = %v", err)
+	}
+	if _, err := manager.SetDesired(context.Background(), "admin", "plugin-b", artifactB.ID, DesiredEnabled, `{}`, 20); err != nil {
+		t.Fatalf("SetDesired(b) error = %v", err)
+	}
+	if err := manager.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+
+	result, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{Host: "play.example", Upstream: "backend"})
+	if !errors.Is(err, api.ErrBlocked) {
+		t.Fatalf("ConnectUpstream() error = %v, want ErrBlocked", err)
+	}
+	if !result.Handled {
+		t.Fatalf("ConnectUpstream() = %+v, want handled", result)
+	}
+	plan := manager.DispatchPlan(context.Background())
+	if got := plan.Handlers[0].Blocked; got != 1 {
+		t.Fatalf("blocked count = %d, want 1", got)
+	}
+	if got := plan.Handlers[1].Calls; got != 0 {
+		t.Fatalf("second handler calls = %d, want 0", got)
 	}
 }
 
@@ -240,6 +284,176 @@ func TestAcceptorPanicIsRecovered(t *testing.T) {
 	}
 }
 
+func TestProtocolProxyTrackDrainAndForceClose(t *testing.T) {
+	clientGateway, clientSide := net.Pipe()
+	defer clientSide.Close()
+	pluginGateway, pluginSide := net.Pipe()
+	defer pluginSide.Close()
+	handlerReturned := make(chan struct{})
+	adapter := &fakeAdapter{
+		handlers: map[string]api.UpstreamConnectHandler{
+			"plugin-a": func(req api.UpstreamConnectRequest) (net.Conn, error) {
+				go func() {
+					buf := make([]byte, len(req.InitialData))
+					if _, err := io.ReadFull(pluginSide, buf); err != nil {
+						t.Errorf("plugin side initial read error = %v", err)
+					}
+					close(handlerReturned)
+					_, _ = pluginSide.Read(make([]byte, 1))
+				}()
+				return pluginGateway, nil
+			},
+		},
+	}
+	manager := newManagerForTest(t, adapter)
+	artifact := uploadTestArtifactWithCapabilities(t, manager, "plugin-a", json.RawMessage(`{"upstream_connect":{"mode":"protocol-proxy"}}`))
+	if _, err := manager.SetDesired(context.Background(), "admin", "plugin-a", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", "plugin-a"); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{
+			Host:        "play.example",
+			Upstream:    "backend",
+			Source:      clientGateway,
+			InitialData: []byte("hello"),
+		})
+		errCh <- err
+	}()
+	<-handlerReturned
+	waitForPluginManagerTest(t, func() bool {
+		return manager.DispatchPlan(context.Background()).Handlers[0].ActiveProxy == 1
+	})
+	plan := manager.DispatchPlan(context.Background())
+	if got := plan.Handlers[0].ActiveProxy; got != 1 {
+		t.Fatalf("active proxy = %d, want 1", got)
+	}
+	if _, err := manager.Disable(context.Background(), "admin", "plugin-a"); err != nil {
+		t.Fatalf("Disable() error = %v", err)
+	}
+	closed, err := manager.ForceCloseDraining(context.Background(), "admin", "plugin-a")
+	if err != nil {
+		t.Fatalf("ForceCloseDraining() error = %v", err)
+	}
+	if closed != 1 {
+		t.Fatalf("ForceCloseDraining() = %d, want 1", closed)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("ConnectUpstream() error = %v", err)
+	}
+	waitForPluginManagerTest(t, func() bool {
+		return manager.activeProxyCountLocked("plugin-a") == 0
+	})
+}
+
+func TestProtocolProxyReplaysInitialAndForwardsClientBytes(t *testing.T) {
+	clientGateway, clientSide := net.Pipe()
+	defer clientSide.Close()
+
+	initial := []byte("initial-handshake")
+	next := []byte("login-start")
+	pluginRead := make(chan []byte, 1)
+	adapter := &fakeAdapter{
+		handlers: map[string]api.UpstreamConnectHandler{
+			"plugin-a": func(api.UpstreamConnectRequest) (net.Conn, error) {
+				gatewayEnd, pluginEnd := net.Pipe()
+				go func() {
+					defer pluginEnd.Close()
+					buf := make([]byte, len(initial)+len(next))
+					if _, err := io.ReadFull(pluginEnd, buf); err != nil {
+						t.Errorf("plugin read error = %v", err)
+						return
+					}
+					pluginRead <- buf
+				}()
+				return gatewayEnd, nil
+			},
+		},
+	}
+	manager := newManagerForTest(t, adapter)
+	enableProtocolProxyTestPlugin(t, manager, "plugin-a")
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{
+			Source:      clientGateway,
+			InitialData: initial,
+		})
+		errCh <- err
+	}()
+	if _, err := clientSide.Write(next); err != nil {
+		t.Fatalf("client write error = %v", err)
+	}
+	got := <-pluginRead
+	if !bytes.Equal(got, append(append([]byte(nil), initial...), next...)) {
+		t.Fatalf("plugin bytes = %q, want initial+next", got)
+	}
+	_ = clientSide.Close()
+	if err := <-errCh; err != nil {
+		t.Fatalf("ConnectUpstream() error = %v", err)
+	}
+	plan := manager.DispatchPlan(context.Background())
+	if got := plan.Handlers[0].ProxyBytesIn; got != uint64(len(next)) {
+		t.Fatalf("proxy bytes in = %d, want %d", got, len(next))
+	}
+}
+
+func TestProtocolProxyInitialWriteTimeoutClosesUnreadableConn(t *testing.T) {
+	reader, writer := net.Pipe()
+	defer reader.Close()
+	adapter := &fakeAdapter{
+		handlers: map[string]api.UpstreamConnectHandler{
+			"plugin-a": func(api.UpstreamConnectRequest) (net.Conn, error) {
+				return writer, nil
+			},
+		},
+	}
+	manager := newManagerForTest(t, adapter)
+	artifact := uploadTestArtifactWithCapabilities(t, manager, "plugin-a", json.RawMessage(`{"upstream_connect":{"mode":"protocol-proxy"}}`))
+	if _, err := manager.SetDesired(context.Background(), "admin", "plugin-a", artifact.ID, DesiredEnabled, `{"unused":true}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", "plugin-a"); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	sourceGateway, sourceClient := net.Pipe()
+	defer sourceGateway.Close()
+	defer sourceClient.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		initial := bytes.Repeat([]byte("x"), 2*1024*1024)
+		_, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{
+			Source:      sourceGateway,
+			InitialData: initial,
+		})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("ConnectUpstream() error = nil, want initial replay failure")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ConnectUpstream() did not return after initial write deadline")
+	}
+}
+
+func enableProtocolProxyTestPlugin(t *testing.T, manager *Manager, pluginID string) ArtifactRecord {
+	t.Helper()
+	artifact := uploadTestArtifactWithCapabilities(t, manager, pluginID, json.RawMessage(`{"upstream_connect":{"mode":"protocol-proxy"}}`))
+	if _, err := manager.SetDesired(context.Background(), "admin", pluginID, artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", pluginID); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	return artifact
+}
+
 func newManagerForTest(t *testing.T, adapter RuntimeAdapter) *Manager {
 	t.Helper()
 	db := openPluginManagerTestDB(t)
@@ -265,8 +479,13 @@ func openPluginManagerTestDB(t *testing.T) *sql.DB {
 
 func uploadTestArtifact(t *testing.T, manager *Manager, pluginID string) ArtifactRecord {
 	t.Helper()
+	return uploadTestArtifactWithCapabilities(t, manager, pluginID, nil)
+}
+
+func uploadTestArtifactWithCapabilities(t *testing.T, manager *Manager, pluginID string, capabilities json.RawMessage) ArtifactRecord {
+	t.Helper()
 	packagePath := writeTestMCGP(t, map[string][]byte{
-		"manifest.json": testManifestBytes(t, pluginID),
+		"manifest.json": testManifestBytesWithCapabilities(t, pluginID, capabilities),
 		"plugin.so":     []byte("fake plugin bytes " + pluginID),
 	})
 	artifact, err := manager.UploadArtifact(context.Background(), ArtifactUpload{
@@ -278,6 +497,23 @@ func uploadTestArtifact(t *testing.T, manager *Manager, pluginID string) Artifac
 		t.Fatalf("UploadArtifact(%s) error = %v", pluginID, err)
 	}
 	return artifact
+}
+
+func waitForPluginManagerTest(t *testing.T, done func() bool) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for plugin manager condition")
+		case <-ticker.C:
+			if done() {
+				return
+			}
+		}
+	}
 }
 
 type fakeAdapter struct {

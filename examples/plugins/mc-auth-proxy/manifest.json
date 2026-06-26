@@ -1,0 +1,63 @@
+{
+  "schema_version": "mc-gateway.plugin/v1",
+  "id": "mc-auth-proxy",
+  "name": "Minecraft Auth Proxy",
+  "version": "0.1.0",
+  "description": "Protocol-proxy example that owns Minecraft login handling and returns a stable fixture disconnect.",
+  "artifact_type": "binary",
+  "runtime": {
+    "type": "go-plugin",
+    "entry": "plugin.so",
+    "entry_symbol": "Plugin",
+    "metadata_symbol": "MCGatewayPluginMetadata"
+  },
+  "api_version": "plugin-api/v1",
+  "sdk_module": "github.com/tursom/mc-gateway/plugin/api",
+  "go_version": "go1.24.0",
+  "go_os": "linux",
+  "go_arch": "amd64",
+  "extension_points": [
+    { "type": "hook", "key": "upstream.connect/v1" }
+  ],
+  "capabilities": {
+    "upstream_connect": { "mode": "protocol-proxy" },
+    "minecraft": {
+      "protocol_versions": {
+        "min": 47,
+        "max": 767,
+        "tested": [47, 760, 763, 767],
+        "unsupported_policy": "kick"
+      },
+      "states": {
+        "status": "transparent",
+        "login": "handled",
+        "configuration": "transparent",
+        "play": "transparent"
+      },
+      "auth_modes": ["fixture"],
+      "forwarding": {
+        "supported": ["none", "velocity-modern"],
+        "default": "none",
+        "requires_secret": false
+      },
+      "unsupported_policy": "kick",
+      "modded": {
+        "forge": "transparent",
+        "fabric": "transparent",
+        "fml": "unsupported",
+        "unknown": "pass"
+      }
+    }
+  },
+  "runtime_limits": {
+    "handler_timeout_ms": 3000,
+    "initial_write_timeout_ms": 1000
+  },
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "match_host": { "type": "string" },
+      "message": { "type": "string" }
+    }
+  }
+}

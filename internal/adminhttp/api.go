@@ -34,6 +34,7 @@ type APIHandlers struct {
 	PluginsList     http.HandlerFunc
 	PluginItem      SegmentHandlerFunc
 	PluginAction    SegmentHandlerFunc
+	PluginDraining  SegmentHandlerFunc
 	PluginDispatch  http.HandlerFunc
 }
 
@@ -86,6 +87,10 @@ func NewAPIHandler(prefix string, handlers APIHandlers) http.HandlerFunc {
 			callHandler(w, r, handlers.PluginDispatch)
 		case strings.HasPrefix(path, "/plugins/"):
 			pluginPath := strings.TrimPrefix(path, "/plugins/")
+			if strings.HasSuffix(pluginPath, "/draining/force-close") {
+				callSegmentHandler(w, r, handlers.PluginDraining, strings.TrimSuffix(pluginPath, "/draining/force-close"))
+				return
+			}
 			if strings.Count(pluginPath, "/") == 1 {
 				callSegmentHandler(w, r, handlers.PluginAction, pluginPath)
 				return

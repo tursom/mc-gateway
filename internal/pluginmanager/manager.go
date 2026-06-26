@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	stdplugin "plugin"
 	"reflect"
@@ -76,6 +77,11 @@ type Manager struct {
 	mu       sync.Mutex
 	loaded   map[string]*loadedPlugin
 	snapshot atomic.Value
+
+	proxyMu     sync.Mutex
+	proxySeq    uint64
+	proxyConns  map[uint64]*proxyConnection
+	drainingIDs map[string]bool
 }
 
 type loadedPlugin struct {
@@ -87,18 +93,52 @@ type loadedPlugin struct {
 }
 
 type upstreamHandler struct {
+	pluginID            string
+	artifactID          string
+	priority            int
+	handlerID           string
+	mode                string
+	timeout             time.Duration
+	initialWriteTimeout time.Duration
+	accept              func(api.UpstreamConnectRequest) bool
+	handle              func(api.UpstreamConnectRequest) (net.Conn, error)
+
+	calls          atomic.Uint64
+	errors         atomic.Uint64
+	panics         atomic.Uint64
+	timeouts       atomic.Uint64
+	blocked        atomic.Uint64
+	activeProxy    atomic.Int64
+	proxyStarted   atomic.Uint64
+	proxyCompleted atomic.Uint64
+	proxyErrors    atomic.Uint64
+	proxyBytesIn   atomic.Uint64
+	proxyBytesOut  atomic.Uint64
+	proxyDuration  atomic.Uint64
+}
+
+type proxyConnection struct {
+	id         uint64
 	pluginID   string
 	artifactID string
-	priority   int
 	handlerID  string
-	timeout    time.Duration
-	accept     func(api.UpstreamConnectRequest) bool
-	handle     func(api.UpstreamConnectRequest) (net.Conn, error)
+	handler    *upstreamHandler
+	client     net.Conn
+	endpoint   net.Conn
+	startedAt  time.Time
+	draining   bool
+}
 
-	calls    atomic.Uint64
-	errors   atomic.Uint64
-	panics   atomic.Uint64
-	timeouts atomic.Uint64
+type ProxyConnectionHandle struct {
+	manager *Manager
+	id      uint64
+}
+
+type ProxyConnectionStats struct {
+	BytesToPlugin int64
+	BytesToClient int64
+	Duration      time.Duration
+	Err           error
 }
 
 type Options struct {
@@ -115,12 +155,14 @@ func New(options Options) *Manager {
 		adapter = GoPluginAdapter{}
 	}
 	manager := &Manager{
-		repo:       NewRepository(options.DB),
-		store:      NewArtifactStore(options.ArtifactRoot),
-		adapter:    adapter,
-		handleConn: options.HandleConn,
-		wg:         options.WaitGroup,
-		loaded:     make(map[string]*loadedPlugin),
+		repo:        NewRepository(options.DB),
+		store:       NewArtifactStore(options.ArtifactRoot),
+		adapter:     adapter,
+		handleConn:  options.HandleConn,
+		wg:          options.WaitGroup,
+		loaded:      make(map[string]*loadedPlugin),
+		proxyConns:  make(map[uint64]*proxyConnection),
+		drainingIDs: make(map[string]bool),
 	}
 	manager.publish(nil)
 	return manager
@@ -207,6 +249,7 @@ func (m *Manager) Enable(ctx context.Context, actor, pluginID string) (PluginRec
 	if err := m.markEnabled(ctx, loaded); err != nil {
 		return PluginRecord{}, err
 	}
+	m.clearDrainingLocked(pluginID)
 	m.publish(next)
 	_ = m.repo.UpdateArtifactStatus(ctx, loaded.artifact.ID, ArtifactStatusLoaded, "")
 	_ = m.repo.RecordOperation(ctx, pluginID, loaded.artifact.ID, "enable", "succeeded", actor, "plugin enabled", map[string]any{
@@ -229,13 +272,20 @@ func (m *Manager) Disable(ctx context.Context, actor, pluginID string) (PluginRe
 		return PluginRecord{}, err
 	}
 	m.removeFromDispatchLocked(pluginID)
+	m.markDrainingLocked(pluginID)
 	if loaded := m.loaded[pluginID]; loaded != nil && loaded.instance != nil {
 		if err := loaded.instance.Destroy(); err != nil {
 			_ = m.repo.RecordOperation(ctx, pluginID, loaded.artifact.ID, "disable", "warning", actor, err.Error(), nil)
 		}
 	}
+	runtimeState := RuntimeDisabled
+	if m.activeProxyCountLocked(pluginID) > 0 {
+		runtimeState = RuntimeDraining
+	}
 	delete(m.loaded, pluginID)
-	if err := m.repo.MarkRuntime(ctx, pluginID, RuntimeDisabled, "", "", pluginRecord.DesiredGeneration, "", nil, nil); err != nil {
+	if err := m.repo.MarkRuntime(ctx, pluginID, runtimeState, "", "", pluginRecord.DesiredGeneration, "", map[string]any{
+		"active_proxy_connections": m.activeProxyCountLocked(pluginID),
+	}, nil); err != nil {
 		return PluginRecord{}, err
 	}
 	_ = m.repo.RecordOperation(ctx, pluginID, pluginRecord.DesiredArtifactID, "disable", "succeeded", actor, "plugin disabled", nil)
@@ -251,6 +301,7 @@ func (m *Manager) Delete(ctx context.Context, actor, pluginID string) error {
 		return err
 	}
 	m.removeFromDispatchLocked(pluginID)
+	m.markDrainingLocked(pluginID)
 	if loaded := m.loaded[pluginID]; loaded != nil && loaded.instance != nil {
 		_ = loaded.instance.Destroy()
 	}
@@ -288,6 +339,7 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 		}
 		nextByPlugin[pluginRecord.ID] = loaded.handlers
 		_ = m.markEnabled(ctx, loaded)
+		m.clearDrainingLocked(pluginRecord.ID)
 	}
 	m.publish(flattenHandlers(nextByPlugin))
 	return nil
@@ -305,6 +357,7 @@ func (m *Manager) ConnectUpstream(ctx context.Context, req api.UpstreamConnectRe
 	if req.Context == nil {
 		req.Context = ctx
 	}
+	req.InitialData = append([]byte(nil), req.InitialData...)
 	for _, handler := range handlers {
 		accepted, err := handler.accepts(req)
 		if err != nil {
@@ -321,10 +374,52 @@ func (m *Manager) ConnectUpstream(ctx context.Context, req api.UpstreamConnectRe
 			return UpstreamResult{Handled: true}, err
 		}
 		if conn != nil {
-			return UpstreamResult{Conn: conn, Handled: true}, nil
+			result := UpstreamResult{
+				Conn:      conn,
+				Handled:   true,
+				Mode:      handler.mode,
+				PluginID:  handler.pluginID,
+				HandlerID: handler.handlerID,
+			}
+			if handler.mode == UpstreamModeProtocolProxy {
+				return m.startProtocolProxy(ctx, handler, result, req)
+			}
+			return result, nil
 		}
 	}
 	return UpstreamResult{}, nil
+}
+
+func (m *Manager) startProtocolProxy(ctx context.Context, handler *upstreamHandler, result UpstreamResult, req api.UpstreamConnectRequest) (UpstreamResult, error) {
+	endpoint := result.Conn
+	initial := append([]byte(nil), req.InitialData...)
+	if len(initial) > 0 {
+		if handler.initialWriteTimeout > 0 {
+			_ = endpoint.SetWriteDeadline(time.Now().Add(handler.initialWriteTimeout))
+			defer endpoint.SetWriteDeadline(time.Time{})
+		}
+		if err := writeAll(endpoint, initial); err != nil {
+			handler.proxyErrors.Add(1)
+			_ = endpoint.Close()
+			return UpstreamResult{Handled: true, Mode: handler.mode, PluginID: handler.pluginID, HandlerID: handler.handlerID}, fmt.Errorf("plugin %s protocol-proxy initial replay failed: %w", handler.pluginID, err)
+		}
+	}
+
+	handle := m.TrackProxyConnection(result, req.Source, endpoint)
+	if handle == nil {
+		_ = endpoint.Close()
+		return UpstreamResult{Handled: true, Mode: handler.mode, PluginID: handler.pluginID, HandlerID: handler.handlerID}, fmt.Errorf("plugin %s protocol-proxy tracking failed", handler.pluginID)
+	}
+	runProtocolProxy(ctx, handle, req.Source, endpoint)
+
+	return UpstreamResult{
+		Handled:         true,
+		Mode:            handler.mode,
+		PluginID:        handler.pluginID,
+		HandlerID:       handler.handlerID,
+		InitialDataSent: len(initial) > 0,
+		Proxied:         true,
+	}, nil
 }
 
 func (h *upstreamHandler) accepts(req api.UpstreamConnectRequest) (accepted bool, err error) {
@@ -364,6 +459,106 @@ func (m *Manager) DispatchPlan(ctx context.Context) DispatchPlan {
 		plan.Handlers = handlerSummaries(handlers)
 	}
 	return plan
+}
+
+func (m *Manager) TrackProxyConnection(result UpstreamResult, client, endpoint net.Conn) *ProxyConnectionHandle {
+	if result.Mode != UpstreamModeProtocolProxy || client == nil || endpoint == nil {
+		return nil
+	}
+	handler := m.findHandler(result.PluginID, result.HandlerID)
+	if handler == nil {
+		return nil
+	}
+	id := atomic.AddUint64(&m.proxySeq, 1)
+	proxyConn := &proxyConnection{
+		id:         id,
+		pluginID:   result.PluginID,
+		artifactID: handler.artifactID,
+		handlerID:  result.HandlerID,
+		handler:    handler,
+		client:     client,
+		endpoint:   endpoint,
+		startedAt:  time.Now(),
+	}
+	handler.activeProxy.Add(1)
+	handler.proxyStarted.Add(1)
+	m.proxyMu.Lock()
+	proxyConn.draining = m.drainingIDs[result.PluginID]
+	m.proxyConns[id] = proxyConn
+	m.proxyMu.Unlock()
+	return &ProxyConnectionHandle{manager: m, id: id}
+}
+
+func (h *ProxyConnectionHandle) Finish(stats ProxyConnectionStats) {
+	if h == nil || h.manager == nil {
+		return
+	}
+	h.manager.finishProxyConnection(h.id, stats)
+}
+
+func (m *Manager) ForceCloseDraining(ctx context.Context, actor, pluginID string) (int, error) {
+	_ = ctx
+	var conns []*proxyConnection
+	m.proxyMu.Lock()
+	for _, conn := range m.proxyConns {
+		if conn.pluginID == pluginID && conn.draining {
+			conns = append(conns, conn)
+		}
+	}
+	m.proxyMu.Unlock()
+	for _, conn := range conns {
+		_ = conn.client.Close()
+		_ = conn.endpoint.Close()
+	}
+	_ = m.repo.RecordOperation(ctx, pluginID, "", "force_close_draining", "succeeded", actor, "draining protocol-proxy connections force closed", map[string]any{
+		"closed": len(conns),
+	})
+	return len(conns), nil
+}
+
+func (m *Manager) findHandler(pluginID, handlerID string) *upstreamHandler {
+	value := m.snapshot.Load()
+	if handlers, ok := value.([]*upstreamHandler); ok {
+		for _, handler := range handlers {
+			if handler.pluginID == pluginID && handler.handlerID == handlerID {
+				return handler
+			}
+		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if loaded := m.loaded[pluginID]; loaded != nil {
+		for _, handler := range loaded.handlers {
+			if handler.handlerID == handlerID {
+				return handler
+			}
+		}
+	}
+	return nil
+}
+
+func (m *Manager) finishProxyConnection(id uint64, stats ProxyConnectionStats) {
+	m.proxyMu.Lock()
+	proxyConn := m.proxyConns[id]
+	delete(m.proxyConns, id)
+	m.proxyMu.Unlock()
+	if proxyConn == nil || proxyConn.handler == nil {
+		return
+	}
+	proxyConn.handler.activeProxy.Add(-1)
+	proxyConn.handler.proxyCompleted.Add(1)
+	if stats.Err != nil {
+		proxyConn.handler.proxyErrors.Add(1)
+	}
+	if stats.BytesToPlugin > 0 {
+		proxyConn.handler.proxyBytesIn.Add(uint64(stats.BytesToPlugin))
+	}
+	if stats.BytesToClient > 0 {
+		proxyConn.handler.proxyBytesOut.Add(uint64(stats.BytesToClient))
+	}
+	if stats.Duration > 0 {
+		proxyConn.handler.proxyDuration.Add(uint64(stats.Duration.Milliseconds()))
+	}
 }
 
 func (m *Manager) loadLocked(ctx context.Context, pluginRecord PluginRecord) (*loadedPlugin, error) {
@@ -426,6 +621,35 @@ func (m *Manager) removeFromDispatchLocked(pluginID string) {
 	m.publish(flattenHandlers(current))
 }
 
+func (m *Manager) markDrainingLocked(pluginID string) {
+	m.proxyMu.Lock()
+	defer m.proxyMu.Unlock()
+	m.drainingIDs[pluginID] = true
+	for _, conn := range m.proxyConns {
+		if conn.pluginID == pluginID {
+			conn.draining = true
+		}
+	}
+}
+
+func (m *Manager) clearDrainingLocked(pluginID string) {
+	m.proxyMu.Lock()
+	delete(m.drainingIDs, pluginID)
+	m.proxyMu.Unlock()
+}
+
+func (m *Manager) activeProxyCountLocked(pluginID string) int {
+	m.proxyMu.Lock()
+	defer m.proxyMu.Unlock()
+	count := 0
+	for _, conn := range m.proxyConns {
+		if conn.pluginID == pluginID {
+			count++
+		}
+	}
+	return count
+}
+
 func (m *Manager) publish(handlers []*upstreamHandler) {
 	sort.SliceStable(handlers, func(i, j int) bool {
 		if handlers[i].priority != handlers[j].priority {
@@ -441,31 +665,42 @@ func (m *Manager) publish(handlers []*upstreamHandler) {
 
 func buildHandlers(pluginRecord PluginRecord, artifact ArtifactRecord, gateway *Gateway) []*upstreamHandler {
 	timeout := DefaultHandlerTimeout
+	initialWriteTimeout := DefaultInitialWriteTimeout
 	var manifest Manifest
-	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err == nil && manifest.RuntimeLimits.HandlerTimeoutMS > 0 {
-		timeout = time.Duration(manifest.RuntimeLimits.HandlerTimeoutMS) * time.Millisecond
+	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err == nil {
+		if manifest.RuntimeLimits.HandlerTimeoutMS > 0 {
+			timeout = time.Duration(manifest.RuntimeLimits.HandlerTimeoutMS) * time.Millisecond
+		}
+		if manifest.RuntimeLimits.InitialWriteTimeoutMS > 0 {
+			initialWriteTimeout = time.Duration(manifest.RuntimeLimits.InitialWriteTimeoutMS) * time.Millisecond
+		}
 	}
 	var handlers []*upstreamHandler
+	mode := upstreamModeFromArtifact(artifact)
 	if hook, ok := gateway.UpstreamConnectHandler(); ok {
 		handlers = append(handlers, &upstreamHandler{
-			pluginID:   pluginRecord.ID,
-			artifactID: artifact.ID,
-			priority:   pluginRecord.Priority,
-			handlerID:  "upstream.connect/v1",
-			timeout:    timeout,
-			accept:     hook.Acceptor(),
-			handle:     hook.Handler(),
+			pluginID:            pluginRecord.ID,
+			artifactID:          artifact.ID,
+			priority:            pluginRecord.Priority,
+			handlerID:           "upstream.connect/v1",
+			mode:                mode,
+			timeout:             timeout,
+			initialWriteTimeout: initialWriteTimeout,
+			accept:              hook.Acceptor(),
+			handle:              hook.Handler(),
 		})
 	}
 	if hook, ok := gateway.LegacyUpstreamHandler(); ok {
 		acceptor := hook.Acceptor()
 		handler := hook.Handler()
 		handlers = append(handlers, &upstreamHandler{
-			pluginID:   pluginRecord.ID,
-			artifactID: artifact.ID,
-			priority:   pluginRecord.Priority,
-			handlerID:  "legacy-upstream",
-			timeout:    timeout,
+			pluginID:            pluginRecord.ID,
+			artifactID:          artifact.ID,
+			priority:            pluginRecord.Priority,
+			handlerID:           "legacy-upstream",
+			mode:                UpstreamModeDialer,
+			timeout:             timeout,
+			initialWriteTimeout: initialWriteTimeout,
 			accept: func(req api.UpstreamConnectRequest) bool {
 				return acceptor(req.Source, req.Upstream)
 			},
@@ -475,6 +710,19 @@ func buildHandlers(pluginRecord PluginRecord, artifact ArtifactRecord, gateway *
 		})
 	}
 	return handlers
+}
+
+func upstreamModeFromArtifact(artifact ArtifactRecord) string {
+	var summary CapabilitySummary
+	if err := json.Unmarshal([]byte(artifact.CapabilitiesSummaryJSON), &summary); err == nil {
+		switch summary.UpstreamConnect.Mode {
+		case UpstreamModeProtocolProxy:
+			return UpstreamModeProtocolProxy
+		case UpstreamModeDialer:
+			return UpstreamModeDialer
+		}
+	}
+	return UpstreamModeDialer
 }
 
 func (h *upstreamHandler) invoke(req api.UpstreamConnectRequest) (conn net.Conn, err error) {
@@ -508,6 +756,9 @@ func (h *upstreamHandler) invoke(req api.UpstreamConnectRequest) (conn net.Conn,
 		go closeLateConn(done)
 		return nil, ctx.Err()
 	case result := <-done:
+		if errors.Is(result.err, api.ErrBlocked) {
+			h.blocked.Add(1)
+		}
 		if result.err != nil && !errors.Is(result.err, api.ErrPass) {
 			h.errors.Add(1)
 		}
@@ -527,6 +778,116 @@ func closeLateConn(done <-chan result) {
 	}
 }
 
+type proxyCopyResult struct {
+	toPlugin bool
+	bytes    int64
+	err      error
+}
+
+type closeWriter interface {
+	CloseWrite() error
+}
+
+type closeReader interface {
+	CloseRead() error
+}
+
+func runProtocolProxy(ctx context.Context, handle *ProxyConnectionHandle, client, endpoint net.Conn) {
+	start := time.Now()
+	defer client.Close()
+	defer endpoint.Close()
+	done := make(chan proxyCopyResult, 2)
+	stopContext := make(chan struct{})
+	if ctx != nil {
+		go func() {
+			select {
+			case <-ctx.Done():
+				_ = client.Close()
+				_ = endpoint.Close()
+			case <-stopContext:
+			}
+		}()
+	}
+
+	go copyProtocolProxy(endpoint, client, true, done)
+	go copyProtocolProxy(client, endpoint, false, done)
+
+	var stats ProxyConnectionStats
+	for i := 0; i < 2; i++ {
+		result := <-done
+		if result.toPlugin {
+			stats.BytesToPlugin += result.bytes
+		} else {
+			stats.BytesToClient += result.bytes
+		}
+		if result.err != nil && !errors.Is(result.err, io.EOF) && stats.Err == nil {
+			stats.Err = result.err
+		}
+	}
+	close(stopContext)
+	stats.Duration = time.Since(start)
+	handle.Finish(stats)
+}
+
+func copyProtocolProxy(dst io.Writer, src io.Reader, toPlugin bool, done chan<- proxyCopyResult) {
+	result := proxyCopyResult{toPlugin: toPlugin}
+	defer func() {
+		if rec := recover(); rec != nil {
+			result.err = fmt.Errorf("protocol-proxy copy panic: %v", rec)
+		}
+		closeRead(src)
+		if toPlugin {
+			closeWriteOnly(dst)
+		} else {
+			closeWrite(dst)
+		}
+		done <- result
+	}()
+	result.bytes, result.err = copyForward(dst, src)
+}
+
+func copyForward(dst io.Writer, src io.Reader) (int64, error) {
+	return io.Copy(dst, src)
+}
+
+func writeAll(w io.Writer, buf []byte) error {
+	for len(buf) > 0 {
+		n, err := w.Write(buf)
+		if n > 0 {
+			buf = buf[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
+}
+
+func closeWrite(conn any) {
+	if closer, ok := conn.(closeWriter); ok {
+		_ = closer.CloseWrite()
+		return
+	}
+	if closer, ok := conn.(io.Closer); ok {
+		_ = closer.Close()
+	}
+}
+
+func closeWriteOnly(conn any) {
+	if closer, ok := conn.(closeWriter); ok {
+		_ = closer.CloseWrite()
+	}
+}
+
+func closeRead(conn any) {
+	if closer, ok := conn.(closeReader); ok {
+		_ = closer.CloseRead()
+	}
+}
+
 func flattenHandlers(byPlugin map[string][]*upstreamHandler) []*upstreamHandler {
 	var handlers []*upstreamHandler
 	for _, pluginHandlers := range byPlugin {
@@ -539,16 +900,25 @@ func handlerSummaries(handlers []*upstreamHandler) []DispatchHandlerSummary {
 	summaries := make([]DispatchHandlerSummary, 0, len(handlers))
 	for _, handler := range handlers {
 		summaries = append(summaries, DispatchHandlerSummary{
-			PluginID:       handler.pluginID,
-			ArtifactID:     handler.artifactID,
-			Priority:       handler.priority,
-			HandlerID:      handler.handlerID,
-			ExtensionPoint: ExtensionUpstreamConnect,
-			TimeoutMS:      handler.timeout.Milliseconds(),
-			Calls:          handler.calls.Load(),
-			Errors:         handler.errors.Load(),
-			Panics:         handler.panics.Load(),
-			Timeouts:       handler.timeouts.Load(),
+			PluginID:        handler.pluginID,
+			ArtifactID:      handler.artifactID,
+			Priority:        handler.priority,
+			HandlerID:       handler.handlerID,
+			ExtensionPoint:  ExtensionUpstreamConnect,
+			Mode:            handler.mode,
+			TimeoutMS:       handler.timeout.Milliseconds(),
+			Calls:           handler.calls.Load(),
+			Errors:          handler.errors.Load(),
+			Panics:          handler.panics.Load(),
+			Timeouts:        handler.timeouts.Load(),
+			Blocked:         handler.blocked.Load(),
+			ActiveProxy:     handler.activeProxy.Load(),
+			ProxyStarted:    handler.proxyStarted.Load(),
+			ProxyCompleted:  handler.proxyCompleted.Load(),
+			ProxyErrors:     handler.proxyErrors.Load(),
+			ProxyBytesIn:    handler.proxyBytesIn.Load(),
+			ProxyBytesOut:   handler.proxyBytesOut.Load(),
+			ProxyDurationMS: handler.proxyDuration.Load(),
 		})
 	}
 	return summaries

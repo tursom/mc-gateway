@@ -188,9 +188,9 @@ func (s ArtifactStore) ValidateAndStore(upload ArtifactUpload) (ArtifactRecord, 
 	if err != nil {
 		return ArtifactRecord{}, err
 	}
-	capabilities := manifest.Capabilities
-	if len(capabilities) == 0 {
-		capabilities = json.RawMessage(`{}`)
+	capabilities, err := capabilitiesSummaryJSON(manifest.Capabilities)
+	if err != nil {
+		return ArtifactRecord{}, err
 	}
 	now := s.now().Unix()
 	return ArtifactRecord{
@@ -217,6 +217,38 @@ func (s ArtifactStore) ValidateAndStore(upload ArtifactUpload) (ArtifactRecord, 
 		CreatedAt:               now,
 		UpdatedAt:               now,
 	}, nil
+}
+
+func capabilitiesSummaryJSON(raw json.RawMessage) ([]byte, error) {
+	summary := CapabilitySummary{
+		UpstreamConnect: UpstreamConnectCapability{Mode: UpstreamModeDialer},
+	}
+	if len(raw) == 0 {
+		return json.Marshal(summary)
+	}
+	summary.Raw = append(json.RawMessage(nil), raw...)
+	var caps struct {
+		UpstreamConnect UpstreamConnectCapability `json:"upstream_connect"`
+		Minecraft       *MinecraftCapability      `json:"minecraft"`
+	}
+	if err := json.Unmarshal(raw, &caps); err != nil {
+		return nil, fmt.Errorf("invalid capabilities: %w", err)
+	}
+	if caps.UpstreamConnect.Mode != "" {
+		summary.UpstreamConnect.Mode = caps.UpstreamConnect.Mode
+	}
+	if caps.Minecraft != nil {
+		summary.Minecraft = caps.Minecraft
+		if summary.Minecraft.UnsupportedPolicy == "" {
+			summary.Minecraft.UnsupportedPolicy = summary.Minecraft.ProtocolVersions.UnsupportedPolicy
+		}
+	}
+	switch summary.UpstreamConnect.Mode {
+	case UpstreamModeDialer, UpstreamModeProtocolProxy:
+	default:
+		return nil, fmt.Errorf("unsupported upstream_connect.mode %q", summary.UpstreamConnect.Mode)
+	}
+	return json.Marshal(summary)
 }
 
 func validateManifest(manifest Manifest) error {

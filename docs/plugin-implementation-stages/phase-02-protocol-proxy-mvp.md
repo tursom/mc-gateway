@@ -6,6 +6,8 @@
 
 本阶段使 MC 正版/三方登录插件具备技术可行性：登录、身份映射、forwarding 和登录后的协议处理都由插件完成，gateway core 只负责连接交接和治理。
 
+阶段 2 实现后，gateway core 不解析 login/encryption/session，不消费插件内部认证结果，也不根据玩家名、UUID、权限或 session 状态改变后续路由。protocol-proxy 插件接管连接后，Minecraft 登录业务完全属于插件；core 只保留 initial data replay、双向 copy、draining、force close 和低基数运行摘要。
+
 ## 可用性检查点
 
 阶段结束时必须能做到：

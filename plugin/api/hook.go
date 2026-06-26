@@ -24,12 +24,27 @@ type (
 	}
 
 	UpstreamConnectRequest struct {
-		Context     context.Context
-		Source      net.Conn
-		Host        string
-		Upstream    string
-		InitialData []byte
-		Metadata    map[string]string
+		Context          context.Context
+		Source           net.Conn
+		Host             string
+		Upstream         string
+		InitialData      []byte
+		Metadata         map[string]string
+		ConnectionID     string
+		TraceID          string
+		SourceAddr       string
+		ServerHost       string
+		RawServerHost    string
+		ProtocolVersion  int
+		NextState        int
+		RouteID          string
+		RouteTags        []string
+		UpstreamRaw      string
+		UpstreamProtocol string
+		UpstreamAddress  string
+		Transport        string
+		ServiceName      string
+		ListenerPort     int
 	}
 
 	UpstreamConnectAcceptor func(UpstreamConnectRequest) bool

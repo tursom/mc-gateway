@@ -90,16 +90,24 @@ func setGatewayTestRoutes(routes map[string]string) {
 }
 
 func gatewayTestPacket(host string, tail ...byte) []byte {
-	packet := []byte{
-		byte(4 + 1 + len(host) + len(tail)),
-		0x00,
-		0x00,
-		0x00,
-		byte(len(host)),
+	protocolVersion := byte(0x63)
+	nextState := byte(0x02)
+	extra := []byte(nil)
+	if len(tail) > 0 {
+		protocolVersion = tail[0]
 	}
-	packet = append(packet, host...)
-	packet = append(packet, tail...)
-	return packet
+	if len(tail) > 1 {
+		nextState = tail[1]
+	}
+	if len(tail) > 2 {
+		extra = tail[2:]
+	}
+	payload := []byte{0x00, protocolVersion, byte(len(host))}
+	payload = append(payload, host...)
+	payload = append(payload, 0x63, 0xdd, nextState)
+	payload = append(payload, extra...)
+	packet := []byte{byte(len(payload))}
+	return append(packet, payload...)
 }
 
 type gatewayTestConn struct {

@@ -263,8 +263,13 @@ func newGatewayTestPluginDB(t *testing.T) *sql.DB {
 
 func uploadGatewayTestArtifact(t *testing.T, manager *pluginmanager.Manager, pluginID string) pluginmanager.ArtifactRecord {
 	t.Helper()
+	return uploadGatewayTestArtifactWithCapabilities(t, manager, pluginID, "")
+}
+
+func uploadGatewayTestArtifactWithCapabilities(t *testing.T, manager *pluginmanager.Manager, pluginID string, capabilities string) pluginmanager.ArtifactRecord {
+	t.Helper()
 	artifact, err := manager.UploadArtifact(context.Background(), pluginmanager.ArtifactUpload{
-		SourcePath: writeGatewayTestMCGP(t, pluginID),
+		SourcePath: writeGatewayTestMCGPWithCapabilities(t, pluginID, capabilities),
 		FileName:   pluginID + ".mcgp",
 		Actor:      "admin",
 	})
@@ -275,6 +280,10 @@ func uploadGatewayTestArtifact(t *testing.T, manager *pluginmanager.Manager, plu
 }
 
 func writeGatewayTestMCGP(t *testing.T, pluginID string) string {
+	return writeGatewayTestMCGPWithCapabilities(t, pluginID, "")
+}
+
+func writeGatewayTestMCGPWithCapabilities(t *testing.T, pluginID string, capabilities string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "plugin.mcgp")
 	file, err := os.Create(path)
@@ -283,7 +292,7 @@ func writeGatewayTestMCGP(t *testing.T, pluginID string) string {
 	}
 	writer := zip.NewWriter(file)
 	entries := map[string][]byte{
-		"manifest.json": gatewayTestManifest(t, pluginID),
+		"manifest.json": gatewayTestManifestWithCapabilities(t, pluginID, capabilities),
 		"plugin.so":     []byte("fake plugin bytes " + pluginID),
 	}
 	for name, data := range entries {
@@ -305,7 +314,14 @@ func writeGatewayTestMCGP(t *testing.T, pluginID string) string {
 }
 
 func gatewayTestManifest(t *testing.T, pluginID string) []byte {
+	return gatewayTestManifestWithCapabilities(t, pluginID, "")
+}
+
+func gatewayTestManifestWithCapabilities(t *testing.T, pluginID string, capabilities string) []byte {
 	t.Helper()
+	if capabilities == "" {
+		capabilities = `{"extension_points":["upstream.connect/v1"]}`
+	}
 	manifest := pluginmanager.Manifest{
 		SchemaVersion: pluginmanager.SchemaVersion,
 		ID:            pluginID,
@@ -325,6 +341,7 @@ func gatewayTestManifest(t *testing.T, pluginID string) []byte {
 			Type: "hook",
 			Key:  pluginmanager.ExtensionUpstreamConnect,
 		}},
+		Capabilities: json.RawMessage(capabilities),
 	}
 	data, err := json.Marshal(manifest)
 	if err != nil {

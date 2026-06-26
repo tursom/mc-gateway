@@ -35,6 +35,7 @@ func TestNewAPIHandlerRoutesRequests(t *testing.T) {
 		{name: "plugins list", method: http.MethodGet, path: "/admin/api/plugins", wantCall: "plugins_list"},
 		{name: "plugin item", method: http.MethodPut, path: "/admin/api/plugins/upstream-rewrite", wantCall: "plugin_item", wantSegment: "upstream-rewrite"},
 		{name: "plugin action", method: http.MethodPost, path: "/admin/api/plugins/upstream-rewrite/enable", wantCall: "plugin_action", wantSegment: "upstream-rewrite/enable"},
+		{name: "plugin draining force close", method: http.MethodPost, path: "/admin/api/plugins/mc-auth-proxy/draining/force-close", wantCall: "plugin_draining", wantSegment: "mc-auth-proxy"},
 		{name: "plugin dispatch", method: http.MethodGet, path: "/admin/api/plugins/dispatch-plan", wantCall: "plugin_dispatch"},
 	}
 
@@ -68,6 +69,7 @@ func TestNewAPIHandlerRoutesRequests(t *testing.T) {
 				PluginsList:     recordCall(&gotCall, "plugins_list"),
 				PluginItem:      recordSegmentCall(&gotCall, &gotSegment, "plugin_item"),
 				PluginAction:    recordSegmentCall(&gotCall, &gotSegment, "plugin_action"),
+				PluginDraining:  recordSegmentCall(&gotCall, &gotSegment, "plugin_draining"),
 				PluginDispatch:  recordCall(&gotCall, "plugin_dispatch"),
 			})
 

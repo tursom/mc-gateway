@@ -205,6 +205,36 @@ func handleAdminPluginAction(w http.ResponseWriter, r *http.Request, rawSegment 
 	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"plugin": plugin})
 }
 
+func handleAdminPluginDraining(w http.ResponseWriter, r *http.Request, rawPluginID string) {
+	session, ok := requireRole(w, r, adminRoleAdmin)
+	if !ok {
+		return
+	}
+	if pluginsManager == nil {
+		adminhttp.WriteAPIError(w, http.StatusServiceUnavailable, "plugin manager is not initialized")
+		return
+	}
+	if r.Method != http.MethodPost {
+		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	pluginID, err := adminhttp.PathSegment(rawPluginID)
+	if err != nil {
+		adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	closed, err := pluginsManager.ForceCloseDraining(r.Context(), session.Username, pluginID)
+	if err != nil {
+		recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_force_close_draining", "plugin", pluginID, false, err.Error())
+		writePluginManagerError(w, err)
+		return
+	}
+	recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_force_close_draining", "plugin", pluginID, true, "draining protocol-proxy connections force closed", map[string]any{
+		"closed": closed,
+	})
+	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"closed": closed})
+}
+
 func handleAdminPluginDispatchPlan(w http.ResponseWriter, r *http.Request) {
 	if _, ok := requireRole(w, r, adminRoleMember); !ok {
 		return

@@ -91,7 +91,14 @@ func TestArtifactStoreRejectsUnsafePackage(t *testing.T) {
 }
 
 func testManifestBytes(t *testing.T, pluginID string) []byte {
+	return testManifestBytesWithCapabilities(t, pluginID, json.RawMessage(`{"extension_points":["upstream.connect/v1"]}`))
+}
+
+func testManifestBytesWithCapabilities(t *testing.T, pluginID string, capabilities json.RawMessage) []byte {
 	t.Helper()
+	if len(capabilities) == 0 {
+		capabilities = json.RawMessage(`{"extension_points":["upstream.connect/v1"]}`)
+	}
 	manifest := Manifest{
 		SchemaVersion: SchemaVersion,
 		ID:            pluginID,
@@ -111,7 +118,7 @@ func testManifestBytes(t *testing.T, pluginID string) []byte {
 			Type: "hook",
 			Key:  ExtensionUpstreamConnect,
 		}},
-		Capabilities:  json.RawMessage(`{"extension_points":["upstream.connect/v1"]}`),
+		Capabilities:  capabilities,
 		ConfigSchema:  json.RawMessage(`{"type":"object"}`),
 		RuntimeLimits: RuntimeLimits{HandlerTimeoutMS: 3000},
 	}

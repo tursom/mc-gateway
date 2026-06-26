@@ -20,6 +20,9 @@ const (
 
 	ExtensionUpstreamConnect = "upstream.connect/v1"
 
+	UpstreamModeDialer        = "dialer"
+	UpstreamModeProtocolProxy = "protocol-proxy"
+
 	ArtifactStatusUploaded  = "uploaded"
 	ArtifactStatusValidated = "validated"
 	ArtifactStatusLoadable  = "loadable"
@@ -36,14 +39,16 @@ const (
 	RuntimeEnabled   = "enabled"
 	RuntimeFailed    = "failed"
 	RuntimeDisabled  = "disabled"
+	RuntimeDraining  = "draining"
 
-	DefaultPriority           = 100
-	DefaultHandlerTimeout     = 3 * time.Second
-	DefaultManifestMaxBytes   = 256 * 1024
-	DefaultPackageMaxBytes    = 64 * 1024 * 1024
-	DefaultPackageMaxEntries  = 2048
-	DefaultExtractedMaxBytes  = 256 * 1024 * 1024
-	DefaultNonRuntimeMaxBytes = 16 * 1024 * 1024
+	DefaultPriority            = 100
+	DefaultHandlerTimeout      = 3 * time.Second
+	DefaultManifestMaxBytes    = 256 * 1024
+	DefaultPackageMaxBytes     = 64 * 1024 * 1024
+	DefaultPackageMaxEntries   = 2048
+	DefaultExtractedMaxBytes   = 256 * 1024 * 1024
+	DefaultNonRuntimeMaxBytes  = 16 * 1024 * 1024
+	DefaultInitialWriteTimeout = time.Second
 )
 
 var (
@@ -85,7 +90,40 @@ type ExtensionPoint struct {
 }
 
 type RuntimeLimits struct {
-	HandlerTimeoutMS int `json:"handler_timeout_ms"`
+	HandlerTimeoutMS      int `json:"handler_timeout_ms"`
+	InitialWriteTimeoutMS int `json:"initial_write_timeout_ms"`
+}
+
+type CapabilitySummary struct {
+	UpstreamConnect UpstreamConnectCapability `json:"upstream_connect,omitempty"`
+	Minecraft       *MinecraftCapability      `json:"minecraft,omitempty"`
+	Raw             json.RawMessage           `json:"raw,omitempty"`
+}
+
+type UpstreamConnectCapability struct {
+	Mode string `json:"mode,omitempty"`
+}
+
+type MinecraftCapability struct {
+	ProtocolVersions  MinecraftProtocolVersions `json:"protocol_versions,omitempty"`
+	States            map[string]string         `json:"states,omitempty"`
+	AuthModes         []string                  `json:"auth_modes,omitempty"`
+	Forwarding        MinecraftForwarding       `json:"forwarding,omitempty"`
+	UnsupportedPolicy string                    `json:"unsupported_policy,omitempty"`
+	Modded            map[string]string         `json:"modded,omitempty"`
+}
+
+type MinecraftProtocolVersions struct {
+	Min               int    `json:"min,omitempty"`
+	Max               int    `json:"max,omitempty"`
+	Tested            []int  `json:"tested,omitempty"`
+	UnsupportedPolicy string `json:"unsupported_policy,omitempty"`
+}
+
+type MinecraftForwarding struct {
+	Supported      []string `json:"supported,omitempty"`
+	Default        string   `json:"default,omitempty"`
+	RequiresSecret bool     `json:"requires_secret,omitempty"`
 }
 
 type ArtifactRecord struct {
@@ -163,21 +201,35 @@ type DispatchPlan struct {
 }
 
 type DispatchHandlerSummary struct {
-	PluginID       string `json:"plugin_id"`
-	ArtifactID     string `json:"artifact_id"`
-	Priority       int    `json:"priority"`
-	HandlerID      string `json:"handler_id"`
-	ExtensionPoint string `json:"extension_point"`
-	TimeoutMS      int64  `json:"timeout_ms"`
-	Calls          uint64 `json:"calls"`
-	Errors         uint64 `json:"errors"`
-	Panics         uint64 `json:"panics"`
-	Timeouts       uint64 `json:"timeouts"`
+	PluginID        string `json:"plugin_id"`
+	ArtifactID      string `json:"artifact_id"`
+	Priority        int    `json:"priority"`
+	HandlerID       string `json:"handler_id"`
+	ExtensionPoint  string `json:"extension_point"`
+	Mode            string `json:"mode"`
+	TimeoutMS       int64  `json:"timeout_ms"`
+	Calls           uint64 `json:"calls"`
+	Errors          uint64 `json:"errors"`
+	Panics          uint64 `json:"panics"`
+	Timeouts        uint64 `json:"timeouts"`
+	Blocked         uint64 `json:"blocked"`
+	ActiveProxy     int64  `json:"active_proxy_connections"`
+	ProxyStarted    uint64 `json:"proxy_connections_started"`
+	ProxyCompleted  uint64 `json:"proxy_connections_completed"`
+	ProxyErrors     uint64 `json:"proxy_errors"`
+	ProxyBytesIn    uint64 `json:"proxy_bytes_in"`
+	ProxyBytesOut   uint64 `json:"proxy_bytes_out"`
+	ProxyDurationMS uint64 `json:"proxy_duration_ms"`
 }
 
 type UpstreamResult struct {
-	Conn    net.Conn
-	Handled bool
+	Conn            net.Conn
+	Handled         bool
+	Mode            string
+	PluginID        string
+	HandlerID       string
+	InitialDataSent bool
+	Proxied         bool
 }
 
 type Gateway struct {
