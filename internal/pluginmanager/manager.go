@@ -31,6 +31,52 @@ type ConfigDryRunAdapter interface {
 type GoPluginAdapter struct{}
 
 func (a GoPluginAdapter) Load(ctx context.Context, artifact ArtifactRecord, pluginRecord PluginRecord, gateway *Gateway) (api.Plugin, error) {
+	return a.instantiate(ctx, artifact, pluginRecord, gateway, true)
+}
+
+func (a GoPluginAdapter) DryRunConfig(ctx context.Context, artifact ArtifactRecord, pluginRecord PluginRecord) error {
+	_ = ctx
+	_, err := a.instantiate(ctx, artifact, pluginRecord, nil, false)
+	return err
+}
+
+func (a GoPluginAdapter) RunPreflight(ctx context.Context, artifact ArtifactRecord, pluginRecord PluginRecord, profile, action string) (api.PreflightResult, error) {
+	instance, err := a.instantiate(ctx, artifact, pluginRecord, nil, false)
+	if err != nil {
+		return api.PreflightResult{}, err
+	}
+	checker, ok := instance.(api.PreflightChecker)
+	if !ok {
+		return api.PreflightResult{}, nil
+	}
+	var config map[string]any
+	_ = json.Unmarshal([]byte(defaultJSONObject(pluginRecord.ConfigJSON)), &config)
+	return checker.Preflight(api.PreflightContext{
+		PluginID:      pluginRecord.ID,
+		ArtifactID:    artifact.ID,
+		Profile:       profile,
+		Action:        action,
+		Config:        config,
+		Scope:         jsonObjectFromRaw(manifestCapabilitiesRaw(artifact), "scope"),
+		Rollout:       jsonObjectFromRaw(manifestCapabilitiesRaw(artifact), "rollout"),
+		RuntimeLimits: jsonObjectFromRaw(artifact.MetadataJSON, "runtime_limits"),
+		Features:      stringSlice(jsonObjectFromRaw(manifestCapabilitiesRaw(artifact), "required_features")),
+	})
+}
+
+func (a GoPluginAdapter) RunSelfTest(ctx context.Context, artifact ArtifactRecord, pluginRecord PluginRecord, profile string) (api.SelfTestResult, error) {
+	instance, err := a.instantiate(ctx, artifact, pluginRecord, nil, false)
+	if err != nil {
+		return api.SelfTestResult{}, err
+	}
+	tester, ok := instance.(api.SelfTester)
+	if !ok {
+		return api.SelfTestResult{}, nil
+	}
+	return tester.SelfTest(api.SelfTestProfile{Name: profile})
+}
+
+func (a GoPluginAdapter) instantiate(ctx context.Context, artifact ArtifactRecord, pluginRecord PluginRecord, gateway *Gateway, init bool) (api.Plugin, error) {
 	_ = ctx
 	opened, err := stdplugin.Open(artifact.FilePath)
 	if err != nil {
@@ -59,42 +105,12 @@ func (a GoPluginAdapter) Load(ctx context.Context, artifact ArtifactRecord, plug
 	if err := instance.ReloadConfig(cfg); err != nil {
 		return nil, err
 	}
-	if err := instance.Init(gateway); err != nil {
-		return nil, err
-	}
-	return instance, nil
-}
-
-func (a GoPluginAdapter) DryRunConfig(ctx context.Context, artifact ArtifactRecord, pluginRecord PluginRecord) error {
-	_ = ctx
-	opened, err := stdplugin.Open(artifact.FilePath)
-	if err != nil {
-		return err
-	}
-	symbolName := "Plugin"
-	var manifest Manifest
-	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err == nil && manifest.Runtime.EntrySymbol != "" {
-		symbolName = manifest.Runtime.EntrySymbol
-	}
-	symbol, err := opened.Lookup(symbolName)
-	if err != nil {
-		return err
-	}
-	factory, ok := symbol.(func() api.Plugin)
-	if !ok {
-		return fmt.Errorf("plugin symbol %q has invalid signature", symbolName)
-	}
-	instance := factory()
-	cfg := instance.NewConfigObj()
-	if cfg != nil && pluginRecord.ConfigJSON != "" && canUnmarshalInto(cfg) {
-		if err := json.Unmarshal([]byte(pluginRecord.ConfigJSON), cfg); err != nil {
-			return fmt.Errorf("decode plugin config: %w", err)
+	if init {
+		if err := instance.Init(gateway); err != nil {
+			return nil, err
 		}
 	}
-	if err := instance.ReloadConfig(cfg); err != nil {
-		return err
-	}
-	return nil
+	return instance, nil
 }
 
 func canUnmarshalInto(value any) bool {
@@ -106,12 +122,13 @@ func canUnmarshalInto(value any) bool {
 }
 
 type Manager struct {
-	repo       Repository
-	store      ArtifactStore
-	adapter    RuntimeAdapter
-	builders   map[string]SourceBuilder
-	handleConn func(net.Conn)
-	wg         *sync.WaitGroup
+	repo          Repository
+	store         ArtifactStore
+	adapter       RuntimeAdapter
+	builders      map[string]SourceBuilder
+	handleConn    func(net.Conn)
+	wg            *sync.WaitGroup
+	policyProfile string
 
 	mu       sync.Mutex
 	loaded   map[string]*loadedPlugin
@@ -181,12 +198,13 @@ type ProxyConnectionStats struct {
 }
 
 type Options struct {
-	DB           *sql.DB
-	ArtifactRoot string
-	HandleConn   func(net.Conn)
-	WaitGroup    *sync.WaitGroup
-	Adapter      RuntimeAdapter
-	Builders     map[string]SourceBuilder
+	DB            *sql.DB
+	ArtifactRoot  string
+	HandleConn    func(net.Conn)
+	WaitGroup     *sync.WaitGroup
+	Adapter       RuntimeAdapter
+	Builders      map[string]SourceBuilder
+	PolicyProfile string
 }
 
 func New(options Options) *Manager {
@@ -195,15 +213,16 @@ func New(options Options) *Manager {
 		adapter = GoPluginAdapter{}
 	}
 	manager := &Manager{
-		repo:        NewRepository(options.DB),
-		store:       NewArtifactStore(options.ArtifactRoot),
-		adapter:     adapter,
-		builders:    options.Builders,
-		handleConn:  options.HandleConn,
-		wg:          options.WaitGroup,
-		loaded:      make(map[string]*loadedPlugin),
-		proxyConns:  make(map[uint64]*proxyConnection),
-		drainingIDs: make(map[string]bool),
+		repo:          NewRepository(options.DB),
+		store:         NewArtifactStore(options.ArtifactRoot),
+		adapter:       adapter,
+		builders:      options.Builders,
+		handleConn:    options.HandleConn,
+		wg:            options.WaitGroup,
+		policyProfile: options.PolicyProfile,
+		loaded:        make(map[string]*loadedPlugin),
+		proxyConns:    make(map[uint64]*proxyConnection),
+		drainingIDs:   make(map[string]bool),
 	}
 	if manager.builders == nil {
 		manager.builders = map[string]SourceBuilder{
@@ -539,6 +558,17 @@ func (m *Manager) RollbackArtifact(ctx context.Context, actor, pluginID, artifac
 	if err != nil {
 		return PluginRecord{}, err
 	}
+	decision, err := m.EvaluateGovernance(ctx, pluginID, artifactID, GovernanceActionRollback, m.currentPolicyProfile(), current.ConfigJSON)
+	if err == nil && !decision.OK {
+		err = governanceBlockedError(decision)
+	}
+	if err != nil {
+		_ = m.repo.RecordOperation(ctx, pluginID, artifactID, "artifact_rollback_gate", "failed", actor, err.Error(), map[string]any{
+			"active_changed":      false,
+			"governance_decision": decision,
+		})
+		return PluginRecord{}, err
+	}
 	if _, err := m.DryRunConfig(ctx, pluginID, artifactID, current.ConfigJSON); err != nil {
 		_ = m.repo.RecordOperation(ctx, pluginID, artifactID, "artifact_rollback", "failed", actor, err.Error(), map[string]any{
 			"active_changed": false,
@@ -553,8 +583,9 @@ func (m *Manager) RollbackArtifact(ctx context.Context, actor, pluginID, artifac
 		return PluginRecord{}, err
 	}
 	_ = m.repo.RecordOperation(ctx, pluginID, artifactID, "artifact_rollback", "succeeded", actor, "artifact rollback desired state updated", map[string]any{
-		"desired_generation": plugin.DesiredGeneration,
-		"active_changed":     false,
+		"desired_generation":  plugin.DesiredGeneration,
+		"active_changed":      false,
+		"governance_decision": decision,
 	})
 	return plugin, nil
 }
@@ -576,6 +607,19 @@ func (m *Manager) RollbackConfigSnapshot(ctx context.Context, actor string, snap
 		desiredState = snapshot.DesiredState
 		priority = snapshot.Priority
 	}
+	decision, err := m.EvaluateGovernance(ctx, snapshot.PluginID, artifactID, GovernanceActionRollback, m.currentPolicyProfile(), snapshot.ConfigJSON)
+	if err == nil && !decision.OK {
+		err = governanceBlockedError(decision)
+	}
+	if err != nil {
+		_ = m.repo.RecordOperation(ctx, snapshot.PluginID, artifactID, "config_rollback_gate", "failed", actor, err.Error(), map[string]any{
+			"snapshot_id":         snapshot.ID,
+			"full_desired":        fullDesired,
+			"active_changed":      false,
+			"governance_decision": decision,
+		})
+		return PluginRecord{}, err
+	}
 	if _, err := m.DryRunConfig(ctx, snapshot.PluginID, artifactID, snapshot.ConfigJSON); err != nil {
 		_ = m.repo.RecordOperation(ctx, snapshot.PluginID, artifactID, "config_rollback", "failed", actor, err.Error(), map[string]any{
 			"snapshot_id":    snapshot.ID,
@@ -594,10 +638,11 @@ func (m *Manager) RollbackConfigSnapshot(ctx context.Context, actor string, snap
 		return PluginRecord{}, err
 	}
 	_ = m.repo.RecordOperation(ctx, snapshot.PluginID, artifactID, "config_rollback", "succeeded", actor, "config snapshot rollback desired state updated", map[string]any{
-		"snapshot_id":        snapshot.ID,
-		"full_desired":       fullDesired,
-		"desired_generation": next.DesiredGeneration,
-		"active_changed":     false,
+		"snapshot_id":         snapshot.ID,
+		"full_desired":        fullDesired,
+		"desired_generation":  next.DesiredGeneration,
+		"active_changed":      false,
+		"governance_decision": decision,
 	})
 	return next, nil
 }
@@ -630,6 +675,17 @@ func (m *Manager) Enable(ctx context.Context, actor, pluginID string) (PluginRec
 			return PluginRecord{}, err
 		}
 	}
+	decision, err := m.EvaluateGovernance(ctx, pluginID, pluginRecord.DesiredArtifactID, GovernanceActionEnable, m.currentPolicyProfile(), pluginRecord.ConfigJSON)
+	if err == nil && !decision.OK {
+		err = governanceBlockedError(decision)
+	}
+	if err != nil {
+		_ = m.repo.MarkRuntime(ctx, pluginID, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"governance": decision}, nil)
+		_ = m.repo.RecordOperation(ctx, pluginID, pluginRecord.DesiredArtifactID, "enable_gate", "failed", actor, err.Error(), map[string]any{
+			"decision": decision,
+		})
+		return PluginRecord{}, err
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -656,8 +712,9 @@ func (m *Manager) Enable(ctx context.Context, actor, pluginID string) (PluginRec
 	m.publish(next)
 	_ = m.repo.UpdateArtifactStatus(ctx, loaded.artifact.ID, ArtifactStatusLoaded, "")
 	_ = m.repo.RecordOperation(ctx, pluginID, loaded.artifact.ID, "enable", "succeeded", actor, "plugin enabled", map[string]any{
-		"desired_generation": loaded.record.DesiredGeneration,
-		"handler_count":      len(loaded.handlers),
+		"desired_generation":  loaded.record.DesiredGeneration,
+		"handler_count":       len(loaded.handlers),
+		"governance_decision": decision,
 	})
 	return m.repo.Plugin(ctx, pluginID)
 }
@@ -728,6 +785,15 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 	}
 	nextByPlugin := make(map[string][]*upstreamHandler)
 	for _, pluginRecord := range desired {
+		decision, err := m.EvaluateGovernance(ctx, pluginRecord.ID, pluginRecord.DesiredArtifactID, GovernanceActionEnable, m.currentPolicyProfile(), pluginRecord.ConfigJSON)
+		if err == nil && !decision.OK {
+			err = governanceBlockedError(decision)
+		}
+		if err != nil {
+			_ = m.repo.MarkRuntime(ctx, pluginRecord.ID, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"governance": decision}, nil)
+			_ = m.repo.RecordOperation(ctx, pluginRecord.ID, pluginRecord.DesiredArtifactID, "reconcile_gate", "failed", "system", err.Error(), map[string]any{"decision": decision})
+			continue
+		}
 		loaded, err := m.loadLocked(ctx, pluginRecord)
 		if err != nil {
 			_ = m.repo.MarkRuntime(ctx, pluginRecord.ID, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
@@ -899,6 +965,38 @@ func (m *Manager) ConfigSnapshotDiff(ctx context.Context, snapshotID int64) (Con
 
 func (m *Manager) ListSecrets(ctx context.Context, pluginID string) ([]SecretRecord, error) {
 	return m.repo.ListSecrets(ctx, pluginID)
+}
+
+func (m *Manager) quarantineAffected(ctx context.Context, advisory AdvisoryRecord) {
+	plugins, err := m.repo.ListPlugins(ctx)
+	if err != nil {
+		return
+	}
+	var manifests = make(map[string]Manifest)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, plugin := range plugins {
+		if plugin.RuntimeState != RuntimeEnabled || plugin.ActiveArtifactID == "" {
+			continue
+		}
+		artifact, err := m.repo.Artifact(ctx, plugin.ActiveArtifactID)
+		if err != nil {
+			continue
+		}
+		manifest := manifests[artifact.ID]
+		if manifest.ID == "" {
+			_ = json.Unmarshal([]byte(artifact.MetadataJSON), &manifest)
+			manifests[artifact.ID] = manifest
+		}
+		if advisoryMatches(advisory, artifact, manifest) {
+			m.removeFromDispatchLocked(plugin.ID)
+			m.markDrainingLocked(plugin.ID)
+			_ = m.repo.MarkRuntime(ctx, plugin.ID, RuntimeDraining, artifact.ID, artifact.ID, plugin.AppliedGeneration, "plugin quarantined by advisory "+advisory.AdvisoryID, map[string]any{
+				"quarantine":  true,
+				"advisory_id": advisory.AdvisoryID,
+			}, nil)
+		}
+	}
 }
 
 func (m *Manager) UpsertSecret(ctx context.Context, actor, pluginID, artifactID, name, value string, reloadRequired, hotReload bool) (SecretRecord, error) {

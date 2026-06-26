@@ -168,6 +168,10 @@ export function renderPluginDetail(plugin: PluginView | null = selectedPlugin())
         </dl>
       </section>
       <section class="panel">
+        <h3>Governance</h3>
+        ${governancePanel(plugin, canWrite)}
+      </section>
+      <section class="panel">
         <h3>Config</h3>
         <textarea id="pluginConfigEditor" ${canWrite ? "" : "readonly"}>${escapeHTML(prettyJSON(plugin.config_json || "{}"))}</textarea>
         <div class="row-actions">${canWrite ? `
@@ -262,6 +266,12 @@ function bindPluginDetailEvents(plugin: PluginView): void {
   document.querySelectorAll<HTMLButtonElement>("[data-snapshot-diff]").forEach((button) => {
     button.addEventListener("click", () => showSnapshotDiff(plugin.id, Number(button.dataset.snapshotDiff || "0")));
   });
+  document.getElementById("pluginGovernanceReviewBtn")?.addEventListener("click", () => createGovernanceReview(plugin));
+  document.getElementById("pluginGovernanceOverrideBtn")?.addEventListener("click", () => createGovernanceOverride(plugin));
+  document.getElementById("pluginGovernancePreflightBtn")?.addEventListener("click", () => runGovernancePreflight(plugin));
+  document.getElementById("pluginGovernanceSelfTestBtn")?.addEventListener("click", () => runGovernanceSelfTest(plugin));
+  document.getElementById("pluginGovernanceBenchmarkBtn")?.addEventListener("click", () => recordGovernanceBenchmark(plugin));
+  document.getElementById("pluginGovernanceAdvisoryBtn")?.addEventListener("click", () => createArtifactRevokeAdvisory(plugin));
 }
 
 async function dryRunConfig(plugin: PluginView): Promise<void> {
@@ -413,6 +423,117 @@ async function showSnapshotDiff(pluginID: string, snapshotID: number): Promise<v
   }
 }
 
+async function createGovernanceReview(plugin: PluginView): Promise<void> {
+  try {
+    await api(`/plugins/${encodeURIComponent(plugin.id)}/governance/review`, {
+      method: "POST",
+      body: { artifact_id: plugin.desired_artifact_id, profile: "prod", decision: "approved" },
+    });
+    await loadPluginDetail(plugin.id);
+    showAlert("");
+  } catch (err) {
+    showAlert((err as Error).message);
+  }
+}
+
+async function createGovernanceOverride(plugin: PluginView): Promise<void> {
+  const reason = window.prompt("Reason");
+  if (!reason) {
+    return;
+  }
+  try {
+    await api(`/plugins/${encodeURIComponent(plugin.id)}/governance/override`, {
+      method: "POST",
+      body: { artifact_id: plugin.desired_artifact_id, profile: "prod", action: "enable", reason, ttl_seconds: 3600 },
+    });
+    await loadPluginDetail(plugin.id);
+    showAlert("");
+  } catch (err) {
+    showAlert((err as Error).message);
+  }
+}
+
+async function runGovernancePreflight(plugin: PluginView): Promise<void> {
+  try {
+    const data = await api<Record<string, unknown>>(`/plugins/${encodeURIComponent(plugin.id)}/governance/preflight`, {
+      method: "POST",
+      body: { artifact_id: plugin.desired_artifact_id, config_json: configEditorValue() },
+    });
+    el("pluginDryRunResult").textContent = formatJSON(data);
+    await loadPluginDetail(plugin.id);
+    showAlert("");
+  } catch (err) {
+    showAlert((err as Error).message);
+  }
+}
+
+async function runGovernanceSelfTest(plugin: PluginView): Promise<void> {
+  try {
+    const data = await api<Record<string, unknown>>(`/plugins/${encodeURIComponent(plugin.id)}/governance/self-test`, {
+      method: "POST",
+      body: { artifact_id: plugin.desired_artifact_id },
+    });
+    el("pluginDryRunResult").textContent = formatJSON(data);
+    await loadPluginDetail(plugin.id);
+    showAlert("");
+  } catch (err) {
+    showAlert((err as Error).message);
+  }
+}
+
+async function recordGovernanceBenchmark(plugin: PluginView): Promise<void> {
+  const diff = Number(window.prompt("Baseline diff, e.g. 0.25", "0.25"));
+  if (!Number.isFinite(diff)) {
+    return;
+  }
+  try {
+    await api(`/plugins/${encodeURIComponent(plugin.id)}/governance/benchmark`, {
+      method: "POST",
+      body: {
+        artifact_id: plugin.desired_artifact_id,
+        profile: "prod",
+        benchmark_profile: "manual",
+        p95_ms: 0,
+        p99_ms: 0,
+        error_rate: 0,
+        active_proxy_capacity: 0,
+        baseline_diff: diff,
+      },
+    });
+    await loadPluginDetail(plugin.id);
+    showAlert("");
+  } catch (err) {
+    showAlert((err as Error).message);
+  }
+}
+
+async function createArtifactRevokeAdvisory(plugin: PluginView): Promise<void> {
+  const artifact = plugin.desired_artifact;
+  if (!artifact) {
+    return;
+  }
+  const advisoryID = window.prompt("Advisory ID", `local-${shortID(artifact.sha256)}`);
+  if (!advisoryID) {
+    return;
+  }
+  try {
+    await api("/plugin-advisories", {
+      method: "POST",
+      body: {
+        advisory_id: advisoryID,
+        status: "revoked",
+        action: "revoke",
+        artifact_sha256: artifact.sha256,
+        recommended_action: "rollback or upgrade",
+      },
+    });
+    await loadPluginDetail(plugin.id);
+    showAlert("");
+  } catch (err) {
+    showAlert((err as Error).message);
+  }
+}
+
 function uploadInventoryDetail(): string {
   const artifact = selectedArtifact();
   if (!artifact) {
@@ -527,6 +648,50 @@ function pluginActionButtons(plugin: PluginView): string {
     <button type="button" data-plugin-action="enable">Enable</button>
     <button class="secondary" type="button" data-plugin-action="disable">Disable</button>
     <button class="danger" type="button" data-plugin-action="delete">Delete</button>
+  `;
+}
+
+function governancePanel(plugin: PluginView, canWrite: boolean): string {
+  if (plugin.governance_error) {
+    return `<div class="alert inline-alert">${escapeHTML(plugin.governance_error)}</div>`;
+  }
+  const governance = plugin.governance;
+  const decision = governance?.decision;
+  const issues = decision?.issues || [];
+  return `
+    <dl class="kv">
+      <dt>Profile</dt><dd>${escapeHTML(decision?.profile || "")}</dd>
+      <dt>Risk</dt><dd>${escapeHTML(decision?.risk_level || "")}</dd>
+      <dt>Policy</dt><dd>${escapeHTML(shortID(decision?.policy_hash || ""))}</dd>
+      <dt>Decision</dt><dd>${badge(decision?.ok ? "allowed" : "blocked", !decision?.ok)}</dd>
+      <dt>Review</dt><dd>${badge(decision?.review_required ? "required" : "not required", Boolean(decision?.review_required))}</dd>
+      <dt>Override</dt><dd>${badge(decision?.warning_override_used ? "used" : "not used", Boolean(decision?.warning_override_used))}</dd>
+    </dl>
+    ${issues.length ? `<div class="mini-list">${issues.map((issue) => `
+      <div class="mini-row">
+        <span>${badge(issue.severity, issue.severity !== "info")}</span>
+        <span>${escapeHTML(issue.code)}</span>
+        <span>${escapeHTML(issue.message)}</span>
+      </div>
+    `).join("")}</div>` : `<div class="empty">No governance issues</div>`}
+    ${canWrite ? `
+      <div class="row-actions">
+        <button class="secondary" type="button" id="pluginGovernanceReviewBtn">Review</button>
+        <button class="secondary" type="button" id="pluginGovernanceOverrideBtn">Override</button>
+        <button class="secondary" type="button" id="pluginGovernancePreflightBtn">Preflight</button>
+        <button class="secondary" type="button" id="pluginGovernanceSelfTestBtn">Self-test</button>
+        <button class="secondary" type="button" id="pluginGovernanceBenchmarkBtn">Benchmark</button>
+        <button class="danger" type="button" id="pluginGovernanceAdvisoryBtn">Revoke artifact</button>
+      </div>
+    ` : ""}
+    <pre class="log-output">${escapeHTML(formatJSON({
+      conflicts: governance?.conflicts,
+      reviews: governance?.reviews || [],
+      warning_overrides: governance?.warning_overrides || [],
+      preflights: governance?.preflights || [],
+      benchmarks: governance?.benchmarks || [],
+      advisories: governance?.advisories || [],
+    }))}</pre>
   `;
 }
 

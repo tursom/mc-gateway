@@ -117,6 +117,42 @@ export interface PluginProxyConnection {
   draining: boolean;
 }
 
+export interface GovernanceIssue {
+  code: string;
+  severity: string;
+  message: string;
+  plugin_id?: string;
+  artifact_id?: string;
+  details?: Record<string, unknown>;
+}
+
+export interface GovernanceDecision {
+  ok: boolean;
+  action: string;
+  profile: string;
+  risk_level: string;
+  policy_hash: string;
+  review_required: boolean;
+  warning_override_used: boolean;
+  issues?: GovernanceIssue[];
+  checks?: GovernanceIssue[];
+}
+
+export interface GovernanceStatus {
+  decision?: GovernanceDecision;
+  policy?: Record<string, unknown>;
+  reviews?: Record<string, unknown>[];
+  warning_overrides?: Record<string, unknown>[];
+  preflights?: Record<string, unknown>[];
+  benchmarks?: Record<string, unknown>[];
+  advisories?: Record<string, unknown>[];
+  conflicts?: {
+    ok: boolean;
+    issues?: GovernanceIssue[];
+    plan?: unknown;
+  };
+}
+
 export interface PluginView {
   id: string;
   name?: string;
@@ -151,6 +187,8 @@ export interface PluginView {
   manifest?: Record<string, unknown>;
   active_proxy_connections?: number;
   proxy_connections?: PluginProxyConnection[];
+  governance?: GovernanceStatus;
+  governance_error?: string;
   updated_at?: number;
 }
 

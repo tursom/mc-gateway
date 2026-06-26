@@ -510,10 +510,11 @@ func TestProtocolProxyTrackDrainAndForceClose(t *testing.T) {
 		},
 	}
 	manager := newManagerForTest(t, adapter)
-	artifact := uploadTestArtifactWithCapabilities(t, manager, "plugin-a", json.RawMessage(`{"upstream_connect":{"mode":"protocol-proxy"}}`))
+	artifact := uploadTestArtifactWithCapabilities(t, manager, "plugin-a", testProtocolProxyCapabilities())
 	if _, err := manager.SetDesired(context.Background(), "admin", "plugin-a", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
 		t.Fatalf("SetDesired() error = %v", err)
 	}
+	approveGovernanceForTest(t, manager, "plugin-a", artifact.ID)
 	if _, err := manager.Enable(context.Background(), "admin", "plugin-a"); err != nil {
 		t.Fatalf("Enable() error = %v", err)
 	}
@@ -616,10 +617,11 @@ func TestProtocolProxyInitialWriteTimeoutClosesUnreadableConn(t *testing.T) {
 		},
 	}
 	manager := newManagerForTest(t, adapter)
-	artifact := uploadTestArtifactWithCapabilities(t, manager, "plugin-a", json.RawMessage(`{"upstream_connect":{"mode":"protocol-proxy"}}`))
+	artifact := uploadTestArtifactWithCapabilities(t, manager, "plugin-a", testProtocolProxyCapabilities())
 	if _, err := manager.SetDesired(context.Background(), "admin", "plugin-a", artifact.ID, DesiredEnabled, `{"unused":true}`, 10); err != nil {
 		t.Fatalf("SetDesired() error = %v", err)
 	}
+	approveGovernanceForTest(t, manager, "plugin-a", artifact.ID)
 	if _, err := manager.Enable(context.Background(), "admin", "plugin-a"); err != nil {
 		t.Fatalf("Enable() error = %v", err)
 	}
@@ -648,19 +650,44 @@ func TestProtocolProxyInitialWriteTimeoutClosesUnreadableConn(t *testing.T) {
 
 func enableProtocolProxyTestPlugin(t *testing.T, manager *Manager, pluginID string) ArtifactRecord {
 	t.Helper()
-	artifact := uploadTestArtifactWithCapabilities(t, manager, pluginID, json.RawMessage(`{"upstream_connect":{"mode":"protocol-proxy"}}`))
+	artifact := uploadTestArtifactWithCapabilities(t, manager, pluginID, testProtocolProxyCapabilities())
 	if _, err := manager.SetDesired(context.Background(), "admin", pluginID, artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
 		t.Fatalf("SetDesired() error = %v", err)
 	}
+	approveGovernanceForTest(t, manager, pluginID, artifact.ID)
 	if _, err := manager.Enable(context.Background(), "admin", pluginID); err != nil {
 		t.Fatalf("Enable() error = %v", err)
 	}
 	return artifact
 }
 
+func approveGovernanceForTest(t *testing.T, manager *Manager, pluginID, artifactID string) {
+	t.Helper()
+	if _, err := manager.CreateReview(context.Background(), "admin", pluginID, GovernanceReviewRequest{
+		ArtifactID: artifactID,
+		Profile:    PolicyProfileProd,
+		Decision:   ReviewDecisionApproved,
+		Notes:      "test approval",
+	}); err != nil {
+		t.Fatalf("CreateReview(%s) error = %v", pluginID, err)
+	}
+}
+
 func newManagerForTest(t *testing.T, adapter RuntimeAdapter) *Manager {
 	t.Helper()
 	return newManagerForTestWithBuilders(t, adapter, nil)
+}
+
+func testProtocolProxyCapabilities() json.RawMessage {
+	return json.RawMessage(`{
+		"upstream_connect":{"mode":"protocol-proxy"},
+		"scope":{"type":"host","values":["play.example"]},
+		"rollout":{"mode":"canary"},
+		"minecraft":{
+			"protocol_versions":{"tested":[767]},
+			"forwarding":{"supported":["none"],"default":"none"}
+		}
+	}`)
 }
 
 func newManagerForTestWithBuilders(t *testing.T, adapter RuntimeAdapter, builders map[string]SourceBuilder) *Manager {

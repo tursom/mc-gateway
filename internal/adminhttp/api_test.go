@@ -44,8 +44,11 @@ func TestNewAPIHandlerRoutesRequests(t *testing.T) {
 		{name: "plugin config dry-run", method: http.MethodPost, path: "/admin/api/plugins/upstream-rewrite/config/dry-run", wantCall: "plugin_config", wantSegment: "upstream-rewrite/config/dry-run"},
 		{name: "plugin secrets", method: http.MethodGet, path: "/admin/api/plugins/upstream-rewrite/secrets", wantCall: "plugin_secrets", wantSegment: "upstream-rewrite/secrets"},
 		{name: "plugin rollback artifact", method: http.MethodPost, path: "/admin/api/plugins/upstream-rewrite/rollback/artifact", wantCall: "plugin_rollback", wantSegment: "upstream-rewrite/rollback/artifact"},
+		{name: "plugin governance", method: http.MethodGet, path: "/admin/api/plugins/upstream-rewrite/governance", wantCall: "plugin_governance", wantSegment: "upstream-rewrite/governance"},
+		{name: "plugin governance review", method: http.MethodPost, path: "/admin/api/plugins/upstream-rewrite/governance/review", wantCall: "plugin_governance", wantSegment: "upstream-rewrite/governance/review"},
 		{name: "plugin draining force close", method: http.MethodPost, path: "/admin/api/plugins/mc-auth-proxy/draining/force-close", wantCall: "plugin_draining", wantSegment: "mc-auth-proxy"},
 		{name: "plugin dispatch", method: http.MethodGet, path: "/admin/api/plugins/dispatch-plan", wantCall: "plugin_dispatch"},
+		{name: "plugin advisories", method: http.MethodGet, path: "/admin/api/plugin-advisories", wantCall: "plugin_advisories"},
 	}
 
 	for _, tt := range tests {
@@ -73,20 +76,22 @@ func TestNewAPIHandlerRoutesRequests(t *testing.T) {
 
 				AuditLogs: recordCall(&gotCall, "audit_logs"),
 
-				PluginArtifacts: recordCall(&gotCall, "plugin_artifacts"),
-				PluginArtifact:  recordSegmentCall(&gotCall, &gotSegment, "plugin_artifact"),
-				PluginSources:   recordCall(&gotCall, "plugin_sources"),
-				PluginBuilds:    recordCall(&gotCall, "plugin_builds"),
-				PluginBuild:     recordSegmentCall(&gotCall, &gotSegment, "plugin_build"),
-				PluginGC:        recordCall(&gotCall, "plugin_gc"),
-				PluginsList:     recordCall(&gotCall, "plugins_list"),
-				PluginItem:      recordSegmentCall(&gotCall, &gotSegment, "plugin_item"),
-				PluginAction:    recordSegmentCall(&gotCall, &gotSegment, "plugin_action"),
-				PluginConfig:    recordSegmentCall(&gotCall, &gotSegment, "plugin_config"),
-				PluginSecrets:   recordSegmentCall(&gotCall, &gotSegment, "plugin_secrets"),
-				PluginRollback:  recordSegmentCall(&gotCall, &gotSegment, "plugin_rollback"),
-				PluginDraining:  recordSegmentCall(&gotCall, &gotSegment, "plugin_draining"),
-				PluginDispatch:  recordCall(&gotCall, "plugin_dispatch"),
+				PluginArtifacts:  recordCall(&gotCall, "plugin_artifacts"),
+				PluginArtifact:   recordSegmentCall(&gotCall, &gotSegment, "plugin_artifact"),
+				PluginSources:    recordCall(&gotCall, "plugin_sources"),
+				PluginBuilds:     recordCall(&gotCall, "plugin_builds"),
+				PluginBuild:      recordSegmentCall(&gotCall, &gotSegment, "plugin_build"),
+				PluginGC:         recordCall(&gotCall, "plugin_gc"),
+				PluginsList:      recordCall(&gotCall, "plugins_list"),
+				PluginItem:       recordSegmentCall(&gotCall, &gotSegment, "plugin_item"),
+				PluginAction:     recordSegmentCall(&gotCall, &gotSegment, "plugin_action"),
+				PluginConfig:     recordSegmentCall(&gotCall, &gotSegment, "plugin_config"),
+				PluginSecrets:    recordSegmentCall(&gotCall, &gotSegment, "plugin_secrets"),
+				PluginRollback:   recordSegmentCall(&gotCall, &gotSegment, "plugin_rollback"),
+				PluginDraining:   recordSegmentCall(&gotCall, &gotSegment, "plugin_draining"),
+				PluginDispatch:   recordCall(&gotCall, "plugin_dispatch"),
+				PluginGovernance: recordSegmentCall(&gotCall, &gotSegment, "plugin_governance"),
+				PluginAdvisories: recordCall(&gotCall, "plugin_advisories"),
 			})
 
 			resp := httptest.NewRecorder()

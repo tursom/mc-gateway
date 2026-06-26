@@ -209,6 +209,81 @@ CREATE TABLE IF NOT EXISTS plugin_secrets (
     PRIMARY KEY(plugin_id, name)
 );
 
+CREATE TABLE IF NOT EXISTS plugin_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plugin_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    profile TEXT NOT NULL DEFAULT 'dev',
+    risk_level TEXT NOT NULL DEFAULT 'low',
+    config_hash TEXT NOT NULL DEFAULT '',
+    scope_hash TEXT NOT NULL DEFAULT '',
+    rollout_hash TEXT NOT NULL DEFAULT '',
+    runtime_limits_hash TEXT NOT NULL DEFAULT '',
+    features_hash TEXT NOT NULL DEFAULT '',
+    policy_hash TEXT NOT NULL DEFAULT '',
+    decision TEXT NOT NULL DEFAULT 'approved',
+    notes TEXT NOT NULL DEFAULT '',
+    reviewed_by TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS plugin_warning_overrides (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plugin_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    profile TEXT NOT NULL DEFAULT 'dev',
+    action TEXT NOT NULL DEFAULT '',
+    policy_hash TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL DEFAULT '',
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS plugin_advisories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    advisory_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    action TEXT NOT NULL DEFAULT 'denylist',
+    artifact_sha256 TEXT NOT NULL DEFAULT '',
+    plugin_id TEXT NOT NULL DEFAULT '',
+    version_range TEXT NOT NULL DEFAULT '',
+    dependency_name TEXT NOT NULL DEFAULT '',
+    dependency_range TEXT NOT NULL DEFAULT '',
+    recommended_action TEXT NOT NULL DEFAULT '',
+    fixed_version TEXT NOT NULL DEFAULT '',
+    mitigation TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS plugin_preflight_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plugin_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    profile TEXT NOT NULL DEFAULT 'dev',
+    status TEXT NOT NULL DEFAULT '',
+    result_json TEXT NOT NULL DEFAULT '{}',
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS plugin_benchmarks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plugin_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    profile TEXT NOT NULL DEFAULT 'dev',
+    benchmark_profile TEXT NOT NULL DEFAULT '',
+    p95_ms REAL NOT NULL DEFAULT 0,
+    p99_ms REAL NOT NULL DEFAULT 0,
+    error_rate REAL NOT NULL DEFAULT 0,
+    active_proxy_capacity INTEGER NOT NULL DEFAULT 0,
+    baseline_diff REAL NOT NULL DEFAULT 0,
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_routes_enabled ON routes(enabled);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_plugin_artifacts_plugin_id ON plugin_artifacts(plugin_id, created_at);
@@ -218,6 +293,12 @@ CREATE INDEX IF NOT EXISTS idx_plugin_builds_plugin_id ON plugin_builds(plugin_i
 CREATE INDEX IF NOT EXISTS idx_plugin_builds_source_id ON plugin_builds(source_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_plugin_config_snapshots_plugin_id ON plugin_config_snapshots(plugin_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_plugin_secrets_plugin_id ON plugin_secrets(plugin_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_plugin_reviews_lookup ON plugin_reviews(plugin_id, artifact_id, profile, policy_hash, created_at);
+CREATE INDEX IF NOT EXISTS idx_plugin_warning_overrides_lookup ON plugin_warning_overrides(plugin_id, artifact_id, profile, action, expires_at);
+CREATE INDEX IF NOT EXISTS idx_plugin_advisories_artifact ON plugin_advisories(artifact_sha256, status);
+CREATE INDEX IF NOT EXISTS idx_plugin_advisories_plugin ON plugin_advisories(plugin_id, status);
+CREATE INDEX IF NOT EXISTS idx_plugin_preflight_lookup ON plugin_preflight_results(plugin_id, artifact_id, profile, created_at);
+CREATE INDEX IF NOT EXISTS idx_plugin_benchmarks_lookup ON plugin_benchmarks(plugin_id, artifact_id, profile, created_at);
 INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, strftime('%s','now'));
 `
 	if _, err := db.Exec(schema); err != nil {

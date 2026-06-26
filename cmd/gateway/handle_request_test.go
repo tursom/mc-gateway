@@ -90,10 +90,11 @@ func TestHandleRequestProtocolProxyReplaysInitialDataOnce(t *testing.T) {
 			return gatewayEnd, nil
 		}},
 	})
-	artifact := uploadGatewayTestArtifactWithCapabilities(t, pluginsManager, "proxy-plugin", `{"upstream_connect":{"mode":"protocol-proxy"}}`)
+	artifact := uploadGatewayTestArtifactWithCapabilities(t, pluginsManager, "proxy-plugin", gatewayProtocolProxyCapabilities())
 	if _, err := pluginsManager.SetDesired(context.Background(), "admin", "proxy-plugin", artifact.ID, pluginmanager.DesiredEnabled, `{}`, 10); err != nil {
 		t.Fatalf("SetDesired() error = %v", err)
 	}
+	approveGatewayPluginGovernanceForTest(t, "proxy-plugin", artifact.ID)
 	if _, err := pluginsManager.Enable(context.Background(), "admin", "proxy-plugin"); err != nil {
 		t.Fatalf("Enable() error = %v", err)
 	}
@@ -216,10 +217,11 @@ func TestHandleRequestProtocolProxyDisableSkipsNewConnections(t *testing.T) {
 			return gatewayEnd, nil
 		}},
 	})
-	artifact := uploadGatewayTestArtifactWithCapabilities(t, pluginsManager, "proxy-plugin", `{"upstream_connect":{"mode":"protocol-proxy"}}`)
+	artifact := uploadGatewayTestArtifactWithCapabilities(t, pluginsManager, "proxy-plugin", gatewayProtocolProxyCapabilities())
 	if _, err := pluginsManager.SetDesired(context.Background(), "admin", "proxy-plugin", artifact.ID, pluginmanager.DesiredEnabled, `{}`, 10); err != nil {
 		t.Fatalf("SetDesired() error = %v", err)
 	}
+	approveGatewayPluginGovernanceForTest(t, "proxy-plugin", artifact.ID)
 	if _, err := pluginsManager.Enable(context.Background(), "admin", "proxy-plugin"); err != nil {
 		t.Fatalf("Enable() error = %v", err)
 	}

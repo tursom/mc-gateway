@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -599,6 +600,359 @@ FROM plugin_secrets`
 	return secrets, rows.Err()
 }
 
+func (r Repository) SaveReview(ctx context.Context, review ReviewRecord) (ReviewRecord, error) {
+	now := r.now().Unix()
+	if review.CreatedAt == 0 {
+		review.CreatedAt = now
+	}
+	if review.Profile == "" {
+		review.Profile = PolicyProfileDev
+	}
+	if review.RiskLevel == "" {
+		review.RiskLevel = RiskLow
+	}
+	if review.Decision == "" {
+		review.Decision = ReviewDecisionApproved
+	}
+	_, err := r.db.ExecContext(ctx, `
+INSERT INTO plugin_reviews(
+    plugin_id, artifact_id, profile, risk_level, config_hash, scope_hash, rollout_hash,
+    runtime_limits_hash, features_hash, policy_hash, decision, notes, reviewed_by, created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		review.PluginID, review.ArtifactID, review.Profile, review.RiskLevel, review.ConfigHash, review.ScopeHash, review.RolloutHash,
+		review.RuntimeLimitsHash, review.FeaturesHash, review.PolicyHash, review.Decision, review.Notes, review.ReviewedBy, review.CreatedAt)
+	if err != nil {
+		return ReviewRecord{}, err
+	}
+	id, err := lastInsertID(ctx, r.db)
+	if err != nil {
+		return ReviewRecord{}, err
+	}
+	review.ID = id
+	return review, nil
+}
+
+func (r Repository) ListReviews(ctx context.Context, pluginID string) ([]ReviewRecord, error) {
+	query := `
+SELECT id, plugin_id, artifact_id, profile, risk_level, config_hash, scope_hash, rollout_hash,
+       runtime_limits_hash, features_hash, policy_hash, decision, notes, reviewed_by, created_at
+FROM plugin_reviews`
+	var args []any
+	if pluginID != "" {
+		query += ` WHERE plugin_id = ?`
+		args = append(args, pluginID)
+	}
+	query += ` ORDER BY created_at DESC, id DESC`
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var reviews []ReviewRecord
+	for rows.Next() {
+		review, err := scanReview(rows)
+		if err != nil {
+			return nil, err
+		}
+		reviews = append(reviews, review)
+	}
+	return reviews, rows.Err()
+}
+
+func (r Repository) ApprovedReview(ctx context.Context, pluginID, artifactID, profile, policyHash, configHash, scopeHash, rolloutHash, runtimeHash, featuresHash string) (ReviewRecord, error) {
+	row := r.db.QueryRowContext(ctx, `
+SELECT id, plugin_id, artifact_id, profile, risk_level, config_hash, scope_hash, rollout_hash,
+       runtime_limits_hash, features_hash, policy_hash, decision, notes, reviewed_by, created_at
+FROM plugin_reviews
+WHERE plugin_id = ? AND artifact_id = ? AND profile = ? AND policy_hash = ?
+  AND config_hash = ? AND scope_hash = ? AND rollout_hash = ? AND runtime_limits_hash = ? AND features_hash = ?
+  AND decision = ?
+ORDER BY created_at DESC, id DESC
+LIMIT 1`, pluginID, artifactID, profile, policyHash, configHash, scopeHash, rolloutHash, runtimeHash, featuresHash, ReviewDecisionApproved)
+	review, err := scanReview(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ReviewRecord{}, nil
+	}
+	return review, err
+}
+
+func (r Repository) SaveWarningOverride(ctx context.Context, override WarningOverrideRecord) (WarningOverrideRecord, error) {
+	now := r.now().Unix()
+	if override.CreatedAt == 0 {
+		override.CreatedAt = now
+	}
+	if override.Profile == "" {
+		override.Profile = PolicyProfileDev
+	}
+	_, err := r.db.ExecContext(ctx, `
+INSERT INTO plugin_warning_overrides(plugin_id, artifact_id, profile, action, policy_hash, reason, created_by, expires_at, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		override.PluginID, override.ArtifactID, override.Profile, override.Action, override.PolicyHash, override.Reason, override.CreatedBy, override.ExpiresAt, override.CreatedAt)
+	if err != nil {
+		return WarningOverrideRecord{}, err
+	}
+	id, err := lastInsertID(ctx, r.db)
+	if err != nil {
+		return WarningOverrideRecord{}, err
+	}
+	override.ID = id
+	return override, nil
+}
+
+func (r Repository) ActiveWarningOverride(ctx context.Context, pluginID, artifactID, profile, action, policyHash string) (WarningOverrideRecord, bool, error) {
+	row := r.db.QueryRowContext(ctx, `
+SELECT id, plugin_id, artifact_id, profile, action, policy_hash, reason, created_by, expires_at, created_at
+FROM plugin_warning_overrides
+WHERE plugin_id = ? AND artifact_id = ? AND profile = ? AND action = ? AND policy_hash = ? AND expires_at > ?
+ORDER BY expires_at DESC, id DESC
+LIMIT 1`, pluginID, artifactID, profile, action, policyHash, r.now().Unix())
+	override, err := scanWarningOverride(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return WarningOverrideRecord{}, false, nil
+	}
+	if err != nil {
+		return WarningOverrideRecord{}, false, err
+	}
+	return override, true, nil
+}
+
+func (r Repository) ListWarningOverrides(ctx context.Context, pluginID string) ([]WarningOverrideRecord, error) {
+	query := `
+SELECT id, plugin_id, artifact_id, profile, action, policy_hash, reason, created_by, expires_at, created_at
+FROM plugin_warning_overrides`
+	var args []any
+	if pluginID != "" {
+		query += ` WHERE plugin_id = ?`
+		args = append(args, pluginID)
+	}
+	query += ` ORDER BY created_at DESC, id DESC`
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var overrides []WarningOverrideRecord
+	for rows.Next() {
+		override, err := scanWarningOverride(rows)
+		if err != nil {
+			return nil, err
+		}
+		overrides = append(overrides, override)
+	}
+	return overrides, rows.Err()
+}
+
+func (r Repository) UpsertAdvisory(ctx context.Context, actor string, req AdvisoryRequest) (AdvisoryRecord, error) {
+	now := r.now().Unix()
+	if req.Status == "" {
+		req.Status = AdvisoryStatusActive
+	}
+	if req.Action == "" {
+		req.Action = AdvisoryActionDenylist
+	}
+	if strings.TrimSpace(req.AdvisoryID) == "" {
+		return AdvisoryRecord{}, errors.New("advisory_id is required")
+	}
+	res, err := r.db.ExecContext(ctx, `
+UPDATE plugin_advisories
+SET status = ?, action = ?, artifact_sha256 = ?, plugin_id = ?, version_range = ?,
+    dependency_name = ?, dependency_range = ?, recommended_action = ?, fixed_version = ?,
+    mitigation = ?, created_by = ?, updated_at = ?
+WHERE advisory_id = ?`,
+		req.Status, req.Action, req.ArtifactSHA256, req.PluginID, req.VersionRange,
+		req.DependencyName, req.DependencyRange, req.RecommendedAction, req.FixedVersion,
+		req.Mitigation, actor, now, req.AdvisoryID)
+	if err != nil {
+		return AdvisoryRecord{}, err
+	}
+	if rows, _ := res.RowsAffected(); rows == 0 {
+		_, err = r.db.ExecContext(ctx, `
+INSERT INTO plugin_advisories(
+    advisory_id, status, action, artifact_sha256, plugin_id, version_range, dependency_name,
+    dependency_range, recommended_action, fixed_version, mitigation, created_by, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			req.AdvisoryID, req.Status, req.Action, req.ArtifactSHA256, req.PluginID, req.VersionRange, req.DependencyName,
+			req.DependencyRange, req.RecommendedAction, req.FixedVersion, req.Mitigation, actor, now, now)
+		if err != nil {
+			return AdvisoryRecord{}, err
+		}
+	}
+	return r.AdvisoryByID(ctx, req.AdvisoryID)
+}
+
+func (r Repository) AdvisoryByID(ctx context.Context, advisoryID string) (AdvisoryRecord, error) {
+	row := r.db.QueryRowContext(ctx, `
+SELECT id, advisory_id, status, action, artifact_sha256, plugin_id, version_range, dependency_name,
+       dependency_range, recommended_action, fixed_version, mitigation, created_by, created_at, updated_at
+FROM plugin_advisories
+WHERE advisory_id = ?
+ORDER BY id DESC
+LIMIT 1`, advisoryID)
+	return scanAdvisory(row)
+}
+
+func (r Repository) ListAdvisories(ctx context.Context, pluginID string) ([]AdvisoryRecord, error) {
+	query := `
+SELECT id, advisory_id, status, action, artifact_sha256, plugin_id, version_range, dependency_name,
+       dependency_range, recommended_action, fixed_version, mitigation, created_by, created_at, updated_at
+FROM plugin_advisories`
+	var args []any
+	if pluginID != "" {
+		query += ` WHERE plugin_id = ? OR plugin_id = ''`
+		args = append(args, pluginID)
+	}
+	query += ` ORDER BY updated_at DESC, id DESC`
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var advisories []AdvisoryRecord
+	for rows.Next() {
+		advisory, err := scanAdvisory(rows)
+		if err != nil {
+			return nil, err
+		}
+		advisories = append(advisories, advisory)
+	}
+	return advisories, rows.Err()
+}
+
+func (r Repository) SavePreflight(ctx context.Context, record PreflightRecord) (PreflightRecord, error) {
+	now := r.now().Unix()
+	if record.CreatedAt == 0 {
+		record.CreatedAt = now
+	}
+	if record.Profile == "" {
+		record.Profile = PolicyProfileDev
+	}
+	if record.ResultJSON == "" || !json.Valid([]byte(record.ResultJSON)) {
+		record.ResultJSON = "{}"
+	}
+	_, err := r.db.ExecContext(ctx, `
+INSERT INTO plugin_preflight_results(plugin_id, artifact_id, profile, status, result_json, created_by, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		record.PluginID, record.ArtifactID, record.Profile, record.Status, record.ResultJSON, record.CreatedBy, record.CreatedAt)
+	if err != nil {
+		return PreflightRecord{}, err
+	}
+	id, err := lastInsertID(ctx, r.db)
+	if err != nil {
+		return PreflightRecord{}, err
+	}
+	record.ID = id
+	return record, nil
+}
+
+func (r Repository) ListPreflights(ctx context.Context, pluginID string) ([]PreflightRecord, error) {
+	query := `
+SELECT id, plugin_id, artifact_id, profile, status, result_json, created_by, created_at
+FROM plugin_preflight_results`
+	var args []any
+	if pluginID != "" {
+		query += ` WHERE plugin_id = ?`
+		args = append(args, pluginID)
+	}
+	query += ` ORDER BY created_at DESC, id DESC`
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var records []PreflightRecord
+	for rows.Next() {
+		record, err := scanPreflight(rows)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	return records, rows.Err()
+}
+
+func (r Repository) SaveBenchmark(ctx context.Context, actor string, req BenchmarkRequest) (BenchmarkRecord, error) {
+	now := r.now().Unix()
+	if req.Profile == "" {
+		req.Profile = PolicyProfileDev
+	}
+	record := BenchmarkRecord{
+		PluginID:            "",
+		ArtifactID:          req.ArtifactID,
+		Profile:             req.Profile,
+		BenchmarkProfile:    req.BenchmarkProfile,
+		P95MS:               req.P95MS,
+		P99MS:               req.P99MS,
+		ErrorRate:           req.ErrorRate,
+		ActiveProxyCapacity: req.ActiveProxyCapacity,
+		BaselineDiff:        req.BaselineDiff,
+		CreatedBy:           actor,
+		CreatedAt:           now,
+	}
+	artifact, err := r.Artifact(ctx, req.ArtifactID)
+	if err != nil {
+		return BenchmarkRecord{}, err
+	}
+	record.PluginID = artifact.PluginID
+	_, err = r.db.ExecContext(ctx, `
+INSERT INTO plugin_benchmarks(
+    plugin_id, artifact_id, profile, benchmark_profile, p95_ms, p99_ms, error_rate,
+    active_proxy_capacity, baseline_diff, created_by, created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		record.PluginID, record.ArtifactID, record.Profile, record.BenchmarkProfile, record.P95MS, record.P99MS, record.ErrorRate,
+		record.ActiveProxyCapacity, record.BaselineDiff, record.CreatedBy, record.CreatedAt)
+	if err != nil {
+		return BenchmarkRecord{}, err
+	}
+	id, err := lastInsertID(ctx, r.db)
+	if err != nil {
+		return BenchmarkRecord{}, err
+	}
+	record.ID = id
+	return record, nil
+}
+
+func (r Repository) ListBenchmarks(ctx context.Context, pluginID string) ([]BenchmarkRecord, error) {
+	query := `
+SELECT id, plugin_id, artifact_id, profile, benchmark_profile, p95_ms, p99_ms, error_rate,
+       active_proxy_capacity, baseline_diff, created_by, created_at
+FROM plugin_benchmarks`
+	var args []any
+	if pluginID != "" {
+		query += ` WHERE plugin_id = ?`
+		args = append(args, pluginID)
+	}
+	query += ` ORDER BY created_at DESC, id DESC`
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var records []BenchmarkRecord
+	for rows.Next() {
+		record, err := scanBenchmark(rows)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	return records, rows.Err()
+}
+
+func (r Repository) LatestBenchmark(ctx context.Context, pluginID, artifactID, profile string) (BenchmarkRecord, error) {
+	row := r.db.QueryRowContext(ctx, `
+SELECT id, plugin_id, artifact_id, profile, benchmark_profile, p95_ms, p99_ms, error_rate,
+       active_proxy_capacity, baseline_diff, created_by, created_at
+FROM plugin_benchmarks
+WHERE plugin_id = ? AND artifact_id = ? AND profile = ?
+ORDER BY created_at DESC, id DESC
+LIMIT 1`, pluginID, artifactID, profile)
+	benchmark, err := scanBenchmark(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return BenchmarkRecord{}, nil
+	}
+	return benchmark, err
+}
+
 func (r Repository) RecordOperation(ctx context.Context, pluginID, artifactID, operation, status, actor, message string, metadata any) error {
 	metadataJSON, err := marshalDefaultObject(metadata)
 	if err != nil {
@@ -689,6 +1043,55 @@ func scanBuild(row rowScanner) (BuildRecord, error) {
 	)
 	build.VendorRequired = vendorRequired != 0
 	return build, err
+}
+
+func scanReview(row rowScanner) (ReviewRecord, error) {
+	var review ReviewRecord
+	err := row.Scan(
+		&review.ID, &review.PluginID, &review.ArtifactID, &review.Profile, &review.RiskLevel,
+		&review.ConfigHash, &review.ScopeHash, &review.RolloutHash, &review.RuntimeLimitsHash,
+		&review.FeaturesHash, &review.PolicyHash, &review.Decision, &review.Notes, &review.ReviewedBy, &review.CreatedAt,
+	)
+	return review, err
+}
+
+func scanWarningOverride(row rowScanner) (WarningOverrideRecord, error) {
+	var override WarningOverrideRecord
+	err := row.Scan(
+		&override.ID, &override.PluginID, &override.ArtifactID, &override.Profile, &override.Action,
+		&override.PolicyHash, &override.Reason, &override.CreatedBy, &override.ExpiresAt, &override.CreatedAt,
+	)
+	return override, err
+}
+
+func scanAdvisory(row rowScanner) (AdvisoryRecord, error) {
+	var advisory AdvisoryRecord
+	err := row.Scan(
+		&advisory.ID, &advisory.AdvisoryID, &advisory.Status, &advisory.Action, &advisory.ArtifactSHA256,
+		&advisory.PluginID, &advisory.VersionRange, &advisory.DependencyName, &advisory.DependencyRange,
+		&advisory.RecommendedAction, &advisory.FixedVersion, &advisory.Mitigation, &advisory.CreatedBy,
+		&advisory.CreatedAt, &advisory.UpdatedAt,
+	)
+	return advisory, err
+}
+
+func scanPreflight(row rowScanner) (PreflightRecord, error) {
+	var record PreflightRecord
+	err := row.Scan(
+		&record.ID, &record.PluginID, &record.ArtifactID, &record.Profile, &record.Status,
+		&record.ResultJSON, &record.CreatedBy, &record.CreatedAt,
+	)
+	return record, err
+}
+
+func scanBenchmark(row rowScanner) (BenchmarkRecord, error) {
+	var record BenchmarkRecord
+	err := row.Scan(
+		&record.ID, &record.PluginID, &record.ArtifactID, &record.Profile, &record.BenchmarkProfile,
+		&record.P95MS, &record.P99MS, &record.ErrorRate, &record.ActiveProxyCapacity,
+		&record.BaselineDiff, &record.CreatedBy, &record.CreatedAt,
+	)
+	return record, err
 }
 
 func marshalDefaultObject(value any) (string, error) {

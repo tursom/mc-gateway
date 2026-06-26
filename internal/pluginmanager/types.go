@@ -53,6 +53,34 @@ const (
 	RuntimeDisabled  = "disabled"
 	RuntimeDraining  = "draining"
 
+	PolicyProfileDev     = "dev"
+	PolicyProfileStaging = "staging"
+	PolicyProfileProd    = "prod"
+
+	RiskLow    = "low"
+	RiskMedium = "medium"
+	RiskHigh   = "high"
+
+	GateSeverityWarning  = "warning"
+	GateSeverityBlocking = "blocking"
+	GateSeverityInfo     = "info"
+
+	GovernanceActionEnable    = "enable"
+	GovernanceActionRollback  = "rollback"
+	GovernanceActionPromotion = "promotion_apply"
+
+	AdvisoryActionDenylist   = "denylist"
+	AdvisoryActionQuarantine = "quarantine"
+	AdvisoryActionRevoke     = "revoke"
+	AdvisoryActionMitigate   = "mitigate"
+
+	ReviewDecisionApproved = "approved"
+	ReviewDecisionRejected = "rejected"
+
+	AdvisoryStatusActive  = "active"
+	AdvisoryStatusRevoked = "revoked"
+	AdvisoryStatusAcked   = "acknowledged"
+
 	DefaultPriority            = 100
 	DefaultHandlerTimeout      = 3 * time.Second
 	DefaultManifestMaxBytes    = 256 * 1024
@@ -256,6 +284,196 @@ type SecretRecord struct {
 	UpdatedBy       string `json:"updated_by"`
 	CreatedAt       int64  `json:"created_at"`
 	UpdatedAt       int64  `json:"updated_at"`
+}
+
+type PolicySnapshot struct {
+	Profile                   string  `json:"profile"`
+	WarningOverrideTTLSeconds int64   `json:"warning_override_ttl_seconds"`
+	ReviewRequiredRisk        string  `json:"review_required_risk"`
+	WarnBenchmarkRegression   float64 `json:"warn_benchmark_regression"`
+	BlockBenchmarkRegression  float64 `json:"block_benchmark_regression"`
+	CreatedAt                 int64   `json:"created_at"`
+}
+
+type GovernanceIssue struct {
+	Code       string         `json:"code"`
+	Severity   string         `json:"severity"`
+	Message    string         `json:"message"`
+	PluginID   string         `json:"plugin_id,omitempty"`
+	ArtifactID string         `json:"artifact_id,omitempty"`
+	Details    map[string]any `json:"details,omitempty"`
+}
+
+type GovernanceDecision struct {
+	OK                  bool              `json:"ok"`
+	Action              string            `json:"action"`
+	Profile             string            `json:"profile"`
+	RiskLevel           string            `json:"risk_level"`
+	PolicyHash          string            `json:"policy_hash"`
+	ReviewRequired      bool              `json:"review_required"`
+	WarningOverrideUsed bool              `json:"warning_override_used"`
+	Issues              []GovernanceIssue `json:"issues"`
+	Checks              []GovernanceIssue `json:"checks"`
+	CreatedAt           int64             `json:"created_at"`
+}
+
+type ConflictAnalysis struct {
+	OK        bool              `json:"ok"`
+	Issues    []GovernanceIssue `json:"issues"`
+	Plan      DispatchPlan      `json:"plan"`
+	CreatedAt int64             `json:"created_at"`
+}
+
+type PreflightCheck struct {
+	Code     string         `json:"code"`
+	Severity string         `json:"severity"`
+	Message  string         `json:"message"`
+	Details  map[string]any `json:"details,omitempty"`
+}
+
+type PreflightResult struct {
+	OK        bool             `json:"ok"`
+	Profile   string           `json:"profile"`
+	Checks    []PreflightCheck `json:"checks"`
+	CreatedAt int64            `json:"created_at"`
+}
+
+type GovernanceStatus struct {
+	Decision         GovernanceDecision      `json:"decision"`
+	Policy           PolicySnapshot          `json:"policy"`
+	Reviews          []ReviewRecord          `json:"reviews"`
+	WarningOverrides []WarningOverrideRecord `json:"warning_overrides"`
+	Preflights       []PreflightRecord       `json:"preflights"`
+	Benchmarks       []BenchmarkRecord       `json:"benchmarks"`
+	Advisories       []AdvisoryRecord        `json:"advisories"`
+	Conflicts        ConflictAnalysis        `json:"conflicts"`
+}
+
+type ReviewRecord struct {
+	ID                int64  `json:"id"`
+	PluginID          string `json:"plugin_id"`
+	ArtifactID        string `json:"artifact_id"`
+	Profile           string `json:"profile"`
+	RiskLevel         string `json:"risk_level"`
+	ConfigHash        string `json:"config_hash"`
+	ScopeHash         string `json:"scope_hash"`
+	RolloutHash       string `json:"rollout_hash"`
+	RuntimeLimitsHash string `json:"runtime_limits_hash"`
+	FeaturesHash      string `json:"features_hash"`
+	PolicyHash        string `json:"policy_hash"`
+	Decision          string `json:"decision"`
+	Notes             string `json:"notes"`
+	ReviewedBy        string `json:"reviewed_by"`
+	CreatedAt         int64  `json:"created_at"`
+}
+
+type WarningOverrideRecord struct {
+	ID         int64  `json:"id"`
+	PluginID   string `json:"plugin_id"`
+	ArtifactID string `json:"artifact_id"`
+	Profile    string `json:"profile"`
+	Action     string `json:"action"`
+	PolicyHash string `json:"policy_hash"`
+	Reason     string `json:"reason"`
+	CreatedBy  string `json:"created_by"`
+	ExpiresAt  int64  `json:"expires_at"`
+	CreatedAt  int64  `json:"created_at"`
+}
+
+type AdvisoryRecord struct {
+	ID                int64  `json:"id"`
+	AdvisoryID        string `json:"advisory_id"`
+	Status            string `json:"status"`
+	Action            string `json:"action"`
+	ArtifactSHA256    string `json:"artifact_sha256"`
+	PluginID          string `json:"plugin_id"`
+	VersionRange      string `json:"version_range"`
+	DependencyName    string `json:"dependency_name"`
+	DependencyRange   string `json:"dependency_range"`
+	RecommendedAction string `json:"recommended_action"`
+	FixedVersion      string `json:"fixed_version"`
+	Mitigation        string `json:"mitigation"`
+	CreatedBy         string `json:"created_by"`
+	CreatedAt         int64  `json:"created_at"`
+	UpdatedAt         int64  `json:"updated_at"`
+}
+
+type PreflightRecord struct {
+	ID         int64  `json:"id"`
+	PluginID   string `json:"plugin_id"`
+	ArtifactID string `json:"artifact_id"`
+	Profile    string `json:"profile"`
+	Status     string `json:"status"`
+	ResultJSON string `json:"result_json"`
+	CreatedBy  string `json:"created_by"`
+	CreatedAt  int64  `json:"created_at"`
+}
+
+type BenchmarkRecord struct {
+	ID                  int64   `json:"id"`
+	PluginID            string  `json:"plugin_id"`
+	ArtifactID          string  `json:"artifact_id"`
+	Profile             string  `json:"profile"`
+	BenchmarkProfile    string  `json:"benchmark_profile"`
+	P95MS               float64 `json:"p95_ms"`
+	P99MS               float64 `json:"p99_ms"`
+	ErrorRate           float64 `json:"error_rate"`
+	ActiveProxyCapacity int64   `json:"active_proxy_capacity"`
+	BaselineDiff        float64 `json:"baseline_diff"`
+	CreatedBy           string  `json:"created_by"`
+	CreatedAt           int64   `json:"created_at"`
+}
+
+type GovernanceReviewRequest struct {
+	ArtifactID string `json:"artifact_id"`
+	Profile    string `json:"profile"`
+	Decision   string `json:"decision"`
+	Notes      string `json:"notes"`
+}
+
+type WarningOverrideRequest struct {
+	ArtifactID string `json:"artifact_id"`
+	Profile    string `json:"profile"`
+	Action     string `json:"action"`
+	Reason     string `json:"reason"`
+	TTLSeconds int64  `json:"ttl_seconds"`
+}
+
+type PreflightRequest struct {
+	ArtifactID string `json:"artifact_id"`
+	Profile    string `json:"profile"`
+	Action     string `json:"action"`
+	ConfigJSON string `json:"config_json"`
+}
+
+type SelfTestRequest struct {
+	ArtifactID string `json:"artifact_id"`
+	Profile    string `json:"profile"`
+}
+
+type AdvisoryRequest struct {
+	AdvisoryID        string `json:"advisory_id"`
+	Status            string `json:"status"`
+	Action            string `json:"action"`
+	ArtifactSHA256    string `json:"artifact_sha256"`
+	PluginID          string `json:"plugin_id"`
+	VersionRange      string `json:"version_range"`
+	DependencyName    string `json:"dependency_name"`
+	DependencyRange   string `json:"dependency_range"`
+	RecommendedAction string `json:"recommended_action"`
+	FixedVersion      string `json:"fixed_version"`
+	Mitigation        string `json:"mitigation"`
+}
+
+type BenchmarkRequest struct {
+	ArtifactID          string  `json:"artifact_id"`
+	Profile             string  `json:"profile"`
+	BenchmarkProfile    string  `json:"benchmark_profile"`
+	P95MS               float64 `json:"p95_ms"`
+	P99MS               float64 `json:"p99_ms"`
+	ErrorRate           float64 `json:"error_rate"`
+	ActiveProxyCapacity int64   `json:"active_proxy_capacity"`
+	BaselineDiff        float64 `json:"baseline_diff"`
 }
 
 type ProxyConnectionSummary struct {

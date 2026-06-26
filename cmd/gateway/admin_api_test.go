@@ -314,6 +314,105 @@ func TestAdminPluginPhase4API(t *testing.T) {
 	}
 }
 
+func TestAdminPluginPhase5GovernanceAPI(t *testing.T) {
+	handler := newAdminTestHandlerWithAdmin(t)
+	pluginsManager = pluginmanager.New(pluginmanager.Options{
+		DB:           adminDB,
+		ArtifactRoot: filepath.Join(filepath.Dir(adminDBPath), "plugins", "artifacts"),
+		Adapter:      gatewayTestPluginAdapter{},
+	})
+	adminToken := adminTestLogin(t, handler, "admin", "secret")
+	resp := adminTestRequest(t, handler, http.MethodPost, "/admin/api/users", adminToken, map[string]any{
+		"username": "member",
+		"role":     "member",
+		"password": "member-secret",
+	})
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("create member status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	memberToken := adminTestLogin(t, handler, "member", "member-secret")
+
+	artifact := uploadGatewayPhase5ProtocolProxyArtifact(t, "phase5-proxy")
+	if _, err := pluginsManager.SetDesired(context.Background(), "admin", "phase5-proxy", artifact.ID, pluginmanager.DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	resp = adminTestRequest(t, handler, http.MethodGet, "/admin/api/plugins/phase5-proxy/governance?profile=prod", memberToken, nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("member governance status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "review_required") {
+		t.Fatalf("governance status body = %s, want review_required", resp.Body.String())
+	}
+	resp = adminTestRequest(t, handler, http.MethodPost, "/admin/api/plugins/phase5-proxy/governance/review", memberToken, map[string]any{
+		"artifact_id": artifact.ID,
+		"profile":     pluginmanager.PolicyProfileProd,
+	})
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("member review write status = %d, want forbidden; body=%s", resp.Code, resp.Body.String())
+	}
+	resp = adminTestRequest(t, handler, http.MethodPost, "/admin/api/plugins/phase5-proxy/governance/review", adminToken, map[string]any{
+		"artifact_id": artifact.ID,
+		"profile":     pluginmanager.PolicyProfileProd,
+		"decision":    pluginmanager.ReviewDecisionApproved,
+		"notes":       "phase 5 approval",
+	})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("admin review write status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	resp = adminTestRequest(t, handler, http.MethodPost, "/admin/api/plugins/phase5-proxy/governance/preflight", adminToken, map[string]any{
+		"artifact_id": artifact.ID,
+		"profile":     pluginmanager.PolicyProfileProd,
+		"action":      pluginmanager.GovernanceActionEnable,
+	})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("preflight status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	resp = adminTestRequest(t, handler, http.MethodPost, "/admin/api/plugins/phase5-proxy/governance/benchmark", adminToken, map[string]any{
+		"artifact_id":           artifact.ID,
+		"profile":               pluginmanager.PolicyProfileProd,
+		"benchmark_profile":     "release",
+		"p95_ms":                10,
+		"p99_ms":                20,
+		"baseline_diff":         0.25,
+		"active_proxy_capacity": 100,
+	})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("benchmark status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	resp = adminTestRequest(t, handler, http.MethodPost, "/admin/api/plugins/phase5-proxy/governance/override", adminToken, map[string]any{
+		"artifact_id": artifact.ID,
+		"profile":     pluginmanager.PolicyProfileProd,
+		"action":      pluginmanager.GovernanceActionEnable,
+		"reason":      "accepted warning for rollout",
+		"ttl_seconds": 3600,
+	})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("override status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	resp = adminTestRequest(t, handler, http.MethodPost, "/admin/api/plugin-advisories", adminToken, map[string]any{
+		"advisory_id":     "MCG-2026-ADMIN",
+		"status":          pluginmanager.AdvisoryStatusRevoked,
+		"action":          pluginmanager.AdvisoryActionRevoke,
+		"artifact_sha256": artifact.SHA256,
+	})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("advisory status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	resp = adminTestRequest(t, handler, http.MethodGet, "/admin/api/plugin-advisories?plugin_id=phase5-proxy", memberToken, nil)
+	if resp.Code != http.StatusOK || !strings.Contains(resp.Body.String(), "MCG-2026-ADMIN") {
+		t.Fatalf("member advisory read status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	resp = adminTestRequest(t, handler, http.MethodGet, "/admin/api/audit-logs", adminToken, nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("audit status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	for _, action := range []string{"plugin_governance_review", "plugin_governance_override", "plugin_governance_advisory"} {
+		if !strings.Contains(resp.Body.String(), action) {
+			t.Fatalf("audit body missing %s: %s", action, resp.Body.String())
+		}
+	}
+}
+
 func uploadGatewayPhase4Artifact(t *testing.T, pluginID string) pluginmanager.ArtifactRecord {
 	t.Helper()
 	var manifest pluginmanager.Manifest
@@ -329,6 +428,31 @@ func uploadGatewayPhase4Artifact(t *testing.T, pluginID string) pluginmanager.Ar
 			Reload: "reload_required",
 		},
 	}}
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("Marshal manifest error = %v", err)
+	}
+	artifact, err := pluginsManager.UploadArtifact(context.Background(), pluginmanager.ArtifactUpload{
+		SourcePath: writeGatewayTestMCGPEntries(t, map[string][]byte{
+			"manifest.json": manifestBytes,
+			"plugin.so":     []byte("fake plugin bytes " + pluginID),
+		}),
+		FileName: pluginID + ".mcgp",
+		Actor:    "admin",
+	})
+	if err != nil {
+		t.Fatalf("UploadArtifact() error = %v", err)
+	}
+	return artifact
+}
+
+func uploadGatewayPhase5ProtocolProxyArtifact(t *testing.T, pluginID string) pluginmanager.ArtifactRecord {
+	t.Helper()
+	var manifest pluginmanager.Manifest
+	if err := json.Unmarshal(gatewayTestManifestWithCapabilities(t, pluginID, gatewayProtocolProxyCapabilities()), &manifest); err != nil {
+		t.Fatalf("Unmarshal manifest error = %v", err)
+	}
+	manifest.RuntimeLimits = pluginmanager.RuntimeLimits{HandlerTimeoutMS: 3000}
 	manifestBytes, err := json.Marshal(manifest)
 	if err != nil {
 		t.Fatalf("Marshal manifest error = %v", err)

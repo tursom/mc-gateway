@@ -671,6 +671,175 @@ func handleAdminPluginDispatchPlan(w http.ResponseWriter, r *http.Request) {
 	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"dispatch_plan": pluginsManager.DispatchPlan(r.Context())})
 }
 
+func handleAdminPluginGovernance(w http.ResponseWriter, r *http.Request, rawSegment string) {
+	session, ok := requireRole(w, r, adminRoleMember)
+	if !ok {
+		return
+	}
+	if pluginsManager == nil {
+		adminhttp.WriteAPIError(w, http.StatusServiceUnavailable, "plugin manager is not initialized")
+		return
+	}
+	pluginID, action, ok := splitPluginSubresource(w, rawSegment, "governance")
+	if !ok {
+		return
+	}
+	switch {
+	case r.Method == http.MethodGet && action == "":
+		status, err := pluginsManager.GovernanceStatus(r.Context(), pluginID, r.URL.Query().Get("artifact_id"), r.URL.Query().Get("profile"))
+		if err != nil {
+			writePluginManagerError(w, err)
+			return
+		}
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"governance": status})
+	case r.Method == http.MethodPost && action == "review":
+		if session.Role != adminRoleAdmin {
+			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		var req pluginmanager.GovernanceReviewRequest
+		if !adminhttp.DecodeJSONRequest(w, r, &req) {
+			return
+		}
+		review, err := pluginsManager.CreateReview(r.Context(), session.Username, pluginID, req)
+		if err != nil {
+			recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_review", "plugin", pluginID, false, err.Error())
+			writePluginManagerError(w, err)
+			return
+		}
+		recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_review", "plugin", pluginID, true, "governance review recorded", map[string]any{
+			"artifact_id": review.ArtifactID,
+			"profile":     review.Profile,
+			"policy_hash": review.PolicyHash,
+			"decision":    review.Decision,
+		})
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"review": review})
+	case r.Method == http.MethodPost && action == "override":
+		if session.Role != adminRoleAdmin {
+			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		var req pluginmanager.WarningOverrideRequest
+		if !adminhttp.DecodeJSONRequest(w, r, &req) {
+			return
+		}
+		override, err := pluginsManager.CreateWarningOverride(r.Context(), session.Username, pluginID, req)
+		if err != nil {
+			recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_override", "plugin", pluginID, false, err.Error())
+			writePluginManagerError(w, err)
+			return
+		}
+		recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_override", "plugin", pluginID, true, "governance warning override recorded", map[string]any{
+			"artifact_id": override.ArtifactID,
+			"profile":     override.Profile,
+			"action":      override.Action,
+			"expires_at":  override.ExpiresAt,
+		})
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"override": override})
+	case r.Method == http.MethodPost && action == "preflight":
+		if session.Role != adminRoleAdmin {
+			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		var req pluginmanager.PreflightRequest
+		if !adminhttp.DecodeJSONRequest(w, r, &req) {
+			return
+		}
+		result, err := pluginsManager.RunPreflight(r.Context(), session.Username, pluginID, req)
+		if err != nil {
+			recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_preflight", "plugin", pluginID, false, err.Error())
+			writePluginManagerError(w, err)
+			return
+		}
+		recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_preflight", "plugin", pluginID, result.OK, "governance preflight completed", map[string]any{"profile": result.Profile})
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"preflight": result})
+	case r.Method == http.MethodPost && action == "self-test":
+		if session.Role != adminRoleAdmin {
+			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		var req pluginmanager.SelfTestRequest
+		if !adminhttp.DecodeJSONRequest(w, r, &req) {
+			return
+		}
+		result, err := pluginsManager.RunSelfTest(r.Context(), session.Username, pluginID, req)
+		if err != nil {
+			recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_self_test", "plugin", pluginID, false, err.Error())
+			writePluginManagerError(w, err)
+			return
+		}
+		recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_self_test", "plugin", pluginID, result.OK, "governance self-test completed", map[string]any{"profile": result.Profile})
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"self_test": result})
+	case r.Method == http.MethodPost && action == "benchmark":
+		if session.Role != adminRoleAdmin {
+			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		var req pluginmanager.BenchmarkRequest
+		if !adminhttp.DecodeJSONRequest(w, r, &req) {
+			return
+		}
+		benchmark, err := pluginsManager.SaveBenchmark(r.Context(), session.Username, req)
+		if err != nil {
+			recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_benchmark", "plugin", pluginID, false, err.Error())
+			writePluginManagerError(w, err)
+			return
+		}
+		recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_benchmark", "plugin", pluginID, true, "governance benchmark recorded", map[string]any{
+			"artifact_id":   benchmark.ArtifactID,
+			"profile":       benchmark.Profile,
+			"baseline_diff": benchmark.BaselineDiff,
+		})
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"benchmark": benchmark})
+	default:
+		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func handleAdminPluginAdvisories(w http.ResponseWriter, r *http.Request) {
+	session, ok := requireRole(w, r, adminRoleMember)
+	if !ok {
+		return
+	}
+	if pluginsManager == nil {
+		adminhttp.WriteAPIError(w, http.StatusServiceUnavailable, "plugin manager is not initialized")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		advisories, err := pluginsManager.ListAdvisories(r.Context(), r.URL.Query().Get("plugin_id"))
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"advisories": advisories})
+	case http.MethodPost:
+		if session.Role != adminRoleAdmin {
+			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		var req pluginmanager.AdvisoryRequest
+		if !adminhttp.DecodeJSONRequest(w, r, &req) {
+			return
+		}
+		advisory, err := pluginsManager.UpsertAdvisory(r.Context(), session.Username, req)
+		if err != nil {
+			recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_advisory", "plugin_advisory", req.AdvisoryID, false, err.Error())
+			writePluginManagerError(w, err)
+			return
+		}
+		recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_advisory", "plugin_advisory", advisory.AdvisoryID, true, "plugin advisory upserted", map[string]any{
+			"action":          advisory.Action,
+			"status":          advisory.Status,
+			"artifact_sha256": advisory.ArtifactSHA256,
+			"plugin_id":       advisory.PluginID,
+		})
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"advisory": advisory})
+	default:
+		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
 func receivePluginArtifact(r *http.Request, actor string) (pluginmanager.ArtifactRecord, error) {
 	if err := r.ParseMultipartForm(64 << 20); err != nil {
 		return pluginmanager.ArtifactRecord{}, err
@@ -870,6 +1039,12 @@ func pluginView(r *http.Request, plugin pluginmanager.PluginRecord, detail bool)
 	if detail {
 		view["manifest"] = manifest
 		view["operations_path"] = "/plugin-artifacts?plugin_id=" + plugin.ID
+		governance, err := pluginsManager.GovernanceStatus(r.Context(), plugin.ID, plugin.DesiredArtifactID, pluginsManager.PolicyProfile())
+		if err != nil {
+			view["governance_error"] = err.Error()
+		} else {
+			view["governance"] = governance
+		}
 		view["active_proxy_connections"] = activeProxyConnections(plugin)
 		connections, err := pluginsManager.ActiveProxyConnections(r.Context(), plugin.ID)
 		if err != nil {

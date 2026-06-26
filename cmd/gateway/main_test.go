@@ -279,6 +279,18 @@ func uploadGatewayTestArtifactWithCapabilities(t *testing.T, manager *pluginmana
 	return artifact
 }
 
+func approveGatewayPluginGovernanceForTest(t *testing.T, pluginID, artifactID string) {
+	t.Helper()
+	if _, err := pluginsManager.CreateReview(context.Background(), "admin", pluginID, pluginmanager.GovernanceReviewRequest{
+		ArtifactID: artifactID,
+		Profile:    pluginmanager.PolicyProfileProd,
+		Decision:   pluginmanager.ReviewDecisionApproved,
+		Notes:      "test approval",
+	}); err != nil {
+		t.Fatalf("CreateReview(%s) error = %v", pluginID, err)
+	}
+}
+
 func writeGatewayTestMCGP(t *testing.T, pluginID string) string {
 	return writeGatewayTestMCGPWithCapabilities(t, pluginID, "")
 }
@@ -320,6 +332,18 @@ func writeGatewayTestMCGPEntries(t *testing.T, entries map[string][]byte) string
 
 func gatewayTestManifest(t *testing.T, pluginID string) []byte {
 	return gatewayTestManifestWithCapabilities(t, pluginID, "")
+}
+
+func gatewayProtocolProxyCapabilities() string {
+	return `{
+		"upstream_connect":{"mode":"protocol-proxy"},
+		"scope":{"type":"host","values":["play.example"]},
+		"rollout":{"mode":"canary"},
+		"minecraft":{
+			"protocol_versions":{"tested":[767]},
+			"forwarding":{"supported":["none"],"default":"none"}
+		}
+	}`
 }
 
 func gatewayTestManifestWithCapabilities(t *testing.T, pluginID string, capabilities string) []byte {

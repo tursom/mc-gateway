@@ -23,6 +23,44 @@ type (
 		ReloadConfig(config any) error
 	}
 
+	PreflightCheck struct {
+		Code     string `json:"code"`
+		Severity string `json:"severity"`
+		Message  string `json:"message"`
+	}
+
+	PreflightContext struct {
+		PluginID      string         `json:"plugin_id"`
+		ArtifactID    string         `json:"artifact_id"`
+		Profile       string         `json:"profile"`
+		Action        string         `json:"action"`
+		Config        map[string]any `json:"config,omitempty"`
+		Scope         any            `json:"scope,omitempty"`
+		Rollout       any            `json:"rollout,omitempty"`
+		RuntimeLimits any            `json:"runtime_limits,omitempty"`
+		Features      []string       `json:"features,omitempty"`
+	}
+
+	PreflightResult struct {
+		Checks []PreflightCheck `json:"checks"`
+	}
+
+	SelfTestProfile struct {
+		Name string `json:"name"`
+	}
+
+	SelfTestResult struct {
+		Checks []PreflightCheck `json:"checks"`
+	}
+
+	PreflightChecker interface {
+		Preflight(context any) (PreflightResult, error)
+	}
+
+	SelfTester interface {
+		SelfTest(profile SelfTestProfile) (SelfTestResult, error)
+	}
+
 	Gateway interface {
 		HandleConn(conn net.Conn)
 
