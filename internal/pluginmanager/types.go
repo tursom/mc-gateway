@@ -19,12 +19,17 @@ const (
 	ArtifactTypeSource = "source"
 	RuntimeGoPlugin    = "go-plugin"
 	RuntimeBuiltin     = "builtin"
+	RuntimeSandbox     = "sandbox-process"
+	RuntimeWASM        = "wasm"
 	RuntimeEntry       = "plugin.so"
+	RuntimeWASMEntry   = "plugin.wasm"
 	SourceBuildEntry   = "."
 
 	ExtensionUpstreamConnect   = "upstream.connect/v1"
 	ExtensionRouteResolve      = "route.resolve/v1"
 	ExtensionRouteResolver     = "route.resolver/v1"
+	ExtensionRuleEvaluate      = "rule.evaluate/v1"
+	ExtensionConfigValidate    = "config.validate/v1"
 	ExtensionStatusPing        = "status.ping/v1"
 	ExtensionConnectionFilter  = "connection.filter/v1"
 	ExtensionHandshakeFilter   = "handshake.filter/v1"
@@ -63,6 +68,26 @@ const (
 	RuntimeFailed    = "failed"
 	RuntimeDisabled  = "disabled"
 	RuntimeDraining  = "draining"
+
+	PluginServiceModeInProcess       = "in-process"
+	PluginServiceModeGoPluginProcess = "go-plugin-process"
+	PluginServiceModeSandboxProcess  = "sandbox-process"
+
+	PluginMigrationDrainOnly = "drain-only"
+	PluginMigrationFDLive    = "fd-live"
+	PluginMigrationFDLiveSHM = "fd-live-shm"
+
+	RepositoryTypeOfficial = "official"
+	RepositoryTypeInternal = "internal"
+	RepositoryTypeFile     = "file"
+	RepositoryTypeURL      = "url"
+
+	SupplyChainStatusAllowed = "allowed"
+	SupplyChainStatusBlocked = "blocked"
+	SupplyChainStatusWarning = "warning"
+
+	InstrumentationStatusAvailable = "available"
+	InstrumentationStatusBlocked   = "blocked"
 
 	PolicyProfileDev     = "dev"
 	PolicyProfileStaging = "staging"
@@ -173,6 +198,7 @@ type ExtensionPoint struct {
 type RuntimeLimits struct {
 	HandlerTimeoutMS      int `json:"handler_timeout_ms"`
 	InitialWriteTimeoutMS int `json:"initial_write_timeout_ms"`
+	MemoryBytes           int `json:"memory_bytes,omitempty"`
 }
 
 type SecretSpec struct {
@@ -254,7 +280,13 @@ type CapabilitySummary struct {
 	ExternalDeps    []ExternalSpec            `json:"external_dependencies,omitempty"`
 	DataStores      []DataStoreSpec           `json:"data_stores,omitempty"`
 	FileStores      []FileStoreSpec           `json:"file_stores,omitempty"`
+	Runtime         RuntimeCapability         `json:"runtime,omitempty"`
 	Raw             json.RawMessage           `json:"raw,omitempty"`
+}
+
+type RuntimeCapability struct {
+	RequiredCapabilities []string `json:"required_capabilities,omitempty"`
+	RequiredFeatures     []string `json:"required_features,omitempty"`
 }
 
 type UpstreamConnectCapability struct {
@@ -668,6 +700,105 @@ type BuildRequest struct {
 	GONOSUMDB      string `json:"go_no_sumdb"`
 	GOPRIVATE      string `json:"go_private"`
 	VendorRequired bool   `json:"vendor_required"`
+}
+
+type PluginServiceState struct {
+	DesiredMode     string `json:"desired_mode"`
+	ActiveMode      string `json:"active_mode"`
+	AppliedAt       int64  `json:"applied_at"`
+	RestartRequired bool   `json:"restart_required"`
+	LiveMigration   string `json:"live_migration"`
+	LastError       string `json:"last_error"`
+	UpdatedBy       string `json:"updated_by"`
+	UpdatedAt       int64  `json:"updated_at"`
+}
+
+type PluginServiceStatus struct {
+	Service PluginServiceState         `json:"service"`
+	Hosts   []PluginHostRuntimeSummary `json:"hosts"`
+}
+
+type PluginHostRuntimeSummary struct {
+	PluginID    string `json:"plugin_id"`
+	ArtifactID  string `json:"artifact_id"`
+	State       string `json:"state"`
+	DrainMode   string `json:"drain_mode"`
+	CrashLoop   bool   `json:"crash_loop"`
+	CrashCount  int    `json:"crash_count"`
+	LastError   string `json:"last_error"`
+	StartedAt   int64  `json:"started_at"`
+	DrainingAt  int64  `json:"draining_at"`
+	ExitedAt    int64  `json:"exited_at"`
+	LastCrashAt int64  `json:"last_crash_at"`
+}
+
+type RepositoryImportRequest struct {
+	RepositoryType string `json:"repository_type"`
+	IndexPath      string `json:"index_path"`
+	ArtifactID     string `json:"artifact_id"`
+	PluginID       string `json:"plugin_id"`
+	Version        string `json:"version"`
+	TrustPolicy    string `json:"trust_policy"`
+}
+
+type RepositoryImportRecord struct {
+	ID             int64  `json:"id"`
+	RepositoryType string `json:"repository_type"`
+	IndexPath      string `json:"index_path"`
+	RepositoryName string `json:"repository_name"`
+	CandidateID    string `json:"candidate_id"`
+	PluginID       string `json:"plugin_id"`
+	Version        string `json:"version"`
+	ArtifactID     string `json:"artifact_id"`
+	PackageSHA256  string `json:"package_sha256"`
+	TrustPolicy    string `json:"trust_policy"`
+	AdmissionJSON  string `json:"admission_json"`
+	ImportedBy     string `json:"imported_by"`
+	CreatedAt      int64  `json:"created_at"`
+}
+
+type SupplyChainAssessment struct {
+	ID         int64             `json:"id"`
+	PluginID   string            `json:"plugin_id"`
+	ArtifactID string            `json:"artifact_id"`
+	Status     string            `json:"status"`
+	Issues     []GovernanceIssue `json:"issues"`
+	Signature  map[string]any    `json:"signature,omitempty"`
+	SBOM       map[string]any    `json:"sbom,omitempty"`
+	License    map[string]any    `json:"license,omitempty"`
+	Advisory   map[string]any    `json:"advisory,omitempty"`
+	Metadata   map[string]any    `json:"metadata,omitempty"`
+	CreatedBy  string            `json:"created_by"`
+	CreatedAt  int64             `json:"created_at"`
+}
+
+type InstrumentationRecord struct {
+	ID                int64  `json:"id"`
+	Name              string `json:"name"`
+	Version           string `json:"version"`
+	Profile           string `json:"profile"`
+	GeneratedDiffHash string `json:"generated_diff_hash"`
+	ProvenanceJSON    string `json:"provenance_json"`
+	ConformanceJSON   string `json:"conformance_json"`
+	BenchmarkJSON     string `json:"benchmark_json"`
+	SmokeJSON         string `json:"smoke_json"`
+	RunbookRollback   string `json:"runbook_rollback"`
+	Status            string `json:"status"`
+	CreatedBy         string `json:"created_by"`
+	CreatedAt         int64  `json:"created_at"`
+}
+
+type InstrumentationRequest struct {
+	Name              string         `json:"name"`
+	Version           string         `json:"version"`
+	Profile           string         `json:"profile"`
+	GeneratedDiffHash string         `json:"generated_diff_hash"`
+	Provenance        map[string]any `json:"provenance"`
+	Conformance       map[string]any `json:"conformance"`
+	Benchmark         map[string]any `json:"benchmark"`
+	Smoke             map[string]any `json:"smoke"`
+	RunbookRollback   string         `json:"runbook_rollback"`
+	Status            string         `json:"status"`
 }
 
 type GCCandidate struct {

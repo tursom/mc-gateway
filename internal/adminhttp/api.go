@@ -29,25 +29,29 @@ type APIHandlers struct {
 
 	AuditLogs http.HandlerFunc
 
-	PluginArtifacts    http.HandlerFunc
-	PluginArtifact     SegmentHandlerFunc
-	PluginSources      http.HandlerFunc
-	PluginBuilds       http.HandlerFunc
-	PluginBuild        SegmentHandlerFunc
-	PluginGC           http.HandlerFunc
-	PluginsList        http.HandlerFunc
-	PluginItem         SegmentHandlerFunc
-	PluginAction       SegmentHandlerFunc
-	PluginConfig       SegmentHandlerFunc
-	PluginSecrets      SegmentHandlerFunc
-	PluginRollback     SegmentHandlerFunc
-	PluginOperations   SegmentHandlerFunc
-	PluginOperationsGC http.HandlerFunc
-	PluginDraining     SegmentHandlerFunc
-	PluginDispatch     http.HandlerFunc
-	PluginGovernance   SegmentHandlerFunc
-	PluginAdvisories   http.HandlerFunc
-	PluginDiagnostics  SegmentHandlerFunc
+	PluginArtifacts       http.HandlerFunc
+	PluginArtifact        SegmentHandlerFunc
+	PluginSources         http.HandlerFunc
+	PluginBuilds          http.HandlerFunc
+	PluginBuild           SegmentHandlerFunc
+	PluginGC              http.HandlerFunc
+	PluginsList           http.HandlerFunc
+	PluginItem            SegmentHandlerFunc
+	PluginAction          SegmentHandlerFunc
+	PluginConfig          SegmentHandlerFunc
+	PluginSecrets         SegmentHandlerFunc
+	PluginRollback        SegmentHandlerFunc
+	PluginOperations      SegmentHandlerFunc
+	PluginOperationsGC    http.HandlerFunc
+	PluginDraining        SegmentHandlerFunc
+	PluginDispatch        http.HandlerFunc
+	PluginGovernance      SegmentHandlerFunc
+	PluginAdvisories      http.HandlerFunc
+	PluginDiagnostics     SegmentHandlerFunc
+	PluginService         http.HandlerFunc
+	PluginRepositories    http.HandlerFunc
+	PluginSupplyChain     http.HandlerFunc
+	PluginInstrumentation http.HandlerFunc
 }
 
 func NewAPIHandler(prefix string, handlers APIHandlers) http.HandlerFunc {
@@ -109,6 +113,14 @@ func NewAPIHandler(prefix string, handlers APIHandlers) http.HandlerFunc {
 			callHandler(w, r, handlers.PluginDispatch)
 		case path == "/plugin-advisories" && (r.Method == http.MethodGet || r.Method == http.MethodPost):
 			callHandler(w, r, handlers.PluginAdvisories)
+		case path == "/plugin-service" && (r.Method == http.MethodGet || r.Method == http.MethodPut || r.Method == http.MethodPost):
+			callHandler(w, r, handlers.PluginService)
+		case path == "/plugin-repositories/imports" && (r.Method == http.MethodGet || r.Method == http.MethodPost):
+			callHandler(w, r, handlers.PluginRepositories)
+		case path == "/plugin-supply-chain" && (r.Method == http.MethodGet || r.Method == http.MethodPost):
+			callHandler(w, r, handlers.PluginSupplyChain)
+		case path == "/plugin-instrumentation" && (r.Method == http.MethodGet || r.Method == http.MethodPost):
+			callHandler(w, r, handlers.PluginInstrumentation)
 		case strings.HasPrefix(path, "/plugins/"):
 			pluginPath := strings.TrimPrefix(path, "/plugins/")
 			if strings.Contains(pluginPath, "/governance/") || strings.HasSuffix(pluginPath, "/governance") {

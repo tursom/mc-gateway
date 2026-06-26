@@ -117,6 +117,44 @@ export interface PluginProxyConnection {
   draining: boolean;
 }
 
+export interface PluginServiceState {
+  desired_mode: string;
+  active_mode: string;
+  applied_at?: number;
+  restart_required: boolean;
+  live_migration?: string;
+  last_error?: string;
+  updated_by?: string;
+  updated_at?: number;
+}
+
+export interface PluginHostRuntimeSummary {
+  plugin_id: string;
+  artifact_id: string;
+  state: string;
+  drain_mode: string;
+  crash_loop: boolean;
+  crash_count: number;
+  last_error?: string;
+}
+
+export interface PluginServiceStatus {
+  service: PluginServiceState;
+  hosts?: PluginHostRuntimeSummary[];
+}
+
+export interface PluginInstrumentation {
+  id: number;
+  name: string;
+  version: string;
+  profile: string;
+  generated_diff_hash: string;
+  runbook_rollback: string;
+  status: string;
+  created_by?: string;
+  created_at?: number;
+}
+
 export interface GovernanceIssue {
   code: string;
   severity: string;

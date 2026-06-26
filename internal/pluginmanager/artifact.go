@@ -412,6 +412,7 @@ func capabilitiesSummaryJSON(raw json.RawMessage) ([]byte, error) {
 		Providers       []ProviderCapability      `json:"providers"`
 		EventSubscriber EventSubscriberCapability `json:"event_subscriber"`
 		Minecraft       *MinecraftCapability      `json:"minecraft"`
+		Runtime         RuntimeCapability         `json:"runtime"`
 	}
 	if err := json.Unmarshal(raw, &caps); err != nil {
 		return nil, fmt.Errorf("invalid capabilities: %w", err)
@@ -424,6 +425,8 @@ func capabilitiesSummaryJSON(raw json.RawMessage) ([]byte, error) {
 	summary.Middleware = caps.Middleware
 	summary.Providers = append([]ProviderCapability(nil), caps.Providers...)
 	summary.EventSubscriber = caps.EventSubscriber
+	summary.Runtime = caps.Runtime
+	summary.Runtime.RequiredFeatures = append(summary.Runtime.RequiredFeatures, stringSlice(jsonObjectFromRaw(string(raw), "required_features"))...)
 	if caps.Minecraft != nil {
 		summary.Minecraft = caps.Minecraft
 		if summary.Minecraft.UnsupportedPolicy == "" {
@@ -465,9 +468,11 @@ func validateManifest(manifest Manifest) error {
 		return errors.New("version is required")
 	case manifest.ArtifactType != ArtifactTypeBinary && manifest.ArtifactType != ArtifactTypeSource:
 		return fmt.Errorf("unsupported artifact_type %q", manifest.ArtifactType)
-	case manifest.Runtime.Type != RuntimeGoPlugin && manifest.Runtime.Type != RuntimeBuiltin:
+	case manifest.Runtime.Type != RuntimeGoPlugin && manifest.Runtime.Type != RuntimeBuiltin && manifest.Runtime.Type != RuntimeSandbox && manifest.Runtime.Type != RuntimeWASM:
 		return fmt.Errorf("unsupported runtime.type %q", manifest.Runtime.Type)
 	case manifest.ArtifactType == ArtifactTypeBinary && manifest.Runtime.Type == RuntimeGoPlugin && manifest.Runtime.Entry != RuntimeEntry:
+		return fmt.Errorf("unsupported runtime.entry %q", manifest.Runtime.Entry)
+	case manifest.ArtifactType == ArtifactTypeBinary && manifest.Runtime.Type == RuntimeWASM && manifest.Runtime.Entry != RuntimeWASMEntry:
 		return fmt.Errorf("unsupported runtime.entry %q", manifest.Runtime.Entry)
 	case manifest.ArtifactType == ArtifactTypeSource && rawSourceBuildEntry(manifest) == "":
 		return errors.New("build.entry is required for source artifacts")
@@ -524,7 +529,8 @@ func supportedExtensionPoint(key string) bool {
 	switch key {
 	case ExtensionUpstreamConnect, ExtensionRouteResolve, ExtensionRouteResolver, ExtensionStatusPing,
 		ExtensionConnectionFilter, ExtensionHandshakeFilter, ExtensionEventSubscriber,
-		ExtensionProvider, ExtensionAuthProvider, ExtensionAdminAuthProvider:
+		ExtensionProvider, ExtensionAuthProvider, ExtensionAdminAuthProvider,
+		ExtensionRuleEvaluate, ExtensionConfigValidate:
 		return true
 	default:
 		return false

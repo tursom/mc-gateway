@@ -3,7 +3,7 @@ import { showAlert } from "../alerts.js";
 import { badge, el, escapeAttr, escapeHTML, getFormInput } from "../dom.js";
 import { isAdmin } from "../session.js";
 import { state } from "../state.js";
-import type { PluginArtifact, PluginBuild, PluginDryRunResult, PluginOperations, PluginProxyConnection, PluginSecret, PluginSnapshot, PluginView } from "../types.js";
+import type { PluginArtifact, PluginBuild, PluginDryRunResult, PluginInstrumentation, PluginOperations, PluginProxyConnection, PluginSecret, PluginServiceStatus, PluginSnapshot, PluginView } from "../types.js";
 
 interface PluginsResponse {
   plugins?: PluginView[];
@@ -15,6 +15,14 @@ interface ArtifactsResponse {
 
 interface BuildsResponse {
   builds?: PluginBuild[];
+}
+
+interface PluginServiceResponse {
+  plugin_service?: PluginServiceStatus;
+}
+
+interface InstrumentationResponse {
+  instrumentation?: PluginInstrumentation[];
 }
 
 interface PluginResponse {
@@ -42,14 +50,18 @@ interface OperationsResponse {
 
 export async function loadPlugins(): Promise<void> {
   try {
-    const [data, artifacts, builds] = await Promise.all([
+    const [data, artifacts, builds, service, instrumentation] = await Promise.all([
       api<PluginsResponse>("/plugins"),
       api<ArtifactsResponse>("/plugin-artifacts"),
       api<BuildsResponse>("/plugin-builds"),
+      api<PluginServiceResponse>("/plugin-service"),
+      api<InstrumentationResponse>("/plugin-instrumentation"),
     ]);
     state.plugins = data.plugins || [];
     state.pluginArtifacts = artifacts.artifacts || [];
     state.pluginBuilds = builds.builds || [];
+    state.pluginService = service.plugin_service || null;
+    state.pluginInstrumentation = instrumentation.instrumentation || [];
     const firstPlugin = state.plugins[0];
     if (!state.selectedPluginID && firstPlugin) {
       state.selectedPluginID = firstPlugin.id;
@@ -68,6 +80,7 @@ export async function loadPlugins(): Promise<void> {
 export function renderPlugins(): void {
   const managed = new Set(state.plugins.map((plugin) => plugin.id));
   const unmanagedArtifacts = state.pluginArtifacts.filter((artifact) => !managed.has(artifact.plugin_id));
+  renderPluginServicePanel();
   el("pluginsBody").innerHTML = state.plugins.map((plugin) => `
     <tr class="${plugin.id === state.selectedPluginID ? "selected" : ""}">
       <td><button class="link-button" type="button" data-plugin-detail="${escapeAttr(plugin.id)}">${escapeHTML(plugin.id)}</button></td>
@@ -241,6 +254,83 @@ export function renderPluginDetail(plugin: PluginView | null = selectedPlugin())
 export function bindPluginEvents(): void {
   el<HTMLInputElement>("pluginUploadInput").addEventListener("change", uploadPluginPackage);
   el<HTMLButtonElement>("refreshPluginsBtn").addEventListener("click", loadPlugins);
+}
+
+function renderPluginServicePanel(): void {
+  const container = document.getElementById("pluginServicePanel");
+  if (!container) {
+    return;
+  }
+  const service = state.pluginService?.service;
+  const canWrite = isAdmin();
+  container.innerHTML = `
+    <section class="panel">
+      <div class="detail-header compact">
+        <div>
+          <h3>Plugin Service</h3>
+          <p>${service ? `active ${escapeHTML(service.active_mode)} · desired ${escapeHTML(service.desired_mode)}` : "not loaded"}</p>
+        </div>
+        ${service ? badge(service.restart_required ? "restart required" : "applied", service.restart_required) : ""}
+      </div>
+      ${service ? `
+        <div class="status-grid dense">
+          ${detailStat("Desired mode", service.desired_mode)}
+          ${detailStat("Active mode", service.active_mode)}
+          ${detailStat("Migration", service.live_migration || "drain-only")}
+          ${detailStat("Restart", service.restart_required ? "required" : "not required")}
+        </div>
+        ${service.last_error ? `<div class="alert inline-alert">${escapeHTML(service.last_error)}</div>` : ""}
+        ${canWrite ? `
+          <form id="pluginServiceForm" class="inline-form">
+            <select name="desired_mode">
+              ${["in-process", "go-plugin-process", "sandbox-process"].map((mode) => `<option value="${mode}" ${mode === service.desired_mode ? "selected" : ""}>${mode}</option>`).join("")}
+            </select>
+            <button type="submit">Set desired</button>
+          </form>
+        ` : ""}
+      ` : ""}
+    </section>
+    <section class="panel">
+      <h3>Build-Time Instrumentation</h3>
+      ${instrumentationList(state.pluginInstrumentation)}
+    </section>
+  `;
+  const form = document.getElementById("pluginServiceForm");
+  if (form instanceof HTMLFormElement) {
+    form.addEventListener("submit", updatePluginServiceMode);
+  }
+}
+
+async function updatePluginServiceMode(event: Event): Promise<void> {
+  event.preventDefault();
+  const form = event.currentTarget as HTMLFormElement;
+  try {
+    await api("/plugin-service", {
+      method: "PUT",
+      body: { desired_mode: getFormInput(form, "desired_mode") },
+    });
+    await loadPlugins();
+  } catch (err) {
+    showAlert((err as Error).message);
+  }
+}
+
+function instrumentationList(records: PluginInstrumentation[]): string {
+  if (!records.length) {
+    return `<p class="muted">No instrumentation metadata</p>`;
+  }
+  return `<table class="mini-table">
+    <thead><tr><th>Name</th><th>Profile</th><th>Status</th><th>Diff</th><th>Rollback</th></tr></thead>
+    <tbody>${records.map((record) => `
+      <tr>
+        <td>${escapeHTML(record.name)} ${escapeHTML(record.version || "")}</td>
+        <td>${escapeHTML(record.profile || "")}</td>
+        <td>${badge(record.status || "available", record.status === "blocked")}</td>
+        <td>${escapeHTML(shortID(record.generated_diff_hash || ""))}</td>
+        <td>${escapeHTML(record.runbook_rollback || "")}</td>
+      </tr>
+    `).join("")}</tbody>
+  </table>`;
 }
 
 async function uploadPluginPackage(event: Event): Promise<void> {

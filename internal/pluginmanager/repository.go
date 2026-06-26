@@ -306,6 +306,62 @@ WHERE id = ?`,
 	return err
 }
 
+func (r Repository) PluginServiceState(ctx context.Context) (PluginServiceState, error) {
+	row := r.db.QueryRowContext(ctx, `
+SELECT desired_mode, active_mode, applied_at, live_migration, last_error, updated_by, updated_at
+FROM plugin_service_state WHERE id = 1`)
+	state, err := scanPluginServiceState(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		now := r.now().Unix()
+		_, err = r.db.ExecContext(ctx, `
+INSERT OR IGNORE INTO plugin_service_state(id, desired_mode, active_mode, applied_at, live_migration, updated_by, updated_at)
+VALUES (1, ?, ?, ?, ?, ?, ?)`,
+			PluginServiceModeInProcess, PluginServiceModeInProcess, now, PluginMigrationDrainOnly, "system", now)
+		if err != nil {
+			return PluginServiceState{}, err
+		}
+		return PluginServiceState{
+			DesiredMode:   PluginServiceModeInProcess,
+			ActiveMode:    PluginServiceModeInProcess,
+			AppliedAt:     now,
+			LiveMigration: PluginMigrationDrainOnly,
+			UpdatedBy:     "system",
+			UpdatedAt:     now,
+		}, nil
+	}
+	state = normalizePluginServiceState(state)
+	return state, err
+}
+
+func (r Repository) SetPluginServiceDesired(ctx context.Context, actor, mode string) (PluginServiceState, error) {
+	now := r.now().Unix()
+	if _, err := r.db.ExecContext(ctx, `
+INSERT INTO plugin_service_state(id, desired_mode, active_mode, applied_at, live_migration, updated_by, updated_at)
+VALUES (1, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET desired_mode = excluded.desired_mode, updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
+		mode, PluginServiceModeInProcess, 0, PluginMigrationDrainOnly, actor, now); err != nil {
+		return PluginServiceState{}, err
+	}
+	return r.PluginServiceState(ctx)
+}
+
+func (r Repository) ApplyPluginServiceActive(ctx context.Context, mode string) (PluginServiceState, error) {
+	now := r.now().Unix()
+	if _, err := r.db.ExecContext(ctx, `
+INSERT INTO plugin_service_state(id, desired_mode, active_mode, applied_at, live_migration, last_error, updated_by, updated_at)
+VALUES (1, ?, ?, ?, ?, '', 'system', ?)
+ON CONFLICT(id) DO UPDATE SET active_mode = excluded.active_mode, applied_at = excluded.applied_at, last_error = '', updated_at = excluded.updated_at`,
+		mode, mode, now, PluginMigrationDrainOnly, now); err != nil {
+		return PluginServiceState{}, err
+	}
+	return r.PluginServiceState(ctx)
+}
+
+func (r Repository) SetPluginServiceError(ctx context.Context, message string) error {
+	_, err := r.db.ExecContext(ctx, `UPDATE plugin_service_state SET last_error = ?, updated_at = ? WHERE id = 1`, message, r.now().Unix())
+	return err
+}
+
 func (r Repository) UpdateArtifactStatus(ctx context.Context, artifactID, status, message string) error {
 	_, err := r.db.ExecContext(ctx, `UPDATE plugin_artifacts SET status = ?, error = ?, updated_at = ? WHERE id = ?`,
 		status, message, r.now().Unix(), artifactID)
@@ -818,6 +874,151 @@ FROM plugin_advisories`
 	return advisories, rows.Err()
 }
 
+func (r Repository) SaveRepositoryImport(ctx context.Context, record RepositoryImportRecord) (RepositoryImportRecord, error) {
+	now := r.now().Unix()
+	if record.CreatedAt == 0 {
+		record.CreatedAt = now
+	}
+	if record.AdmissionJSON == "" || !json.Valid([]byte(record.AdmissionJSON)) {
+		record.AdmissionJSON = "{}"
+	}
+	_, err := r.db.ExecContext(ctx, `
+INSERT INTO plugin_repository_imports(
+    repository_type, index_path, repository_name, candidate_id, plugin_id, version,
+    artifact_id, package_sha256, trust_policy, admission_json, imported_by, created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		record.RepositoryType, record.IndexPath, record.RepositoryName, record.CandidateID, record.PluginID, record.Version,
+		record.ArtifactID, record.PackageSHA256, record.TrustPolicy, record.AdmissionJSON, record.ImportedBy, record.CreatedAt)
+	if err != nil {
+		return RepositoryImportRecord{}, err
+	}
+	id, err := lastInsertID(ctx, r.db)
+	if err != nil {
+		return RepositoryImportRecord{}, err
+	}
+	return r.RepositoryImport(ctx, id)
+}
+
+func (r Repository) RepositoryImport(ctx context.Context, id int64) (RepositoryImportRecord, error) {
+	row := r.db.QueryRowContext(ctx, `
+SELECT id, repository_type, index_path, repository_name, candidate_id, plugin_id, version,
+       artifact_id, package_sha256, trust_policy, admission_json, imported_by, created_at
+FROM plugin_repository_imports WHERE id = ?`, id)
+	return scanRepositoryImport(row)
+}
+
+func (r Repository) ListRepositoryImports(ctx context.Context) ([]RepositoryImportRecord, error) {
+	rows, err := r.db.QueryContext(ctx, `
+SELECT id, repository_type, index_path, repository_name, candidate_id, plugin_id, version,
+       artifact_id, package_sha256, trust_policy, admission_json, imported_by, created_at
+FROM plugin_repository_imports ORDER BY created_at DESC, id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var imports []RepositoryImportRecord
+	for rows.Next() {
+		record, err := scanRepositoryImport(rows)
+		if err != nil {
+			return nil, err
+		}
+		imports = append(imports, record)
+	}
+	return imports, rows.Err()
+}
+
+func (r Repository) SaveSupplyChainAssessment(ctx context.Context, assessment SupplyChainAssessment) (SupplyChainAssessment, error) {
+	now := r.now().Unix()
+	if assessment.CreatedAt == 0 {
+		assessment.CreatedAt = now
+	}
+	issues, err := json.Marshal(assessment.Issues)
+	if err != nil {
+		return SupplyChainAssessment{}, err
+	}
+	signature, err := marshalDefaultObject(assessment.Signature)
+	if err != nil {
+		return SupplyChainAssessment{}, err
+	}
+	sbom, err := marshalDefaultObject(assessment.SBOM)
+	if err != nil {
+		return SupplyChainAssessment{}, err
+	}
+	license, err := marshalDefaultObject(assessment.License)
+	if err != nil {
+		return SupplyChainAssessment{}, err
+	}
+	advisory, err := marshalDefaultObject(assessment.Advisory)
+	if err != nil {
+		return SupplyChainAssessment{}, err
+	}
+	metadata, err := marshalDefaultObject(assessment.Metadata)
+	if err != nil {
+		return SupplyChainAssessment{}, err
+	}
+	if assessment.Status == "" {
+		assessment.Status = SupplyChainStatusAllowed
+	}
+	_, err = r.db.ExecContext(ctx, `
+INSERT INTO plugin_supply_chain_assessments(
+    plugin_id, artifact_id, status, issues_json, signature_json, sbom_json,
+    license_json, advisory_json, metadata_json, created_by, created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		assessment.PluginID, assessment.ArtifactID, assessment.Status, string(issues), signature, sbom,
+		license, advisory, metadata, assessment.CreatedBy, assessment.CreatedAt)
+	if err != nil {
+		return SupplyChainAssessment{}, err
+	}
+	id, err := lastInsertID(ctx, r.db)
+	if err != nil {
+		return SupplyChainAssessment{}, err
+	}
+	return r.SupplyChainAssessment(ctx, id)
+}
+
+func (r Repository) SupplyChainAssessment(ctx context.Context, id int64) (SupplyChainAssessment, error) {
+	row := r.db.QueryRowContext(ctx, `
+SELECT id, plugin_id, artifact_id, status, issues_json, signature_json, sbom_json,
+       license_json, advisory_json, metadata_json, created_by, created_at
+FROM plugin_supply_chain_assessments WHERE id = ?`, id)
+	return scanSupplyChainAssessment(row)
+}
+
+func (r Repository) ListSupplyChainAssessments(ctx context.Context, pluginID, artifactID string) ([]SupplyChainAssessment, error) {
+	query := `
+SELECT id, plugin_id, artifact_id, status, issues_json, signature_json, sbom_json,
+       license_json, advisory_json, metadata_json, created_by, created_at
+FROM plugin_supply_chain_assessments`
+	var args []any
+	var clauses []string
+	if pluginID != "" {
+		clauses = append(clauses, "plugin_id = ?")
+		args = append(args, pluginID)
+	}
+	if artifactID != "" {
+		clauses = append(clauses, "artifact_id = ?")
+		args = append(args, artifactID)
+	}
+	if len(clauses) > 0 {
+		query += " WHERE " + strings.Join(clauses, " AND ")
+	}
+	query += ` ORDER BY created_at DESC, id DESC`
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var assessments []SupplyChainAssessment
+	for rows.Next() {
+		assessment, err := scanSupplyChainAssessment(rows)
+		if err != nil {
+			return nil, err
+		}
+		assessments = append(assessments, assessment)
+	}
+	return assessments, rows.Err()
+}
+
 func (r Repository) SavePreflight(ctx context.Context, record PreflightRecord) (PreflightRecord, error) {
 	now := r.now().Unix()
 	if record.CreatedAt == 0 {
@@ -951,6 +1152,72 @@ LIMIT 1`, pluginID, artifactID, profile)
 		return BenchmarkRecord{}, nil
 	}
 	return benchmark, err
+}
+
+func (r Repository) SaveInstrumentation(ctx context.Context, actor string, req InstrumentationRequest) (InstrumentationRecord, error) {
+	now := r.now().Unix()
+	if req.Status == "" {
+		req.Status = InstrumentationStatusAvailable
+	}
+	provenance, err := marshalDefaultObject(req.Provenance)
+	if err != nil {
+		return InstrumentationRecord{}, err
+	}
+	conformance, err := marshalDefaultObject(req.Conformance)
+	if err != nil {
+		return InstrumentationRecord{}, err
+	}
+	benchmark, err := marshalDefaultObject(req.Benchmark)
+	if err != nil {
+		return InstrumentationRecord{}, err
+	}
+	smoke, err := marshalDefaultObject(req.Smoke)
+	if err != nil {
+		return InstrumentationRecord{}, err
+	}
+	_, err = r.db.ExecContext(ctx, `
+INSERT INTO plugin_instrumentation(
+    name, version, profile, generated_diff_hash, provenance_json, conformance_json,
+    benchmark_json, smoke_json, runbook_rollback, status, created_by, created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		req.Name, req.Version, req.Profile, req.GeneratedDiffHash, provenance, conformance,
+		benchmark, smoke, req.RunbookRollback, req.Status, actor, now)
+	if err != nil {
+		return InstrumentationRecord{}, err
+	}
+	id, err := lastInsertID(ctx, r.db)
+	if err != nil {
+		return InstrumentationRecord{}, err
+	}
+	return r.Instrumentation(ctx, id)
+}
+
+func (r Repository) Instrumentation(ctx context.Context, id int64) (InstrumentationRecord, error) {
+	row := r.db.QueryRowContext(ctx, `
+SELECT id, name, version, profile, generated_diff_hash, provenance_json, conformance_json,
+       benchmark_json, smoke_json, runbook_rollback, status, created_by, created_at
+FROM plugin_instrumentation WHERE id = ?`, id)
+	return scanInstrumentation(row)
+}
+
+func (r Repository) ListInstrumentation(ctx context.Context) ([]InstrumentationRecord, error) {
+	rows, err := r.db.QueryContext(ctx, `
+SELECT id, name, version, profile, generated_diff_hash, provenance_json, conformance_json,
+       benchmark_json, smoke_json, runbook_rollback, status, created_by, created_at
+FROM plugin_instrumentation ORDER BY created_at DESC, id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var records []InstrumentationRecord
+	for rows.Next() {
+		record, err := scanInstrumentation(rows)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	return records, rows.Err()
 }
 
 func (r Repository) RecordOperation(ctx context.Context, pluginID, artifactID, operation, status, actor, message string, metadata any) error {
@@ -1320,6 +1587,16 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
+func scanPluginServiceState(row rowScanner) (PluginServiceState, error) {
+	var state PluginServiceState
+	err := row.Scan(
+		&state.DesiredMode, &state.ActiveMode, &state.AppliedAt, &state.LiveMigration,
+		&state.LastError, &state.UpdatedBy, &state.UpdatedAt,
+	)
+	state = normalizePluginServiceState(state)
+	return state, err
+}
+
 func scanArtifact(row rowScanner) (ArtifactRecord, error) {
 	var artifact ArtifactRecord
 	err := row.Scan(
@@ -1427,6 +1704,48 @@ func scanBenchmark(row rowScanner) (BenchmarkRecord, error) {
 	return record, err
 }
 
+func scanRepositoryImport(row rowScanner) (RepositoryImportRecord, error) {
+	var record RepositoryImportRecord
+	err := row.Scan(
+		&record.ID, &record.RepositoryType, &record.IndexPath, &record.RepositoryName,
+		&record.CandidateID, &record.PluginID, &record.Version, &record.ArtifactID,
+		&record.PackageSHA256, &record.TrustPolicy, &record.AdmissionJSON,
+		&record.ImportedBy, &record.CreatedAt,
+	)
+	return record, err
+}
+
+func scanSupplyChainAssessment(row rowScanner) (SupplyChainAssessment, error) {
+	var assessment SupplyChainAssessment
+	var issuesJSON, signatureJSON, sbomJSON, licenseJSON, advisoryJSON, metadataJSON string
+	err := row.Scan(
+		&assessment.ID, &assessment.PluginID, &assessment.ArtifactID, &assessment.Status,
+		&issuesJSON, &signatureJSON, &sbomJSON, &licenseJSON, &advisoryJSON,
+		&metadataJSON, &assessment.CreatedBy, &assessment.CreatedAt,
+	)
+	if err != nil {
+		return assessment, err
+	}
+	_ = json.Unmarshal([]byte(defaultJSONArray(issuesJSON)), &assessment.Issues)
+	assessment.Signature = jsonMap(signatureJSON)
+	assessment.SBOM = jsonMap(sbomJSON)
+	assessment.License = jsonMap(licenseJSON)
+	assessment.Advisory = jsonMap(advisoryJSON)
+	assessment.Metadata = jsonMap(metadataJSON)
+	return assessment, nil
+}
+
+func scanInstrumentation(row rowScanner) (InstrumentationRecord, error) {
+	var record InstrumentationRecord
+	err := row.Scan(
+		&record.ID, &record.Name, &record.Version, &record.Profile, &record.GeneratedDiffHash,
+		&record.ProvenanceJSON, &record.ConformanceJSON, &record.BenchmarkJSON,
+		&record.SmokeJSON, &record.RunbookRollback, &record.Status, &record.CreatedBy,
+		&record.CreatedAt,
+	)
+	return record, err
+}
+
 func marshalDefaultObject(value any) (string, error) {
 	if value == nil {
 		return "{}", nil
@@ -1453,6 +1772,28 @@ func defaultJSONArray(value string) string {
 		return "[]"
 	}
 	return value
+}
+
+func jsonMap(value string) map[string]any {
+	var out map[string]any
+	if json.Unmarshal([]byte(defaultJSONObject(value)), &out) != nil {
+		return nil
+	}
+	return out
+}
+
+func normalizePluginServiceState(state PluginServiceState) PluginServiceState {
+	if state.DesiredMode == "" {
+		state.DesiredMode = PluginServiceModeInProcess
+	}
+	if state.ActiveMode == "" {
+		state.ActiveMode = PluginServiceModeInProcess
+	}
+	if state.LiveMigration == "" {
+		state.LiveMigration = PluginMigrationDrainOnly
+	}
+	state.RestartRequired = state.DesiredMode != state.ActiveMode
+	return state
 }
 
 func boolInt(value bool) int {

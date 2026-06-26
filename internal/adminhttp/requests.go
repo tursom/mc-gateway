@@ -64,3 +64,22 @@ type PluginRollbackRequest struct {
 	SnapshotID  int64  `json:"snapshot_id"`
 	FullDesired bool   `json:"full_desired"`
 }
+
+type PluginServiceRequest struct {
+	DesiredMode string `json:"desired_mode"`
+}
+
+type PluginRepositoryImportRequest struct {
+	RepositoryType string `json:"repository_type"`
+	IndexPath      string `json:"index_path"`
+	ArtifactID     string `json:"artifact_id"`
+	PluginID       string `json:"plugin_id"`
+	Version        string `json:"version"`
+	TrustPolicy    string `json:"trust_policy"`
+}
+
+type PluginSupplyChainRequest struct {
+	PluginID   string         `json:"plugin_id"`
+	ArtifactID string         `json:"artifact_id"`
+	Metadata   map[string]any `json:"metadata"`
+}

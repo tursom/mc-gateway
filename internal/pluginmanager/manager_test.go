@@ -1081,9 +1081,13 @@ func uploadTestArtifactWithManifest(t *testing.T, manager *Manager, pluginID str
 	if err != nil {
 		t.Fatalf("Marshal manifest error = %v", err)
 	}
+	entry := manifest.Runtime.Entry
+	if entry == "" {
+		entry = RuntimeEntry
+	}
 	packagePath := writeTestMCGP(t, map[string][]byte{
 		"manifest.json": manifestBytes,
-		"plugin.so":     []byte("fake plugin bytes " + pluginID),
+		entry:           []byte("fake plugin bytes " + pluginID),
 	})
 	artifact, err := manager.UploadArtifact(context.Background(), ArtifactUpload{
 		SourcePath: packagePath,

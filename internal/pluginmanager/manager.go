@@ -171,6 +171,10 @@ type Manager struct {
 	proxyConns  map[uint64]*proxyConnection
 	drainingIDs map[string]bool
 	operations  *Operations
+
+	serviceMode string
+	hostMu      sync.Mutex
+	hosts       map[string]*pluginHostProcess
 }
 
 type loadedPlugin struct {
@@ -269,6 +273,7 @@ func New(options Options) *Manager {
 		routeCache:    make(map[string]routeCacheEntry),
 		proxyConns:    make(map[uint64]*proxyConnection),
 		drainingIDs:   make(map[string]bool),
+		hosts:         make(map[string]*pluginHostProcess),
 	}
 	manager.operations = NewOperations(manager.repo, options.ArtifactRoot)
 	if manager.builders == nil {
@@ -280,6 +285,7 @@ func New(options Options) *Manager {
 	manager.publish(nil)
 	manager.publishExtensionsLocked(nil)
 	_ = manager.EnsureOfficialPlugins(context.Background(), "system")
+	_ = manager.ApplyPluginServiceMode(context.Background())
 	return manager
 }
 
@@ -811,6 +817,7 @@ func (m *Manager) Enable(ctx context.Context, actor, pluginID string) (PluginRec
 	if err := m.markEnabled(ctx, loaded); err != nil {
 		return PluginRecord{}, err
 	}
+	m.markHostStarted(pluginID, loaded.artifact.ID)
 	m.clearDrainingLocked(pluginID)
 	m.publish(next)
 	m.publishExtensionsLocked(extensions)
@@ -838,6 +845,7 @@ func (m *Manager) Disable(ctx context.Context, actor, pluginID string) (PluginRe
 	m.removeFromDispatchLocked(pluginID)
 	m.removeExtensionsLocked(pluginID)
 	m.markDrainingLocked(pluginID)
+	m.markHostDraining(pluginID)
 	m.operations.StopPlugin(pluginID)
 	if loaded := m.loaded[pluginID]; loaded != nil && loaded.instance != nil {
 		if err := loaded.instance.Destroy(); err != nil {
@@ -869,6 +877,7 @@ func (m *Manager) Delete(ctx context.Context, actor, pluginID string) error {
 	m.removeFromDispatchLocked(pluginID)
 	m.removeExtensionsLocked(pluginID)
 	m.markDrainingLocked(pluginID)
+	m.markHostDraining(pluginID)
 	m.operations.StopPlugin(pluginID)
 	if loaded := m.loaded[pluginID]; loaded != nil && loaded.instance != nil {
 		_ = loaded.instance.Destroy()
@@ -918,6 +927,7 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 		nextByPlugin[pluginRecord.ID] = loaded.handlers
 		extensionsByPlugin[pluginRecord.ID] = loaded.extensions
 		_ = m.markEnabled(ctx, loaded)
+		m.markHostStarted(pluginRecord.ID, loaded.artifact.ID)
 		m.clearDrainingLocked(pluginRecord.ID)
 	}
 	m.publish(flattenHandlers(nextByPlugin))
@@ -1132,6 +1142,7 @@ func (m *Manager) quarantineAffected(ctx context.Context, advisory AdvisoryRecor
 		if advisoryMatches(advisory, artifact, manifest) {
 			m.removeFromDispatchLocked(plugin.ID)
 			m.markDrainingLocked(plugin.ID)
+			m.markHostDraining(plugin.ID)
 			_ = m.repo.MarkRuntime(ctx, plugin.ID, RuntimeDraining, artifact.ID, artifact.ID, plugin.AppliedGeneration, "plugin quarantined by advisory "+advisory.AdvisoryID, map[string]any{
 				"quarantine":  true,
 				"advisory_id": advisory.AdvisoryID,
@@ -1504,6 +1515,7 @@ func (m *Manager) loadLocked(ctx context.Context, pluginRecord PluginRecord) (*l
 	if err := m.repo.MarkRuntime(ctx, pluginRecord.ID, RuntimeLoaded, "", artifact.ID, pluginRecord.AppliedGeneration, "", map[string]any{
 		"handler_count":   len(handlers),
 		"extension_count": extensions.count(),
+		"service_mode":    m.serviceMode,
 	}, loaded.dispatchSummaries()); err != nil {
 		return nil, err
 	}
@@ -1519,6 +1531,21 @@ func (m *Manager) validateArtifactGate(artifact ArtifactRecord) error {
 		return errors.New("desired artifact must be a binary artifact")
 	}
 	if artifact.RuntimeType == RuntimeBuiltin {
+		return nil
+	}
+	if artifact.RuntimeType == RuntimeSandbox {
+		if m.serviceMode != PluginServiceModeSandboxProcess {
+			return errors.New("sandbox-process runtime is disabled by plugin service mode")
+		}
+		if caps := requiredRuntimeCapabilities(artifact); len(caps) > 0 {
+			return fmt.Errorf("sandbox-process cannot enforce required capabilities: %s", strings.Join(caps, ","))
+		}
+		return nil
+	}
+	if artifact.RuntimeType == RuntimeWASM {
+		if m.serviceMode != PluginServiceModeSandboxProcess {
+			return errors.New("wasm runtime is disabled by plugin service mode")
+		}
 		return nil
 	}
 	if artifact.GoVersion != runtime.Version() {
@@ -1563,6 +1590,8 @@ func (m *Manager) markEnabled(ctx context.Context, loaded *loadedPlugin) error {
 	return m.repo.MarkRuntime(ctx, loaded.record.ID, RuntimeEnabled, loaded.artifact.ID, loaded.artifact.ID, loaded.record.DesiredGeneration, "", map[string]any{
 		"handler_count":   len(loaded.handlers),
 		"extension_count": loaded.extensions.count(),
+		"service_mode":    m.serviceMode,
+		"plugin_host":     m.hostSummary(loaded.record.ID),
 	}, loaded.dispatchSummaries())
 }
 
@@ -1685,6 +1714,14 @@ func upstreamModeFromArtifact(artifact ArtifactRecord) string {
 		}
 	}
 	return UpstreamModeDialer
+}
+
+func requiredRuntimeCapabilities(artifact ArtifactRecord) []string {
+	var summary CapabilitySummary
+	if json.Unmarshal([]byte(artifact.CapabilitiesSummaryJSON), &summary) != nil {
+		return nil
+	}
+	return uniqueSortedStrings(summary.Runtime.RequiredCapabilities)
 }
 
 func (h *upstreamHandler) invoke(req api.UpstreamConnectRequest) (conn net.Conn, err error) {

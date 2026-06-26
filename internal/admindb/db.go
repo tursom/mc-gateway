@@ -358,6 +358,64 @@ CREATE TABLE IF NOT EXISTS plugin_diagnostics (
     created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS plugin_service_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    desired_mode TEXT NOT NULL DEFAULT 'in-process',
+    active_mode TEXT NOT NULL DEFAULT 'in-process',
+    applied_at INTEGER NOT NULL DEFAULT 0,
+    live_migration TEXT NOT NULL DEFAULT 'drain-only',
+    last_error TEXT NOT NULL DEFAULT '',
+    updated_by TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS plugin_repository_imports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repository_type TEXT NOT NULL,
+    index_path TEXT NOT NULL DEFAULT '',
+    repository_name TEXT NOT NULL DEFAULT '',
+    candidate_id TEXT NOT NULL DEFAULT '',
+    plugin_id TEXT NOT NULL DEFAULT '',
+    version TEXT NOT NULL DEFAULT '',
+    artifact_id TEXT NOT NULL DEFAULT '',
+    package_sha256 TEXT NOT NULL DEFAULT '',
+    trust_policy TEXT NOT NULL DEFAULT '',
+    admission_json TEXT NOT NULL DEFAULT '{}',
+    imported_by TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS plugin_supply_chain_assessments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plugin_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'allowed',
+    issues_json TEXT NOT NULL DEFAULT '[]',
+    signature_json TEXT NOT NULL DEFAULT '{}',
+    sbom_json TEXT NOT NULL DEFAULT '{}',
+    license_json TEXT NOT NULL DEFAULT '{}',
+    advisory_json TEXT NOT NULL DEFAULT '{}',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS plugin_instrumentation (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    version TEXT NOT NULL DEFAULT '',
+    profile TEXT NOT NULL DEFAULT '',
+    generated_diff_hash TEXT NOT NULL DEFAULT '',
+    provenance_json TEXT NOT NULL DEFAULT '{}',
+    conformance_json TEXT NOT NULL DEFAULT '{}',
+    benchmark_json TEXT NOT NULL DEFAULT '{}',
+    smoke_json TEXT NOT NULL DEFAULT '{}',
+    runbook_rollback TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'available',
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_routes_enabled ON routes(enabled);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_plugin_artifacts_plugin_id ON plugin_artifacts(plugin_id, created_at);
@@ -379,6 +437,11 @@ CREATE INDEX IF NOT EXISTS idx_plugin_traces_lookup ON plugin_traces(plugin_id, 
 CREATE INDEX IF NOT EXISTS idx_plugin_data_expires ON plugin_data(expires_at);
 CREATE INDEX IF NOT EXISTS idx_plugin_files_expires ON plugin_files(expires_at);
 CREATE INDEX IF NOT EXISTS idx_plugin_diagnostics_lookup ON plugin_diagnostics(plugin_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_plugin_repository_imports_artifact ON plugin_repository_imports(artifact_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_plugin_supply_chain_lookup ON plugin_supply_chain_assessments(plugin_id, artifact_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_plugin_instrumentation_lookup ON plugin_instrumentation(name, created_at);
+INSERT OR IGNORE INTO plugin_service_state(id, desired_mode, active_mode, applied_at, live_migration, updated_by, updated_at)
+VALUES (1, 'in-process', 'in-process', strftime('%s','now'), 'drain-only', 'system', strftime('%s','now'));
 INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, strftime('%s','now'));
 `
 	if _, err := db.Exec(schema); err != nil {
@@ -391,6 +454,12 @@ INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, strftime
 		return err
 	}
 	if err := ensureColumn(db, "plugin_secrets", "hot_reload", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "plugin_service_state", "live_migration", "TEXT NOT NULL DEFAULT 'drain-only'"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "plugin_service_state", "last_error", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	return nil

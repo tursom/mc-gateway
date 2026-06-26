@@ -1,4 +1,4 @@
-import type { PluginArtifact, PluginBuild, PluginView, RouteRecord, ServiceRecord, User } from "./types.js";
+import type { PluginArtifact, PluginBuild, PluginInstrumentation, PluginServiceStatus, PluginView, RouteRecord, ServiceRecord, User } from "./types.js";
 
 export const tokenStorageKey = "mcGatewayAdminToken";
 export const languageStorageKey = "mcGatewayAdminLanguage";
@@ -14,6 +14,8 @@ export interface AppState {
   plugins: PluginView[];
   pluginArtifacts: PluginArtifact[];
   pluginBuilds: PluginBuild[];
+  pluginService: PluginServiceStatus | null;
+  pluginInstrumentation: PluginInstrumentation[];
   selectedPluginID: string;
   selectedArtifactID: string;
 }
@@ -29,6 +31,8 @@ export const state: AppState = {
   plugins: [],
   pluginArtifacts: [],
   pluginBuilds: [],
+  pluginService: null,
+  pluginInstrumentation: [],
   selectedPluginID: "",
   selectedArtifactID: "",
 };

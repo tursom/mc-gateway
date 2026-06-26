@@ -431,6 +431,11 @@ func (m *Manager) evaluateGovernance(ctx context.Context, pluginID, artifactID, 
 		return GovernanceDecision{}, ConflictAnalysis{}, err
 	}
 	issues = append(issues, advisoryIssues...)
+	supplyChainIssues, err := m.supplyChainGovernanceIssues(ctx, artifact)
+	if err != nil {
+		return GovernanceDecision{}, ConflictAnalysis{}, err
+	}
+	issues = append(issues, supplyChainIssues...)
 	benchmarkIssues, err := m.benchmarkIssues(ctx, artifact, manifest, policy)
 	if err != nil {
 		return GovernanceDecision{}, ConflictAnalysis{}, err
@@ -495,6 +500,20 @@ func (m *Manager) preflightChecks(ctx context.Context, plugin PluginRecord, arti
 			Severity: GateSeverityBlocking,
 			Message:  "required feature declaration is not supported by gateway",
 			Details:  map[string]any{"features": missing},
+		})
+	}
+	if artifact.RuntimeType == RuntimeSandbox && m.serviceMode != PluginServiceModeSandboxProcess {
+		result.Checks = append(result.Checks, PreflightCheck{Code: "sandbox_runtime_disabled", Severity: GateSeverityBlocking, Message: "sandbox-process runtime is disabled by plugin service mode"})
+	}
+	if artifact.RuntimeType == RuntimeWASM && m.serviceMode != PluginServiceModeSandboxProcess {
+		result.Checks = append(result.Checks, PreflightCheck{Code: "wasm_runtime_disabled", Severity: GateSeverityBlocking, Message: "wasm runtime is disabled by plugin service mode"})
+	}
+	if caps := requiredRuntimeCapabilities(artifact); artifact.RuntimeType == RuntimeSandbox && len(caps) > 0 {
+		result.Checks = append(result.Checks, PreflightCheck{
+			Code:     "capability_enforcement_unavailable",
+			Severity: GateSeverityBlocking,
+			Message:  "sandbox-process required capabilities cannot be enforced by this gateway",
+			Details:  map[string]any{"capabilities": caps},
 		})
 	}
 	if manifest.RuntimeLimits.HandlerTimeoutMS > int(DefaultHandlerTimeout.Milliseconds()) {
@@ -699,6 +718,25 @@ func (m *Manager) benchmarkIssues(ctx context.Context, artifact ArtifactRecord, 
 		issues = append(issues, issue("benchmark_error_rate_warning", GateSeverityWarning, "benchmark error rate exceeds warning threshold", artifact.PluginID, artifact.ID, map[string]any{"error_rate": latest.ErrorRate}))
 	}
 	return issues, nil
+}
+
+func (m *Manager) supplyChainGovernanceIssues(ctx context.Context, artifact ArtifactRecord) ([]GovernanceIssue, error) {
+	assessments, err := m.repo.ListSupplyChainAssessments(ctx, artifact.PluginID, artifact.ID)
+	if err != nil {
+		return nil, err
+	}
+	if len(assessments) == 0 {
+		return nil, nil
+	}
+	latest := assessments[0]
+	if latest.Status == SupplyChainStatusAllowed {
+		return nil, nil
+	}
+	issues := append([]GovernanceIssue(nil), latest.Issues...)
+	if latest.Status == SupplyChainStatusBlocked && len(issues) == 0 {
+		issues = append(issues, issue("supply_chain_blocked", GateSeverityBlocking, "latest supply chain assessment blocks this artifact", artifact.PluginID, artifact.ID, nil))
+	}
+	return sortedIssues(issues), nil
 }
 
 func (m *Manager) hasMatchingReview(ctx context.Context, pluginID, artifactID, profile string, fingerprint governanceFingerprintValue) (bool, error) {

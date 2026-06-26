@@ -1346,3 +1346,186 @@ func writePluginManagerError(w http.ResponseWriter, err error) {
 		adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
 	}
 }
+
+func handleAdminPluginService(w http.ResponseWriter, r *http.Request) {
+	session, ok := requireRole(w, r, adminRoleMember)
+	if !ok {
+		return
+	}
+	if pluginsManager == nil {
+		adminhttp.WriteAPIError(w, http.StatusServiceUnavailable, "plugin manager is not initialized")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		status, err := pluginsManager.PluginServiceStatus(r.Context())
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"plugin_service": status})
+	case http.MethodPut:
+		if session.Role != adminRoleAdmin {
+			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		var req adminhttp.PluginServiceRequest
+		if !adminhttp.DecodeJSONRequest(w, r, &req) {
+			return
+		}
+		state, err := pluginsManager.SetPluginServiceDesired(r.Context(), session.Username, req.DesiredMode)
+		if err != nil {
+			recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_service_mode_update", "plugin_service", "", false, err.Error())
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_service_mode_update", "plugin_service", "", true, "plugin service mode desired state updated", map[string]any{
+			"desired_mode":     state.DesiredMode,
+			"active_mode":      state.ActiveMode,
+			"restart_required": state.RestartRequired,
+		})
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"plugin_service": state})
+	case http.MethodPost:
+		if session.Role != adminRoleAdmin {
+			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		if err := pluginsManager.ApplyPluginServiceMode(r.Context()); err != nil {
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		status, err := pluginsManager.PluginServiceStatus(r.Context())
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"plugin_service": status})
+	default:
+		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func handleAdminPluginRepositories(w http.ResponseWriter, r *http.Request) {
+	session, ok := requireRole(w, r, adminRoleMember)
+	if !ok {
+		return
+	}
+	if pluginsManager == nil {
+		adminhttp.WriteAPIError(w, http.StatusServiceUnavailable, "plugin manager is not initialized")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		imports, err := pluginsManager.ListRepositoryImports(r.Context())
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"imports": imports})
+	case http.MethodPost:
+		if session.Role != adminRoleAdmin {
+			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		var req adminhttp.PluginRepositoryImportRequest
+		if !adminhttp.DecodeJSONRequest(w, r, &req) {
+			return
+		}
+		record, artifact, err := pluginsManager.ImportRepositoryArtifact(r.Context(), session.Username, pluginmanager.RepositoryImportRequest{
+			RepositoryType: req.RepositoryType,
+			IndexPath:      req.IndexPath,
+			ArtifactID:     req.ArtifactID,
+			PluginID:       req.PluginID,
+			Version:        req.Version,
+			TrustPolicy:    req.TrustPolicy,
+		})
+		if err != nil {
+			recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_repository_import", "plugin_repository", req.IndexPath, false, err.Error())
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_repository_import", "plugin_artifact", artifact.ID, true, "repository artifact imported locally", map[string]any{
+			"plugin_id":   artifact.PluginID,
+			"version":     artifact.Version,
+			"auto_enable": false,
+			"import_id":   record.ID,
+		})
+		adminhttp.WriteJSON(w, http.StatusCreated, map[string]any{"import": record, "artifact": artifact})
+	default:
+		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func handleAdminPluginSupplyChain(w http.ResponseWriter, r *http.Request) {
+	session, ok := requireRole(w, r, adminRoleMember)
+	if !ok {
+		return
+	}
+	if pluginsManager == nil {
+		adminhttp.WriteAPIError(w, http.StatusServiceUnavailable, "plugin manager is not initialized")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		assessments, err := pluginsManager.ListSupplyChainAssessments(r.Context(), r.URL.Query().Get("plugin_id"), r.URL.Query().Get("artifact_id"))
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"assessments": assessments})
+	case http.MethodPost:
+		if session.Role != adminRoleAdmin {
+			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		var req adminhttp.PluginSupplyChainRequest
+		if !adminhttp.DecodeJSONRequest(w, r, &req) {
+			return
+		}
+		assessment, err := pluginsManager.AssessSupplyChain(r.Context(), session.Username, req.PluginID, req.ArtifactID, req.Metadata)
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		adminhttp.WriteJSON(w, http.StatusCreated, map[string]any{"assessment": assessment})
+	default:
+		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func handleAdminPluginInstrumentation(w http.ResponseWriter, r *http.Request) {
+	session, ok := requireRole(w, r, adminRoleMember)
+	if !ok {
+		return
+	}
+	if pluginsManager == nil {
+		adminhttp.WriteAPIError(w, http.StatusServiceUnavailable, "plugin manager is not initialized")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		records, err := pluginsManager.ListInstrumentation(r.Context())
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"instrumentation": records})
+	case http.MethodPost:
+		if session.Role != adminRoleAdmin {
+			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		var req pluginmanager.InstrumentationRequest
+		if !adminhttp.DecodeJSONRequest(w, r, &req) {
+			return
+		}
+		record, err := pluginsManager.SaveInstrumentation(r.Context(), session.Username, req)
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		adminhttp.WriteJSON(w, http.StatusCreated, map[string]any{"instrumentation": record})
+	default:
+		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
