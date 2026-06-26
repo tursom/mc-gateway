@@ -30,6 +30,12 @@ func TestNewAPIHandlerRoutesRequests(t *testing.T) {
 		{name: "users create", method: http.MethodPost, path: "/admin/api/users", wantCall: "users_create"},
 		{name: "user item", method: http.MethodPatch, path: "/admin/api/users/member", wantCall: "user_item", wantSegment: "member"},
 		{name: "audit logs", method: http.MethodGet, path: "/admin/api/audit-logs", wantCall: "audit_logs"},
+		{name: "plugin artifacts", method: http.MethodGet, path: "/admin/api/plugin-artifacts", wantCall: "plugin_artifacts"},
+		{name: "plugin artifact", method: http.MethodGet, path: "/admin/api/plugin-artifacts/abc", wantCall: "plugin_artifact", wantSegment: "abc"},
+		{name: "plugins list", method: http.MethodGet, path: "/admin/api/plugins", wantCall: "plugins_list"},
+		{name: "plugin item", method: http.MethodPut, path: "/admin/api/plugins/upstream-rewrite", wantCall: "plugin_item", wantSegment: "upstream-rewrite"},
+		{name: "plugin action", method: http.MethodPost, path: "/admin/api/plugins/upstream-rewrite/enable", wantCall: "plugin_action", wantSegment: "upstream-rewrite/enable"},
+		{name: "plugin dispatch", method: http.MethodGet, path: "/admin/api/plugins/dispatch-plan", wantCall: "plugin_dispatch"},
 	}
 
 	for _, tt := range tests {
@@ -56,6 +62,13 @@ func TestNewAPIHandlerRoutesRequests(t *testing.T) {
 				UserItem:    recordSegmentCall(&gotCall, &gotSegment, "user_item"),
 
 				AuditLogs: recordCall(&gotCall, "audit_logs"),
+
+				PluginArtifacts: recordCall(&gotCall, "plugin_artifacts"),
+				PluginArtifact:  recordSegmentCall(&gotCall, &gotSegment, "plugin_artifact"),
+				PluginsList:     recordCall(&gotCall, "plugins_list"),
+				PluginItem:      recordSegmentCall(&gotCall, &gotSegment, "plugin_item"),
+				PluginAction:    recordSegmentCall(&gotCall, &gotSegment, "plugin_action"),
+				PluginDispatch:  recordCall(&gotCall, "plugin_dispatch"),
 			})
 
 			resp := httptest.NewRecorder()

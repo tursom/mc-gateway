@@ -3,21 +3,23 @@ package adminaudit
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"time"
 )
 
 const DefaultListLimit = 200
 
 type Record struct {
-	ID         int64  `json:"id"`
-	Actor      string `json:"actor"`
-	SourceIP   string `json:"source_ip"`
-	Action     string `json:"action"`
-	TargetType string `json:"target_type"`
-	TargetID   string `json:"target_id"`
-	Success    bool   `json:"success"`
-	Message    string `json:"message"`
-	CreatedAt  int64  `json:"created_at"`
+	ID           int64  `json:"id"`
+	Actor        string `json:"actor"`
+	SourceIP     string `json:"source_ip"`
+	Action       string `json:"action"`
+	TargetType   string `json:"target_type"`
+	TargetID     string `json:"target_id"`
+	Success      bool   `json:"success"`
+	Message      string `json:"message"`
+	MetadataJSON string `json:"metadata_json"`
+	CreatedAt    int64  `json:"created_at"`
 }
 
 type Repository struct {
@@ -41,13 +43,25 @@ func NewRepositoryWithClock(db *sql.DB, now func() time.Time) Repository {
 }
 
 func (r Repository) Record(ctx context.Context, actor, sourceIP, action, targetType, targetID string, success bool, message string) error {
+	return r.RecordWithMetadata(ctx, actor, sourceIP, action, targetType, targetID, success, message, nil)
+}
+
+func (r Repository) RecordWithMetadata(ctx context.Context, actor, sourceIP, action, targetType, targetID string, success bool, message string, metadata any) error {
 	if r.db == nil {
 		return nil
 	}
+	metadataJSON := "{}"
+	if metadata != nil {
+		data, err := json.Marshal(metadata)
+		if err != nil {
+			return err
+		}
+		metadataJSON = string(data)
+	}
 	_, err := r.db.ExecContext(ctx, `
-INSERT INTO audit_logs(actor, source_ip, action, target_type, target_id, success, message, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		actor, sourceIP, action, targetType, targetID, boolToInt(success), message, r.now().Unix())
+INSERT INTO audit_logs(actor, source_ip, action, target_type, target_id, success, message, metadata_json, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		actor, sourceIP, action, targetType, targetID, boolToInt(success), message, metadataJSON, r.now().Unix())
 	return err
 }
 
@@ -56,7 +70,7 @@ func (r Repository) List(ctx context.Context, limit int) ([]Record, error) {
 		limit = DefaultListLimit
 	}
 	rows, err := r.db.QueryContext(ctx, `
-SELECT id, actor, source_ip, action, target_type, target_id, success, message, created_at
+SELECT id, actor, source_ip, action, target_type, target_id, success, message, metadata_json, created_at
 FROM audit_logs
 ORDER BY id DESC
 LIMIT ?`, limit)
@@ -69,7 +83,7 @@ LIMIT ?`, limit)
 	for rows.Next() {
 		var item Record
 		var success int
-		if err := rows.Scan(&item.ID, &item.Actor, &item.SourceIP, &item.Action, &item.TargetType, &item.TargetID, &success, &item.Message, &item.CreatedAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.Actor, &item.SourceIP, &item.Action, &item.TargetType, &item.TargetID, &success, &item.Message, &item.MetadataJSON, &item.CreatedAt); err != nil {
 			return nil, err
 		}
 		item.Success = success != 0

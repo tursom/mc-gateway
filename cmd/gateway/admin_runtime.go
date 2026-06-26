@@ -4,11 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/tursom/mc-gateway/internal/adminconfig"
 	"github.com/tursom/mc-gateway/internal/admindb"
 	"github.com/tursom/mc-gateway/internal/adminservice"
+	"github.com/tursom/mc-gateway/internal/pluginmanager"
 )
 
 const (
@@ -44,6 +46,7 @@ var (
 
 	adminDB        *sql.DB
 	adminDBPath    string
+	pluginsManager *pluginmanager.Manager
 	processStartAt = time.Now()
 )
 
@@ -77,7 +80,17 @@ func initializeGatewayRuntime() error {
 	if err := ensureInitialAdminFromEnv(context.Background(), db, os.Getenv(adminEnvInitialPassword)); err != nil {
 		return err
 	}
-	return refreshRouteSnapshot(context.Background())
+	if err := refreshRouteSnapshot(context.Background()); err != nil {
+		return err
+	}
+
+	pluginsManager = pluginmanager.New(pluginmanager.Options{
+		DB:           db,
+		ArtifactRoot: filepath.Join(filepath.Dir(startup.DBPath), "plugins", "artifacts"),
+		HandleConn:   handleRequest,
+		WaitGroup:    &exitWaitGroup,
+	})
+	return pluginsManager.Reconcile(context.Background())
 }
 
 func closeGatewayRuntime() {

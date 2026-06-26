@@ -34,3 +34,11 @@ type PatchUserRequest struct {
 	Password *string `json:"password"`
 	Disabled *bool   `json:"disabled"`
 }
+
+type PluginDesiredRequest struct {
+	ArtifactID   string         `json:"artifact_id"`
+	DesiredState string         `json:"desired_state"`
+	Priority     int            `json:"priority"`
+	Config       map[string]any `json:"config"`
+	ConfigJSON   string         `json:"config_json"`
+}

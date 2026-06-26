@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net"
 	"unsafe"
@@ -8,6 +9,8 @@ import (
 
 var (
 	UnsupportedHookType = errors.New("unsupported hook type")
+	ErrPass             = errors.New("plugin handler pass")
+	ErrBlocked          = errors.New("plugin handler blocked")
 )
 
 type (
@@ -19,9 +22,28 @@ type (
 		acceptor Accept
 		handler  Handler
 	}
+
+	UpstreamConnectRequest struct {
+		Context     context.Context
+		Source      net.Conn
+		Host        string
+		Upstream    string
+		InitialData []byte
+		Metadata    map[string]string
+	}
+
+	UpstreamConnectAcceptor func(UpstreamConnectRequest) bool
+	UpstreamConnectHandler  func(UpstreamConnectRequest) (net.Conn, error)
 )
 
 var (
+	HookUpstreamConnect = HookType[
+		UpstreamConnectAcceptor,
+		UpstreamConnectHandler,
+	]{
+		key: "upstream.connect/v1",
+	}
+
 	HookUpstream = HookType[
 		func(source net.Conn, host string) bool,
 		func(source net.Conn, host string) (net.Conn, error),

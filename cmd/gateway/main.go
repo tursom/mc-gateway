@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"net"
+	"os"
 	"sync"
 
 	"github.com/rs/zerolog/log"
@@ -11,6 +13,10 @@ import (
 )
 
 func main() {
+	if handled, code := runPluginCLI(os.Args[1:]); handled {
+		os.Exit(code)
+	}
+
 	if err := loadConfig(); err != nil {
 		panic(err)
 	}
@@ -127,17 +133,39 @@ func mapToHost(conn net.Conn) net.Conn {
 
 	var client net.Conn
 
-	ok, err = invokeFirstHookHandler(api.HookUpstream, Handler2[net.Conn, string, bool](conn, host), func(handler func(net.Conn, string) (net.Conn, error)) error {
-		var err error
-		client, err = handler(conn, host)
-		return err
-	})
-	if err != nil {
-		log.Err(err).Msg("Failed to invoke upstream hook")
-		return nil
+	if pluginsManager != nil {
+		result, err := pluginsManager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{
+			Source:      conn,
+			Host:        mcHost,
+			Upstream:    host,
+			InitialData: append([]byte(nil), buf[:n]...),
+		})
+		if err != nil {
+			log.Err(err).
+				Str("client", conn.RemoteAddr().String()).
+				Str("host", mcHost).
+				Str("mc", host).
+				Msg("failed to invoke managed upstream plugin")
+			return nil
+		}
+		if result.Handled {
+			client = result.Conn
+		}
 	}
 
-	if !ok {
+	if client == nil {
+		ok, err = invokeFirstHookHandler(api.HookUpstream, Handler2[net.Conn, string, bool](conn, host), func(handler func(net.Conn, string) (net.Conn, error)) error {
+			var err error
+			client, err = handler(conn, host)
+			return err
+		})
+		if err != nil {
+			log.Err(err).Msg("Failed to invoke upstream hook")
+			return nil
+		}
+	}
+
+	if client == nil {
 		target := upstreamtarget.Parse(host)
 		switch target.Protocol {
 		case upstreamtarget.ProtocolQUIC:

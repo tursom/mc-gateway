@@ -10,6 +10,10 @@ func recordAudit(ctx context.Context, actor, sourceIP, action, targetType, targe
 	_ = adminaudit.NewRepository(adminDB).Record(ctx, actor, sourceIP, action, targetType, targetID, success, message)
 }
 
+func recordAuditMetadata(ctx context.Context, actor, sourceIP, action, targetType, targetID string, success bool, message string, metadata any) {
+	_ = adminaudit.NewRepository(adminDB).RecordWithMetadata(ctx, actor, sourceIP, action, targetType, targetID, success, message, metadata)
+}
+
 func listAuditLogs(ctx context.Context) ([]adminaudit.Record, error) {
 	return adminaudit.NewRepository(adminDB).List(ctx, adminaudit.DefaultListLimit)
 }

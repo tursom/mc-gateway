@@ -24,6 +24,9 @@ func TestAbstractPluginDefaults(t *testing.T) {
 }
 
 func TestHookTypesAndHandlers(t *testing.T) {
+	if got := HookUpstreamConnect.Key(); got != "upstream.connect/v1" {
+		t.Fatalf("HookUpstreamConnect.Key() = %q, want upstream.connect/v1", got)
+	}
 	if got := HookUpstream.Key(); got != "upstream" {
 		t.Fatalf("HookUpstream.Key() = %q, want upstream", got)
 	}

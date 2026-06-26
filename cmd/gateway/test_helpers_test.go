@@ -28,6 +28,7 @@ func saveGatewayState(t *testing.T) func() {
 	oldAdminStartup := adminStartup
 	oldAdminDB := adminDB
 	oldAdminDBPath := adminDBPath
+	oldPluginsManager := pluginsManager
 	oldAdminSessionManager := adminSessionManager
 	oldRouteSnapshot := routeSnapshot.Clone()
 	oldGatewayMetrics := gatewayMetrics
@@ -51,6 +52,7 @@ func saveGatewayState(t *testing.T) func() {
 	}
 	adminDB = nil
 	adminDBPath = ""
+	pluginsManager = nil
 	adminSessionManager = adminsession.NewManager()
 	publishRouteSnapshot(nil)
 	gatewayMetrics = gatewaymetrics.New()
@@ -70,6 +72,7 @@ func saveGatewayState(t *testing.T) func() {
 		adminStartup = oldAdminStartup
 		adminDB = oldAdminDB
 		adminDBPath = oldAdminDBPath
+		pluginsManager = oldPluginsManager
 		adminSessionManager = oldAdminSessionManager
 		publishRouteSnapshot(oldRouteSnapshot)
 		gatewayMetrics = oldGatewayMetrics

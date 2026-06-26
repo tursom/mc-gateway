@@ -28,6 +28,13 @@ type APIHandlers struct {
 	UserItem    SegmentHandlerFunc
 
 	AuditLogs http.HandlerFunc
+
+	PluginArtifacts http.HandlerFunc
+	PluginArtifact  SegmentHandlerFunc
+	PluginsList     http.HandlerFunc
+	PluginItem      SegmentHandlerFunc
+	PluginAction    SegmentHandlerFunc
+	PluginDispatch  http.HandlerFunc
 }
 
 func NewAPIHandler(prefix string, handlers APIHandlers) http.HandlerFunc {
@@ -69,6 +76,21 @@ func NewAPIHandler(prefix string, handlers APIHandlers) http.HandlerFunc {
 			callSegmentHandler(w, r, handlers.UserItem, strings.TrimPrefix(path, "/users/"))
 		case path == "/audit-logs" && r.Method == http.MethodGet:
 			callHandler(w, r, handlers.AuditLogs)
+		case path == "/plugin-artifacts" && (r.Method == http.MethodGet || r.Method == http.MethodPost):
+			callHandler(w, r, handlers.PluginArtifacts)
+		case strings.HasPrefix(path, "/plugin-artifacts/"):
+			callSegmentHandler(w, r, handlers.PluginArtifact, strings.TrimPrefix(path, "/plugin-artifacts/"))
+		case path == "/plugins" && r.Method == http.MethodGet:
+			callHandler(w, r, handlers.PluginsList)
+		case path == "/plugins/dispatch-plan" && r.Method == http.MethodGet:
+			callHandler(w, r, handlers.PluginDispatch)
+		case strings.HasPrefix(path, "/plugins/"):
+			pluginPath := strings.TrimPrefix(path, "/plugins/")
+			if strings.Count(pluginPath, "/") == 1 {
+				callSegmentHandler(w, r, handlers.PluginAction, pluginPath)
+				return
+			}
+			callSegmentHandler(w, r, handlers.PluginItem, pluginPath)
 		default:
 			WriteAPIError(w, http.StatusNotFound, "not found")
 		}
