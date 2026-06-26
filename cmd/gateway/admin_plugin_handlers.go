@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -791,14 +792,47 @@ func handleAdminPluginDraining(w http.ResponseWriter, r *http.Request, rawPlugin
 }
 
 func handleAdminPluginDispatchPlan(w http.ResponseWriter, r *http.Request) {
-	if _, ok := requireRole(w, r, adminRoleMember); !ok {
+	session, ok := requireRole(w, r, adminRoleMember)
+	if !ok {
 		return
 	}
 	if pluginsManager == nil {
 		adminhttp.WriteAPIError(w, http.StatusServiceUnavailable, "plugin manager is not initialized")
 		return
 	}
-	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"dispatch_plan": pluginsManager.DispatchPlan(r.Context())})
+	switch r.Method {
+	case http.MethodGet:
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"dispatch_plan": pluginsManager.DispatchPlan(r.Context())})
+	case http.MethodPost:
+		if session.Role != adminRoleAdmin {
+			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		var req struct {
+			Action string `json:"action"`
+		}
+		if !adminhttp.DecodeJSONRequest(w, r, &req) {
+			return
+		}
+		switch req.Action {
+		case "refresh-routes":
+			cache := pluginsManager.RefreshRouteProviders(r.Context(), session.Username)
+			recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_route_provider_refresh", "plugin_dispatch", "", true, "route provider cache refreshed", map[string]any{"cache_entries": len(cache)})
+			adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"route_cache": cache})
+		case "replay-subscribers":
+			count := pluginsManager.ReplaySubscriberDeadLetters(r.Context(), session.Username)
+			recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_event_subscriber_replay", "plugin_dispatch", "", true, "event subscriber dead letters replay requested", map[string]any{"replayed": count})
+			adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"replayed": count})
+		case "drop-subscriber-dead-letter":
+			count := pluginsManager.DropSubscriberDeadLetters(r.Context(), session.Username)
+			recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_event_subscriber_drop", "plugin_dispatch", "", true, "event subscriber dead letters dropped", map[string]any{"dropped": count})
+			adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"dropped": count})
+		default:
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, "unknown dispatch action")
+		}
+	default:
+		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
 }
 
 func handleAdminPluginGovernance(w http.ResponseWriter, r *http.Request, rawSegment string) {
@@ -1157,6 +1191,7 @@ func pluginView(r *http.Request, plugin pluginmanager.PluginRecord, detail bool)
 		"runtime_summary":      jsonObjectString(plugin.RuntimeSummaryJSON),
 		"dispatch_summary":     jsonArrayString(plugin.DispatchSummaryJSON),
 		"capabilities_summary": jsonObjectString(desiredArtifact.CapabilitiesSummaryJSON),
+		"extension_status":     pluginExtensionStatus(r.Context(), plugin.ID),
 		"minecraft":            pluginMinecraftSummary(desiredArtifact),
 		"config_json":          plugin.ConfigJSON,
 		"config_schema":        jsonObjectString(manifestConfigSchemaString(manifest)),
@@ -1183,6 +1218,33 @@ func pluginView(r *http.Request, plugin pluginmanager.PluginRecord, detail bool)
 		view["proxy_connections"] = connections
 	}
 	return view, nil
+}
+
+func pluginExtensionStatus(ctx context.Context, pluginID string) map[string]any {
+	plan := pluginsManager.DispatchPlan(ctx)
+	filter := func(items []pluginmanager.DispatchHandlerSummary) []pluginmanager.DispatchHandlerSummary {
+		var out []pluginmanager.DispatchHandlerSummary
+		for _, item := range items {
+			if item.PluginID == pluginID {
+				out = append(out, item)
+			}
+		}
+		return out
+	}
+	var providers []pluginmanager.ProviderSummary
+	for _, provider := range plan.Providers {
+		if provider.PluginID == pluginID {
+			providers = append(providers, provider)
+		}
+	}
+	return map[string]any{
+		"routes":      filter(plan.Routes),
+		"statuses":    filter(plan.Statuses),
+		"middleware":  filter(plan.Middleware),
+		"subscribers": filter(plan.Subscribers),
+		"providers":   providers,
+		"route_cache": plan.RouteCache,
+	}
 }
 
 func pluginManifest(artifact pluginmanager.ArtifactRecord) pluginmanager.Manifest {

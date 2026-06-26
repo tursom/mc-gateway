@@ -406,6 +406,11 @@ func capabilitiesSummaryJSON(raw json.RawMessage) ([]byte, error) {
 	summary.Raw = append(json.RawMessage(nil), raw...)
 	var caps struct {
 		UpstreamConnect UpstreamConnectCapability `json:"upstream_connect"`
+		Route           RouteCapability           `json:"route"`
+		Status          StatusCapability          `json:"status"`
+		Middleware      MiddlewareCapability      `json:"middleware"`
+		Providers       []ProviderCapability      `json:"providers"`
+		EventSubscriber EventSubscriberCapability `json:"event_subscriber"`
 		Minecraft       *MinecraftCapability      `json:"minecraft"`
 	}
 	if err := json.Unmarshal(raw, &caps); err != nil {
@@ -414,6 +419,11 @@ func capabilitiesSummaryJSON(raw json.RawMessage) ([]byte, error) {
 	if caps.UpstreamConnect.Mode != "" {
 		summary.UpstreamConnect.Mode = caps.UpstreamConnect.Mode
 	}
+	summary.Route = caps.Route
+	summary.Status = caps.Status
+	summary.Middleware = caps.Middleware
+	summary.Providers = append([]ProviderCapability(nil), caps.Providers...)
+	summary.EventSubscriber = caps.EventSubscriber
 	if caps.Minecraft != nil {
 		summary.Minecraft = caps.Minecraft
 		if summary.Minecraft.UnsupportedPolicy == "" {
@@ -455,35 +465,35 @@ func validateManifest(manifest Manifest) error {
 		return errors.New("version is required")
 	case manifest.ArtifactType != ArtifactTypeBinary && manifest.ArtifactType != ArtifactTypeSource:
 		return fmt.Errorf("unsupported artifact_type %q", manifest.ArtifactType)
-	case manifest.Runtime.Type != RuntimeGoPlugin:
+	case manifest.Runtime.Type != RuntimeGoPlugin && manifest.Runtime.Type != RuntimeBuiltin:
 		return fmt.Errorf("unsupported runtime.type %q", manifest.Runtime.Type)
-	case manifest.ArtifactType == ArtifactTypeBinary && manifest.Runtime.Entry != RuntimeEntry:
+	case manifest.ArtifactType == ArtifactTypeBinary && manifest.Runtime.Type == RuntimeGoPlugin && manifest.Runtime.Entry != RuntimeEntry:
 		return fmt.Errorf("unsupported runtime.entry %q", manifest.Runtime.Entry)
 	case manifest.ArtifactType == ArtifactTypeSource && rawSourceBuildEntry(manifest) == "":
 		return errors.New("build.entry is required for source artifacts")
 	case manifest.APIVersion != APIVersion:
 		return fmt.Errorf("unsupported api_version %q", manifest.APIVersion)
-	case manifest.ArtifactType == ArtifactTypeBinary && manifest.GoVersion == "":
+	case manifest.ArtifactType == ArtifactTypeBinary && manifest.Runtime.Type == RuntimeGoPlugin && manifest.GoVersion == "":
 		return errors.New("go_version is required")
-	case manifest.ArtifactType == ArtifactTypeBinary && manifest.GOOS == "":
+	case manifest.ArtifactType == ArtifactTypeBinary && manifest.Runtime.Type == RuntimeGoPlugin && manifest.GOOS == "":
 		return errors.New("go_os is required")
-	case manifest.ArtifactType == ArtifactTypeBinary && manifest.GOARCH == "":
+	case manifest.ArtifactType == ArtifactTypeBinary && manifest.Runtime.Type == RuntimeGoPlugin && manifest.GOARCH == "":
 		return errors.New("go_arch is required")
 	}
-	if manifest.ArtifactType == ArtifactTypeBinary && manifest.GOOS != "" && manifest.GOOS != runtime.GOOS {
+	if manifest.ArtifactType == ArtifactTypeBinary && manifest.Runtime.Type == RuntimeGoPlugin && manifest.GOOS != "" && manifest.GOOS != runtime.GOOS {
 		return fmt.Errorf("go_os %q does not match gateway %q", manifest.GOOS, runtime.GOOS)
 	}
-	if manifest.ArtifactType == ArtifactTypeBinary && manifest.GOARCH != "" && manifest.GOARCH != runtime.GOARCH {
+	if manifest.ArtifactType == ArtifactTypeBinary && manifest.Runtime.Type == RuntimeGoPlugin && manifest.GOARCH != "" && manifest.GOARCH != runtime.GOARCH {
 		return fmt.Errorf("go_arch %q does not match gateway %q", manifest.GOARCH, runtime.GOARCH)
 	}
 	found := false
 	for _, ep := range manifest.ExtensionPoints {
-		if ep.Type == "hook" && ep.Key == ExtensionUpstreamConnect {
+		if supportedExtensionPoint(ep.Key) {
 			found = true
 		}
 	}
 	if !found {
-		return fmt.Errorf("extension point %q is required", ExtensionUpstreamConnect)
+		return errors.New("at least one supported extension point is required")
 	}
 	seenSecrets := make(map[string]bool, len(manifest.Secrets))
 	for _, secret := range manifest.Secrets {
@@ -508,6 +518,17 @@ func validateManifest(manifest Manifest) error {
 		return err
 	}
 	return nil
+}
+
+func supportedExtensionPoint(key string) bool {
+	switch key {
+	case ExtensionUpstreamConnect, ExtensionRouteResolve, ExtensionRouteResolver, ExtensionStatusPing,
+		ExtensionConnectionFilter, ExtensionHandshakeFilter, ExtensionEventSubscriber,
+		ExtensionProvider, ExtensionAuthProvider, ExtensionAdminAuthProvider:
+		return true
+	default:
+		return false
+	}
 }
 
 func validateNamedSpecs(kind string, names []string) error {

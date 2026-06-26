@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/rs/zerolog/log"
+	"github.com/tursom/mc-gateway/internal/pluginmanager"
 	"github.com/tursom/mc-gateway/internal/upstreamtarget"
 	"github.com/tursom/mc-gateway/plugin/api"
 	"github.com/tursom/mc-gateway/protocol"
@@ -90,6 +91,22 @@ func handleRequest(conn net.Conn) {
 }
 
 func mapToHost(conn net.Conn) net.Conn {
+	if pluginsManager != nil {
+		transport, _, _ := connectionIngress(conn)
+		filter, err := pluginsManager.FilterConnection(context.Background(), api.ConnectionFilterRequest{
+			SourceAddr: conn.RemoteAddr().String(),
+			Transport:  transport,
+		})
+		if err != nil {
+			log.Err(err).Str("client", conn.RemoteAddr().String()).Msg("connection filter failed")
+			return nil
+		}
+		if !filter.Allowed {
+			log.Info().Str("client", conn.RemoteAddr().String()).Str("plugin", filter.PluginID).Str("reason", filter.Reason).Msg("connection rejected by filter")
+			return nil
+		}
+	}
+
 	buf := getProxyBuffer()
 	defer putProxyBuffer(buf)
 
@@ -116,12 +133,44 @@ func mapToHost(conn net.Conn) net.Conn {
 		return nil
 	}
 
-	host, ok := lookupRoute(handshake.ServerHost)
-	if host == "" {
+	if pluginsManager != nil {
+		filter, err := pluginsManager.FilterHandshake(context.Background(), api.HandshakeFilterRequest{
+			SourceAddr:      conn.RemoteAddr().String(),
+			ServerHost:      handshake.ServerHost,
+			RawServerHost:   handshake.RawServerHost,
+			ProtocolVersion: handshake.ProtocolVersion,
+			NextState:       handshake.NextState,
+		})
+		if err != nil {
+			log.Err(err).Str("client", conn.RemoteAddr().String()).Str("host", handshake.ServerHost).Msg("handshake filter failed")
+			return nil
+		}
+		if !filter.Allowed {
+			log.Info().Str("client", conn.RemoteAddr().String()).Str("host", handshake.ServerHost).Str("plugin", filter.PluginID).Str("reason", filter.Reason).Msg("handshake rejected by filter")
+			return nil
+		}
+		if filter.RewriteHost != "" && filter.RewriteHost != handshake.ServerHost {
+			initialData = protocol.ReplaceMcHost(initialData, filter.RewriteHost)
+			handshake = protocol.ParseHandshake(initialData)
+		}
+	}
+
+	if handshake.NextState == 1 {
+		if handled := handleStatusPing(conn, handshake); handled {
+			return nil
+		}
+	}
+
+	routeResult := resolveGatewayRoute(conn, handshake)
+	host := routeResult.Decision.Upstream
+	ok := routeResult.Source != "fallback_miss"
+	if routeResult.Decision.Action == api.RouteDecisionReject || host == "" {
 		gatewayMetrics.RouteMiss()
 		log.Err(errEmptyBuffer).
 			Str("client", conn.RemoteAddr().String()).
 			Str("host", handshake.ServerHost).
+			Str("route_source", routeResult.Source).
+			Str("route_action", routeResult.Decision.Action).
 			Msg("failed to route host")
 		return nil
 	}
@@ -203,6 +252,88 @@ func mapToHost(conn net.Conn) net.Conn {
 	}
 
 	return client
+}
+
+func resolveGatewayRoute(conn net.Conn, handshake protocol.Handshake) pluginmanager.RouteResolveResult {
+	upstream, hit := lookupRoute(handshake.ServerHost)
+	req := api.RouteResolveRequest{
+		Host:             handshake.ServerHost,
+		RawServerHost:    handshake.RawServerHost,
+		SourceAddr:       conn.RemoteAddr().String(),
+		ProtocolVersion:  handshake.ProtocolVersion,
+		NextState:        handshake.NextState,
+		FallbackUpstream: upstream,
+		FallbackHit:      hit,
+		Handshake: api.UpstreamHandshakeRef{
+			ServerHost:      handshake.ServerHost,
+			RawServerHost:   handshake.RawServerHost,
+			ProtocolVersion: handshake.ProtocolVersion,
+			NextState:       handshake.NextState,
+		},
+	}
+	if pluginsManager != nil {
+		result, err := pluginsManager.ResolveRoute(context.Background(), req, func(req api.RouteResolveRequest) (string, bool) {
+			return lookupRoute(req.Host)
+		})
+		if err == nil {
+			return result
+		}
+		log.Err(err).Str("client", conn.RemoteAddr().String()).Str("host", handshake.ServerHost).Msg("route resolver failed")
+	}
+	action := api.RouteDecisionFallback
+	source := "sqlite_fallback"
+	if upstream == "" {
+		action = api.RouteDecisionReject
+		source = "fallback_miss"
+	}
+	return pluginmanager.RouteResolveResult{
+		Decision: api.RouteDecision{Action: action, Upstream: upstream, ProviderID: "sqlite", Reason: "sqlite route snapshot fallback"},
+		Source:   source,
+	}
+}
+
+func handleStatusPing(conn net.Conn, handshake protocol.Handshake) bool {
+	if pluginsManager == nil {
+		return false
+	}
+	result, err := pluginsManager.StatusPing(context.Background(), api.StatusPingRequest{
+		Host:            handshake.ServerHost,
+		RawServerHost:   handshake.RawServerHost,
+		SourceAddr:      conn.RemoteAddr().String(),
+		ProtocolVersion: handshake.ProtocolVersion,
+	})
+	if err != nil || !result.Handled {
+		if err != nil {
+			log.Err(err).Str("host", handshake.ServerHost).Msg("status ping plugin failed")
+		}
+		return false
+	}
+	payload := map[string]any{
+		"description": map[string]any{"text": result.Response.MOTD},
+		"players": map[string]any{
+			"online": result.Response.OnlinePlayers,
+			"max":    result.Response.MaxPlayers,
+		},
+		"version": map[string]any{
+			"name":     result.Response.VersionText,
+			"protocol": result.Response.ProtocolVersion,
+		},
+	}
+	if result.Response.Favicon != "" {
+		payload["favicon"] = result.Response.Favicon
+	}
+	if result.Response.Maintenance {
+		payload["maintenance"] = map[string]any{"window": result.Response.MaintenanceWindow}
+	}
+	packet, err := protocol.StatusResponsePacket(payload)
+	if err != nil {
+		log.Err(err).Str("host", handshake.ServerHost).Msg("failed to build status response")
+		return true
+	}
+	if err := writeAll(conn, packet); err != nil {
+		log.Err(err).Str("host", handshake.ServerHost).Msg("failed to write status response")
+	}
+	return true
 }
 
 func newUpstreamConnectRequest(conn net.Conn, upstream string, handshake protocol.Handshake, initialData []byte, routeHit bool) api.UpstreamConnectRequest {

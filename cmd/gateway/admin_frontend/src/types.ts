@@ -176,6 +176,7 @@ export interface PluginView {
   last_error?: string;
   runtime_summary?: Record<string, unknown>;
   dispatch_summary?: unknown[];
+  extension_status?: Record<string, unknown>;
   capabilities_summary?: Record<string, unknown>;
   minecraft?: unknown;
   config_json?: string;

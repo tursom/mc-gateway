@@ -1,0 +1,35 @@
+{
+  "schema_version": "mc-gateway.plugin/v1",
+  "id": "extension-ecosystem-example",
+  "name": "Extension Ecosystem Example",
+  "version": "0.1.0",
+  "description": "Example fixture for route, status, subscriber and provider extension points.",
+  "artifact_type": "binary",
+  "runtime": {
+    "type": "go-plugin",
+    "entry": "plugin.so",
+    "entry_symbol": "Plugin",
+    "metadata_symbol": "MCGatewayPluginMetadata"
+  },
+  "api_version": "plugin-api/v1",
+  "sdk_module": "github.com/tursom/mc-gateway/plugin/api",
+  "sdk_module_version": "v0.1.0",
+  "go_version": "go1.24.0",
+  "go_os": "linux",
+  "go_arch": "amd64",
+  "extension_points": [
+    { "type": "provider", "key": "route.resolve/v1" },
+    { "type": "hook", "key": "status.ping/v1" },
+    { "type": "event", "key": "event.subscriber/v1" },
+    { "type": "provider", "key": "admin.auth.provider/v1" }
+  ],
+  "capabilities": {
+    "extension_points": ["route.resolve/v1", "status.ping/v1", "event.subscriber/v1", "admin.auth.provider/v1"],
+    "route": { "cache_ttl_ms": 60000 },
+    "status": { "hosts": ["blue.example", "red.example"] },
+    "event_subscriber": { "mode": "at_least_once", "max_retry": 3 },
+    "providers": [{ "type": "admin.auth.provider/v1", "name": "external-identity", "fallback": true }]
+  },
+  "runtime_limits": { "handler_timeout_ms": 1000 },
+  "config_schema": { "type": "object" }
+}

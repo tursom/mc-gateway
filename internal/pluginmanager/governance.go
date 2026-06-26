@@ -904,7 +904,10 @@ func requiredFeatures(manifest Manifest) []string {
 
 func supportedFeature(feature string) bool {
 	switch feature {
-	case "", ExtensionUpstreamConnect, "upstream.connect", "minecraft", "config", "secret", "preflight", "self-test":
+	case "", ExtensionUpstreamConnect, ExtensionRouteResolve, ExtensionRouteResolver, ExtensionStatusPing,
+		ExtensionConnectionFilter, ExtensionHandshakeFilter, ExtensionEventSubscriber,
+		ExtensionProvider, ExtensionAuthProvider, ExtensionAdminAuthProvider,
+		"upstream.connect", "minecraft", "config", "secret", "preflight", "self-test":
 		return true
 	default:
 		return false

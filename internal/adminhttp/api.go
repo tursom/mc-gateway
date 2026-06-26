@@ -105,7 +105,7 @@ func NewAPIHandler(prefix string, handlers APIHandlers) http.HandlerFunc {
 			callHandler(w, r, handlers.PluginOperationsGC)
 		case path == "/plugins" && r.Method == http.MethodGet:
 			callHandler(w, r, handlers.PluginsList)
-		case path == "/plugins/dispatch-plan" && r.Method == http.MethodGet:
+		case path == "/plugins/dispatch-plan" && (r.Method == http.MethodGet || r.Method == http.MethodPost):
 			callHandler(w, r, handlers.PluginDispatch)
 		case path == "/plugin-advisories" && (r.Method == http.MethodGet || r.Method == http.MethodPost):
 			callHandler(w, r, handlers.PluginAdvisories)

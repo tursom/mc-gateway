@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/tursom/mc-gateway/plugin/api"
+	"github.com/tursom/mc-gateway/plugin/official/rulepolicy"
 )
 
 type RuntimeAdapter interface {
@@ -78,6 +79,9 @@ func (a GoPluginAdapter) RunSelfTest(ctx context.Context, artifact ArtifactRecor
 
 func (a GoPluginAdapter) instantiate(ctx context.Context, artifact ArtifactRecord, pluginRecord PluginRecord, gateway *Gateway, init bool) (api.Plugin, error) {
 	_ = ctx
+	if artifact.RuntimeType == RuntimeBuiltin || artifact.PluginID == "official.rule-policy" {
+		return instantiateBuiltinPlugin(artifact, pluginRecord, gateway, init)
+	}
 	opened, err := stdplugin.Open(artifact.FilePath)
 	if err != nil {
 		return nil, err
@@ -113,6 +117,31 @@ func (a GoPluginAdapter) instantiate(ctx context.Context, artifact ArtifactRecor
 	return instance, nil
 }
 
+func instantiateBuiltinPlugin(artifact ArtifactRecord, pluginRecord PluginRecord, gateway *Gateway, init bool) (api.Plugin, error) {
+	var instance api.Plugin
+	switch artifact.PluginID {
+	case "official.rule-policy":
+		instance = rulepolicy.New()
+	default:
+		return nil, fmt.Errorf("unknown builtin plugin %q", artifact.PluginID)
+	}
+	cfg := instance.NewConfigObj()
+	if cfg != nil && pluginRecord.ConfigJSON != "" && canUnmarshalInto(cfg) {
+		if err := json.Unmarshal([]byte(pluginRecord.ConfigJSON), cfg); err != nil {
+			return nil, fmt.Errorf("decode plugin config: %w", err)
+		}
+	}
+	if err := instance.ReloadConfig(cfg); err != nil {
+		return nil, err
+	}
+	if init {
+		if err := instance.Init(gateway); err != nil {
+			return nil, err
+		}
+	}
+	return instance, nil
+}
+
 func canUnmarshalInto(value any) bool {
 	if value == nil {
 		return false
@@ -130,9 +159,12 @@ type Manager struct {
 	wg            *sync.WaitGroup
 	policyProfile string
 
-	mu       sync.Mutex
-	loaded   map[string]*loadedPlugin
-	snapshot atomic.Value
+	mu                sync.Mutex
+	loaded            map[string]*loadedPlugin
+	snapshot          atomic.Value
+	extensionSnapshot atomic.Value
+	routeCacheMu      sync.Mutex
+	routeCache        map[string]routeCacheEntry
 
 	proxyMu     sync.Mutex
 	proxySeq    uint64
@@ -142,11 +174,20 @@ type Manager struct {
 }
 
 type loadedPlugin struct {
-	record   PluginRecord
-	artifact ArtifactRecord
-	instance api.Plugin
-	gateway  *Gateway
-	handlers []*upstreamHandler
+	record     PluginRecord
+	artifact   ArtifactRecord
+	instance   api.Plugin
+	gateway    *Gateway
+	handlers   []*upstreamHandler
+	extensions pluginExtensions
+}
+
+type pluginExtensions struct {
+	routes      []*routeHandler
+	statuses    []*statusHandler
+	middleware  []*middlewareHandler
+	subscribers []*subscriberHandler
+	providers   []ProviderSummary
 }
 
 type upstreamHandler struct {
@@ -225,6 +266,7 @@ func New(options Options) *Manager {
 		wg:            options.WaitGroup,
 		policyProfile: options.PolicyProfile,
 		loaded:        make(map[string]*loadedPlugin),
+		routeCache:    make(map[string]routeCacheEntry),
 		proxyConns:    make(map[uint64]*proxyConnection),
 		drainingIDs:   make(map[string]bool),
 	}
@@ -236,7 +278,61 @@ func New(options Options) *Manager {
 		}
 	}
 	manager.publish(nil)
+	manager.publishExtensionsLocked(nil)
+	_ = manager.EnsureOfficialPlugins(context.Background(), "system")
 	return manager
+}
+
+func (m *Manager) EnsureOfficialPlugins(ctx context.Context, actor string) error {
+	now := time.Now().Unix()
+	manifest := Manifest{
+		SchemaVersion: SchemaVersion,
+		ID:            "official.rule-policy",
+		Name:          "Official Rule Policy",
+		Version:       "0.1.0",
+		Description:   "Built-in official rule/policy extension for host rewrite, CIDR policy, rate limit, maintenance mode and upstream rewrite.",
+		ArtifactType:  ArtifactTypeBinary,
+		Runtime: RuntimeManifest{
+			Type: RuntimeBuiltin,
+		},
+		APIVersion: APIVersion,
+		ExtensionPoints: []ExtensionPoint{
+			{Type: "middleware", Key: ExtensionConnectionFilter},
+			{Type: "middleware", Key: ExtensionHandshakeFilter},
+			{Type: "provider", Key: ExtensionRouteResolve},
+			{Type: "hook", Key: ExtensionStatusPing},
+		},
+		Capabilities:  json.RawMessage(`{"extension_points":["connection.filter/v1","handshake.filter/v1","route.resolve/v1","status.ping/v1"],"middleware":{"fail_policy":"fail_open"},"route":{"cache_ttl_ms":60000},"status":{"hosts":["*"]}}`),
+		RuntimeLimits: RuntimeLimits{HandlerTimeoutMS: int(DefaultHandlerTimeout / time.Millisecond)},
+		ConfigSchema:  json.RawMessage(`{"type":"object","properties":{"host_rewrite":{"type":"object"},"upstream_rewrite":{"type":"object"},"source_allow_cidr":{"type":"array"},"source_deny_cidr":{"type":"array"},"rate_limit":{"type":"object"},"maintenance":{"type":"object"}}}`),
+	}
+	metadata, _ := json.Marshal(manifest)
+	extensionPoints, _ := json.Marshal(manifest.ExtensionPoints)
+	summaryJSON, _ := manifestCapabilitiesSummaryJSON(manifest)
+	artifact := ArtifactRecord{
+		ID:                      "builtin-official-rule-policy-0.1.0",
+		PluginID:                manifest.ID,
+		Version:                 manifest.Version,
+		FileName:                "builtin:official.rule-policy",
+		FilePath:                "",
+		SHA256:                  "builtin:official.rule-policy:0.1.0",
+		PackageSHA256:           "builtin:official.rule-policy:0.1.0",
+		ArtifactType:            ArtifactTypeBinary,
+		RuntimeType:             RuntimeBuiltin,
+		Status:                  ArtifactStatusLoadable,
+		MetadataJSON:            string(metadata),
+		CapabilitiesSummaryJSON: string(summaryJSON),
+		ExtensionPointsJSON:     string(extensionPoints),
+		APIVersion:              APIVersion,
+		UploadedBy:              actor,
+		CreatedAt:               now,
+		UpdatedAt:               now,
+	}
+	if err := m.repo.SaveArtifact(ctx, artifact); err != nil {
+		return err
+	}
+	_ = m.repo.RecordOperation(ctx, manifest.ID, artifact.ID, "official_plugin_register", "succeeded", actor, "official rule/policy plugin registered", nil)
+	return nil
 }
 
 func (m *Manager) UploadArtifact(ctx context.Context, upload ArtifactUpload) (ArtifactRecord, error) {
@@ -700,8 +796,8 @@ func (m *Manager) Enable(ctx context.Context, actor, pluginID string) (PluginRec
 		_ = m.repo.RecordOperation(ctx, pluginID, pluginRecord.DesiredArtifactID, "enable", "failed", actor, err.Error(), nil)
 		return PluginRecord{}, err
 	}
-	if len(loaded.handlers) == 0 {
-		err := fmt.Errorf("plugin %q did not register %s", pluginID, ExtensionUpstreamConnect)
+	if len(loaded.handlers) == 0 && loaded.extensions.empty() {
+		err := fmt.Errorf("plugin %q did not register any supported extension point", pluginID)
 		_ = m.repo.MarkRuntime(ctx, pluginID, RuntimeFailed, "", loaded.artifact.ID, pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
 		_ = m.repo.RecordOperation(ctx, pluginID, pluginRecord.DesiredArtifactID, "enable", "failed", actor, err.Error(), nil)
 		return PluginRecord{}, err
@@ -710,11 +806,14 @@ func (m *Manager) Enable(ctx context.Context, actor, pluginID string) (PluginRec
 	current := m.currentHandlersLocked()
 	current[pluginID] = loaded.handlers
 	next := flattenHandlers(current)
+	extensions := m.currentExtensionsLocked()
+	extensions[pluginID] = loaded.extensions
 	if err := m.markEnabled(ctx, loaded); err != nil {
 		return PluginRecord{}, err
 	}
 	m.clearDrainingLocked(pluginID)
 	m.publish(next)
+	m.publishExtensionsLocked(extensions)
 	_ = m.repo.UpdateArtifactStatus(ctx, loaded.artifact.ID, ArtifactStatusLoaded, "")
 	_ = m.repo.RecordOperation(ctx, pluginID, loaded.artifact.ID, "enable", "succeeded", actor, "plugin enabled", map[string]any{
 		"desired_generation":  loaded.record.DesiredGeneration,
@@ -737,6 +836,7 @@ func (m *Manager) Disable(ctx context.Context, actor, pluginID string) (PluginRe
 		return PluginRecord{}, err
 	}
 	m.removeFromDispatchLocked(pluginID)
+	m.removeExtensionsLocked(pluginID)
 	m.markDrainingLocked(pluginID)
 	m.operations.StopPlugin(pluginID)
 	if loaded := m.loaded[pluginID]; loaded != nil && loaded.instance != nil {
@@ -767,6 +867,7 @@ func (m *Manager) Delete(ctx context.Context, actor, pluginID string) error {
 		return err
 	}
 	m.removeFromDispatchLocked(pluginID)
+	m.removeExtensionsLocked(pluginID)
 	m.markDrainingLocked(pluginID)
 	m.operations.StopPlugin(pluginID)
 	if loaded := m.loaded[pluginID]; loaded != nil && loaded.instance != nil {
@@ -791,6 +892,7 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 		return err
 	}
 	nextByPlugin := make(map[string][]*upstreamHandler)
+	extensionsByPlugin := make(map[string]pluginExtensions)
 	for _, pluginRecord := range desired {
 		decision, err := m.EvaluateGovernance(ctx, pluginRecord.ID, pluginRecord.DesiredArtifactID, GovernanceActionEnable, m.currentPolicyProfile(), pluginRecord.ConfigJSON)
 		if err == nil && !decision.OK {
@@ -807,17 +909,19 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 			_ = m.repo.RecordOperation(ctx, pluginRecord.ID, pluginRecord.DesiredArtifactID, "reconcile", "failed", "system", err.Error(), nil)
 			continue
 		}
-		if len(loaded.handlers) == 0 {
-			err := fmt.Errorf("plugin %q did not register %s", pluginRecord.ID, ExtensionUpstreamConnect)
+		if len(loaded.handlers) == 0 && loaded.extensions.empty() {
+			err := fmt.Errorf("plugin %q did not register any supported extension point", pluginRecord.ID)
 			_ = m.repo.MarkRuntime(ctx, pluginRecord.ID, RuntimeFailed, "", loaded.artifact.ID, pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
 			_ = m.repo.RecordOperation(ctx, pluginRecord.ID, pluginRecord.DesiredArtifactID, "reconcile", "failed", "system", err.Error(), nil)
 			continue
 		}
 		nextByPlugin[pluginRecord.ID] = loaded.handlers
+		extensionsByPlugin[pluginRecord.ID] = loaded.extensions
 		_ = m.markEnabled(ctx, loaded)
 		m.clearDrainingLocked(pluginRecord.ID)
 	}
 	m.publish(flattenHandlers(nextByPlugin))
+	m.publishExtensionsLocked(extensionsByPlugin)
 	return nil
 }
 
@@ -1178,6 +1282,13 @@ func (m *Manager) DispatchPlan(ctx context.Context) DispatchPlan {
 	if handlers, ok := value.([]*upstreamHandler); ok {
 		plan.Handlers = handlerSummaries(handlers)
 	}
+	state := m.extensionState()
+	plan.Routes = routeHandlerSummaries(state.routes)
+	plan.Statuses = statusHandlerSummaries(state.statuses)
+	plan.Middleware = middlewareHandlerSummaries(state.middleware)
+	plan.Subscribers = subscriberHandlerSummaries(state.subscribers)
+	plan.Providers = append([]ProviderSummary(nil), state.providers...)
+	plan.RouteCache = m.RouteCacheSnapshot()
 	return plan
 }
 
@@ -1192,6 +1303,13 @@ func (m *Manager) OperationsSnapshot(ctx context.Context, pluginID string) (Oper
 	for _, handler := range plan.Handlers {
 		if pluginID == "" || handler.PluginID == pluginID {
 			handlers = append(handlers, handler)
+		}
+	}
+	for _, group := range [][]DispatchHandlerSummary{plan.Routes, plan.Statuses, plan.Middleware, plan.Subscribers} {
+		for _, handler := range group {
+			if pluginID == "" || handler.PluginID == pluginID {
+				handlers = append(handlers, handler)
+			}
 		}
 	}
 	builds, err := m.repo.ListBuilds(ctx, pluginID)
@@ -1373,17 +1491,20 @@ func (m *Manager) loadLocked(ctx context.Context, pluginRecord PluginRecord) (*l
 		return nil, err
 	}
 	handlers := buildHandlers(pluginRecord, artifact, gateway)
+	extensions := buildExtensions(pluginRecord, artifact, gateway)
 	loaded := &loadedPlugin{
-		record:   pluginRecord,
-		artifact: artifact,
-		instance: instance,
-		gateway:  gateway,
-		handlers: handlers,
+		record:     pluginRecord,
+		artifact:   artifact,
+		instance:   instance,
+		gateway:    gateway,
+		handlers:   handlers,
+		extensions: extensions,
 	}
 	m.loaded[pluginRecord.ID] = loaded
 	if err := m.repo.MarkRuntime(ctx, pluginRecord.ID, RuntimeLoaded, "", artifact.ID, pluginRecord.AppliedGeneration, "", map[string]any{
-		"handler_count": len(handlers),
-	}, handlerSummaries(handlers)); err != nil {
+		"handler_count":   len(handlers),
+		"extension_count": extensions.count(),
+	}, loaded.dispatchSummaries()); err != nil {
 		return nil, err
 	}
 	m.operations.StartTasks(pluginRecord.ID)
@@ -1396,6 +1517,9 @@ func (m *Manager) validateArtifactGate(artifact ArtifactRecord) error {
 	}
 	if artifact.ArtifactType != ArtifactTypeBinary {
 		return errors.New("desired artifact must be a binary artifact")
+	}
+	if artifact.RuntimeType == RuntimeBuiltin {
+		return nil
 	}
 	if artifact.GoVersion != runtime.Version() {
 		return fmt.Errorf("artifact go_version %q does not match gateway %q", artifact.GoVersion, runtime.Version())
@@ -1437,8 +1561,9 @@ func (m *Manager) restartRequired(pluginID, artifactID string) bool {
 func (m *Manager) markEnabled(ctx context.Context, loaded *loadedPlugin) error {
 	m.operations.StartTasks(loaded.record.ID)
 	return m.repo.MarkRuntime(ctx, loaded.record.ID, RuntimeEnabled, loaded.artifact.ID, loaded.artifact.ID, loaded.record.DesiredGeneration, "", map[string]any{
-		"handler_count": len(loaded.handlers),
-	}, handlerSummaries(loaded.handlers))
+		"handler_count":   len(loaded.handlers),
+		"extension_count": loaded.extensions.count(),
+	}, loaded.dispatchSummaries())
 }
 
 func (m *Manager) currentHandlersLocked() map[string][]*upstreamHandler {

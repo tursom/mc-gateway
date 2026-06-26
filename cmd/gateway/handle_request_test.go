@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -248,6 +250,81 @@ func TestHandleRequestProtocolProxyDisableSkipsNewConnections(t *testing.T) {
 	}
 	if legacyUpstream.writeBuf.Len() == 0 {
 		t.Fatal("legacy upstream did not receive second request")
+	}
+}
+
+func TestHandleRequestRouteResolverUsesOverrideAndSQLiteFallback(t *testing.T) {
+	defer saveGatewayState(t)()
+
+	setGatewayTestRoutes(map[string]string{"fallback.example": "fallback-upstream:25565"})
+	var dialed []string
+	pluginsManager = pluginmanager.New(pluginmanager.Options{
+		DB:           newGatewayTestPluginDB(t),
+		ArtifactRoot: t.TempDir(),
+		Adapter: gatewayTestPluginAdapter{initHook: func(gateway *pluginmanager.Gateway) error {
+			return api.RegisterHookHandler(gateway, api.HookRouteResolve,
+				func(api.RouteResolveRequest) bool { return true },
+				func(req api.RouteResolveRequest) (api.RouteDecision, error) {
+					if req.Host == "override.example" {
+						return api.RouteDecision{Action: api.RouteDecisionOverride, Upstream: "override-upstream:25565", CacheTTL: time.Minute}, nil
+					}
+					return api.RouteDecision{Action: api.RouteDecisionPass}, nil
+				})
+		}},
+	})
+	artifact := uploadGatewayTestArtifactWithManifest(t, pluginsManager, "route-plugin", func(manifest *pluginmanager.Manifest) {
+		manifest.ExtensionPoints = []pluginmanager.ExtensionPoint{{Type: "provider", Key: pluginmanager.ExtensionRouteResolve}}
+		manifest.Capabilities = json.RawMessage(`{"extension_points":["route.resolve/v1"]}`)
+	})
+	if _, err := pluginsManager.SetDesired(context.Background(), "admin", "route-plugin", artifact.ID, pluginmanager.DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	if _, err := pluginsManager.Enable(context.Background(), "admin", "route-plugin"); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	registerGatewayUpstreamHook(t, func(net.Conn, string) bool { return true }, func(_ net.Conn, host string) (net.Conn, error) {
+		dialed = append(dialed, host)
+		return newGatewayTestConn(nil), nil
+	})
+
+	handleRequest(newGatewayTestConn(gatewayTestPacket("override.example")))
+	handleRequest(newGatewayTestConn(gatewayTestPacket("fallback.example")))
+
+	if len(dialed) != 2 || dialed[0] != "override-upstream:25565" || dialed[1] != "fallback-upstream:25565" {
+		t.Fatalf("dialed = %+v, want override then sqlite fallback", dialed)
+	}
+}
+
+func TestHandleRequestStatusPingPluginRespondsPerHost(t *testing.T) {
+	defer saveGatewayState(t)()
+
+	pluginsManager = pluginmanager.New(pluginmanager.Options{
+		DB:           newGatewayTestPluginDB(t),
+		ArtifactRoot: t.TempDir(),
+		Adapter: gatewayTestPluginAdapter{initHook: func(gateway *pluginmanager.Gateway) error {
+			return api.RegisterHookHandler(gateway, api.HookStatusPing,
+				func(api.StatusPingRequest) bool { return true },
+				func(req api.StatusPingRequest) (api.StatusPingResponse, error) {
+					return api.StatusPingResponse{MOTD: "hello " + req.Host, VersionText: "phase7", MaxPlayers: 100}, nil
+				})
+		}},
+	})
+	artifact := uploadGatewayTestArtifactWithManifest(t, pluginsManager, "status-plugin", func(manifest *pluginmanager.Manifest) {
+		manifest.ExtensionPoints = []pluginmanager.ExtensionPoint{{Type: "hook", Key: pluginmanager.ExtensionStatusPing}}
+		manifest.Capabilities = json.RawMessage(`{"extension_points":["status.ping/v1"]}`)
+	})
+	if _, err := pluginsManager.SetDesired(context.Background(), "admin", "status-plugin", artifact.ID, pluginmanager.DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	if _, err := pluginsManager.Enable(context.Background(), "admin", "status-plugin"); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+
+	source := newGatewayTestConn(gatewayTestPacket("status.example", 0x63, 0x01))
+	handleRequest(source)
+
+	if got := source.writeBuf.String(); !strings.Contains(got, "hello status.example") {
+		t.Fatalf("status response = %q, want host MOTD", got)
 	}
 }
 

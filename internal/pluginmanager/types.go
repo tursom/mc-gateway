@@ -18,10 +18,20 @@ const (
 	ArtifactTypeBinary = "binary"
 	ArtifactTypeSource = "source"
 	RuntimeGoPlugin    = "go-plugin"
+	RuntimeBuiltin     = "builtin"
 	RuntimeEntry       = "plugin.so"
 	SourceBuildEntry   = "."
 
-	ExtensionUpstreamConnect = "upstream.connect/v1"
+	ExtensionUpstreamConnect   = "upstream.connect/v1"
+	ExtensionRouteResolve      = "route.resolve/v1"
+	ExtensionRouteResolver     = "route.resolver/v1"
+	ExtensionStatusPing        = "status.ping/v1"
+	ExtensionConnectionFilter  = "connection.filter/v1"
+	ExtensionHandshakeFilter   = "handshake.filter/v1"
+	ExtensionEventSubscriber   = "event.subscriber/v1"
+	ExtensionProvider          = "provider/v1"
+	ExtensionAuthProvider      = "auth.provider/v1"
+	ExtensionAdminAuthProvider = "admin.auth.provider/v1"
 
 	UpstreamModeDialer        = "dialer"
 	UpstreamModeProtocolProxy = "protocol-proxy"
@@ -82,23 +92,25 @@ const (
 	AdvisoryStatusRevoked = "revoked"
 	AdvisoryStatusAcked   = "acknowledged"
 
-	DefaultPriority            = 100
-	DefaultHandlerTimeout      = 3 * time.Second
-	DefaultManifestMaxBytes    = 256 * 1024
-	DefaultPackageMaxBytes     = 64 * 1024 * 1024
-	DefaultPackageMaxEntries   = 2048
-	DefaultExtractedMaxBytes   = 256 * 1024 * 1024
-	DefaultNonRuntimeMaxBytes  = 16 * 1024 * 1024
-	DefaultInitialWriteTimeout = time.Second
-	DefaultExternalTimeout     = 5 * time.Second
-	DefaultBuildLogMaxBytes    = 64 * 1024
-	DefaultEventQueueLimit     = 1000
-	DefaultEventRecentLimit    = 1000
-	DefaultLabelValueMaxBytes  = 64
-	DefaultPluginDataQuota     = 16 * 1024 * 1024
-	DefaultPluginDataKeyLimit  = 256 * 1024
-	DefaultPluginFileQuota     = 32 * 1024 * 1024
-	DefaultLogRecentLimit      = 500
+	DefaultPriority             = 100
+	DefaultHandlerTimeout       = 3 * time.Second
+	DefaultSubscriberRetryDelay = 100 * time.Millisecond
+	DefaultSubscriberMaxRetry   = 3
+	DefaultManifestMaxBytes     = 256 * 1024
+	DefaultPackageMaxBytes      = 64 * 1024 * 1024
+	DefaultPackageMaxEntries    = 2048
+	DefaultExtractedMaxBytes    = 256 * 1024 * 1024
+	DefaultNonRuntimeMaxBytes   = 16 * 1024 * 1024
+	DefaultInitialWriteTimeout  = time.Second
+	DefaultExternalTimeout      = 5 * time.Second
+	DefaultBuildLogMaxBytes     = 64 * 1024
+	DefaultEventQueueLimit      = 1000
+	DefaultEventRecentLimit     = 1000
+	DefaultLabelValueMaxBytes   = 64
+	DefaultPluginDataQuota      = 16 * 1024 * 1024
+	DefaultPluginDataKeyLimit   = 256 * 1024
+	DefaultPluginFileQuota      = 32 * 1024 * 1024
+	DefaultLogRecentLimit       = 500
 )
 
 var (
@@ -231,6 +243,11 @@ type FileStoreSpec struct {
 
 type CapabilitySummary struct {
 	UpstreamConnect UpstreamConnectCapability `json:"upstream_connect,omitempty"`
+	Route           RouteCapability           `json:"route,omitempty"`
+	Status          StatusCapability          `json:"status,omitempty"`
+	Middleware      MiddlewareCapability      `json:"middleware,omitempty"`
+	Providers       []ProviderCapability      `json:"providers,omitempty"`
+	EventSubscriber EventSubscriberCapability `json:"event_subscriber,omitempty"`
 	Minecraft       *MinecraftCapability      `json:"minecraft,omitempty"`
 	Events          []EventSpec               `json:"events,omitempty"`
 	CustomMetrics   []MetricSpec              `json:"custom_metrics,omitempty"`
@@ -242,6 +259,32 @@ type CapabilitySummary struct {
 
 type UpstreamConnectCapability struct {
 	Mode string `json:"mode,omitempty"`
+}
+
+type RouteCapability struct {
+	CacheTTLMS int `json:"cache_ttl_ms,omitempty"`
+}
+
+type StatusCapability struct {
+	Hosts []string `json:"hosts,omitempty"`
+}
+
+type MiddlewareCapability struct {
+	FailPolicy string `json:"fail_policy,omitempty"`
+}
+
+type ProviderCapability struct {
+	Type         string   `json:"type,omitempty"`
+	Name         string   `json:"name,omitempty"`
+	Priority     int      `json:"priority,omitempty"`
+	Fallback     bool     `json:"fallback,omitempty"`
+	Dependencies []string `json:"dependencies,omitempty"`
+}
+
+type EventSubscriberCapability struct {
+	Mode       string `json:"mode,omitempty"`
+	QueueLimit int    `json:"queue_limit,omitempty"`
+	MaxRetry   int    `json:"max_retry,omitempty"`
 }
 
 type MinecraftCapability struct {
@@ -652,8 +695,14 @@ type ConfigSnapshot struct {
 }
 
 type DispatchPlan struct {
-	Handlers  []DispatchHandlerSummary `json:"handlers"`
-	UpdatedAt int64                    `json:"updated_at"`
+	Handlers    []DispatchHandlerSummary `json:"handlers"`
+	Routes      []DispatchHandlerSummary `json:"routes"`
+	Statuses    []DispatchHandlerSummary `json:"statuses"`
+	Middleware  []DispatchHandlerSummary `json:"middleware"`
+	Subscribers []DispatchHandlerSummary `json:"subscribers"`
+	Providers   []ProviderSummary        `json:"providers"`
+	RouteCache  []RouteDecisionSummary   `json:"route_cache"`
+	UpdatedAt   int64                    `json:"updated_at"`
 }
 
 type DispatchHandlerSummary struct {
@@ -720,10 +769,39 @@ type EventSummary struct {
 }
 
 type EventQueueSummary struct {
-	Limit       int    `json:"limit"`
-	Queued      int    `json:"queued"`
-	Dropped     uint64 `json:"dropped"`
-	DeadLetters uint64 `json:"dead_letters"`
+	Limit                 int    `json:"limit"`
+	Queued                int    `json:"queued"`
+	Dropped               uint64 `json:"dropped"`
+	DeadLetters           uint64 `json:"dead_letters"`
+	SubscriberQueued      uint64 `json:"subscriber_queued"`
+	SubscriberDropped     uint64 `json:"subscriber_dropped"`
+	SubscriberDeadLetters uint64 `json:"subscriber_dead_letters"`
+}
+
+type RouteDecisionSummary struct {
+	Host       string            `json:"host"`
+	Action     string            `json:"action"`
+	Upstream   string            `json:"upstream,omitempty"`
+	ProviderID string            `json:"provider_id,omitempty"`
+	Source     string            `json:"source"`
+	Reason     string            `json:"reason,omitempty"`
+	Metadata   map[string]string `json:"metadata,omitempty"`
+	CreatedAt  int64             `json:"created_at"`
+	ExpiresAt  int64             `json:"expires_at,omitempty"`
+}
+
+type ProviderSummary struct {
+	PluginID       string            `json:"plugin_id"`
+	ArtifactID     string            `json:"artifact_id"`
+	ExtensionPoint string            `json:"extension_point"`
+	Type           string            `json:"type"`
+	Name           string            `json:"name"`
+	Priority       int               `json:"priority"`
+	Fallback       bool              `json:"fallback"`
+	Dependencies   []string          `json:"dependencies,omitempty"`
+	Metadata       map[string]string `json:"metadata,omitempty"`
+	Status         string            `json:"status"`
+	Error          string            `json:"error,omitempty"`
 }
 
 type CustomMetricSummary struct {
@@ -944,5 +1022,50 @@ func (g *Gateway) LegacyUpstreamHandler() (api.HookHandler[func(net.Conn, string
 
 func (g *Gateway) UpstreamConnectHandler() (api.HookHandler[api.UpstreamConnectAcceptor, api.UpstreamConnectHandler], bool) {
 	handler, ok := g.hooks[api.HookUpstreamConnect.Key()].(api.HookHandler[api.UpstreamConnectAcceptor, api.UpstreamConnectHandler])
+	return handler, ok
+}
+
+func (g *Gateway) RouteResolveHandler() (api.HookHandler[api.RouteResolveAcceptor, api.RouteResolveHandler], bool) {
+	handler, ok := g.hooks[api.HookRouteResolve.Key()].(api.HookHandler[api.RouteResolveAcceptor, api.RouteResolveHandler])
+	return handler, ok
+}
+
+func (g *Gateway) RouteResolverHandler() (api.HookHandler[api.RouteResolveAcceptor, api.RouteResolveHandler], bool) {
+	handler, ok := g.hooks[api.HookRouteResolver.Key()].(api.HookHandler[api.RouteResolveAcceptor, api.RouteResolveHandler])
+	return handler, ok
+}
+
+func (g *Gateway) StatusPingHandler() (api.HookHandler[api.StatusPingAcceptor, api.StatusPingHandler], bool) {
+	handler, ok := g.hooks[api.HookStatusPing.Key()].(api.HookHandler[api.StatusPingAcceptor, api.StatusPingHandler])
+	return handler, ok
+}
+
+func (g *Gateway) ConnectionFilterHandler() (api.HookHandler[api.ConnectionFilterAcceptor, api.ConnectionFilterHandler], bool) {
+	handler, ok := g.hooks[api.HookConnectionFilter.Key()].(api.HookHandler[api.ConnectionFilterAcceptor, api.ConnectionFilterHandler])
+	return handler, ok
+}
+
+func (g *Gateway) HandshakeFilterHandler() (api.HookHandler[api.HandshakeFilterAcceptor, api.HandshakeFilterHandler], bool) {
+	handler, ok := g.hooks[api.HookHandshakeFilter.Key()].(api.HookHandler[api.HandshakeFilterAcceptor, api.HandshakeFilterHandler])
+	return handler, ok
+}
+
+func (g *Gateway) EventSubscriberHandler() (api.HookHandler[api.EventSubscriberAcceptor, api.EventSubscriberHandler], bool) {
+	handler, ok := g.hooks[api.HookEventSubscriber.Key()].(api.HookHandler[api.EventSubscriberAcceptor, api.EventSubscriberHandler])
+	return handler, ok
+}
+
+func (g *Gateway) ProviderHandler() (api.HookHandler[api.ProviderAcceptor, api.ProviderHandler], bool) {
+	handler, ok := g.hooks[api.HookProvider.Key()].(api.HookHandler[api.ProviderAcceptor, api.ProviderHandler])
+	return handler, ok
+}
+
+func (g *Gateway) AuthProviderHandler() (api.HookHandler[api.ProviderAcceptor, api.ProviderHandler], bool) {
+	handler, ok := g.hooks[api.HookAuthProvider.Key()].(api.HookHandler[api.ProviderAcceptor, api.ProviderHandler])
+	return handler, ok
+}
+
+func (g *Gateway) AdminAuthProviderHandler() (api.HookHandler[api.ProviderAcceptor, api.ProviderHandler], bool) {
+	handler, ok := g.hooks[api.HookAdminAuthProvider.Key()].(api.HookHandler[api.ProviderAcceptor, api.ProviderHandler])
 	return handler, ok
 }

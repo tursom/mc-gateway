@@ -1,0 +1,8 @@
+{
+  "route_decisions": ["override", "fallback", "reject", "pass"],
+  "status_hosts": ["blue.example", "red.example"],
+  "event_delivery": ["best_effort", "at_least_once", "dead_letter"],
+  "provider_registry": ["singleton", "priority", "fallback", "admin.auth.provider/v1"],
+  "default_route_must_survive_bad_rule_config": true,
+  "local_admin_break_glass": true
+}

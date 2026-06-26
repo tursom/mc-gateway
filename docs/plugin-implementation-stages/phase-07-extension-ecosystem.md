@@ -114,3 +114,10 @@
 - status 插件 disable 后恢复默认 status。
 - event subscriber disable 后只停止外部投递，不删除本地审计。
 - rule 插件冲突时通过 priority/scope 修复或禁用。
+
+## 实现说明
+
+- Route/status/middleware/provider/event subscriber 仍复用插件 `Gateway.Hook` 注册模型，新增 typed SDK 结构保持和 `upstream.connect/v1` 一致。
+- 官方 rule/policy 以内置官方插件 `official.rule-policy` 提供，管理员启用后通过插件配置完成 host rewrite、source CIDR allow/deny、simple rate limit、maintenance mode 和 upstream rewrite。
+- Admin auth provider 当前作为 provider registry 能力预留和展示，不进入 MC 连接路径，也不替代本地 admin break-glass 登录。
+- Route provider 失败时优先使用 provider cache，未命中时回退到 SQLite route snapshot。

@@ -227,7 +227,8 @@ func TestMapToHostClosesUpstreamWhenInitialWriteFails(t *testing.T) {
 }
 
 type gatewayTestPluginAdapter struct {
-	handler api.UpstreamConnectHandler
+	handler  api.UpstreamConnectHandler
+	initHook func(*pluginmanager.Gateway) error
 }
 
 func (a gatewayTestPluginAdapter) Load(_ context.Context, _ pluginmanager.ArtifactRecord, _ pluginmanager.PluginRecord, gateway *pluginmanager.Gateway) (api.Plugin, error) {
@@ -237,12 +238,16 @@ func (a gatewayTestPluginAdapter) Load(_ context.Context, _ pluginmanager.Artifa
 			return nil, api.ErrPass
 		}
 	}
-	if err := api.RegisterHookHandler(
-		gateway,
-		api.HookUpstreamConnect,
-		func(api.UpstreamConnectRequest) bool { return true },
-		handler,
-	); err != nil {
+	if a.initHook == nil {
+		if err := api.RegisterHookHandler(
+			gateway,
+			api.HookUpstreamConnect,
+			func(api.UpstreamConnectRequest) bool { return true },
+			handler,
+		); err != nil {
+			return nil, err
+		}
+	} else if err := a.initHook(gateway); err != nil {
 		return nil, err
 	}
 	return &gatewayPluginStub{}, nil
@@ -272,6 +277,33 @@ func uploadGatewayTestArtifactWithCapabilities(t *testing.T, manager *pluginmana
 		SourcePath: writeGatewayTestMCGPWithCapabilities(t, pluginID, capabilities),
 		FileName:   pluginID + ".mcgp",
 		Actor:      "admin",
+	})
+	if err != nil {
+		t.Fatalf("UploadArtifact() error = %v", err)
+	}
+	return artifact
+}
+
+func uploadGatewayTestArtifactWithManifest(t *testing.T, manager *pluginmanager.Manager, pluginID string, mutate func(*pluginmanager.Manifest)) pluginmanager.ArtifactRecord {
+	t.Helper()
+	var manifest pluginmanager.Manifest
+	if err := json.Unmarshal(gatewayTestManifest(t, pluginID), &manifest); err != nil {
+		t.Fatalf("Unmarshal manifest error = %v", err)
+	}
+	if mutate != nil {
+		mutate(&manifest)
+	}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("Marshal manifest error = %v", err)
+	}
+	artifact, err := manager.UploadArtifact(context.Background(), pluginmanager.ArtifactUpload{
+		SourcePath: writeGatewayTestMCGPEntries(t, map[string][]byte{
+			"manifest.json": data,
+			"plugin.so":     []byte("fake plugin bytes " + pluginID),
+		}),
+		FileName: pluginID + ".mcgp",
+		Actor:    "admin",
 	})
 	if err != nil {
 		t.Fatalf("UploadArtifact() error = %v", err)

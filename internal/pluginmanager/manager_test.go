@@ -797,6 +797,199 @@ func TestProtocolProxyInitialWriteTimeoutClosesUnreadableConn(t *testing.T) {
 	}
 }
 
+func TestRouteResolverDecisionsCacheAndFallback(t *testing.T) {
+	calls := 0
+	adapter := &fakeAdapter{
+		initOnly: true,
+		initHook: func(gateway *Gateway) error {
+			return api.RegisterHookHandler(gateway, api.HookRouteResolve,
+				func(api.RouteResolveRequest) bool { return true },
+				func(req api.RouteResolveRequest) (api.RouteDecision, error) {
+					calls++
+					switch req.Host {
+					case "override.example":
+						return api.RouteDecision{Action: api.RouteDecisionOverride, Upstream: "10.0.0.10:25565", Reason: "test override", CacheTTL: time.Minute}, nil
+					case "reject.example":
+						return api.RouteDecision{Action: api.RouteDecisionReject, Reason: "test reject", CacheTTL: time.Minute}, nil
+					case "provider-fallback.example":
+						return api.RouteDecision{Action: api.RouteDecisionFallback, Upstream: "provider-fallback:25565", Reason: "provider fallback", CacheTTL: time.Minute}, nil
+					case "pass.example":
+						return api.RouteDecision{Action: api.RouteDecisionPass}, nil
+					case "cached.example":
+						if calls == 1 {
+							return api.RouteDecision{Action: api.RouteDecisionOverride, Upstream: "10.0.0.20:25565", Reason: "cached", CacheTTL: time.Minute}, nil
+						}
+						return api.RouteDecision{}, errors.New("source unavailable")
+					default:
+						return api.RouteDecision{}, errors.New("source unavailable")
+					}
+				})
+		},
+	}
+	manager := newManagerForTest(t, adapter)
+	artifact := uploadTestArtifactWithManifest(t, manager, "route-plugin", func(manifest *Manifest) {
+		manifest.ExtensionPoints = []ExtensionPoint{{Type: "provider", Key: ExtensionRouteResolve}}
+		manifest.Capabilities = json.RawMessage(`{"extension_points":["route.resolve/v1"],"route":{"cache_ttl_ms":60000}}`)
+	})
+	if _, err := manager.SetDesired(context.Background(), "admin", "route-plugin", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", "route-plugin"); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+
+	override, err := manager.ResolveRoute(context.Background(), api.RouteResolveRequest{Host: "override.example"}, nil)
+	if err != nil || override.Decision.Action != api.RouteDecisionOverride || override.Decision.Upstream == "" {
+		t.Fatalf("override decision = %+v err=%v", override, err)
+	}
+	reject, err := manager.ResolveRoute(context.Background(), api.RouteResolveRequest{Host: "reject.example"}, nil)
+	if err != nil || reject.Decision.Action != api.RouteDecisionReject {
+		t.Fatalf("reject decision = %+v err=%v", reject, err)
+	}
+	providerFallback, err := manager.ResolveRoute(context.Background(), api.RouteResolveRequest{Host: "provider-fallback.example"}, nil)
+	if err != nil || providerFallback.Decision.Action != api.RouteDecisionFallback || providerFallback.Decision.Upstream != "provider-fallback:25565" {
+		t.Fatalf("provider fallback decision = %+v err=%v", providerFallback, err)
+	}
+	pass, err := manager.ResolveRoute(context.Background(), api.RouteResolveRequest{Host: "pass.example", FallbackUpstream: "sqlite:25565", FallbackHit: true}, nil)
+	if err != nil || pass.Source != "sqlite_fallback" || pass.Decision.Upstream != "sqlite:25565" {
+		t.Fatalf("pass fallback = %+v err=%v", pass, err)
+	}
+	calls = 0
+	first, err := manager.ResolveRoute(context.Background(), api.RouteResolveRequest{Host: "cached.example"}, nil)
+	if err != nil || first.Source != "provider" {
+		t.Fatalf("first cached decision = %+v err=%v", first, err)
+	}
+	second, err := manager.ResolveRoute(context.Background(), api.RouteResolveRequest{Host: "cached.example"}, nil)
+	if err != nil || second.Source != "cache" || second.Decision.Upstream != "10.0.0.20:25565" {
+		t.Fatalf("cache fallback decision = %+v err=%v", second, err)
+	}
+	sqlite, err := manager.ResolveRoute(context.Background(), api.RouteResolveRequest{Host: "down.example", FallbackUpstream: "sqlite-down:25565", FallbackHit: true}, nil)
+	if err != nil || sqlite.Source != "sqlite_fallback" || sqlite.Decision.Upstream != "sqlite-down:25565" {
+		t.Fatalf("sqlite fallback = %+v err=%v", sqlite, err)
+	}
+}
+
+func TestStatusPingPerHostAndDisableFallsBack(t *testing.T) {
+	adapter := &fakeAdapter{
+		initOnly: true,
+		initHook: func(gateway *Gateway) error {
+			return api.RegisterHookHandler(gateway, api.HookStatusPing,
+				func(api.StatusPingRequest) bool { return true },
+				func(req api.StatusPingRequest) (api.StatusPingResponse, error) {
+					return api.StatusPingResponse{MOTD: "motd for " + req.Host, VersionText: "v1", MaxPlayers: 20}, nil
+				})
+		},
+	}
+	manager := newManagerForTest(t, adapter)
+	artifact := uploadTestArtifactWithManifest(t, manager, "status-plugin", func(manifest *Manifest) {
+		manifest.ExtensionPoints = []ExtensionPoint{{Type: "hook", Key: ExtensionStatusPing}}
+		manifest.Capabilities = json.RawMessage(`{"extension_points":["status.ping/v1"],"status":{"hosts":["a.example","b.example"]}}`)
+	})
+	if _, err := manager.SetDesired(context.Background(), "admin", "status-plugin", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", "status-plugin"); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	status, err := manager.StatusPing(context.Background(), api.StatusPingRequest{Host: "a.example"})
+	if err != nil || !status.Handled || status.Response.MOTD != "motd for a.example" {
+		t.Fatalf("StatusPing() = %+v err=%v", status, err)
+	}
+	if _, err := manager.Disable(context.Background(), "admin", "status-plugin"); err != nil {
+		t.Fatalf("Disable() error = %v", err)
+	}
+	status, err = manager.StatusPing(context.Background(), api.StatusPingRequest{Host: "a.example"})
+	if err != nil || status.Handled {
+		t.Fatalf("StatusPing(disabled) = %+v err=%v, want default fallback", status, err)
+	}
+}
+
+func TestEventSubscriberFailureDoesNotAffectEmitter(t *testing.T) {
+	adapter := &fakeAdapter{
+		initOnly: true,
+		initHook: func(gateway *Gateway) error {
+			return api.RegisterHookHandler(gateway, api.HookEventSubscriber,
+				func(api.EventDeliveryRequest) bool { return true },
+				func(api.EventDeliveryRequest) (api.EventDeliveryResult, error) {
+					return api.EventDeliveryResult{Retry: true, Reason: "sink down"}, errors.New("sink down")
+				})
+		},
+	}
+	manager := newManagerForTest(t, adapter)
+	artifact := uploadTestArtifactWithManifest(t, manager, "subscriber-plugin", func(manifest *Manifest) {
+		manifest.ExtensionPoints = []ExtensionPoint{{Type: "event", Key: ExtensionEventSubscriber}}
+		manifest.Capabilities = json.RawMessage(`{"extension_points":["event.subscriber/v1"],"event_subscriber":{"mode":"at_least_once","max_retry":1}}`)
+	})
+	if _, err := manager.SetDesired(context.Background(), "admin", "subscriber-plugin", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", "subscriber-plugin"); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	emitterManifest := Manifest{Events: []EventSpec{{Name: "audit.test", Fields: []string{"ok"}}}}
+	if err := manager.operations.ForPlugin("emitter", "artifact", emitterManifest).EmitEvent(context.Background(), "audit.test", map[string]string{"ok": "true"}); err != nil {
+		t.Fatalf("EmitEvent() error = %v", err)
+	}
+	waitForPluginManagerTest(t, func() bool {
+		return manager.operations.SubscriberDeadLetters() > 0
+	})
+}
+
+func TestProviderRegistryIncludesUnavailableAdminAuthProvider(t *testing.T) {
+	adapter := &fakeAdapter{
+		initOnly: true,
+		initHook: func(gateway *Gateway) error {
+			return api.RegisterHookHandler(gateway, api.HookAdminAuthProvider,
+				func(api.ProviderRegistration) bool { return true },
+				func() (api.ProviderRegistration, error) {
+					return api.ProviderRegistration{Type: "admin.auth.provider/v1", Name: "oidc", Fallback: true}, errors.New("oidc down")
+				})
+		},
+	}
+	manager := newManagerForTest(t, adapter)
+	artifact := uploadTestArtifactWithManifest(t, manager, "admin-auth-plugin", func(manifest *Manifest) {
+		manifest.ExtensionPoints = []ExtensionPoint{{Type: "provider", Key: ExtensionAdminAuthProvider}}
+		manifest.Capabilities = json.RawMessage(`{"extension_points":["admin.auth.provider/v1"],"providers":[{"type":"admin.auth.provider/v1","name":"oidc","fallback":true}]}`)
+	})
+	if _, err := manager.SetDesired(context.Background(), "admin", "admin-auth-plugin", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", "admin-auth-plugin"); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	plan := manager.DispatchPlan(context.Background())
+	if len(plan.Providers) != 1 || plan.Providers[0].Status != "unavailable" || !plan.Providers[0].Fallback {
+		t.Fatalf("providers = %+v, want unavailable fallback admin auth provider", plan.Providers)
+	}
+}
+
+func TestOfficialRulePolicyBadCIDRDoesNotBreakDefaultRoute(t *testing.T) {
+	manager := newManagerForTest(t, nil)
+	artifact, err := manager.Artifact(context.Background(), "builtin-official-rule-policy-0.1.0")
+	if err != nil {
+		t.Fatalf("official artifact missing: %v", err)
+	}
+	config := `{"source_deny_cidr":["not-a-cidr"],"upstream_rewrite":{"play.example":"rewrite:25565"}}`
+	if _, err := manager.SetDesired(context.Background(), "admin", "official.rule-policy", artifact.ID, DesiredEnabled, config, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", "official.rule-policy"); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	filter, err := manager.FilterConnection(context.Background(), api.ConnectionFilterRequest{SourceAddr: "127.0.0.1:12345"})
+	if err != nil || !filter.Allowed {
+		t.Fatalf("FilterConnection() = %+v err=%v, want allowed despite invalid CIDR", filter, err)
+	}
+	route, err := manager.ResolveRoute(context.Background(), api.RouteResolveRequest{Host: "unknown.example", FallbackUpstream: "default:25565", FallbackHit: true}, nil)
+	if err != nil || route.Source != "sqlite_fallback" || route.Decision.Upstream != "default:25565" {
+		t.Fatalf("default route fallback = %+v err=%v", route, err)
+	}
+	rewrite, err := manager.ResolveRoute(context.Background(), api.RouteResolveRequest{Host: "play.example", FallbackUpstream: "default:25565", FallbackHit: true}, nil)
+	if err != nil || rewrite.Decision.Action != api.RouteDecisionOverride || rewrite.Decision.Upstream != "rewrite:25565" {
+		t.Fatalf("upstream rewrite = %+v err=%v", rewrite, err)
+	}
+}
+
 func enableProtocolProxyTestPlugin(t *testing.T, manager *Manager, pluginID string) ArtifactRecord {
 	t.Helper()
 	artifact := uploadTestArtifactWithCapabilities(t, manager, pluginID, testProtocolProxyCapabilities())
@@ -1054,6 +1247,8 @@ func waitForPluginManagerTest(t *testing.T, done func() bool) {
 type fakeAdapter struct {
 	loads      int
 	handlers   map[string]api.UpstreamConnectHandler
+	initOnly   bool
+	initHook   func(*Gateway) error
 	init       func(*Gateway)
 	loadErr    error
 	loadErrs   map[string]error
@@ -1075,13 +1270,20 @@ func (a *fakeAdapter) Load(_ context.Context, artifact ArtifactRecord, _ PluginR
 	if a.handlers != nil && a.handlers[artifact.PluginID] != nil {
 		handler = a.handlers[artifact.PluginID]
 	}
-	if err := api.RegisterHookHandler(
-		gateway,
-		api.HookUpstreamConnect,
-		func(api.UpstreamConnectRequest) bool { return true },
-		handler,
-	); err != nil {
-		return nil, err
+	if !a.initOnly {
+		if err := api.RegisterHookHandler(
+			gateway,
+			api.HookUpstreamConnect,
+			func(api.UpstreamConnectRequest) bool { return true },
+			handler,
+		); err != nil {
+			return nil, err
+		}
+	}
+	if a.initHook != nil {
+		if err := a.initHook(gateway); err != nil {
+			return nil, err
+		}
 	}
 	if a.init != nil {
 		a.init(gateway)

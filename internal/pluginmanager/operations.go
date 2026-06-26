@@ -55,6 +55,14 @@ type Operations struct {
 	queued     atomic.Uint64
 	dropped    atomic.Uint64
 	deadLetter atomic.Uint64
+
+	subscriberQueue      chan queuedEvent
+	subscriberQueued     atomic.Uint64
+	subscriberDropped    atomic.Uint64
+	subscriberDeadLetter atomic.Uint64
+
+	subscriberMu sync.RWMutex
+	subscribers  []*subscriberHandler
 }
 
 type queuedEvent struct {
@@ -126,13 +134,29 @@ type taskRuntime struct {
 
 func NewOperations(repo Repository, root string) *Operations {
 	ops := &Operations{
-		repo:       repo,
-		root:       root,
-		plugins:    make(map[string]*PluginOperations),
-		eventQueue: make(chan queuedEvent, DefaultEventQueueLimit),
+		repo:            repo,
+		root:            root,
+		plugins:         make(map[string]*PluginOperations),
+		eventQueue:      make(chan queuedEvent, DefaultEventQueueLimit),
+		subscriberQueue: make(chan queuedEvent, DefaultEventQueueLimit),
 	}
 	go ops.consumeEvents()
+	go ops.consumeSubscriberEvents()
 	return ops
+}
+
+func (o *Operations) SetSubscribers(subscribers []*subscriberHandler) {
+	o.subscriberMu.Lock()
+	defer o.subscriberMu.Unlock()
+	o.subscribers = append([]*subscriberHandler(nil), subscribers...)
+}
+
+func (o *Operations) SubscriberDeadLetters() uint64 {
+	return o.subscriberDeadLetter.Load()
+}
+
+func (o *Operations) DropSubscriberDeadLetters() uint64 {
+	return o.subscriberDeadLetter.Swap(0)
 }
 
 func (o *Operations) ForPlugin(pluginID, artifactID string, manifest Manifest) *PluginOperations {
@@ -202,6 +226,71 @@ func (o *Operations) queueEvent(event queuedEvent) {
 		}, true, "event_queue_full", event.traceID, event.connectionID)
 		cancel()
 	}
+	o.queueSubscriberEvent(event)
+}
+
+func (o *Operations) queueSubscriberEvent(event queuedEvent) {
+	o.subscriberMu.RLock()
+	hasSubscribers := len(o.subscribers) > 0
+	o.subscriberMu.RUnlock()
+	if !hasSubscribers || event.dropped {
+		return
+	}
+	select {
+	case o.subscriberQueue <- event:
+		o.subscriberQueued.Add(1)
+	default:
+		o.subscriberDropped.Add(1)
+	}
+}
+
+func (o *Operations) consumeSubscriberEvents() {
+	for event := range o.subscriberQueue {
+		o.subscriberMu.RLock()
+		subscribers := append([]*subscriberHandler(nil), o.subscribers...)
+		o.subscriberMu.RUnlock()
+		for _, subscriber := range subscribers {
+			o.deliverSubscriberEvent(subscriber, event)
+		}
+	}
+}
+
+func (o *Operations) deliverSubscriberEvent(subscriber *subscriberHandler, event queuedEvent) {
+	req := api.EventDeliveryRequest{
+		PluginID:     event.pluginID,
+		Name:         event.name,
+		Fields:       copyStringMap(event.fields),
+		TraceID:      event.traceID,
+		ConnectionID: event.connectionID,
+		Mode:         subscriber.mode,
+	}
+	accepted, err := subscriber.accepts(req)
+	if err != nil || !accepted {
+		return
+	}
+	maxRetry := subscriber.maxRetry
+	if subscriber.mode == api.DeliveryBestEffort {
+		maxRetry = 1
+	}
+	if maxRetry <= 0 {
+		maxRetry = DefaultSubscriberMaxRetry
+	}
+	for attempt := 1; attempt <= maxRetry; attempt++ {
+		req.Attempt = attempt
+		result, err := subscriber.invoke(req)
+		if err == nil && (result.OK || !result.Retry) {
+			return
+		}
+		if attempt < maxRetry {
+			time.Sleep(DefaultSubscriberRetryDelay)
+		}
+	}
+	o.subscriberDeadLetter.Add(1)
+	_ = o.repo.RecordOperation(context.Background(), subscriber.pluginID, subscriber.artifactID, "event_subscriber_delivery", "dead_letter", "system", "event subscriber delivery failed", map[string]any{
+		"event_plugin_id": event.pluginID,
+		"event_name":      event.name,
+		"subscriber_mode": subscriber.mode,
+	})
 }
 
 func (po *PluginOperations) configure(artifactID string, manifest Manifest) {
@@ -581,10 +670,13 @@ func (po *PluginOperations) Snapshot(ctx context.Context, pluginID string, handl
 		ExternalDependencies: externals,
 		GC:                   gc,
 		EventQueue: EventQueueSummary{
-			Limit:       DefaultEventQueueLimit,
-			Queued:      len(po.parent.eventQueue),
-			Dropped:     po.parent.dropped.Load(),
-			DeadLetters: po.parent.deadLetter.Load(),
+			Limit:                 DefaultEventQueueLimit,
+			Queued:                len(po.parent.eventQueue),
+			Dropped:               po.parent.dropped.Load(),
+			DeadLetters:           po.parent.deadLetter.Load(),
+			SubscriberQueued:      po.parent.subscriberQueued.Load(),
+			SubscriberDropped:     po.parent.subscriberDropped.Load(),
+			SubscriberDeadLetters: po.parent.subscriberDeadLetter.Load(),
 		},
 		Diagnostics: diagnostics,
 	}

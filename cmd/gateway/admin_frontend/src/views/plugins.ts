@@ -217,6 +217,10 @@ export function renderPluginDetail(plugin: PluginView | null = selectedPlugin())
         <pre class="log-output">${escapeHTML(formatJSON(plugin.dispatch_summary || []))}</pre>
       </section>
       <section class="panel">
+        <h3>Extension status</h3>
+        <pre class="log-output">${escapeHTML(formatJSON(plugin.extension_status || {}))}</pre>
+      </section>
+      <section class="panel">
         <h3>Operations</h3>
         <div class="row-actions">
           <button class="secondary" type="button" id="pluginOperationsLoadBtn">Refresh</button>

@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"strings"
 )
@@ -111,6 +112,21 @@ func ReadVarInt(buf []byte) (int, int, error) {
 
 func ReadString(buf []byte) (string, int, error) {
 	return readString(buf)
+}
+
+func StatusResponsePacket(value any) ([]byte, error) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	var payload bytes.Buffer
+	payload.Write(encodeVarInt(0))
+	payload.Write(encodeVarInt(len(data)))
+	payload.Write(data)
+	var out bytes.Buffer
+	out.Write(encodeVarInt(payload.Len()))
+	out.Write(payload.Bytes())
+	return out.Bytes(), nil
 }
 
 func readPacket(buf []byte) ([]byte, int, error) {
