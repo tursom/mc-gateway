@@ -144,6 +144,44 @@ CREATE TABLE IF NOT EXISTS plugin_operations (
     created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS plugin_builds (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plugin_id TEXT NOT NULL DEFAULT '',
+    source_id TEXT NOT NULL DEFAULT '',
+    artifact_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'queued',
+    builder_type TEXT NOT NULL DEFAULT '',
+    builder_image TEXT NOT NULL DEFAULT '',
+    builder_version TEXT NOT NULL DEFAULT '',
+    go_version TEXT NOT NULL DEFAULT '',
+    go_os TEXT NOT NULL DEFAULT '',
+    go_arch TEXT NOT NULL DEFAULT '',
+    go_amd64 TEXT NOT NULL DEFAULT '',
+    go_arm64 TEXT NOT NULL DEFAULT '',
+    cgo_enabled TEXT NOT NULL DEFAULT '',
+    build_tags TEXT NOT NULL DEFAULT '',
+    sdk_module TEXT NOT NULL DEFAULT '',
+    sdk_version TEXT NOT NULL DEFAULT '',
+    go_proxy TEXT NOT NULL DEFAULT '',
+    go_no_sumdb TEXT NOT NULL DEFAULT '',
+    go_private TEXT NOT NULL DEFAULT '',
+    vendor_required INTEGER NOT NULL DEFAULT 0,
+    source_sha256 TEXT NOT NULL DEFAULT '',
+    artifact_sha256 TEXT NOT NULL DEFAULT '',
+    module_summary_json TEXT NOT NULL DEFAULT '[]',
+    go_version_m_json TEXT NOT NULL DEFAULT '{}',
+    abi_fingerprint TEXT NOT NULL DEFAULT '',
+    log_summary TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    error TEXT NOT NULL DEFAULT '',
+    started_at INTEGER NOT NULL DEFAULT 0,
+    ended_at INTEGER NOT NULL DEFAULT 0,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS plugin_config_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     plugin_id TEXT NOT NULL,
@@ -161,6 +199,8 @@ CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_plugin_artifacts_plugin_id ON plugin_artifacts(plugin_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_plugins_desired_state ON plugins(desired_state, priority);
 CREATE INDEX IF NOT EXISTS idx_plugin_operations_plugin_id ON plugin_operations(plugin_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_plugin_builds_plugin_id ON plugin_builds(plugin_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_plugin_builds_source_id ON plugin_builds(source_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_plugin_config_snapshots_plugin_id ON plugin_config_snapshots(plugin_id, created_at);
 INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, strftime('%s','now'));
 `

@@ -31,6 +31,10 @@ func newAdminAPIHandler() http.HandlerFunc {
 
 		PluginArtifacts: handleAdminPluginArtifacts,
 		PluginArtifact:  handleAdminPluginArtifact,
+		PluginSources:   handleAdminPluginSources,
+		PluginBuilds:    handleAdminPluginBuilds,
+		PluginBuild:     handleAdminPluginBuild,
+		PluginGC:        handleAdminPluginGC,
 		PluginsList:     handleAdminPluginsList,
 		PluginItem:      handleAdminPluginItem,
 		PluginAction:    handleAdminPluginAction,

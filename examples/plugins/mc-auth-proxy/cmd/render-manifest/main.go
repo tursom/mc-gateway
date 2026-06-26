@@ -7,13 +7,17 @@ import (
 )
 
 func main() {
+	artifactType := os.Getenv("ARTIFACT_TYPE")
+	if artifactType == "" {
+		artifactType = "binary"
+	}
 	manifest := map[string]any{
 		"schema_version": "mc-gateway.plugin/v1",
 		"id":             "mc-auth-proxy",
 		"name":           "Minecraft Auth Proxy",
 		"version":        "0.1.0",
 		"description":    "Protocol-proxy example that reads handshake/login start and returns a login disconnect fixture.",
-		"artifact_type":  "binary",
+		"artifact_type":  artifactType,
 		"runtime": map[string]any{
 			"type":            "go-plugin",
 			"entry":           "plugin.so",
@@ -75,6 +79,17 @@ func main() {
 				"backend":            map[string]any{"type": "string"},
 			},
 		},
+	}
+	if artifactType == "source" {
+		manifest["build"] = map[string]any{
+			"type":            "go",
+			"entry":           ".",
+			"go_version":      runtime.Version(),
+			"cgo_enabled":     true,
+			"tags":            []string{},
+			"vendor_required": false,
+			"output":          "plugin.so",
+		}
 	}
 	encoder := json.NewEncoder(os.Stdout)
 	encoder.SetIndent("", "  ")

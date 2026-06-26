@@ -49,6 +49,94 @@ func NewArtifactStore(root string) ArtifactStore {
 }
 
 func (s ArtifactStore) ValidateAndStore(upload ArtifactUpload) (ArtifactRecord, error) {
+	return s.validateAndStore(upload, "")
+}
+
+func (s ArtifactStore) ValidateAndStoreBinary(upload ArtifactUpload) (ArtifactRecord, error) {
+	return s.validateAndStore(upload, ArtifactTypeBinary)
+}
+
+func (s ArtifactStore) ValidateAndStoreSource(upload ArtifactUpload) (ArtifactRecord, error) {
+	return s.validateAndStore(upload, ArtifactTypeSource)
+}
+
+func (s ArtifactStore) StoreBuiltBinary(upload ArtifactUpload, manifest Manifest, pluginBytes []byte, packageSHA string, metadata map[string]any) (ArtifactRecord, error) {
+	if s.Root == "" {
+		return ArtifactRecord{}, errors.New("plugin artifact root is empty")
+	}
+	if s.now == nil {
+		s.now = time.Now
+	}
+	manifest.ArtifactType = ArtifactTypeBinary
+	manifest.Runtime.Entry = RuntimeEntry
+	if err := validateManifest(manifest); err != nil {
+		return ArtifactRecord{}, err
+	}
+	if len(pluginBytes) == 0 {
+		return ArtifactRecord{}, errors.New("built runtime entry is empty")
+	}
+	pluginSum := sha256.Sum256(pluginBytes)
+	artifactID := hex.EncodeToString(pluginSum[:])
+	artifactDir := filepath.Join(s.Root, manifest.ID, artifactID)
+	if err := os.MkdirAll(artifactDir, 0755); err != nil {
+		return ArtifactRecord{}, err
+	}
+	pluginPath := filepath.Join(artifactDir, RuntimeEntry)
+	if err := os.WriteFile(pluginPath, pluginBytes, 0644); err != nil {
+		return ArtifactRecord{}, err
+	}
+	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return ArtifactRecord{}, err
+	}
+	if err := os.WriteFile(filepath.Join(artifactDir, "manifest.json"), manifestBytes, 0644); err != nil {
+		return ArtifactRecord{}, err
+	}
+	if len(metadata) > 0 {
+		provenance, err := json.MarshalIndent(metadata, "", "  ")
+		if err != nil {
+			return ArtifactRecord{}, err
+		}
+		if err := os.WriteFile(filepath.Join(artifactDir, "provenance.json"), provenance, 0644); err != nil {
+			return ArtifactRecord{}, err
+		}
+	}
+	extensionPoints, err := json.Marshal(extensionPointKeys(manifest))
+	if err != nil {
+		return ArtifactRecord{}, err
+	}
+	capabilities, err := capabilitiesSummaryJSON(manifest.Capabilities)
+	if err != nil {
+		return ArtifactRecord{}, err
+	}
+	now := s.now().Unix()
+	return ArtifactRecord{
+		ID:                      artifactID,
+		PluginID:                manifest.ID,
+		Version:                 manifest.Version,
+		FileName:                upload.FileName,
+		FilePath:                pluginPath,
+		SHA256:                  artifactID,
+		PackageSHA256:           packageSHA,
+		SizeBytes:               int64(len(pluginBytes)),
+		ArtifactType:            ArtifactTypeBinary,
+		RuntimeType:             manifest.Runtime.Type,
+		RuntimeEntry:            manifest.Runtime.Entry,
+		Status:                  ArtifactStatusLoadable,
+		MetadataJSON:            string(manifestBytes),
+		CapabilitiesSummaryJSON: string(capabilities),
+		ExtensionPointsJSON:     string(extensionPoints),
+		APIVersion:              manifest.APIVersion,
+		GoVersion:               manifest.GoVersion,
+		GOOS:                    manifest.GOOS,
+		GOARCH:                  manifest.GOARCH,
+		UploadedBy:              upload.Actor,
+		CreatedAt:               now,
+		UpdatedAt:               now,
+	}, nil
+}
+
+func (s ArtifactStore) validateAndStore(upload ArtifactUpload, expectedArtifactType string) (ArtifactRecord, error) {
 	if s.Root == "" {
 		return ArtifactRecord{}, errors.New("plugin artifact root is empty")
 	}
@@ -100,12 +188,15 @@ func (s ArtifactStore) ValidateAndStore(upload ArtifactUpload) (ArtifactRecord, 
 	entries := make(map[string]*zip.File)
 	var extractedSize uint64
 	for _, file := range reader.File {
+		if file.FileInfo().IsDir() {
+			if _, err := cleanZipDirName(file.Name); err != nil {
+				return ArtifactRecord{}, err
+			}
+			continue
+		}
 		clean, err := cleanZipName(file.Name)
 		if err != nil {
 			return ArtifactRecord{}, err
-		}
-		if file.FileInfo().IsDir() {
-			continue
 		}
 		mode := file.FileInfo().Mode()
 		if !mode.IsRegular() || mode&os.ModeType != 0 {
@@ -140,6 +231,12 @@ func (s ArtifactStore) ValidateAndStore(upload ArtifactUpload) (ArtifactRecord, 
 	}
 	if err := validateManifest(manifest); err != nil {
 		return ArtifactRecord{}, err
+	}
+	if expectedArtifactType != "" && manifest.ArtifactType != expectedArtifactType {
+		return ArtifactRecord{}, fmt.Errorf("artifact_type %q does not match expected %q", manifest.ArtifactType, expectedArtifactType)
+	}
+	if manifest.ArtifactType == ArtifactTypeSource {
+		return s.storeSourcePackage(upload, manifest, manifestBytes, entries, packageSHA)
 	}
 
 	entry := manifest.Runtime.Entry
@@ -219,6 +316,82 @@ func (s ArtifactStore) ValidateAndStore(upload ArtifactUpload) (ArtifactRecord, 
 	}, nil
 }
 
+func (s ArtifactStore) storeSourcePackage(upload ArtifactUpload, manifest Manifest, manifestBytes []byte, entries map[string]*zip.File, packageSHA string) (ArtifactRecord, error) {
+	if err := validateSourceEntries(manifest, entries); err != nil {
+		return ArtifactRecord{}, err
+	}
+	artifactID := packageSHA
+	artifactDir := filepath.Join(s.Root, manifest.ID, artifactID)
+	sourceDir := filepath.Join(artifactDir, "source")
+	if err := os.MkdirAll(sourceDir, 0755); err != nil {
+		return ArtifactRecord{}, err
+	}
+	if err := copyFile(upload.SourcePath, filepath.Join(artifactDir, "source.mcgp")); err != nil {
+		return ArtifactRecord{}, err
+	}
+	var sizeBytes int64
+	for name, file := range entries {
+		if name == "manifest.json" {
+			continue
+		}
+		if file.UncompressedSize64 > uint64(s.MaxNonRuntimeBytes) && !strings.HasPrefix(name, "vendor/") {
+			return ArtifactRecord{}, fmt.Errorf("zip entry %q size %d exceeds limit %d", name, file.UncompressedSize64, s.MaxNonRuntimeBytes)
+		}
+		target := filepath.Join(sourceDir, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+			return ArtifactRecord{}, err
+		}
+		data, err := readZipFile(file, s.MaxExtractedBytes)
+		if err != nil {
+			return ArtifactRecord{}, err
+		}
+		sizeBytes += int64(len(data))
+		if err := os.WriteFile(target, data, 0644); err != nil {
+			return ArtifactRecord{}, err
+		}
+	}
+	if err := os.WriteFile(filepath.Join(artifactDir, "manifest.json"), manifestBytes, 0644); err != nil {
+		return ArtifactRecord{}, err
+	}
+	metadataJSON, err := json.Marshal(manifest)
+	if err != nil {
+		return ArtifactRecord{}, err
+	}
+	extensionPoints, err := json.Marshal(extensionPointKeys(manifest))
+	if err != nil {
+		return ArtifactRecord{}, err
+	}
+	capabilities, err := capabilitiesSummaryJSON(manifest.Capabilities)
+	if err != nil {
+		return ArtifactRecord{}, err
+	}
+	now := s.now().Unix()
+	return ArtifactRecord{
+		ID:                      artifactID,
+		PluginID:                manifest.ID,
+		Version:                 manifest.Version,
+		FileName:                upload.FileName,
+		FilePath:                sourceDir,
+		SHA256:                  artifactID,
+		PackageSHA256:           packageSHA,
+		SizeBytes:               sizeBytes,
+		ArtifactType:            ArtifactTypeSource,
+		RuntimeType:             manifest.Runtime.Type,
+		RuntimeEntry:            sourceBuildEntry(manifest),
+		Status:                  ArtifactStatusValidated,
+		MetadataJSON:            string(metadataJSON),
+		CapabilitiesSummaryJSON: string(capabilities),
+		ExtensionPointsJSON:     string(extensionPoints),
+		APIVersion:              manifest.APIVersion,
+		GoVersion:               manifest.GoVersion,
+		GOOS:                    manifest.GOOS,
+		GOARCH:                  manifest.GOARCH,
+		UploadedBy:              upload.Actor,
+		CreatedAt:               now,
+		UpdatedAt:               now,
+	}, nil
+}
+
 func capabilitiesSummaryJSON(raw json.RawMessage) ([]byte, error) {
 	summary := CapabilitySummary{
 		UpstreamConnect: UpstreamConnectCapability{Mode: UpstreamModeDialer},
@@ -259,25 +432,27 @@ func validateManifest(manifest Manifest) error {
 		return fmt.Errorf("invalid plugin id %q", manifest.ID)
 	case strings.TrimSpace(manifest.Version) == "":
 		return errors.New("version is required")
-	case manifest.ArtifactType != ArtifactTypeBinary:
+	case manifest.ArtifactType != ArtifactTypeBinary && manifest.ArtifactType != ArtifactTypeSource:
 		return fmt.Errorf("unsupported artifact_type %q", manifest.ArtifactType)
 	case manifest.Runtime.Type != RuntimeGoPlugin:
 		return fmt.Errorf("unsupported runtime.type %q", manifest.Runtime.Type)
-	case manifest.Runtime.Entry != RuntimeEntry:
+	case manifest.ArtifactType == ArtifactTypeBinary && manifest.Runtime.Entry != RuntimeEntry:
 		return fmt.Errorf("unsupported runtime.entry %q", manifest.Runtime.Entry)
+	case manifest.ArtifactType == ArtifactTypeSource && rawSourceBuildEntry(manifest) == "":
+		return errors.New("build.entry is required for source artifacts")
 	case manifest.APIVersion != APIVersion:
 		return fmt.Errorf("unsupported api_version %q", manifest.APIVersion)
-	case manifest.GoVersion == "":
+	case manifest.ArtifactType == ArtifactTypeBinary && manifest.GoVersion == "":
 		return errors.New("go_version is required")
-	case manifest.GOOS == "":
+	case manifest.ArtifactType == ArtifactTypeBinary && manifest.GOOS == "":
 		return errors.New("go_os is required")
-	case manifest.GOARCH == "":
+	case manifest.ArtifactType == ArtifactTypeBinary && manifest.GOARCH == "":
 		return errors.New("go_arch is required")
 	}
-	if manifest.GOOS != runtime.GOOS {
+	if manifest.ArtifactType == ArtifactTypeBinary && manifest.GOOS != "" && manifest.GOOS != runtime.GOOS {
 		return fmt.Errorf("go_os %q does not match gateway %q", manifest.GOOS, runtime.GOOS)
 	}
-	if manifest.GOARCH != runtime.GOARCH {
+	if manifest.ArtifactType == ArtifactTypeBinary && manifest.GOARCH != "" && manifest.GOARCH != runtime.GOARCH {
 		return fmt.Errorf("go_arch %q does not match gateway %q", manifest.GOARCH, runtime.GOARCH)
 	}
 	found := false
@@ -290,6 +465,65 @@ func validateManifest(manifest Manifest) error {
 		return fmt.Errorf("extension point %q is required", ExtensionUpstreamConnect)
 	}
 	return nil
+}
+
+func validateSourceEntries(manifest Manifest, entries map[string]*zip.File) error {
+	if _, ok := entries["go.mod"]; !ok {
+		return errors.New("source package requires go.mod")
+	}
+	buildEntry := sourceBuildEntry(manifest)
+	if buildEntry == "" || buildEntry == "." {
+		buildEntry = "."
+	}
+	cleanBuildEntry, err := cleanZipName(buildEntry)
+	if buildEntry == "." {
+		cleanBuildEntry = "."
+		err = nil
+	}
+	if err != nil {
+		return fmt.Errorf("invalid runtime.build_entry: %w", err)
+	}
+	hasBuildSource := false
+	hasAnySource := false
+	for name := range entries {
+		switch {
+		case name == "manifest.json" || name == "go.mod" || name == "go.sum":
+		case strings.HasPrefix(name, "vendor/"):
+		case strings.EqualFold(path.Base(name), "README.md"), strings.EqualFold(path.Base(name), "LICENSE"), strings.Contains(strings.ToLower(path.Base(name)), "sbom"):
+		case strings.HasSuffix(name, ".go"):
+		default:
+			return fmt.Errorf("unsupported source package entry %q", name)
+		}
+		if strings.HasSuffix(name, ".go") {
+			hasAnySource = true
+			if cleanBuildEntry == "." || strings.HasPrefix(name, cleanBuildEntry+"/") || path.Dir(name) == cleanBuildEntry {
+				hasBuildSource = true
+			}
+		}
+	}
+	if !hasAnySource {
+		return errors.New("source package requires at least one Go source file")
+	}
+	if !hasBuildSource {
+		return fmt.Errorf("source package build entry %q has no Go source files", manifest.Runtime.BuildEntry)
+	}
+	return nil
+}
+
+func sourceBuildEntry(manifest Manifest) string {
+	entry := rawSourceBuildEntry(manifest)
+	if entry == "" {
+		return SourceBuildEntry
+	}
+	return entry
+}
+
+func rawSourceBuildEntry(manifest Manifest) string {
+	entry := strings.Trim(strings.TrimSpace(manifest.Build.Entry), "/")
+	if entry == "" {
+		entry = strings.Trim(strings.TrimSpace(manifest.Runtime.BuildEntry), "/")
+	}
+	return entry
 }
 
 func extensionPointKeys(manifest Manifest) []string {
@@ -309,6 +543,14 @@ func cleanZipName(name string) (string, error) {
 		return "", fmt.Errorf("unsafe zip entry %q", name)
 	}
 	return clean, nil
+}
+
+func cleanZipDirName(name string) (string, error) {
+	name = strings.TrimSuffix(name, "/")
+	if name == "" {
+		return "", fmt.Errorf("unsafe zip entry %q", name)
+	}
+	return cleanZipName(name)
 }
 
 func readZipFile(file *zip.File, maxBytes int64) ([]byte, error) {
@@ -340,4 +582,22 @@ func fileSHA256(path string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func copyFile(src, dst string) error {
+	input, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+
+	output, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer output.Close()
+	if _, err := io.Copy(output, input); err != nil {
+		return err
+	}
+	return output.Close()
 }

@@ -7,13 +7,17 @@ import (
 )
 
 func main() {
+	artifactType := os.Getenv("ARTIFACT_TYPE")
+	if artifactType == "" {
+		artifactType = "binary"
+	}
 	manifest := map[string]any{
 		"schema_version": "mc-gateway.plugin/v1",
 		"id":             "upstream-rewrite",
 		"name":           "Upstream Rewrite",
 		"version":        "0.1.0",
 		"description":    "Rewrite selected upstream targets before dialing.",
-		"artifact_type":  "binary",
+		"artifact_type":  artifactType,
 		"runtime": map[string]any{
 			"type":            "go-plugin",
 			"entry":           "plugin.so",
@@ -46,6 +50,17 @@ func main() {
 			},
 			"required": []string{"upstream"},
 		},
+	}
+	if artifactType == "source" {
+		manifest["build"] = map[string]any{
+			"type":            "go",
+			"entry":           ".",
+			"go_version":      runtime.Version(),
+			"cgo_enabled":     true,
+			"tags":            []string{},
+			"vendor_required": false,
+			"output":          "plugin.so",
+		}
 	}
 	encoder := json.NewEncoder(os.Stdout)
 	encoder.SetIndent("", "  ")

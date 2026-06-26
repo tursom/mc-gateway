@@ -38,6 +38,30 @@ func TestArtifactStoreValidateAndStore(t *testing.T) {
 	}
 }
 
+func TestArtifactStoreValidateAndStoreSource(t *testing.T) {
+	packagePath := writeTestMCGP(t, map[string][]byte{
+		"manifest.json": testSourceManifestBytes(t, "source-plugin"),
+		"go.mod":        []byte("module example.com/source-plugin\n\ngo 1.24.0\n"),
+		"main.go":       []byte("package main\n"),
+		"README.md":     []byte("source fixture"),
+	})
+	store := NewArtifactStore(t.TempDir())
+	source, err := store.ValidateAndStoreSource(ArtifactUpload{
+		SourcePath: packagePath,
+		FileName:   "source-plugin.mcgp",
+		Actor:      "admin",
+	})
+	if err != nil {
+		t.Fatalf("ValidateAndStoreSource() error = %v", err)
+	}
+	if source.ArtifactType != ArtifactTypeSource || source.Status != ArtifactStatusValidated {
+		t.Fatalf("source = %+v, want validated source", source)
+	}
+	if _, err := os.Stat(filepath.Join(source.FilePath, "go.mod")); err != nil {
+		t.Fatalf("stored source go.mod stat error = %v", err)
+	}
+}
+
 func TestArtifactStoreRejectsUnsafePackage(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -88,6 +112,60 @@ func TestArtifactStoreRejectsUnsafePackage(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestArtifactStoreRejectsSourceShellScripts(t *testing.T) {
+	store := NewArtifactStore(t.TempDir())
+	_, err := store.ValidateAndStoreSource(ArtifactUpload{
+		SourcePath: writeTestMCGP(t, map[string][]byte{
+			"manifest.json": testSourceManifestBytes(t, "test-plugin"),
+			"go.mod":        []byte("module example.com/test\n"),
+			"main.go":       []byte("package main\n"),
+			"build.sh":      []byte("go build"),
+		}),
+		FileName: "bad-source.mcgp",
+		Actor:    "admin",
+	})
+	if err == nil || !strings.Contains(err.Error(), "unsupported source package entry") {
+		t.Fatalf("ValidateAndStoreSource() error = %v, want unsupported source entry", err)
+	}
+}
+
+func testSourceManifestBytes(t *testing.T, pluginID string) []byte {
+	t.Helper()
+	manifest := Manifest{
+		SchemaVersion: SchemaVersion,
+		ID:            pluginID,
+		Name:          "Source Plugin",
+		Version:       "0.1.0",
+		ArtifactType:  ArtifactTypeSource,
+		Runtime: RuntimeManifest{
+			Type:        RuntimeGoPlugin,
+			EntrySymbol: "Plugin",
+		},
+		Build: BuildManifest{
+			Type:           BuildTypeGo,
+			Entry:          ".",
+			GoVersion:      runtime.Version(),
+			Tags:           []string{},
+			VendorRequired: false,
+			Output:         RuntimeEntry,
+		},
+		APIVersion: APIVersion,
+		GoVersion:  runtime.Version(),
+		GOOS:       runtime.GOOS,
+		GOARCH:     runtime.GOARCH,
+		ExtensionPoints: []ExtensionPoint{{
+			Type: "hook",
+			Key:  ExtensionUpstreamConnect,
+		}},
+		Capabilities: json.RawMessage(`{"extension_points":["upstream.connect/v1"]}`),
+	}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("Marshal source manifest error = %v", err)
+	}
+	return data
 }
 
 func testManifestBytes(t *testing.T, pluginID string) []byte {

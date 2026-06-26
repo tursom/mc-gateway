@@ -9,6 +9,8 @@ import (
 	"io"
 	"net"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,6 +28,104 @@ func TestManagerUploadDoesNotLoadPlugin(t *testing.T) {
 	}
 	if adapter.loads != 0 {
 		t.Fatalf("adapter loads = %d, want 0 for upload-only validation", adapter.loads)
+	}
+}
+
+func TestManagerUploadSourceQueuesBuild(t *testing.T) {
+	manager := newManagerForTest(t, &fakeAdapter{})
+	source := uploadTestSource(t, manager, "plugin-a")
+	builds, err := manager.ListBuilds(context.Background(), "plugin-a")
+	if err != nil {
+		t.Fatalf("ListBuilds() error = %v", err)
+	}
+	if len(builds) != 1 {
+		t.Fatalf("builds = %d, want 1", len(builds))
+	}
+	if builds[0].SourceID != source.ID || builds[0].Status != BuildStatusQueued {
+		t.Fatalf("queued build = %+v, want source %s queued", builds[0], source.ID)
+	}
+}
+
+func TestManagerBuildSourceCreatesBinaryArtifact(t *testing.T) {
+	t.Setenv("GOCACHE", t.TempDir())
+	t.Setenv("GOWORK", "off")
+	manager := newManagerForTest(t, &fakeAdapter{})
+	_ = uploadBuildableTestSource(t, manager, "source-enable")
+	builds, err := manager.ListBuilds(context.Background(), "source-enable")
+	if err != nil {
+		t.Fatalf("ListBuilds() error = %v", err)
+	}
+	if len(builds) != 1 {
+		t.Fatalf("builds = %d, want 1", len(builds))
+	}
+	build, err := manager.RunBuild(context.Background(), "admin", builds[0].ID)
+	if err != nil {
+		t.Fatalf("RunBuild() error = %v", err)
+	}
+	if build.Status != BuildStatusSucceeded || build.ArtifactID == "" {
+		t.Fatalf("build = %+v, want succeeded with artifact", build)
+	}
+	artifact, err := manager.Artifact(context.Background(), build.ArtifactID)
+	if err != nil {
+		t.Fatalf("Artifact() error = %v", err)
+	}
+	if artifact.ArtifactType != ArtifactTypeBinary || artifact.Status != ArtifactStatusLoadable {
+		t.Fatalf("artifact = %+v, want loadable binary", artifact)
+	}
+	if _, err := manager.SetDesired(context.Background(), "admin", artifact.PluginID, artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	plugin, err := manager.Enable(context.Background(), "admin", artifact.PluginID)
+	if err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	if plugin.RuntimeState != RuntimeEnabled || plugin.ActiveArtifactID != artifact.ID {
+		t.Fatalf("plugin = %+v, want enabled built artifact", plugin)
+	}
+}
+
+func TestManagerBuildFailureDoesNotChangeActiveArtifact(t *testing.T) {
+	adapter := &fakeAdapter{}
+	builder := &fakeBuilder{err: errors.New("compile failed")}
+	manager := newManagerForTestWithBuilders(t, adapter, map[string]SourceBuilder{
+		BuilderTypeLocalProcess: builder,
+	})
+	active := uploadTestArtifact(t, manager, "plugin-a")
+	if _, err := manager.SetDesired(context.Background(), "admin", "plugin-a", active.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", "plugin-a"); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	source := uploadTestSource(t, manager, "plugin-a")
+	builds, err := manager.ListBuilds(context.Background(), "plugin-a")
+	if err != nil {
+		t.Fatalf("ListBuilds() error = %v", err)
+	}
+	if len(builds) == 0 || builds[0].SourceID != source.ID {
+		t.Fatalf("queued builds = %+v, want source %s", builds, source.ID)
+	}
+	build, err := manager.RunBuild(context.Background(), "admin", builds[0].ID)
+	if err != nil {
+		t.Fatalf("RunBuild() unexpected manager error = %v", err)
+	}
+	if build.Status != BuildStatusFailed {
+		t.Fatalf("build status = %q, want failed", build.Status)
+	}
+	plugin, err := manager.Plugin(context.Background(), "plugin-a")
+	if err != nil {
+		t.Fatalf("Plugin() error = %v", err)
+	}
+	if plugin.ActiveArtifactID != active.ID {
+		t.Fatalf("active artifact = %q, want unchanged %q", plugin.ActiveArtifactID, active.ID)
+	}
+}
+
+func TestManagerRejectsSourceArtifactLoad(t *testing.T) {
+	manager := newManagerForTest(t, &fakeAdapter{})
+	source := uploadTestSource(t, manager, "plugin-a")
+	if _, err := manager.SetDesired(context.Background(), "admin", "plugin-a", source.ID, DesiredEnabled, `{}`, 10); err == nil || !strings.Contains(err.Error(), "binary artifact") {
+		t.Fatalf("SetDesired(source) error = %v, want binary artifact rejection", err)
 	}
 }
 
@@ -456,11 +556,17 @@ func enableProtocolProxyTestPlugin(t *testing.T, manager *Manager, pluginID stri
 
 func newManagerForTest(t *testing.T, adapter RuntimeAdapter) *Manager {
 	t.Helper()
+	return newManagerForTestWithBuilders(t, adapter, nil)
+}
+
+func newManagerForTestWithBuilders(t *testing.T, adapter RuntimeAdapter, builders map[string]SourceBuilder) *Manager {
+	t.Helper()
 	db := openPluginManagerTestDB(t)
 	return New(Options{
 		DB:           db,
 		ArtifactRoot: t.TempDir(),
 		Adapter:      adapter,
+		Builders:     builders,
 	})
 }
 
@@ -497,6 +603,137 @@ func uploadTestArtifactWithCapabilities(t *testing.T, manager *Manager, pluginID
 		t.Fatalf("UploadArtifact(%s) error = %v", pluginID, err)
 	}
 	return artifact
+}
+
+func uploadTestSource(t *testing.T, manager *Manager, pluginID string) ArtifactRecord {
+	t.Helper()
+	packagePath := writeTestMCGP(t, map[string][]byte{
+		"manifest.json": testSourceManifestBytes(t, pluginID),
+		"go.mod":        []byte("module example.com/" + pluginID + "\n\ngo 1.24.0\n"),
+		"main.go":       []byte("package main\n"),
+	})
+	source, err := manager.UploadSource(context.Background(), ArtifactUpload{
+		SourcePath: packagePath,
+		FileName:   pluginID + "-source.mcgp",
+		Actor:      "admin",
+	})
+	if err != nil {
+		t.Fatalf("UploadSource(%s) error = %v", pluginID, err)
+	}
+	return source
+}
+
+func uploadBuildableTestSource(t *testing.T, manager *Manager, pluginID string) ArtifactRecord {
+	t.Helper()
+	repoRoot, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatalf("Abs(repo root) error = %v", err)
+	}
+	manifest := Manifest{
+		SchemaVersion: SchemaVersion,
+		ID:            pluginID,
+		Name:          "Buildable Source",
+		Version:       "0.1.0",
+		ArtifactType:  ArtifactTypeSource,
+		Runtime: RuntimeManifest{
+			Type:           RuntimeGoPlugin,
+			EntrySymbol:    "Plugin",
+			MetadataSymbol: "MCGatewayPluginMetadata",
+		},
+		Build: BuildManifest{
+			Type:           BuildTypeGo,
+			Entry:          ".",
+			GoVersion:      runtime.Version(),
+			Tags:           []string{},
+			VendorRequired: false,
+			Output:         RuntimeEntry,
+		},
+		APIVersion:       APIVersion,
+		SDKModule:        "github.com/tursom/mc-gateway/plugin/api",
+		SDKModuleVersion: "v0.1.0",
+		GoVersion:        runtime.Version(),
+		GOOS:             runtime.GOOS,
+		GOARCH:           runtime.GOARCH,
+		ExtensionPoints: []ExtensionPoint{{
+			Type: "hook",
+			Key:  ExtensionUpstreamConnect,
+		}},
+		Capabilities: json.RawMessage(`{"extension_points":["upstream.connect/v1"]}`),
+	}
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("Marshal manifest error = %v", err)
+	}
+	mainSource := `package main
+
+import (
+	"encoding/json"
+	"net"
+	"runtime"
+
+	"github.com/tursom/mc-gateway/plugin/api"
+)
+
+type pluginImpl struct{ api.AbstractPlugin }
+
+func Plugin() api.Plugin { return &pluginImpl{} }
+
+func MCGatewayPluginMetadata() string { return manifestJSON }
+
+func (p *pluginImpl) Init(gateway api.Gateway) error {
+	return api.RegisterHookHandler(
+		gateway,
+		api.HookUpstreamConnect,
+		func(api.UpstreamConnectRequest) bool { return true },
+		func(api.UpstreamConnectRequest) (net.Conn, error) {
+			left, right := net.Pipe()
+			_ = right.Close()
+			return left, nil
+		},
+	)
+}
+
+var manifestJSON = compactJSON(map[string]any{
+	"schema_version": "mc-gateway.plugin/v1",
+	"id": "` + pluginID + `",
+	"name": "Buildable Source",
+	"version": "0.1.0",
+	"artifact_type": "binary",
+	"runtime": map[string]any{
+		"type": "go-plugin",
+		"entry": "plugin.so",
+		"entry_symbol": "Plugin",
+		"metadata_symbol": "MCGatewayPluginMetadata",
+	},
+	"api_version": "plugin-api/v1",
+	"sdk_module": "github.com/tursom/mc-gateway/plugin/api",
+	"sdk_module_version": "v0.1.0",
+	"go_version": runtime.Version(),
+	"go_os": runtime.GOOS,
+	"go_arch": runtime.GOARCH,
+	"extension_points": []map[string]any{{"type": "hook", "key": "upstream.connect/v1"}},
+	"capabilities": map[string]any{"extension_points": []string{"upstream.connect/v1"}},
+})
+
+func compactJSON(value any) string {
+	data, _ := json.Marshal(value)
+	return string(data)
+}
+`
+	packagePath := writeTestMCGP(t, map[string][]byte{
+		"manifest.json": manifestBytes,
+		"go.mod":        []byte("module example.com/" + pluginID + "\n\ngo 1.24.0\n\nrequire github.com/tursom/mc-gateway v0.0.0\n\nreplace github.com/tursom/mc-gateway => " + filepath.ToSlash(repoRoot) + "\n"),
+		"main.go":       []byte(mainSource),
+	})
+	source, err := manager.UploadSource(context.Background(), ArtifactUpload{
+		SourcePath: packagePath,
+		FileName:   pluginID + "-source.mcgp",
+		Actor:      "admin",
+	})
+	if err != nil {
+		t.Fatalf("UploadSource(%s) error = %v", pluginID, err)
+	}
+	return source
 }
 
 func waitForPluginManagerTest(t *testing.T, done func() bool) {
@@ -550,6 +787,15 @@ func (a *fakeAdapter) Load(_ context.Context, artifact ArtifactRecord, _ PluginR
 
 type fakePlugin struct {
 	api.AbstractPlugin
+}
+
+type fakeBuilder struct {
+	result BuildResult
+	err    error
+}
+
+func (b *fakeBuilder) Build(context.Context, ArtifactRecord, BuildRequest, BuildRecord) (BuildResult, error) {
+	return b.result, b.err
 }
 
 func newMemoryConn() net.Conn {

@@ -15,8 +15,10 @@ const (
 	APIVersion    = "plugin-api/v1"
 
 	ArtifactTypeBinary = "binary"
+	ArtifactTypeSource = "source"
 	RuntimeGoPlugin    = "go-plugin"
 	RuntimeEntry       = "plugin.so"
+	SourceBuildEntry   = "."
 
 	ExtensionUpstreamConnect = "upstream.connect/v1"
 
@@ -29,6 +31,16 @@ const (
 	ArtifactStatusLoaded    = "loaded"
 	ArtifactStatusRejected  = "rejected"
 	ArtifactStatusDeleted   = "deleted"
+
+	BuildStatusQueued    = "queued"
+	BuildStatusRunning   = "running"
+	BuildStatusSucceeded = "succeeded"
+	BuildStatusFailed    = "failed"
+	BuildStatusCanceled  = "canceled"
+
+	BuilderTypeLocalProcess = "local-process"
+	BuilderTypeContainer    = "container"
+	BuildTypeGo             = "go"
 
 	DesiredEnabled  = "enabled"
 	DesiredDisabled = "disabled"
@@ -49,6 +61,7 @@ const (
 	DefaultExtractedMaxBytes   = 256 * 1024 * 1024
 	DefaultNonRuntimeMaxBytes  = 16 * 1024 * 1024
 	DefaultInitialWriteTimeout = time.Second
+	DefaultBuildLogMaxBytes    = 64 * 1024
 )
 
 var (
@@ -64,6 +77,7 @@ type Manifest struct {
 	Description      string           `json:"description"`
 	ArtifactType     string           `json:"artifact_type"`
 	Runtime          RuntimeManifest  `json:"runtime"`
+	Build            BuildManifest    `json:"build,omitempty"`
 	APIVersion       string           `json:"api_version"`
 	SDKModule        string           `json:"sdk_module"`
 	SDKModuleVersion string           `json:"sdk_module_version"`
@@ -80,8 +94,19 @@ type Manifest struct {
 type RuntimeManifest struct {
 	Type           string `json:"type"`
 	Entry          string `json:"entry"`
+	BuildEntry     string `json:"build_entry"`
 	EntrySymbol    string `json:"entry_symbol"`
 	MetadataSymbol string `json:"metadata_symbol"`
+}
+
+type BuildManifest struct {
+	Type           string   `json:"type"`
+	Entry          string   `json:"entry"`
+	GoVersion      string   `json:"go_version"`
+	CGOEnabled     *bool    `json:"cgo_enabled,omitempty"`
+	Tags           []string `json:"tags"`
+	VendorRequired bool     `json:"vendor_required"`
+	Output         string   `json:"output"`
 }
 
 type ExtensionPoint struct {
@@ -181,6 +206,75 @@ type OperationRecord struct {
 	Message      string `json:"message"`
 	MetadataJSON string `json:"metadata_json"`
 	CreatedAt    int64  `json:"created_at"`
+}
+
+type BuildRecord struct {
+	ID             int64  `json:"id"`
+	PluginID       string `json:"plugin_id"`
+	SourceID       string `json:"source_id"`
+	ArtifactID     string `json:"artifact_id"`
+	Status         string `json:"status"`
+	BuilderType    string `json:"builder_type"`
+	BuilderImage   string `json:"builder_image"`
+	BuilderVersion string `json:"builder_version"`
+	GoVersion      string `json:"go_version"`
+	GOOS           string `json:"go_os"`
+	GOARCH         string `json:"go_arch"`
+	GOAMD64        string `json:"go_amd64"`
+	GOARM64        string `json:"go_arm64"`
+	CGOEnabled     string `json:"cgo_enabled"`
+	BuildTags      string `json:"build_tags"`
+	SDKModule      string `json:"sdk_module"`
+	SDKVersion     string `json:"sdk_version"`
+	GOPROXY        string `json:"go_proxy"`
+	GONOSUMDB      string `json:"go_no_sumdb"`
+	GOPRIVATE      string `json:"go_private"`
+	VendorRequired bool   `json:"vendor_required"`
+	SourceSHA256   string `json:"source_sha256"`
+	ArtifactSHA256 string `json:"artifact_sha256"`
+	ModuleSummary  string `json:"module_summary_json"`
+	GoVersionM     string `json:"go_version_m_json"`
+	ABIFingerprint string `json:"abi_fingerprint"`
+	LogSummary     string `json:"log_summary"`
+	MetadataJSON   string `json:"metadata_json"`
+	Error          string `json:"error"`
+	StartedAt      int64  `json:"started_at"`
+	EndedAt        int64  `json:"ended_at"`
+	DurationMS     int64  `json:"duration_ms"`
+	CreatedBy      string `json:"created_by"`
+	CreatedAt      int64  `json:"created_at"`
+	UpdatedAt      int64  `json:"updated_at"`
+}
+
+type BuildRequest struct {
+	SourceID       string `json:"source_id"`
+	BuilderType    string `json:"builder_type"`
+	BuilderImage   string `json:"builder_image"`
+	BuilderVersion string `json:"builder_version"`
+	GOOS           string `json:"go_os"`
+	GOARCH         string `json:"go_arch"`
+	GOAMD64        string `json:"go_amd64"`
+	GOARM64        string `json:"go_arm64"`
+	CGOEnabled     string `json:"cgo_enabled"`
+	BuildTags      string `json:"build_tags"`
+	SDKModule      string `json:"sdk_module"`
+	SDKVersion     string `json:"sdk_version"`
+	GOPROXY        string `json:"go_proxy"`
+	GONOSUMDB      string `json:"go_no_sumdb"`
+	GOPRIVATE      string `json:"go_private"`
+	VendorRequired bool   `json:"vendor_required"`
+}
+
+type GCCandidate struct {
+	Kind       string `json:"kind"`
+	ID         string `json:"id"`
+	PluginID   string `json:"plugin_id"`
+	Path       string `json:"path"`
+	Protected  bool   `json:"protected"`
+	Reason     string `json:"reason"`
+	SizeBytes  int64  `json:"size_bytes"`
+	CreatedAt  int64  `json:"created_at"`
+	Referenced bool   `json:"referenced"`
 }
 
 type ConfigSnapshot struct {

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -119,6 +120,9 @@ func (r Repository) UpsertDesired(ctx context.Context, actor, pluginID, artifact
 	}
 	if artifact.PluginID != pluginID {
 		return PluginRecord{}, errors.New("artifact plugin_id does not match")
+	}
+	if artifact.ArtifactType != ArtifactTypeBinary {
+		return PluginRecord{}, errors.New("desired artifact must be a binary artifact")
 	}
 
 	now := r.now().Unix()
@@ -266,6 +270,207 @@ func (r Repository) UpdateArtifactStatus(ctx context.Context, artifactID, status
 	return err
 }
 
+func (r Repository) CreateBuild(ctx context.Context, build BuildRecord) (BuildRecord, error) {
+	now := r.now().Unix()
+	build.CreatedAt = now
+	build.UpdatedAt = now
+	if build.Status == "" {
+		build.Status = BuildStatusQueued
+	}
+	_, err := r.db.ExecContext(ctx, `
+INSERT INTO plugin_builds(
+    plugin_id, source_id, artifact_id, status, builder_type, builder_image, builder_version,
+    go_version, go_os, go_arch, go_amd64, go_arm64, cgo_enabled, build_tags,
+    sdk_module, sdk_version, go_proxy, go_no_sumdb, go_private, vendor_required,
+    source_sha256, artifact_sha256, module_summary_json, go_version_m_json, abi_fingerprint,
+    log_summary, metadata_json, error, started_at, ended_at, duration_ms, created_by, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		build.PluginID, build.SourceID, build.ArtifactID, build.Status, build.BuilderType, build.BuilderImage, build.BuilderVersion,
+		build.GoVersion, build.GOOS, build.GOARCH, build.GOAMD64, build.GOARM64, build.CGOEnabled, build.BuildTags,
+		build.SDKModule, build.SDKVersion, build.GOPROXY, build.GONOSUMDB, build.GOPRIVATE, boolInt(build.VendorRequired),
+		build.SourceSHA256, build.ArtifactSHA256, defaultJSONArray(build.ModuleSummary), defaultJSONObject(build.GoVersionM), build.ABIFingerprint,
+		build.LogSummary, defaultJSONObject(build.MetadataJSON), build.Error, build.StartedAt, build.EndedAt, build.DurationMS, build.CreatedBy, build.CreatedAt, build.UpdatedAt)
+	if err != nil {
+		return BuildRecord{}, err
+	}
+	id, err := lastInsertID(ctx, r.db)
+	if err != nil {
+		return BuildRecord{}, err
+	}
+	return r.Build(ctx, id)
+}
+
+func (r Repository) Build(ctx context.Context, id int64) (BuildRecord, error) {
+	row := r.db.QueryRowContext(ctx, `
+SELECT id, plugin_id, source_id, artifact_id, status, builder_type, builder_image, builder_version,
+       go_version, go_os, go_arch, go_amd64, go_arm64, cgo_enabled, build_tags,
+       sdk_module, sdk_version, go_proxy, go_no_sumdb, go_private, vendor_required,
+       source_sha256, artifact_sha256, module_summary_json, go_version_m_json, abi_fingerprint,
+       log_summary, metadata_json, error, started_at, ended_at, duration_ms, created_by, created_at, updated_at
+FROM plugin_builds WHERE id = ?`, id)
+	return scanBuild(row)
+}
+
+func (r Repository) ListBuilds(ctx context.Context, pluginID string) ([]BuildRecord, error) {
+	query := `
+SELECT id, plugin_id, source_id, artifact_id, status, builder_type, builder_image, builder_version,
+       go_version, go_os, go_arch, go_amd64, go_arm64, cgo_enabled, build_tags,
+       sdk_module, sdk_version, go_proxy, go_no_sumdb, go_private, vendor_required,
+       source_sha256, artifact_sha256, module_summary_json, go_version_m_json, abi_fingerprint,
+       log_summary, metadata_json, error, started_at, ended_at, duration_ms, created_by, created_at, updated_at
+FROM plugin_builds`
+	var args []any
+	if pluginID != "" {
+		query += ` WHERE plugin_id = ?`
+		args = append(args, pluginID)
+	}
+	query += ` ORDER BY created_at DESC, id DESC`
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var builds []BuildRecord
+	for rows.Next() {
+		build, err := scanBuild(rows)
+		if err != nil {
+			return nil, err
+		}
+		builds = append(builds, build)
+	}
+	return builds, rows.Err()
+}
+
+func (r Repository) MarkBuildRunning(ctx context.Context, id int64) error {
+	now := r.now().Unix()
+	_, err := r.db.ExecContext(ctx, `UPDATE plugin_builds SET status = ?, started_at = ?, updated_at = ? WHERE id = ? AND status = ?`,
+		BuildStatusRunning, now, now, id, BuildStatusQueued)
+	return err
+}
+
+func (r Repository) FinishBuild(ctx context.Context, build BuildRecord) error {
+	now := r.now().Unix()
+	if build.EndedAt == 0 {
+		build.EndedAt = now
+	}
+	if build.StartedAt > 0 && build.DurationMS == 0 {
+		build.DurationMS = (build.EndedAt - build.StartedAt) * 1000
+	}
+	_, err := r.db.ExecContext(ctx, `
+UPDATE plugin_builds SET
+    artifact_id = ?, status = ?, builder_image = ?, builder_version = ?, go_version = ?,
+    go_os = ?, go_arch = ?, go_amd64 = ?, go_arm64 = ?, cgo_enabled = ?, build_tags = ?,
+    sdk_module = ?, sdk_version = ?, go_proxy = ?, go_no_sumdb = ?, go_private = ?, vendor_required = ?,
+    source_sha256 = ?, artifact_sha256 = ?, module_summary_json = ?, go_version_m_json = ?,
+    abi_fingerprint = ?, log_summary = ?, metadata_json = ?, error = ?, ended_at = ?, duration_ms = ?, updated_at = ?
+WHERE id = ?`,
+		build.ArtifactID, build.Status, build.BuilderImage, build.BuilderVersion, build.GoVersion,
+		build.GOOS, build.GOARCH, build.GOAMD64, build.GOARM64, build.CGOEnabled, build.BuildTags,
+		build.SDKModule, build.SDKVersion, build.GOPROXY, build.GONOSUMDB, build.GOPRIVATE, boolInt(build.VendorRequired),
+		build.SourceSHA256, build.ArtifactSHA256, defaultJSONArray(build.ModuleSummary), defaultJSONObject(build.GoVersionM),
+		build.ABIFingerprint, build.LogSummary, defaultJSONObject(build.MetadataJSON), build.Error, build.EndedAt, build.DurationMS, now,
+		build.ID)
+	return err
+}
+
+func (r Repository) CancelBuild(ctx context.Context, id int64, actor string) (BuildRecord, error) {
+	now := r.now().Unix()
+	res, err := r.db.ExecContext(ctx, `
+UPDATE plugin_builds
+SET status = ?, error = ?, ended_at = ?, updated_at = ?
+WHERE id = ? AND status IN (?, ?)`,
+		BuildStatusCanceled, "build canceled by "+actor, now, now, id, BuildStatusQueued, BuildStatusRunning)
+	if err != nil {
+		return BuildRecord{}, err
+	}
+	if rows, _ := res.RowsAffected(); rows == 0 {
+		return r.Build(ctx, id)
+	}
+	return r.Build(ctx, id)
+}
+
+func (r Repository) RetryBuild(ctx context.Context, id int64, actor string) (BuildRecord, error) {
+	previous, err := r.Build(ctx, id)
+	if err != nil {
+		return BuildRecord{}, err
+	}
+	if previous.Status != BuildStatusFailed && previous.Status != BuildStatusCanceled {
+		return BuildRecord{}, fmt.Errorf("build status %q cannot be retried", previous.Status)
+	}
+	previous.ID = 0
+	previous.ArtifactID = ""
+	previous.ArtifactSHA256 = ""
+	previous.Status = BuildStatusQueued
+	previous.LogSummary = ""
+	previous.Error = ""
+	previous.StartedAt = 0
+	previous.EndedAt = 0
+	previous.DurationMS = 0
+	previous.CreatedBy = actor
+	return r.CreateBuild(ctx, previous)
+}
+
+func (r Repository) ReferencedArtifactIDs(ctx context.Context) (map[string]bool, error) {
+	refs := make(map[string]bool)
+	rows, err := r.db.QueryContext(ctx, `
+SELECT desired_artifact_id, active_artifact_id, loaded_artifact_id
+FROM plugins
+WHERE desired_state <> 'deleted'`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var desired, active, loaded string
+		if err := rows.Scan(&desired, &active, &loaded); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		for _, id := range []string{desired, active, loaded} {
+			if id != "" {
+				refs[id] = true
+			}
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	rows, err = r.db.QueryContext(ctx, `SELECT artifact_id FROM plugin_config_snapshots WHERE artifact_id <> ''`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if id != "" {
+			refs[id] = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	rows, err = r.db.QueryContext(ctx, `SELECT artifact_id FROM plugin_builds WHERE artifact_id <> '' AND status = ?`, BuildStatusSucceeded)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if id != "" {
+			refs[id] = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return refs, nil
+}
+
 func (r Repository) RecordOperation(ctx context.Context, pluginID, artifactID, operation, status, actor, message string, metadata any) error {
 	metadataJSON, err := marshalDefaultObject(metadata)
 	if err != nil {
@@ -322,6 +527,20 @@ func scanPluginRow(row rowScanner, plugin *PluginRecord) error {
 	)
 }
 
+func scanBuild(row rowScanner) (BuildRecord, error) {
+	var build BuildRecord
+	var vendorRequired int
+	err := row.Scan(
+		&build.ID, &build.PluginID, &build.SourceID, &build.ArtifactID, &build.Status, &build.BuilderType, &build.BuilderImage, &build.BuilderVersion,
+		&build.GoVersion, &build.GOOS, &build.GOARCH, &build.GOAMD64, &build.GOARM64, &build.CGOEnabled, &build.BuildTags,
+		&build.SDKModule, &build.SDKVersion, &build.GOPROXY, &build.GONOSUMDB, &build.GOPRIVATE, &vendorRequired,
+		&build.SourceSHA256, &build.ArtifactSHA256, &build.ModuleSummary, &build.GoVersionM, &build.ABIFingerprint,
+		&build.LogSummary, &build.MetadataJSON, &build.Error, &build.StartedAt, &build.EndedAt, &build.DurationMS, &build.CreatedBy, &build.CreatedAt, &build.UpdatedAt,
+	)
+	build.VendorRequired = vendorRequired != 0
+	return build, err
+}
+
 func marshalDefaultObject(value any) (string, error) {
 	if value == nil {
 		return "{}", nil
@@ -334,4 +553,34 @@ func marshalDefaultObject(value any) (string, error) {
 		return "{}", nil
 	}
 	return string(data), nil
+}
+
+func defaultJSONObject(value string) string {
+	if value == "" || !json.Valid([]byte(value)) {
+		return "{}"
+	}
+	return value
+}
+
+func defaultJSONArray(value string) string {
+	if value == "" || !json.Valid([]byte(value)) {
+		return "[]"
+	}
+	return value
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func lastInsertID(ctx context.Context, db *sql.DB) (int64, error) {
+	row := db.QueryRowContext(ctx, `SELECT last_insert_rowid()`)
+	var id int64
+	if err := row.Scan(&id); err != nil {
+		return 0, err
+	}
+	return id, nil
 }

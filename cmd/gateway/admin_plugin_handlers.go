@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/tursom/mc-gateway/internal/adminhttp"
@@ -51,6 +52,179 @@ func handleAdminPluginArtifacts(w http.ResponseWriter, r *http.Request) {
 	default:
 		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+func handleAdminPluginSources(w http.ResponseWriter, r *http.Request) {
+	session, ok := requireRole(w, r, adminRoleMember)
+	if !ok {
+		return
+	}
+	if pluginsManager == nil {
+		adminhttp.WriteAPIError(w, http.StatusServiceUnavailable, "plugin manager is not initialized")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		artifacts, err := pluginsManager.ListArtifacts(r.Context(), r.URL.Query().Get("plugin_id"))
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		var sources []pluginmanager.ArtifactRecord
+		for _, artifact := range artifacts {
+			if artifact.ArtifactType == pluginmanager.ArtifactTypeSource {
+				sources = append(sources, artifact)
+			}
+		}
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"sources": sources})
+	case http.MethodPost:
+		if session.Role != adminRoleAdmin {
+			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		source, err := receivePluginSource(r, session.Username)
+		if err != nil {
+			recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_source_upload", "plugin_source", "", false, err.Error())
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_source_upload", "plugin_source", source.ID, true, "source package uploaded", map[string]any{
+			"plugin_id":     source.PluginID,
+			"version":       source.Version,
+			"source_sha256": source.SHA256,
+		})
+		adminhttp.WriteJSON(w, http.StatusCreated, map[string]any{"source": source})
+	default:
+		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func handleAdminPluginBuilds(w http.ResponseWriter, r *http.Request) {
+	session, ok := requireRole(w, r, adminRoleMember)
+	if !ok {
+		return
+	}
+	if pluginsManager == nil {
+		adminhttp.WriteAPIError(w, http.StatusServiceUnavailable, "plugin manager is not initialized")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		builds, err := pluginsManager.ListBuilds(r.Context(), r.URL.Query().Get("plugin_id"))
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"builds": builds})
+	case http.MethodPost:
+		if session.Role != adminRoleAdmin {
+			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		var req pluginmanager.BuildRequest
+		if !adminhttp.DecodeJSONRequest(w, r, &req) {
+			return
+		}
+		build, err := pluginsManager.CreateBuild(r.Context(), session.Username, req)
+		if err != nil {
+			recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_source_build", "plugin_build", req.SourceID, false, err.Error())
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_source_build_queue", "plugin_build", strconv.FormatInt(build.ID, 10), true, "build queued", map[string]any{
+			"plugin_id":       build.PluginID,
+			"source_sha256":   build.SourceSHA256,
+			"artifact_sha256": build.ArtifactSHA256,
+			"builder_type":    build.BuilderType,
+			"go_version":      build.GoVersion,
+		})
+		adminhttp.WriteJSON(w, http.StatusCreated, map[string]any{"build": build})
+	default:
+		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func handleAdminPluginBuild(w http.ResponseWriter, r *http.Request, rawSegment string) {
+	session, ok := requireRole(w, r, adminRoleMember)
+	if !ok {
+		return
+	}
+	if pluginsManager == nil {
+		adminhttp.WriteAPIError(w, http.StatusServiceUnavailable, "plugin manager is not initialized")
+		return
+	}
+	parts := strings.Split(rawSegment, "/")
+	id, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		adminhttp.WriteAPIError(w, http.StatusBadRequest, "invalid build id")
+		return
+	}
+	if len(parts) == 1 && r.Method == http.MethodGet {
+		build, err := pluginsManager.Build(r.Context(), id)
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"build": build})
+		return
+	}
+	if session.Role != adminRoleAdmin {
+		adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	if len(parts) != 2 || r.Method != http.MethodPost {
+		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	action, err := adminhttp.PathSegment(parts[1])
+	if err != nil {
+		adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var build pluginmanager.BuildRecord
+	switch action {
+	case "run":
+		build, err = pluginsManager.RunBuild(r.Context(), session.Username, id)
+	case "cancel":
+		build, err = pluginsManager.CancelBuild(r.Context(), session.Username, id)
+	case "retry":
+		build, err = pluginsManager.RetryBuild(r.Context(), session.Username, id)
+	default:
+		adminhttp.WriteAPIError(w, http.StatusBadRequest, "unknown build action")
+		return
+	}
+	if err != nil {
+		recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_build_"+action, "plugin_build", strconv.FormatInt(id, 10), false, err.Error())
+		adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_build_"+action, "plugin_build", strconv.FormatInt(id, 10), true, "build "+action+" succeeded")
+	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"build": build})
+}
+
+func handleAdminPluginGC(w http.ResponseWriter, r *http.Request) {
+	session, ok := requireRole(w, r, adminRoleMember)
+	if !ok {
+		return
+	}
+	if pluginsManager == nil {
+		adminhttp.WriteAPIError(w, http.StatusServiceUnavailable, "plugin manager is not initialized")
+		return
+	}
+	dryRun := r.Method == http.MethodGet
+	if r.Method == http.MethodPost && session.Role != adminRoleAdmin {
+		adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	candidates, err := pluginsManager.RunGC(r.Context(), session.Username, dryRun)
+	if err != nil {
+		adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{
+		"dry_run":    dryRun,
+		"candidates": candidates,
+	})
 }
 
 func handleAdminPluginArtifact(w http.ResponseWriter, r *http.Request, rawArtifactID string) {
@@ -271,7 +445,50 @@ func receivePluginArtifact(r *http.Request, actor string) (pluginmanager.Artifac
 		return pluginmanager.ArtifactRecord{}, err
 	}
 
-	return pluginsManager.UploadArtifact(r.Context(), pluginmanager.ArtifactUpload{
+	upload := pluginmanager.ArtifactUpload{
+		SourcePath: tmpPath,
+		FileName:   filepath.Base(header.Filename),
+		Actor:      actor,
+	}
+	manifest, err := readPackageManifest(tmpPath)
+	if err != nil {
+		return pluginmanager.ArtifactRecord{}, err
+	}
+	if manifest.ArtifactType == pluginmanager.ArtifactTypeSource {
+		return pluginsManager.UploadSource(r.Context(), upload)
+	}
+	return pluginsManager.UploadArtifact(r.Context(), upload)
+}
+
+func receivePluginSource(r *http.Request, actor string) (pluginmanager.ArtifactRecord, error) {
+	if err := r.ParseMultipartForm(64 << 20); err != nil {
+		return pluginmanager.ArtifactRecord{}, err
+	}
+	file, header, err := r.FormFile("artifact")
+	if err != nil {
+		file, header, err = r.FormFile("source")
+	}
+	if err != nil {
+		return pluginmanager.ArtifactRecord{}, err
+	}
+	defer file.Close()
+
+	tmp, err := os.CreateTemp("", "mc-gateway-plugin-source-*.mcgp")
+	if err != nil {
+		return pluginmanager.ArtifactRecord{}, err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	defer tmp.Close()
+
+	if _, err := tmp.ReadFrom(file); err != nil {
+		return pluginmanager.ArtifactRecord{}, err
+	}
+	if err := tmp.Close(); err != nil {
+		return pluginmanager.ArtifactRecord{}, err
+	}
+
+	return pluginsManager.UploadSource(r.Context(), pluginmanager.ArtifactUpload{
 		SourcePath: tmpPath,
 		FileName:   filepath.Base(header.Filename),
 		Actor:      actor,

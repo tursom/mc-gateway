@@ -11,7 +11,14 @@ Build and package:
 ./build.sh
 ```
 
-The package is written to `dist/upstream-rewrite.mcgp`.
+The binary package is written to `dist/upstream-rewrite.mcgp`; the source
+package is written to `dist/upstream-rewrite-source.mcgp`.
+
+Build the source package through the gateway builder:
+
+```sh
+go run ../../../cmd/gateway plugin source-build dist/upstream-rewrite-source.mcgp dist/upstream-rewrite-built.mcgp
+```
 
 Example config JSON:
 

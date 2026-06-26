@@ -15,7 +15,14 @@ Build and package:
 ./build.sh
 ```
 
-The package is written to `dist/mc-auth-proxy.mcgp`.
+The binary package is written to `dist/mc-auth-proxy.mcgp`; the source package
+is written to `dist/mc-auth-proxy-source.mcgp`.
+
+Build the source package through the gateway builder:
+
+```sh
+go run ../../../cmd/gateway plugin source-build dist/mc-auth-proxy-source.mcgp dist/mc-auth-proxy-built.mcgp
+```
 
 Example config JSON:
 

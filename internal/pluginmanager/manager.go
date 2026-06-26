@@ -10,6 +10,7 @@ import (
 	"net"
 	stdplugin "plugin"
 	"reflect"
+	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -71,6 +72,7 @@ type Manager struct {
 	repo       Repository
 	store      ArtifactStore
 	adapter    RuntimeAdapter
+	builders   map[string]SourceBuilder
 	handleConn func(net.Conn)
 	wg         *sync.WaitGroup
 
@@ -147,6 +149,7 @@ type Options struct {
 	HandleConn   func(net.Conn)
 	WaitGroup    *sync.WaitGroup
 	Adapter      RuntimeAdapter
+	Builders     map[string]SourceBuilder
 }
 
 func New(options Options) *Manager {
@@ -158,11 +161,18 @@ func New(options Options) *Manager {
 		repo:        NewRepository(options.DB),
 		store:       NewArtifactStore(options.ArtifactRoot),
 		adapter:     adapter,
+		builders:    options.Builders,
 		handleConn:  options.HandleConn,
 		wg:          options.WaitGroup,
 		loaded:      make(map[string]*loadedPlugin),
 		proxyConns:  make(map[uint64]*proxyConnection),
 		drainingIDs: make(map[string]bool),
+	}
+	if manager.builders == nil {
+		manager.builders = map[string]SourceBuilder{
+			BuilderTypeLocalProcess: LocalProcessBuilder{StoreRoot: options.ArtifactRoot},
+			BuilderTypeContainer:    ContainerBuilder{},
+		}
 	}
 	manager.publish(nil)
 	return manager
@@ -174,6 +184,9 @@ func (m *Manager) UploadArtifact(ctx context.Context, upload ArtifactUpload) (Ar
 		_ = m.repo.RecordOperation(ctx, "", "", "artifact_upload", "failed", upload.Actor, err.Error(), nil)
 		return ArtifactRecord{}, err
 	}
+	if artifact.ArtifactType == ArtifactTypeSource {
+		return m.saveSourceArtifact(ctx, upload.Actor, artifact, "artifact_upload")
+	}
 	if err := m.repo.SaveArtifact(ctx, artifact); err != nil {
 		return ArtifactRecord{}, err
 	}
@@ -184,6 +197,203 @@ func (m *Manager) UploadArtifact(ctx context.Context, upload ArtifactUpload) (Ar
 		"extension_points": artifact.ExtensionPointsJSON,
 	})
 	return artifact, nil
+}
+
+func (m *Manager) UploadSource(ctx context.Context, upload ArtifactUpload) (ArtifactRecord, error) {
+	artifact, err := m.store.ValidateAndStoreSource(upload)
+	if err != nil {
+		_ = m.repo.RecordOperation(ctx, "", "", "source_upload", "failed", upload.Actor, err.Error(), nil)
+		return ArtifactRecord{}, err
+	}
+	return m.saveSourceArtifact(ctx, upload.Actor, artifact, "source_upload")
+}
+
+func (m *Manager) saveSourceArtifact(ctx context.Context, actor string, artifact ArtifactRecord, operation string) (ArtifactRecord, error) {
+	if err := m.repo.SaveArtifact(ctx, artifact); err != nil {
+		return ArtifactRecord{}, err
+	}
+	build, err := m.CreateBuild(ctx, actor, BuildRequest{SourceID: artifact.ID})
+	if err != nil {
+		_ = m.repo.RecordOperation(ctx, artifact.PluginID, artifact.ID, "source_build_queue", "failed", actor, err.Error(), nil)
+		return ArtifactRecord{}, err
+	}
+	_ = m.repo.RecordOperation(ctx, artifact.PluginID, artifact.ID, operation, "succeeded", actor, "source package uploaded", map[string]any{
+		"source_sha256": artifact.SHA256,
+		"api_version":   artifact.APIVersion,
+		"go_version":    artifact.GoVersion,
+		"build_id":      build.ID,
+	})
+	return artifact, nil
+}
+
+func (m *Manager) BuildSource(ctx context.Context, actor string, req BuildRequest) (BuildRecord, error) {
+	build, err := m.CreateBuild(ctx, actor, req)
+	if err != nil {
+		return BuildRecord{}, err
+	}
+	return m.RunBuild(ctx, actor, build.ID)
+}
+
+func (m *Manager) CreateBuild(ctx context.Context, actor string, req BuildRequest) (BuildRecord, error) {
+	source, err := m.repo.Artifact(ctx, req.SourceID)
+	if err != nil {
+		return BuildRecord{}, err
+	}
+	if source.ArtifactType != ArtifactTypeSource {
+		return BuildRecord{}, fmt.Errorf("artifact %s is %q, want source", source.ID, source.ArtifactType)
+	}
+	req = defaultBuildRequest(req, source)
+	if req.GOOS != runtime.GOOS || req.GOARCH != runtime.GOARCH {
+		return BuildRecord{}, fmt.Errorf("build target %s/%s does not match gateway %s/%s", req.GOOS, req.GOARCH, runtime.GOOS, runtime.GOARCH)
+	}
+	builder := m.builders[req.BuilderType]
+	if builder == nil {
+		return BuildRecord{}, fmt.Errorf("builder type %q is not available", req.BuilderType)
+	}
+	build, err := m.repo.CreateBuild(ctx, BuildRecord{
+		PluginID:       source.PluginID,
+		SourceID:       source.ID,
+		Status:         BuildStatusQueued,
+		BuilderType:    req.BuilderType,
+		BuilderImage:   req.BuilderImage,
+		BuilderVersion: req.BuilderVersion,
+		GOOS:           req.GOOS,
+		GOARCH:         req.GOARCH,
+		GOAMD64:        req.GOAMD64,
+		GOARM64:        req.GOARM64,
+		CGOEnabled:     req.CGOEnabled,
+		BuildTags:      req.BuildTags,
+		SDKModule:      req.SDKModule,
+		SDKVersion:     req.SDKVersion,
+		GOPROXY:        req.GOPROXY,
+		GONOSUMDB:      req.GONOSUMDB,
+		GOPRIVATE:      req.GOPRIVATE,
+		VendorRequired: req.VendorRequired,
+		SourceSHA256:   source.SHA256,
+		ModuleSummary:  "[]",
+		GoVersionM:     "{}",
+		MetadataJSON:   "{}",
+		CreatedBy:      actor,
+	})
+	if err != nil {
+		return BuildRecord{}, err
+	}
+	_ = m.repo.RecordOperation(ctx, source.PluginID, source.ID, "source_build_queue", "succeeded", actor, "source build queued", map[string]any{
+		"build_id":      build.ID,
+		"builder_type":  req.BuilderType,
+		"source_sha256": source.SHA256,
+	})
+	return build, nil
+}
+
+func (m *Manager) RunBuild(ctx context.Context, actor string, buildID int64) (BuildRecord, error) {
+	build, err := m.repo.Build(ctx, buildID)
+	if err != nil {
+		return BuildRecord{}, err
+	}
+	if build.Status != BuildStatusQueued {
+		return BuildRecord{}, fmt.Errorf("build status %q cannot be run", build.Status)
+	}
+	source, err := m.repo.Artifact(ctx, build.SourceID)
+	if err != nil {
+		return BuildRecord{}, err
+	}
+	req := BuildRequest{
+		SourceID:       build.SourceID,
+		BuilderType:    build.BuilderType,
+		BuilderImage:   build.BuilderImage,
+		BuilderVersion: build.BuilderVersion,
+		GOOS:           build.GOOS,
+		GOARCH:         build.GOARCH,
+		GOAMD64:        build.GOAMD64,
+		GOARM64:        build.GOARM64,
+		CGOEnabled:     build.CGOEnabled,
+		BuildTags:      build.BuildTags,
+		SDKModule:      build.SDKModule,
+		SDKVersion:     build.SDKVersion,
+		GOPROXY:        build.GOPROXY,
+		GONOSUMDB:      build.GONOSUMDB,
+		GOPRIVATE:      build.GOPRIVATE,
+		VendorRequired: build.VendorRequired,
+	}
+	builder := m.builders[build.BuilderType]
+	if builder == nil {
+		return BuildRecord{}, fmt.Errorf("builder type %q is not available", build.BuilderType)
+	}
+	start := time.Now()
+	if err := m.repo.MarkBuildRunning(ctx, build.ID); err != nil {
+		return BuildRecord{}, err
+	}
+	build, _ = m.repo.Build(ctx, build.ID)
+	result, buildErr := builder.Build(ctx, source, req, build)
+	build.StartedAt = start.Unix()
+	build.EndedAt = time.Now().Unix()
+	build.DurationMS = buildDurationMS(start)
+	build.GoVersion = result.GoVersion
+	build.ModuleSummary = result.ModuleSummary
+	build.GoVersionM = result.GoVersionM
+	build.ABIFingerprint = result.ABIFingerprint
+	build.LogSummary = result.LogSummary
+	build.SourceSHA256 = source.SHA256
+	if buildErr != nil {
+		build.Status = BuildStatusFailed
+		build.Error = buildErr.Error()
+		_ = m.repo.FinishBuild(ctx, build)
+		_ = m.repo.RecordOperation(ctx, source.PluginID, source.ID, "source_build", "failed", actor, buildErr.Error(), map[string]any{
+			"build_id":       build.ID,
+			"source_sha256":  source.SHA256,
+			"builder_type":   req.BuilderType,
+			"log_summary":    result.LogSummary,
+			"active_changed": false,
+		})
+		return m.repo.Build(ctx, build.ID)
+	}
+	if result.Manifest.GoVersion != result.GoVersion {
+		build.Status = BuildStatusFailed
+		build.Error = fmt.Sprintf("manifest go_version %q does not match built Go version %q", result.Manifest.GoVersion, result.GoVersion)
+		_ = m.repo.FinishBuild(ctx, build)
+		return m.repo.Build(ctx, build.ID)
+	}
+	metadata := result.Metadata
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	metadata["build_id"] = build.ID
+	metadata["module_summary"] = json.RawMessage(defaultJSONArray(result.ModuleSummary))
+	metadata["go_version_m"] = json.RawMessage(defaultJSONObject(result.GoVersionM))
+	artifact, err := m.store.StoreBuiltBinary(ArtifactUpload{
+		FileName: result.Manifest.ID + "-" + result.Manifest.Version + ".mcgp",
+		Actor:    actor,
+	}, result.Manifest, result.ArtifactBytes, source.PackageSHA256, metadata)
+	if err != nil {
+		build.Status = BuildStatusFailed
+		build.Error = err.Error()
+		_ = m.repo.FinishBuild(ctx, build)
+		return m.repo.Build(ctx, build.ID)
+	}
+	if err := m.repo.SaveArtifact(ctx, artifact); err != nil {
+		build.Status = BuildStatusFailed
+		build.Error = err.Error()
+		_ = m.repo.FinishBuild(ctx, build)
+		return m.repo.Build(ctx, build.ID)
+	}
+	build.Status = BuildStatusSucceeded
+	build.ArtifactID = artifact.ID
+	build.ArtifactSHA256 = artifact.SHA256
+	metadataBytes, _ := json.Marshal(metadata)
+	build.MetadataJSON = string(metadataBytes)
+	if err := m.repo.FinishBuild(ctx, build); err != nil {
+		return BuildRecord{}, err
+	}
+	_ = m.repo.RecordOperation(ctx, source.PluginID, artifact.ID, "source_build", "succeeded", actor, "source build succeeded", map[string]any{
+		"build_id":        build.ID,
+		"source_id":       source.ID,
+		"source_sha256":   source.SHA256,
+		"artifact_sha256": artifact.SHA256,
+		"builder_type":    req.BuilderType,
+		"go_version":      result.GoVersion,
+	})
+	return m.repo.Build(ctx, build.ID)
 }
 
 func (m *Manager) SetDesired(ctx context.Context, actor, pluginID, artifactID, desiredState, configJSON string, priority int) (PluginRecord, error) {
@@ -440,6 +650,55 @@ func (m *Manager) ListArtifacts(ctx context.Context, pluginID string) ([]Artifac
 	return m.repo.ListArtifacts(ctx, pluginID)
 }
 
+func (m *Manager) ListBuilds(ctx context.Context, pluginID string) ([]BuildRecord, error) {
+	return m.repo.ListBuilds(ctx, pluginID)
+}
+
+func (m *Manager) Build(ctx context.Context, id int64) (BuildRecord, error) {
+	return m.repo.Build(ctx, id)
+}
+
+func (m *Manager) CancelBuild(ctx context.Context, actor string, id int64) (BuildRecord, error) {
+	build, err := m.repo.CancelBuild(ctx, id, actor)
+	if err != nil {
+		return BuildRecord{}, err
+	}
+	_ = m.repo.RecordOperation(ctx, build.PluginID, build.SourceID, "source_build_cancel", "succeeded", actor, "build canceled", map[string]any{"build_id": id})
+	return build, nil
+}
+
+func (m *Manager) RetryBuild(ctx context.Context, actor string, id int64) (BuildRecord, error) {
+	build, err := m.repo.Build(ctx, id)
+	if err != nil {
+		return BuildRecord{}, err
+	}
+	if build.Status != BuildStatusFailed && build.Status != BuildStatusCanceled {
+		return BuildRecord{}, fmt.Errorf("build status %q cannot be retried", build.Status)
+	}
+	next, err := m.CreateBuild(ctx, actor, BuildRequest{
+		SourceID:       build.SourceID,
+		BuilderType:    build.BuilderType,
+		BuilderImage:   build.BuilderImage,
+		BuilderVersion: build.BuilderVersion,
+		GOOS:           build.GOOS,
+		GOARCH:         build.GOARCH,
+		GOAMD64:        build.GOAMD64,
+		GOARM64:        build.GOARM64,
+		CGOEnabled:     build.CGOEnabled,
+		BuildTags:      build.BuildTags,
+		SDKModule:      build.SDKModule,
+		SDKVersion:     build.SDKVersion,
+		GOPROXY:        build.GOPROXY,
+		GONOSUMDB:      build.GONOSUMDB,
+		GOPRIVATE:      build.GOPRIVATE,
+		VendorRequired: build.VendorRequired,
+	})
+	if err != nil {
+		return BuildRecord{}, err
+	}
+	return m.RunBuild(ctx, actor, next.ID)
+}
+
 func (m *Manager) Artifact(ctx context.Context, id string) (ArtifactRecord, error) {
 	return m.repo.Artifact(ctx, id)
 }
@@ -573,6 +832,15 @@ func (m *Manager) loadLocked(ctx context.Context, pluginRecord PluginRecord) (*l
 	}
 	if artifact.Status == ArtifactStatusDeleted || artifact.Status == ArtifactStatusRejected {
 		return nil, fmt.Errorf("artifact status %q is not loadable", artifact.Status)
+	}
+	if artifact.ArtifactType != ArtifactTypeBinary {
+		return nil, fmt.Errorf("artifact type %q is not loadable", artifact.ArtifactType)
+	}
+	if artifact.GoVersion != runtime.Version() {
+		return nil, fmt.Errorf("artifact go_version %q does not match gateway %q", artifact.GoVersion, runtime.Version())
+	}
+	if artifact.GOOS != runtime.GOOS || artifact.GOARCH != runtime.GOARCH {
+		return nil, fmt.Errorf("artifact target %s/%s does not match gateway %s/%s", artifact.GOOS, artifact.GOARCH, runtime.GOOS, runtime.GOARCH)
 	}
 
 	gateway := NewGateway(pluginRecord.ID, m.handleConn, m.wg)

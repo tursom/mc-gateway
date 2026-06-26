@@ -31,6 +31,10 @@ type APIHandlers struct {
 
 	PluginArtifacts http.HandlerFunc
 	PluginArtifact  SegmentHandlerFunc
+	PluginSources   http.HandlerFunc
+	PluginBuilds    http.HandlerFunc
+	PluginBuild     SegmentHandlerFunc
+	PluginGC        http.HandlerFunc
 	PluginsList     http.HandlerFunc
 	PluginItem      SegmentHandlerFunc
 	PluginAction    SegmentHandlerFunc
@@ -81,6 +85,14 @@ func NewAPIHandler(prefix string, handlers APIHandlers) http.HandlerFunc {
 			callHandler(w, r, handlers.PluginArtifacts)
 		case strings.HasPrefix(path, "/plugin-artifacts/"):
 			callSegmentHandler(w, r, handlers.PluginArtifact, strings.TrimPrefix(path, "/plugin-artifacts/"))
+		case path == "/plugin-sources" && (r.Method == http.MethodGet || r.Method == http.MethodPost):
+			callHandler(w, r, handlers.PluginSources)
+		case path == "/plugin-builds" && (r.Method == http.MethodGet || r.Method == http.MethodPost):
+			callHandler(w, r, handlers.PluginBuilds)
+		case strings.HasPrefix(path, "/plugin-builds/"):
+			callSegmentHandler(w, r, handlers.PluginBuild, strings.TrimPrefix(path, "/plugin-builds/"))
+		case path == "/plugin-gc" && (r.Method == http.MethodGet || r.Method == http.MethodPost):
+			callHandler(w, r, handlers.PluginGC)
 		case path == "/plugins" && r.Method == http.MethodGet:
 			callHandler(w, r, handlers.PluginsList)
 		case path == "/plugins/dispatch-plan" && r.Method == http.MethodGet:
