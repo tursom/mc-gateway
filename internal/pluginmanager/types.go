@@ -1,6 +1,7 @@
 package pluginmanager
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net"
@@ -89,7 +90,15 @@ const (
 	DefaultExtractedMaxBytes   = 256 * 1024 * 1024
 	DefaultNonRuntimeMaxBytes  = 16 * 1024 * 1024
 	DefaultInitialWriteTimeout = time.Second
+	DefaultExternalTimeout     = 5 * time.Second
 	DefaultBuildLogMaxBytes    = 64 * 1024
+	DefaultEventQueueLimit     = 1000
+	DefaultEventRecentLimit    = 1000
+	DefaultLabelValueMaxBytes  = 64
+	DefaultPluginDataQuota     = 16 * 1024 * 1024
+	DefaultPluginDataKeyLimit  = 256 * 1024
+	DefaultPluginFileQuota     = 32 * 1024 * 1024
+	DefaultLogRecentLimit      = 500
 )
 
 var (
@@ -117,6 +126,12 @@ type Manifest struct {
 	RuntimeLimits    RuntimeLimits    `json:"runtime_limits"`
 	ConfigSchema     json.RawMessage  `json:"config_schema"`
 	Secrets          []SecretSpec     `json:"secrets,omitempty"`
+	Events           []EventSpec      `json:"events,omitempty"`
+	CustomMetrics    []MetricSpec     `json:"custom_metrics,omitempty"`
+	BackgroundTasks  []TaskSpec       `json:"background_tasks,omitempty"`
+	ExternalDeps     []ExternalSpec   `json:"external_dependencies,omitempty"`
+	DataStores       []DataStoreSpec  `json:"data_stores,omitempty"`
+	FileStores       []FileStoreSpec  `json:"file_stores,omitempty"`
 	SupplyChain      json.RawMessage  `json:"supply_chain"`
 }
 
@@ -162,9 +177,66 @@ type SecretRotation struct {
 	Reload      string `json:"reload,omitempty"`
 }
 
+type EventSpec struct {
+	Name   string   `json:"name"`
+	Fields []string `json:"fields,omitempty"`
+}
+
+type MetricSpec struct {
+	Name   string   `json:"name"`
+	Type   string   `json:"type,omitempty"`
+	Labels []string `json:"labels,omitempty"`
+}
+
+type TaskSpec struct {
+	ID          string `json:"id"`
+	Name        string `json:"name,omitempty"`
+	Mode        string `json:"mode,omitempty"`
+	Interval    string `json:"interval,omitempty"`
+	RunOnStart  bool   `json:"run_on_start,omitempty"`
+	Jitter      string `json:"jitter,omitempty"`
+	Timeout     string `json:"timeout,omitempty"`
+	Manual      bool   `json:"manual,omitempty"`
+	RequireRole string `json:"require_role,omitempty"`
+}
+
+type ExternalSpec struct {
+	Name        string   `json:"name"`
+	Endpoint    string   `json:"endpoint"`
+	Purpose     string   `json:"purpose,omitempty"`
+	Required    bool     `json:"required,omitempty"`
+	Timeout     string   `json:"timeout,omitempty"`
+	Retry       int      `json:"retry,omitempty"`
+	FailPolicy  string   `json:"fail_policy,omitempty"`
+	DataClasses []string `json:"data_classes,omitempty"`
+	Traceparent bool     `json:"traceparent,omitempty"`
+}
+
+type DataStoreSpec struct {
+	Name          string `json:"name"`
+	SchemaVersion int    `json:"schema_version,omitempty"`
+	DataClass     string `json:"data_class,omitempty"`
+	QuotaBytes    int64  `json:"quota_bytes,omitempty"`
+	Retention     string `json:"retention,omitempty"`
+	Exportable    bool   `json:"exportable,omitempty"`
+}
+
+type FileStoreSpec struct {
+	Namespace  string `json:"namespace"`
+	DataClass  string `json:"data_class,omitempty"`
+	QuotaBytes int64  `json:"quota_bytes,omitempty"`
+	Retention  string `json:"retention,omitempty"`
+	Readonly   bool   `json:"readonly,omitempty"`
+}
+
 type CapabilitySummary struct {
 	UpstreamConnect UpstreamConnectCapability `json:"upstream_connect,omitempty"`
 	Minecraft       *MinecraftCapability      `json:"minecraft,omitempty"`
+	Events          []EventSpec               `json:"events,omitempty"`
+	CustomMetrics   []MetricSpec              `json:"custom_metrics,omitempty"`
+	ExternalDeps    []ExternalSpec            `json:"external_dependencies,omitempty"`
+	DataStores      []DataStoreSpec           `json:"data_stores,omitempty"`
+	FileStores      []FileStoreSpec           `json:"file_stores,omitempty"`
 	Raw             json.RawMessage           `json:"raw,omitempty"`
 }
 
@@ -604,6 +676,162 @@ type DispatchHandlerSummary struct {
 	ProxyBytesIn    uint64 `json:"proxy_bytes_in"`
 	ProxyBytesOut   uint64 `json:"proxy_bytes_out"`
 	ProxyDurationMS uint64 `json:"proxy_duration_ms"`
+	DurationCount   uint64 `json:"duration_count"`
+	DurationSumMS   uint64 `json:"duration_sum_ms"`
+	DurationMaxMS   uint64 `json:"duration_max_ms"`
+}
+
+type OperationsSnapshot struct {
+	PluginID             string                      `json:"plugin_id,omitempty"`
+	UpdatedAt            int64                       `json:"updated_at"`
+	Handlers             []DispatchHandlerSummary    `json:"handlers"`
+	Builds               []BuildMetricSummary        `json:"builds"`
+	Events               []EventSummary              `json:"events"`
+	CustomMetrics        []CustomMetricSummary       `json:"custom_metrics"`
+	Logs                 []LogSummary                `json:"logs"`
+	Traces               []TraceSummary              `json:"traces"`
+	BackgroundTasks      []BackgroundTaskSummary     `json:"background_tasks"`
+	PluginData           []PluginDataSummary         `json:"plugin_data"`
+	PluginFiles          []PluginFileSummary         `json:"plugin_files"`
+	ExternalDependencies []ExternalDependencySummary `json:"external_dependencies"`
+	GC                   []GCCandidate               `json:"gc,omitempty"`
+	EventQueue           EventQueueSummary           `json:"event_queue"`
+	Diagnostics          []DiagnosticPackageSummary  `json:"diagnostics,omitempty"`
+}
+
+type BuildMetricSummary struct {
+	PluginID      string `json:"plugin_id"`
+	BuildID       int64  `json:"build_id"`
+	Status        string `json:"status"`
+	DurationMS    int64  `json:"duration_ms"`
+	Failed        bool   `json:"failed"`
+	ErrorRedacted string `json:"error_redacted,omitempty"`
+	CreatedAt     int64  `json:"created_at"`
+}
+
+type EventSummary struct {
+	PluginID    string            `json:"plugin_id"`
+	Name        string            `json:"name"`
+	Count       uint64            `json:"count"`
+	Dropped     uint64            `json:"dropped"`
+	DeadLetters uint64            `json:"dead_letters"`
+	Fields      map[string]string `json:"fields,omitempty"`
+	LastSeenAt  int64             `json:"last_seen_at"`
+}
+
+type EventQueueSummary struct {
+	Limit       int    `json:"limit"`
+	Queued      int    `json:"queued"`
+	Dropped     uint64 `json:"dropped"`
+	DeadLetters uint64 `json:"dead_letters"`
+}
+
+type CustomMetricSummary struct {
+	PluginID   string            `json:"plugin_id"`
+	Name       string            `json:"name"`
+	Type       string            `json:"type"`
+	Count      uint64            `json:"count"`
+	LastValue  float64           `json:"last_value"`
+	Labels     map[string]string `json:"labels,omitempty"`
+	LastSeenAt int64             `json:"last_seen_at"`
+}
+
+type LogSummary struct {
+	PluginID     string            `json:"plugin_id"`
+	Level        string            `json:"level"`
+	Message      string            `json:"message"`
+	Fields       map[string]string `json:"fields,omitempty"`
+	TraceID      string            `json:"trace_id,omitempty"`
+	ConnectionID string            `json:"connection_id,omitempty"`
+	CreatedAt    int64             `json:"created_at"`
+}
+
+type TraceSummary struct {
+	PluginID     string `json:"plugin_id"`
+	TraceID      string `json:"trace_id"`
+	ConnectionID string `json:"connection_id"`
+	HandlerID    string `json:"handler_id,omitempty"`
+	Operation    string `json:"operation"`
+	Status       string `json:"status"`
+	DurationMS   int64  `json:"duration_ms"`
+	CreatedAt    int64  `json:"created_at"`
+}
+
+type BackgroundTaskSummary struct {
+	PluginID            string `json:"plugin_id"`
+	TaskID              string `json:"task_id"`
+	Name                string `json:"name"`
+	Mode                string `json:"mode"`
+	IntervalMS          int64  `json:"interval_ms"`
+	RunOnStart          bool   `json:"run_on_start"`
+	TimeoutMS           int64  `json:"timeout_ms"`
+	Manual              bool   `json:"manual"`
+	Running             bool   `json:"running"`
+	LastRunAt           int64  `json:"last_run_at"`
+	NextRunAt           int64  `json:"next_run_at"`
+	LastDurationMS      int64  `json:"last_duration_ms"`
+	LastError           string `json:"last_error,omitempty"`
+	Skipped             uint64 `json:"skipped"`
+	ConsecutiveFailures uint64 `json:"consecutive_failures"`
+}
+
+type PluginDataSummary struct {
+	PluginID      string `json:"plugin_id"`
+	Key           string `json:"key"`
+	SchemaVersion int    `json:"schema_version"`
+	DataClass     string `json:"data_class"`
+	Exportable    bool   `json:"exportable"`
+	SizeBytes     int64  `json:"size_bytes"`
+	ExpiresAt     int64  `json:"expires_at"`
+	UpdatedAt     int64  `json:"updated_at"`
+}
+
+type PluginDataRecord struct {
+	PluginDataSummary
+	Value []byte `json:"-"`
+}
+
+type PluginFileSummary struct {
+	PluginID  string `json:"plugin_id"`
+	Namespace string `json:"namespace"`
+	Path      string `json:"path"`
+	DataClass string `json:"data_class"`
+	SizeBytes int64  `json:"size_bytes"`
+	ExpiresAt int64  `json:"expires_at"`
+	UpdatedAt int64  `json:"updated_at"`
+	Orphaned  bool   `json:"orphaned"`
+	Readonly  bool   `json:"readonly"`
+}
+
+type PluginFileRecord struct {
+	PluginFileSummary
+}
+
+type ExternalDependencySummary struct {
+	PluginID            string   `json:"plugin_id"`
+	Name                string   `json:"name"`
+	Endpoint            string   `json:"endpoint"`
+	Purpose             string   `json:"purpose"`
+	Required            bool     `json:"required"`
+	FailPolicy          string   `json:"fail_policy"`
+	DataClasses         []string `json:"data_classes,omitempty"`
+	Requests            uint64   `json:"requests"`
+	Errors              uint64   `json:"errors"`
+	Inflight            int64    `json:"inflight"`
+	DurationCount       uint64   `json:"duration_count"`
+	DurationSumMS       uint64   `json:"duration_sum_ms"`
+	CircuitState        string   `json:"circuit_state"`
+	ConsecutiveFailures uint64   `json:"consecutive_failures"`
+	RecentError         string   `json:"recent_error,omitempty"`
+	LastStatus          string   `json:"last_status,omitempty"`
+	LastSeenAt          int64    `json:"last_seen_at"`
+}
+
+type DiagnosticPackageSummary struct {
+	PluginID  string   `json:"plugin_id"`
+	CreatedAt int64    `json:"created_at"`
+	SizeBytes int64    `json:"size_bytes"`
+	Sections  []string `json:"sections"`
 }
 
 type UpstreamResult struct {
@@ -621,14 +849,16 @@ type Gateway struct {
 	handleConn func(net.Conn)
 	wg         *sync.WaitGroup
 	hooks      map[string]any
+	ops        *PluginOperations
 }
 
-func NewGateway(pluginID string, handleConn func(net.Conn), wg *sync.WaitGroup) *Gateway {
+func NewGateway(pluginID string, handleConn func(net.Conn), wg *sync.WaitGroup, ops *PluginOperations) *Gateway {
 	return &Gateway{
 		PluginID:   pluginID,
 		handleConn: handleConn,
 		wg:         wg,
 		hooks:      make(map[string]any),
+		ops:        ops,
 	}
 }
 
@@ -656,6 +886,55 @@ func (g *Gateway) ExitWaitGroup() *sync.WaitGroup {
 		g.wg = &sync.WaitGroup{}
 	}
 	return g.wg
+}
+
+func (g *Gateway) EmitEvent(ctx context.Context, name string, fields map[string]string) error {
+	if g.ops == nil {
+		return nil
+	}
+	return g.ops.EmitEvent(ctx, name, fields)
+}
+
+func (g *Gateway) ObserveMetric(ctx context.Context, name string, value float64, labels map[string]string) error {
+	if g.ops == nil {
+		return nil
+	}
+	return g.ops.ObserveMetric(ctx, name, value, labels)
+}
+
+func (g *Gateway) Logger() api.Logger {
+	if g.ops == nil {
+		return noopOperationsLogger{}
+	}
+	return g.ops.Logger()
+}
+
+func (g *Gateway) DataStore() api.DataStore {
+	if g.ops == nil {
+		return noopOperationsDataStore{}
+	}
+	return g.ops.DataStore()
+}
+
+func (g *Gateway) FileStore() api.FileStore {
+	if g.ops == nil {
+		return noopOperationsFileStore{}
+	}
+	return g.ops.FileStore()
+}
+
+func (g *Gateway) ExternalClient(name string) api.ExternalClient {
+	if g.ops == nil {
+		return noopOperationsExternalClient{}
+	}
+	return g.ops.ExternalClient(name)
+}
+
+func (g *Gateway) RegisterBackgroundTask(task api.BackgroundTask) error {
+	if g.ops == nil {
+		return nil
+	}
+	return g.ops.RegisterBackgroundTask(task)
 }
 
 func (g *Gateway) LegacyUpstreamHandler() (api.HookHandler[func(net.Conn, string) bool, func(net.Conn, string) (net.Conn, error)], bool) {

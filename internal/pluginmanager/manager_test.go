@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"path/filepath"
@@ -194,6 +195,154 @@ func TestManagerSecretVersionsAreSummariesOnly(t *testing.T) {
 	data, _ := json.Marshal(second)
 	if strings.Contains(string(data), "secret-one") || strings.Contains(string(data), "secret-two") {
 		t.Fatalf("secret summary leaked value: %s", data)
+	}
+}
+
+func TestManagerOperationsRecordsHandlerMetricsEventsAndDiagnostics(t *testing.T) {
+	var gateway *Gateway
+	manager := newManagerForTest(t, &fakeAdapter{
+		init: func(g *Gateway) {
+			gateway = g
+		},
+		handlers: map[string]api.UpstreamConnectHandler{
+			"plugin-a": func(req api.UpstreamConnectRequest) (net.Conn, error) {
+				_ = gateway.EmitEvent(req.Context, "auth.success", map[string]string{"result": "fixture_accept", "mode": "fixture"})
+				gateway.Logger().Info(req.Context, "auth success token=secret-value", map[string]string{"result": "fixture_accept"})
+				return newMemoryConn(), nil
+			},
+		},
+	})
+	artifact := uploadTestArtifactWithManifest(t, manager, "plugin-a", func(manifest *Manifest) {
+		manifest.Events = []EventSpec{{Name: "auth.success", Fields: []string{"result", "mode"}}}
+		manifest.CustomMetrics = []MetricSpec{{Name: "auth.attempts", Type: "counter", Labels: []string{"result", "mode"}}}
+	})
+	if _, err := manager.SetDesired(context.Background(), "admin", "plugin-a", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", "plugin-a"); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	if _, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{Host: "play.example", Upstream: "backend"}); err != nil {
+		t.Fatalf("ConnectUpstream() error = %v", err)
+	}
+	deadline := time.Now().Add(time.Second)
+	var snap OperationsSnapshot
+	for time.Now().Before(deadline) {
+		var err error
+		snap, err = manager.OperationsSnapshot(context.Background(), "plugin-a")
+		if err != nil {
+			t.Fatalf("OperationsSnapshot() error = %v", err)
+		}
+		if len(snap.Events) > 0 && len(snap.Handlers) > 0 && snap.Handlers[0].Calls > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(snap.Events) == 0 || snap.Events[0].Name != "auth.success" {
+		t.Fatalf("events = %+v, want auth.success", snap.Events)
+	}
+	if len(snap.Handlers) == 0 || snap.Handlers[0].Calls == 0 || snap.Handlers[0].DurationCount == 0 {
+		t.Fatalf("handler metrics = %+v, want calls and duration", snap.Handlers)
+	}
+	data, _, err := manager.DiagnosticPackage(context.Background(), "admin", "plugin-a")
+	if err != nil {
+		t.Fatalf("DiagnosticPackage() error = %v", err)
+	}
+	if bytes.Contains(data, []byte("secret-value")) || bytes.Contains(data, []byte("packet")) {
+		t.Fatalf("diagnostic leaked sensitive content: %s", data)
+	}
+}
+
+func TestManagerOperationsRejectsUndeclaredAndHighCardinalityEvents(t *testing.T) {
+	var gateway *Gateway
+	manager := newManagerForTest(t, &fakeAdapter{init: func(g *Gateway) { gateway = g }})
+	artifact := uploadTestArtifactWithManifest(t, manager, "plugin-a", func(manifest *Manifest) {
+		manifest.Events = []EventSpec{{Name: "auth.failure", Fields: []string{"result"}}}
+	})
+	if _, err := manager.SetDesired(context.Background(), "admin", "plugin-a", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", "plugin-a"); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	if err := gateway.EmitEvent(context.Background(), "auth.success", map[string]string{"result": "ok"}); err == nil {
+		t.Fatal("EmitEvent(undeclared) error = nil")
+	}
+	var highCardinalityErr error
+	for i := 0; i < 70; i++ {
+		highCardinalityErr = gateway.EmitEvent(context.Background(), "auth.failure", map[string]string{"result": fmt.Sprintf("result-%02d", i)})
+		if highCardinalityErr != nil {
+			break
+		}
+	}
+	if highCardinalityErr == nil {
+		t.Fatal("EmitEvent(high-cardinality) error = nil")
+	}
+}
+
+func TestManagerOperationsBackgroundTaskDataQuotaExternalAndGC(t *testing.T) {
+	var gateway *Gateway
+	manager := newManagerForTest(t, &fakeAdapter{init: func(g *Gateway) {
+		gateway = g
+		_ = g.RegisterBackgroundTask(api.BackgroundTask{
+			ID:      "sync",
+			Manual:  true,
+			Timeout: 20 * time.Millisecond,
+			Run: func(ctx context.Context) error {
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		})
+	}})
+	artifact := uploadTestArtifactWithManifest(t, manager, "plugin-a", func(manifest *Manifest) {
+		manifest.BackgroundTasks = []TaskSpec{{ID: "sync", Mode: "manual", Manual: true, Timeout: "20ms"}}
+		manifest.DataStores = []DataStoreSpec{{Name: "cache", SchemaVersion: 1, QuotaBytes: 8, DataClass: "cache"}}
+		manifest.ExternalDeps = []ExternalSpec{{Name: "session", Endpoint: "http://127.0.0.1:1", Purpose: "auth", Timeout: "20ms", Required: true}}
+	})
+	if _, err := manager.SetDesired(context.Background(), "admin", "plugin-a", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", "plugin-a"); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	start := time.Now()
+	if _, err := manager.TriggerBackgroundTask(context.Background(), "admin", "plugin-a", "sync", manager.operations.plugins["plugin-a"].tasks["sync"].confirmToken); err != nil {
+		t.Fatalf("TriggerBackgroundTask() error = %v", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatal("background task trigger blocked too long")
+	}
+	if err := gateway.DataStore().Put(context.Background(), api.DataRecord{Key: "one", Value: []byte("12345678"), SchemaVersion: 1}); err != nil {
+		t.Fatalf("DataStore.Put(within quota) error = %v", err)
+	}
+	if err := gateway.DataStore().Put(context.Background(), api.DataRecord{Key: "two", Value: []byte("x")}); err == nil {
+		t.Fatal("DataStore.Put(over quota) error = nil")
+	}
+	if _, err := gateway.ExternalClient("session").DoHTTP(context.Background(), api.ExternalRequest{Method: "GET", URL: "http://127.0.0.1:1"}); err == nil {
+		t.Fatal("ExternalClient.DoHTTP() error = nil, want connection error")
+	}
+	snap, err := manager.OperationsSnapshot(context.Background(), "plugin-a")
+	if err != nil {
+		t.Fatalf("OperationsSnapshot() error = %v", err)
+	}
+	if len(snap.ExternalDependencies) == 0 || snap.ExternalDependencies[0].Errors == 0 {
+		t.Fatalf("external summaries = %+v, want error count", snap.ExternalDependencies)
+	}
+	if err := manager.repo.PutPluginData(context.Background(), PluginDataSummary{PluginID: "plugin-a", Key: "expired", SizeBytes: 3, ExpiresAt: time.Now().Add(-time.Second).Unix()}, []byte("old")); err != nil {
+		t.Fatalf("PutPluginData(expired) error = %v", err)
+	}
+	candidates, err := manager.RunOperationsGC(context.Background(), "admin", "plugin-a", true)
+	if err != nil {
+		t.Fatalf("RunOperationsGC(dry-run) error = %v", err)
+	}
+	found := false
+	for _, candidate := range candidates {
+		if candidate.Kind == "plugin_data" && candidate.ID == "expired" && candidate.SizeBytes > 0 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("gc candidates = %+v, want expired plugin_data with size", candidates)
 	}
 }
 
@@ -905,6 +1054,7 @@ func waitForPluginManagerTest(t *testing.T, done func() bool) {
 type fakeAdapter struct {
 	loads      int
 	handlers   map[string]api.UpstreamConnectHandler
+	init       func(*Gateway)
 	loadErr    error
 	loadErrs   map[string]error
 	dryRunErr  error
@@ -932,6 +1082,9 @@ func (a *fakeAdapter) Load(_ context.Context, artifact ArtifactRecord, _ PluginR
 		handler,
 	); err != nil {
 		return nil, err
+	}
+	if a.init != nil {
+		a.init(gateway)
 	}
 	return &fakePlugin{}, nil
 }

@@ -3,7 +3,7 @@ import { showAlert } from "../alerts.js";
 import { badge, el, escapeAttr, escapeHTML, getFormInput } from "../dom.js";
 import { isAdmin } from "../session.js";
 import { state } from "../state.js";
-import type { PluginArtifact, PluginBuild, PluginDryRunResult, PluginProxyConnection, PluginSecret, PluginSnapshot, PluginView } from "../types.js";
+import type { PluginArtifact, PluginBuild, PluginDryRunResult, PluginOperations, PluginProxyConnection, PluginSecret, PluginSnapshot, PluginView } from "../types.js";
 
 interface PluginsResponse {
   plugins?: PluginView[];
@@ -31,6 +31,13 @@ interface SnapshotDiffResponse {
     sensitive_paths?: string[];
     restart_required?: boolean;
   };
+}
+
+interface OperationsResponse {
+  operations?: PluginOperations;
+  candidates?: Record<string, unknown>[];
+  diagnostic?: Record<string, unknown>;
+  summary?: Record<string, unknown>;
 }
 
 export async function loadPlugins(): Promise<void> {
@@ -210,6 +217,15 @@ export function renderPluginDetail(plugin: PluginView | null = selectedPlugin())
         <pre class="log-output">${escapeHTML(formatJSON(plugin.dispatch_summary || []))}</pre>
       </section>
       <section class="panel">
+        <h3>Operations</h3>
+        <div class="row-actions">
+          <button class="secondary" type="button" id="pluginOperationsLoadBtn">Refresh</button>
+          <button class="secondary" type="button" id="pluginOperationsGCDryRunBtn">GC dry-run</button>
+          <button class="secondary" type="button" id="pluginDiagnosticBtn">Diagnostic</button>
+        </div>
+        <pre id="pluginOperationsOutput" class="log-output"></pre>
+      </section>
+      <section class="panel">
         <h3>Active proxy connections</h3>
         ${proxyConnectionList(plugin.proxy_connections || [])}
       </section>
@@ -272,6 +288,9 @@ function bindPluginDetailEvents(plugin: PluginView): void {
   document.getElementById("pluginGovernanceSelfTestBtn")?.addEventListener("click", () => runGovernanceSelfTest(plugin));
   document.getElementById("pluginGovernanceBenchmarkBtn")?.addEventListener("click", () => recordGovernanceBenchmark(plugin));
   document.getElementById("pluginGovernanceAdvisoryBtn")?.addEventListener("click", () => createArtifactRevokeAdvisory(plugin));
+  document.getElementById("pluginOperationsLoadBtn")?.addEventListener("click", () => loadPluginOperations(plugin));
+  document.getElementById("pluginOperationsGCDryRunBtn")?.addEventListener("click", () => dryRunOperationsGC(plugin));
+  document.getElementById("pluginDiagnosticBtn")?.addEventListener("click", () => loadDiagnosticPackage(plugin));
 }
 
 async function dryRunConfig(plugin: PluginView): Promise<void> {
@@ -528,6 +547,36 @@ async function createArtifactRevokeAdvisory(plugin: PluginView): Promise<void> {
       },
     });
     await loadPluginDetail(plugin.id);
+    showAlert("");
+  } catch (err) {
+    showAlert((err as Error).message);
+  }
+}
+
+async function loadPluginOperations(plugin: PluginView): Promise<void> {
+  try {
+    const data = await api<OperationsResponse>(`/plugins/${encodeURIComponent(plugin.id)}/operations`);
+    el("pluginOperationsOutput").textContent = formatJSON(data.operations || {});
+    showAlert("");
+  } catch (err) {
+    showAlert((err as Error).message);
+  }
+}
+
+async function dryRunOperationsGC(plugin: PluginView): Promise<void> {
+  try {
+    const data = await api<OperationsResponse>(`/plugins/${encodeURIComponent(plugin.id)}/operations/gc`);
+    el("pluginOperationsOutput").textContent = formatJSON(data);
+    showAlert("");
+  } catch (err) {
+    showAlert((err as Error).message);
+  }
+}
+
+async function loadDiagnosticPackage(plugin: PluginView): Promise<void> {
+  try {
+    const data = await api<OperationsResponse>(`/plugins/${encodeURIComponent(plugin.id)}/operations/diagnostic`);
+    el("pluginOperationsOutput").textContent = formatJSON(data);
     showAlert("");
   } catch (err) {
     showAlert((err as Error).message);

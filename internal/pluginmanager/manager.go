@@ -138,6 +138,7 @@ type Manager struct {
 	proxySeq    uint64
 	proxyConns  map[uint64]*proxyConnection
 	drainingIDs map[string]bool
+	operations  *Operations
 }
 
 type loadedPlugin struct {
@@ -171,6 +172,9 @@ type upstreamHandler struct {
 	proxyBytesIn   atomic.Uint64
 	proxyBytesOut  atomic.Uint64
 	proxyDuration  atomic.Uint64
+	durationCount  atomic.Uint64
+	durationSumMS  atomic.Uint64
+	durationMaxMS  atomic.Uint64
 }
 
 type proxyConnection struct {
@@ -224,6 +228,7 @@ func New(options Options) *Manager {
 		proxyConns:    make(map[uint64]*proxyConnection),
 		drainingIDs:   make(map[string]bool),
 	}
+	manager.operations = NewOperations(manager.repo, options.ArtifactRoot)
 	if manager.builders == nil {
 		manager.builders = map[string]SourceBuilder{
 			BuilderTypeLocalProcess: LocalProcessBuilder{StoreRoot: options.ArtifactRoot},
@@ -733,6 +738,7 @@ func (m *Manager) Disable(ctx context.Context, actor, pluginID string) (PluginRe
 	}
 	m.removeFromDispatchLocked(pluginID)
 	m.markDrainingLocked(pluginID)
+	m.operations.StopPlugin(pluginID)
 	if loaded := m.loaded[pluginID]; loaded != nil && loaded.instance != nil {
 		if err := loaded.instance.Destroy(); err != nil {
 			_ = m.repo.RecordOperation(ctx, pluginID, loaded.artifact.ID, "disable", "warning", actor, err.Error(), nil)
@@ -762,6 +768,7 @@ func (m *Manager) Delete(ctx context.Context, actor, pluginID string) error {
 	}
 	m.removeFromDispatchLocked(pluginID)
 	m.markDrainingLocked(pluginID)
+	m.operations.StopPlugin(pluginID)
 	if loaded := m.loaded[pluginID]; loaded != nil && loaded.instance != nil {
 		_ = loaded.instance.Destroy()
 	}
@@ -835,7 +842,26 @@ func (m *Manager) ConnectUpstream(ctx context.Context, req api.UpstreamConnectRe
 		if !accepted {
 			continue
 		}
+		req.Context = WithTraceContext(req.Context, handler.pluginID, req.TraceID, req.ConnectionID, handler.handlerID)
+		start := time.Now()
 		conn, err := handler.invoke(req)
+		status := "ok"
+		if err != nil {
+			status = "error"
+		}
+		_ = m.repo.SaveTrace(context.Background(), TraceSummary{
+			PluginID:     handler.pluginID,
+			TraceID:      req.TraceID,
+			ConnectionID: req.ConnectionID,
+			HandlerID:    handler.handlerID,
+			Operation:    "plugin.handler." + handler.handlerID,
+			Status:       status,
+			DurationMS:   time.Since(start).Milliseconds(),
+		}, map[string]string{
+			"host":     req.ServerHost,
+			"upstream": req.UpstreamAddress,
+			"mode":     handler.mode,
+		})
 		if errors.Is(err, api.ErrPass) {
 			continue
 		}
@@ -843,6 +869,17 @@ func (m *Manager) ConnectUpstream(ctx context.Context, req api.UpstreamConnectRe
 			return UpstreamResult{Handled: true}, err
 		}
 		if conn != nil {
+			if handler.mode == UpstreamModeDialer {
+				_ = m.repo.SaveTrace(context.Background(), TraceSummary{
+					PluginID:     handler.pluginID,
+					TraceID:      req.TraceID,
+					ConnectionID: req.ConnectionID,
+					HandlerID:    handler.handlerID,
+					Operation:    "backend.dial",
+					Status:       "plugin_supplied",
+					DurationMS:   0,
+				}, map[string]string{"upstream": req.UpstreamAddress})
+			}
 			result := UpstreamResult{
 				Conn:      conn,
 				Handled:   true,
@@ -1144,6 +1181,73 @@ func (m *Manager) DispatchPlan(ctx context.Context) DispatchPlan {
 	return plan
 }
 
+func (m *Manager) OperationsSnapshot(ctx context.Context, pluginID string) (OperationsSnapshot, error) {
+	if pluginID != "" {
+		if _, err := m.repo.Plugin(ctx, pluginID); err != nil {
+			return OperationsSnapshot{}, err
+		}
+	}
+	plan := m.DispatchPlan(ctx)
+	var handlers []DispatchHandlerSummary
+	for _, handler := range plan.Handlers {
+		if pluginID == "" || handler.PluginID == pluginID {
+			handlers = append(handlers, handler)
+		}
+	}
+	builds, err := m.repo.ListBuilds(ctx, pluginID)
+	if err != nil {
+		return OperationsSnapshot{}, err
+	}
+	gc, _ := m.operations.GCCandidates(ctx, pluginID)
+	return m.operations.Snapshot(ctx, pluginID, handlers, builds, gc), nil
+}
+
+func (m *Manager) TriggerBackgroundTask(ctx context.Context, actor, pluginID, taskID, confirmToken string) (BackgroundTaskSummary, error) {
+	summary, err := m.operations.TriggerTask(pluginID, taskID, confirmToken)
+	if err != nil {
+		_ = m.repo.RecordOperation(ctx, pluginID, "", "background_task_trigger", "failed", actor, err.Error(), map[string]any{"task_id": taskID})
+		return BackgroundTaskSummary{}, err
+	}
+	_ = m.repo.RecordOperation(ctx, pluginID, "", "background_task_trigger", "succeeded", actor, "background task triggered", map[string]any{"task_id": taskID})
+	return summary, nil
+}
+
+func (m *Manager) DiagnosticPackage(ctx context.Context, actor, pluginID string) ([]byte, DiagnosticPackageSummary, error) {
+	plugin, err := m.repo.Plugin(ctx, pluginID)
+	if err != nil {
+		return nil, DiagnosticPackageSummary{}, err
+	}
+	artifact, err := m.repo.Artifact(ctx, plugin.DesiredArtifactID)
+	if err != nil {
+		return nil, DiagnosticPackageSummary{}, err
+	}
+	var manifest Manifest
+	_ = json.Unmarshal([]byte(artifact.MetadataJSON), &manifest)
+	plan := m.DispatchPlan(ctx)
+	var handlers []DispatchHandlerSummary
+	for _, handler := range plan.Handlers {
+		if handler.PluginID == pluginID {
+			handlers = append(handlers, handler)
+		}
+	}
+	builds, _ := m.repo.ListBuilds(ctx, pluginID)
+	gc, _ := m.operations.GCCandidates(ctx, pluginID)
+	data, summary, err := m.operations.DiagnosticPackage(ctx, plugin, manifest, handlers, builds, gc)
+	if err != nil {
+		_ = m.repo.RecordOperation(ctx, pluginID, artifact.ID, "diagnostic_package", "failed", actor, err.Error(), nil)
+		return nil, DiagnosticPackageSummary{}, err
+	}
+	_ = m.repo.RecordOperation(ctx, pluginID, artifact.ID, "diagnostic_package", "succeeded", actor, "diagnostic package generated", map[string]any{
+		"size_bytes": summary.SizeBytes,
+		"sections":   summary.Sections,
+	})
+	return data, summary, nil
+}
+
+func (m *Manager) RunOperationsGC(ctx context.Context, actor, pluginID string, dryRun bool) ([]GCCandidate, error) {
+	return m.operations.RunGC(ctx, actor, pluginID, dryRun)
+}
+
 func (m *Manager) TrackProxyConnection(result UpstreamResult, client, endpoint net.Conn) *ProxyConnectionHandle {
 	if result.Mode != UpstreamModeProtocolProxy || client == nil || endpoint == nil {
 		return nil
@@ -1258,7 +1362,11 @@ func (m *Manager) loadLocked(ctx context.Context, pluginRecord PluginRecord) (*l
 		return nil, err
 	}
 
-	gateway := NewGateway(pluginRecord.ID, m.handleConn, m.wg)
+	var manifest Manifest
+	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err != nil {
+		return nil, err
+	}
+	gateway := NewGateway(pluginRecord.ID, m.handleConn, m.wg, m.operations.ForPlugin(pluginRecord.ID, artifact.ID, manifest))
 	instance, err := m.adapter.Load(ctx, artifact, pluginRecord, gateway)
 	if err != nil {
 		_ = m.repo.MarkRuntime(ctx, pluginRecord.ID, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
@@ -1278,6 +1386,7 @@ func (m *Manager) loadLocked(ctx context.Context, pluginRecord PluginRecord) (*l
 	}, handlerSummaries(handlers)); err != nil {
 		return nil, err
 	}
+	m.operations.StartTasks(pluginRecord.ID)
 	return loaded, nil
 }
 
@@ -1326,6 +1435,7 @@ func (m *Manager) restartRequired(pluginID, artifactID string) bool {
 }
 
 func (m *Manager) markEnabled(ctx context.Context, loaded *loadedPlugin) error {
+	m.operations.StartTasks(loaded.record.ID)
 	return m.repo.MarkRuntime(ctx, loaded.record.ID, RuntimeEnabled, loaded.artifact.ID, loaded.artifact.ID, loaded.record.DesiredGeneration, "", map[string]any{
 		"handler_count": len(loaded.handlers),
 	}, handlerSummaries(loaded.handlers))
@@ -1454,6 +1564,18 @@ func upstreamModeFromArtifact(artifact ArtifactRecord) string {
 
 func (h *upstreamHandler) invoke(req api.UpstreamConnectRequest) (conn net.Conn, err error) {
 	h.calls.Add(1)
+	start := time.Now()
+	defer func() {
+		durationMS := uint64(time.Since(start).Milliseconds())
+		h.durationCount.Add(1)
+		h.durationSumMS.Add(durationMS)
+		for {
+			current := h.durationMaxMS.Load()
+			if durationMS <= current || h.durationMaxMS.CompareAndSwap(current, durationMS) {
+				break
+			}
+		}
+	}()
 	ctx := req.Context
 	if ctx == nil {
 		ctx = context.Background()
@@ -1966,6 +2088,9 @@ func handlerSummaries(handlers []*upstreamHandler) []DispatchHandlerSummary {
 			ProxyBytesIn:    handler.proxyBytesIn.Load(),
 			ProxyBytesOut:   handler.proxyBytesOut.Load(),
 			ProxyDurationMS: handler.proxyDuration.Load(),
+			DurationCount:   handler.durationCount.Load(),
+			DurationSumMS:   handler.durationSumMS.Load(),
+			DurationMaxMS:   handler.durationMaxMS.Load(),
 		})
 	}
 	return summaries

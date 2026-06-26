@@ -192,6 +192,22 @@ export interface PluginView {
   updated_at?: number;
 }
 
+export interface PluginOperations {
+  handlers?: Record<string, unknown>[];
+  builds?: Record<string, unknown>[];
+  events?: Record<string, unknown>[];
+  custom_metrics?: Record<string, unknown>[];
+  logs?: Record<string, unknown>[];
+  traces?: Record<string, unknown>[];
+  background_tasks?: Record<string, unknown>[];
+  plugin_data?: Record<string, unknown>[];
+  plugin_files?: Record<string, unknown>[];
+  external_dependencies?: Record<string, unknown>[];
+  gc?: Record<string, unknown>[];
+  event_queue?: Record<string, unknown>;
+  diagnostics?: Record<string, unknown>[];
+}
+
 export interface PluginDryRunResult {
   ok: boolean;
   restart_required: boolean;

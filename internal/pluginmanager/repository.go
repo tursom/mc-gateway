@@ -965,6 +965,339 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 	return err
 }
 
+func (r Repository) ListOperations(ctx context.Context, pluginID string, limit int) ([]OperationRecord, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	query := `
+SELECT id, plugin_id, artifact_id, operation, status, actor, message, metadata_json, created_at
+FROM plugin_operations`
+	var args []any
+	if pluginID != "" {
+		query += ` WHERE plugin_id = ?`
+		args = append(args, pluginID)
+	}
+	query += ` ORDER BY created_at DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var records []OperationRecord
+	for rows.Next() {
+		var record OperationRecord
+		if err := rows.Scan(&record.ID, &record.PluginID, &record.ArtifactID, &record.Operation, &record.Status, &record.Actor, &record.Message, &record.MetadataJSON, &record.CreatedAt); err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	return records, rows.Err()
+}
+
+func (r Repository) SaveEvent(ctx context.Context, event EventSummary, dropped bool, reason, traceID, connectionID string) error {
+	fields, err := marshalDefaultObject(event.Fields)
+	if err != nil {
+		return err
+	}
+	_, err = r.db.ExecContext(ctx, `
+INSERT INTO plugin_events(plugin_id, name, fields_json, dropped, reason, trace_id, connection_id, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		event.PluginID, event.Name, fields, boolInt(dropped), reason, traceID, connectionID, r.now().Unix())
+	return err
+}
+
+func (r Repository) RecentEvents(ctx context.Context, pluginID string, limit int) ([]EventSummary, error) {
+	if limit <= 0 {
+		limit = DefaultEventRecentLimit
+	}
+	query := `SELECT plugin_id, name, fields_json, dropped, reason, created_at FROM plugin_events`
+	var args []any
+	if pluginID != "" {
+		query += ` WHERE plugin_id = ?`
+		args = append(args, pluginID)
+	}
+	query += ` ORDER BY created_at DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var events []EventSummary
+	for rows.Next() {
+		var event EventSummary
+		var fieldsJSON string
+		var dropped int
+		var reason string
+		if err := rows.Scan(&event.PluginID, &event.Name, &fieldsJSON, &dropped, &reason, &event.LastSeenAt); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal([]byte(defaultJSONObject(fieldsJSON)), &event.Fields)
+		if dropped != 0 {
+			event.Dropped = 1
+			if reason != "" {
+				if event.Fields == nil {
+					event.Fields = make(map[string]string)
+				}
+				event.Fields["drop_reason"] = reason
+			}
+		} else {
+			event.Count = 1
+		}
+		events = append(events, event)
+	}
+	return events, rows.Err()
+}
+
+func (r Repository) SaveLog(ctx context.Context, log LogSummary) error {
+	fields, err := marshalDefaultObject(log.Fields)
+	if err != nil {
+		return err
+	}
+	_, err = r.db.ExecContext(ctx, `
+INSERT INTO plugin_logs(plugin_id, level, message, fields_json, trace_id, connection_id, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		log.PluginID, log.Level, log.Message, fields, log.TraceID, log.ConnectionID, r.now().Unix())
+	return err
+}
+
+func (r Repository) RecentLogs(ctx context.Context, pluginID string, limit int) ([]LogSummary, error) {
+	if limit <= 0 {
+		limit = DefaultLogRecentLimit
+	}
+	query := `SELECT plugin_id, level, message, fields_json, trace_id, connection_id, created_at FROM plugin_logs`
+	var args []any
+	if pluginID != "" {
+		query += ` WHERE plugin_id = ?`
+		args = append(args, pluginID)
+	}
+	query += ` ORDER BY created_at DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var logs []LogSummary
+	for rows.Next() {
+		var item LogSummary
+		var fieldsJSON string
+		if err := rows.Scan(&item.PluginID, &item.Level, &item.Message, &fieldsJSON, &item.TraceID, &item.ConnectionID, &item.CreatedAt); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal([]byte(defaultJSONObject(fieldsJSON)), &item.Fields)
+		logs = append(logs, item)
+	}
+	return logs, rows.Err()
+}
+
+func (r Repository) SaveTrace(ctx context.Context, trace TraceSummary, fields map[string]string) error {
+	fieldsJSON, err := marshalDefaultObject(fields)
+	if err != nil {
+		return err
+	}
+	_, err = r.db.ExecContext(ctx, `
+INSERT INTO plugin_traces(plugin_id, trace_id, connection_id, handler_id, operation, status, duration_ms, fields_json, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		trace.PluginID, trace.TraceID, trace.ConnectionID, trace.HandlerID, trace.Operation, trace.Status, trace.DurationMS, fieldsJSON, r.now().Unix())
+	return err
+}
+
+func (r Repository) RecentTraces(ctx context.Context, pluginID string, limit int) ([]TraceSummary, error) {
+	if limit <= 0 {
+		limit = 200
+	}
+	query := `SELECT plugin_id, trace_id, connection_id, handler_id, operation, status, duration_ms, created_at FROM plugin_traces`
+	var args []any
+	if pluginID != "" {
+		query += ` WHERE plugin_id = ?`
+		args = append(args, pluginID)
+	}
+	query += ` ORDER BY created_at DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var traces []TraceSummary
+	for rows.Next() {
+		var trace TraceSummary
+		if err := rows.Scan(&trace.PluginID, &trace.TraceID, &trace.ConnectionID, &trace.HandlerID, &trace.Operation, &trace.Status, &trace.DurationMS, &trace.CreatedAt); err != nil {
+			return nil, err
+		}
+		traces = append(traces, trace)
+	}
+	return traces, rows.Err()
+}
+
+func (r Repository) PutPluginData(ctx context.Context, record PluginDataSummary, value []byte) error {
+	now := r.now().Unix()
+	_, err := r.db.ExecContext(ctx, `
+INSERT INTO plugin_data(plugin_id, key, value, schema_version, data_class, exportable, size_bytes, expires_at, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(plugin_id, key) DO UPDATE SET
+    value = excluded.value,
+    schema_version = excluded.schema_version,
+    data_class = excluded.data_class,
+    exportable = excluded.exportable,
+    size_bytes = excluded.size_bytes,
+    expires_at = excluded.expires_at,
+    updated_at = excluded.updated_at`,
+		record.PluginID, record.Key, value, record.SchemaVersion, record.DataClass, boolInt(record.Exportable), int64(len(value)), record.ExpiresAt, now, now)
+	return err
+}
+
+func (r Repository) GetPluginData(ctx context.Context, pluginID, key string) (PluginDataSummary, []byte, error) {
+	row := r.db.QueryRowContext(ctx, `
+SELECT plugin_id, key, value, schema_version, data_class, exportable, size_bytes, expires_at, updated_at
+FROM plugin_data WHERE plugin_id = ? AND key = ?`, pluginID, key)
+	var record PluginDataSummary
+	var exportable int
+	var value []byte
+	err := row.Scan(&record.PluginID, &record.Key, &value, &record.SchemaVersion, &record.DataClass, &exportable, &record.SizeBytes, &record.ExpiresAt, &record.UpdatedAt)
+	record.Exportable = exportable != 0
+	return record, value, err
+}
+
+func (r Repository) DeletePluginData(ctx context.Context, pluginID, key string) error {
+	_, err := r.db.ExecContext(ctx, `DELETE FROM plugin_data WHERE plugin_id = ? AND key = ?`, pluginID, key)
+	return err
+}
+
+func (r Repository) ListPluginData(ctx context.Context, pluginID string) ([]PluginDataSummary, error) {
+	query := `SELECT plugin_id, key, schema_version, data_class, exportable, size_bytes, expires_at, updated_at FROM plugin_data`
+	var args []any
+	if pluginID != "" {
+		query += ` WHERE plugin_id = ?`
+		args = append(args, pluginID)
+	}
+	query += ` ORDER BY updated_at DESC, key ASC`
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var records []PluginDataSummary
+	for rows.Next() {
+		var record PluginDataSummary
+		var exportable int
+		if err := rows.Scan(&record.PluginID, &record.Key, &record.SchemaVersion, &record.DataClass, &exportable, &record.SizeBytes, &record.ExpiresAt, &record.UpdatedAt); err != nil {
+			return nil, err
+		}
+		record.Exportable = exportable != 0
+		records = append(records, record)
+	}
+	return records, rows.Err()
+}
+
+func (r Repository) PluginDataUsage(ctx context.Context, pluginID string) (int64, error) {
+	row := r.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(size_bytes), 0) FROM plugin_data WHERE plugin_id = ?`, pluginID)
+	var total int64
+	return total, row.Scan(&total)
+}
+
+func (r Repository) UpsertPluginFile(ctx context.Context, record PluginFileSummary, diskPath string) error {
+	now := r.now().Unix()
+	_, err := r.db.ExecContext(ctx, `
+INSERT INTO plugin_files(plugin_id, namespace, path, disk_path, data_class, exportable, readonly, size_bytes, expires_at, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(plugin_id, namespace, path) DO UPDATE SET
+    disk_path = excluded.disk_path,
+    data_class = excluded.data_class,
+    exportable = excluded.exportable,
+    readonly = excluded.readonly,
+    size_bytes = excluded.size_bytes,
+    expires_at = excluded.expires_at,
+    updated_at = excluded.updated_at`,
+		record.PluginID, record.Namespace, record.Path, diskPath, record.DataClass, boolInt(record.Readonly), boolInt(record.Readonly), record.SizeBytes, record.ExpiresAt, now, now)
+	return err
+}
+
+func (r Repository) DeletePluginFile(ctx context.Context, pluginID, namespace, name string) error {
+	_, err := r.db.ExecContext(ctx, `DELETE FROM plugin_files WHERE plugin_id = ? AND namespace = ? AND path = ?`, pluginID, namespace, name)
+	return err
+}
+
+func (r Repository) ListPluginFiles(ctx context.Context, pluginID string) ([]PluginFileSummary, error) {
+	query := `SELECT plugin_id, namespace, path, data_class, size_bytes, expires_at, updated_at, readonly FROM plugin_files`
+	var args []any
+	if pluginID != "" {
+		query += ` WHERE plugin_id = ?`
+		args = append(args, pluginID)
+	}
+	query += ` ORDER BY updated_at DESC, namespace ASC, path ASC`
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var records []PluginFileSummary
+	for rows.Next() {
+		var record PluginFileSummary
+		var readonly int
+		if err := rows.Scan(&record.PluginID, &record.Namespace, &record.Path, &record.DataClass, &record.SizeBytes, &record.ExpiresAt, &record.UpdatedAt, &readonly); err != nil {
+			return nil, err
+		}
+		record.Readonly = readonly != 0
+		records = append(records, record)
+	}
+	return records, rows.Err()
+}
+
+func (r Repository) PluginFileUsage(ctx context.Context, pluginID string) (int64, error) {
+	row := r.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(size_bytes), 0) FROM plugin_files WHERE plugin_id = ?`, pluginID)
+	var total int64
+	return total, row.Scan(&total)
+}
+
+func (r Repository) SaveDiagnostic(ctx context.Context, pluginID, path string, size int64, sections []string) (DiagnosticPackageSummary, error) {
+	sectionsJSON, err := marshalDefaultObject(sections)
+	if err != nil {
+		return DiagnosticPackageSummary{}, err
+	}
+	now := r.now().Unix()
+	result, err := r.db.ExecContext(ctx, `
+INSERT INTO plugin_diagnostics(plugin_id, path, size_bytes, sections_json, created_at)
+VALUES (?, ?, ?, ?, ?)`, pluginID, path, size, sectionsJSON, now)
+	if err != nil {
+		return DiagnosticPackageSummary{}, err
+	}
+	_, _ = result.LastInsertId()
+	return DiagnosticPackageSummary{PluginID: pluginID, CreatedAt: now, SizeBytes: size, Sections: sections}, nil
+}
+
+func (r Repository) ListDiagnostics(ctx context.Context, pluginID string, limit int) ([]DiagnosticPackageSummary, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	query := `SELECT plugin_id, size_bytes, sections_json, created_at FROM plugin_diagnostics`
+	var args []any
+	if pluginID != "" {
+		query += ` WHERE plugin_id = ?`
+		args = append(args, pluginID)
+	}
+	query += ` ORDER BY created_at DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var records []DiagnosticPackageSummary
+	for rows.Next() {
+		var record DiagnosticPackageSummary
+		var sectionsJSON string
+		if err := rows.Scan(&record.PluginID, &record.SizeBytes, &sectionsJSON, &record.CreatedAt); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal([]byte(defaultJSONArray(sectionsJSON)), &record.Sections)
+		records = append(records, record)
+	}
+	return records, rows.Err()
+}
+
 func (r Repository) DispatchPlan(ctx context.Context) (DispatchPlan, error) {
 	plugins, err := r.ListPlugins(ctx)
 	if err != nil {

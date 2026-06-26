@@ -574,6 +574,136 @@ func handleAdminPluginRollback(w http.ResponseWriter, r *http.Request, rawSegmen
 	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"plugin": plugin})
 }
 
+func handleAdminPluginOperations(w http.ResponseWriter, r *http.Request, rawSegment string) {
+	session, ok := requireRole(w, r, adminRoleMember)
+	if !ok {
+		return
+	}
+	if pluginsManager == nil {
+		adminhttp.WriteAPIError(w, http.StatusServiceUnavailable, "plugin manager is not initialized")
+		return
+	}
+	pluginID, action, ok := splitPluginSubresource(w, rawSegment, "operations")
+	if !ok {
+		return
+	}
+	switch {
+	case r.Method == http.MethodGet && action == "":
+		snapshot, err := pluginsManager.OperationsSnapshot(r.Context(), pluginID)
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"operations": snapshot})
+	case r.Method == http.MethodPost && strings.HasPrefix(action, "tasks/") && strings.HasSuffix(action, "/trigger"):
+		if session.Role != adminRoleAdmin {
+			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		parts := strings.Split(action, "/")
+		if len(parts) != 3 {
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, "invalid task trigger path")
+			return
+		}
+		taskID, err := adminhttp.PathSegment(parts[1])
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		var req struct {
+			ConfirmToken string `json:"confirm_token"`
+		}
+		if !adminhttp.DecodeJSONRequest(w, r, &req) {
+			return
+		}
+		task, err := pluginsManager.TriggerBackgroundTask(r.Context(), session.Username, pluginID, taskID, req.ConfirmToken)
+		if err != nil {
+			recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_background_task_trigger", "plugin", pluginID, false, err.Error())
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_background_task_trigger", "plugin", pluginID, true, "background task triggered", map[string]any{"task_id": taskID})
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"task": task})
+	case r.Method == http.MethodGet && action == "diagnostic":
+		data, summary, err := pluginsManager.DiagnosticPackage(r.Context(), session.Username, pluginID)
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		var body any
+		if err := json.Unmarshal(data, &body); err != nil {
+			body = map[string]any{"error": "diagnostic package could not be decoded"}
+		}
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"diagnostic": body, "summary": summary})
+	case (r.Method == http.MethodGet || r.Method == http.MethodPost) && action == "gc":
+		if r.Method == http.MethodPost && session.Role != adminRoleAdmin {
+			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		dryRun := r.Method == http.MethodGet
+		candidates, err := pluginsManager.RunOperationsGC(r.Context(), session.Username, pluginID, dryRun)
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"dry_run": dryRun, "candidates": candidates})
+	default:
+		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func handleAdminPluginOperationsGC(w http.ResponseWriter, r *http.Request) {
+	session, ok := requireRole(w, r, adminRoleMember)
+	if !ok {
+		return
+	}
+	if pluginsManager == nil {
+		adminhttp.WriteAPIError(w, http.StatusServiceUnavailable, "plugin manager is not initialized")
+		return
+	}
+	if r.Method == http.MethodPost && session.Role != adminRoleAdmin {
+		adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	dryRun := r.Method == http.MethodGet
+	candidates, err := pluginsManager.RunOperationsGC(r.Context(), session.Username, r.URL.Query().Get("plugin_id"), dryRun)
+	if err != nil {
+		adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"dry_run": dryRun, "candidates": candidates})
+}
+
+func handleAdminPluginDiagnostics(w http.ResponseWriter, r *http.Request, rawPluginID string) {
+	session, ok := requireRole(w, r, adminRoleAdmin)
+	if !ok {
+		return
+	}
+	if pluginsManager == nil {
+		adminhttp.WriteAPIError(w, http.StatusServiceUnavailable, "plugin manager is not initialized")
+		return
+	}
+	if r.Method != http.MethodGet {
+		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	pluginID, err := adminhttp.PathSegment(rawPluginID)
+	if err != nil {
+		adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	data, summary, err := pluginsManager.DiagnosticPackage(r.Context(), session.Username, pluginID)
+	if err != nil {
+		writePluginManagerError(w, err)
+		return
+	}
+	var body any
+	if err := json.Unmarshal(data, &body); err != nil {
+		body = map[string]any{"error": "diagnostic package could not be decoded"}
+	}
+	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"diagnostic": body, "summary": summary})
+}
+
 func handleAdminPluginAction(w http.ResponseWriter, r *http.Request, rawSegment string) {
 	session, ok := requireRole(w, r, adminRoleAdmin)
 	if !ok {

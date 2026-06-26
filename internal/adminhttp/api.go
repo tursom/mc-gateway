@@ -29,22 +29,25 @@ type APIHandlers struct {
 
 	AuditLogs http.HandlerFunc
 
-	PluginArtifacts  http.HandlerFunc
-	PluginArtifact   SegmentHandlerFunc
-	PluginSources    http.HandlerFunc
-	PluginBuilds     http.HandlerFunc
-	PluginBuild      SegmentHandlerFunc
-	PluginGC         http.HandlerFunc
-	PluginsList      http.HandlerFunc
-	PluginItem       SegmentHandlerFunc
-	PluginAction     SegmentHandlerFunc
-	PluginConfig     SegmentHandlerFunc
-	PluginSecrets    SegmentHandlerFunc
-	PluginRollback   SegmentHandlerFunc
-	PluginDraining   SegmentHandlerFunc
-	PluginDispatch   http.HandlerFunc
-	PluginGovernance SegmentHandlerFunc
-	PluginAdvisories http.HandlerFunc
+	PluginArtifacts    http.HandlerFunc
+	PluginArtifact     SegmentHandlerFunc
+	PluginSources      http.HandlerFunc
+	PluginBuilds       http.HandlerFunc
+	PluginBuild        SegmentHandlerFunc
+	PluginGC           http.HandlerFunc
+	PluginsList        http.HandlerFunc
+	PluginItem         SegmentHandlerFunc
+	PluginAction       SegmentHandlerFunc
+	PluginConfig       SegmentHandlerFunc
+	PluginSecrets      SegmentHandlerFunc
+	PluginRollback     SegmentHandlerFunc
+	PluginOperations   SegmentHandlerFunc
+	PluginOperationsGC http.HandlerFunc
+	PluginDraining     SegmentHandlerFunc
+	PluginDispatch     http.HandlerFunc
+	PluginGovernance   SegmentHandlerFunc
+	PluginAdvisories   http.HandlerFunc
+	PluginDiagnostics  SegmentHandlerFunc
 }
 
 func NewAPIHandler(prefix string, handlers APIHandlers) http.HandlerFunc {
@@ -98,6 +101,8 @@ func NewAPIHandler(prefix string, handlers APIHandlers) http.HandlerFunc {
 			callSegmentHandler(w, r, handlers.PluginBuild, strings.TrimPrefix(path, "/plugin-builds/"))
 		case path == "/plugin-gc" && (r.Method == http.MethodGet || r.Method == http.MethodPost):
 			callHandler(w, r, handlers.PluginGC)
+		case path == "/plugin-operations-gc" && (r.Method == http.MethodGet || r.Method == http.MethodPost):
+			callHandler(w, r, handlers.PluginOperationsGC)
 		case path == "/plugins" && r.Method == http.MethodGet:
 			callHandler(w, r, handlers.PluginsList)
 		case path == "/plugins/dispatch-plan" && r.Method == http.MethodGet:
@@ -108,6 +113,14 @@ func NewAPIHandler(prefix string, handlers APIHandlers) http.HandlerFunc {
 			pluginPath := strings.TrimPrefix(path, "/plugins/")
 			if strings.Contains(pluginPath, "/governance/") || strings.HasSuffix(pluginPath, "/governance") {
 				callSegmentHandler(w, r, handlers.PluginGovernance, pluginPath)
+				return
+			}
+			if strings.Contains(pluginPath, "/operations/") || strings.HasSuffix(pluginPath, "/operations") {
+				callSegmentHandler(w, r, handlers.PluginOperations, pluginPath)
+				return
+			}
+			if strings.HasSuffix(pluginPath, "/diagnostics") {
+				callSegmentHandler(w, r, handlers.PluginDiagnostics, strings.TrimSuffix(pluginPath, "/diagnostics"))
 				return
 			}
 			if strings.HasSuffix(pluginPath, "/draining/force-close") {

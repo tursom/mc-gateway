@@ -21,6 +21,7 @@ import (
 var (
 	pluginIDPattern   = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
 	secretNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	schemaKeyPattern  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 )
 
 type ArtifactStore struct {
@@ -108,7 +109,7 @@ func (s ArtifactStore) StoreBuiltBinary(upload ArtifactUpload, manifest Manifest
 	if err != nil {
 		return ArtifactRecord{}, err
 	}
-	capabilities, err := capabilitiesSummaryJSON(manifest.Capabilities)
+	capabilities, err := manifestCapabilitiesSummaryJSON(manifest)
 	if err != nil {
 		return ArtifactRecord{}, err
 	}
@@ -288,7 +289,7 @@ func (s ArtifactStore) validateAndStore(upload ArtifactUpload, expectedArtifactT
 	if err != nil {
 		return ArtifactRecord{}, err
 	}
-	capabilities, err := capabilitiesSummaryJSON(manifest.Capabilities)
+	capabilities, err := manifestCapabilitiesSummaryJSON(manifest)
 	if err != nil {
 		return ArtifactRecord{}, err
 	}
@@ -364,7 +365,7 @@ func (s ArtifactStore) storeSourcePackage(upload ArtifactUpload, manifest Manife
 	if err != nil {
 		return ArtifactRecord{}, err
 	}
-	capabilities, err := capabilitiesSummaryJSON(manifest.Capabilities)
+	capabilities, err := manifestCapabilitiesSummaryJSON(manifest)
 	if err != nil {
 		return ArtifactRecord{}, err
 	}
@@ -427,6 +428,23 @@ func capabilitiesSummaryJSON(raw json.RawMessage) ([]byte, error) {
 	return json.Marshal(summary)
 }
 
+func manifestCapabilitiesSummaryJSON(manifest Manifest) ([]byte, error) {
+	data, err := capabilitiesSummaryJSON(manifest.Capabilities)
+	if err != nil {
+		return nil, err
+	}
+	var summary CapabilitySummary
+	if err := json.Unmarshal(data, &summary); err != nil {
+		return nil, err
+	}
+	summary.Events = append([]EventSpec(nil), manifest.Events...)
+	summary.CustomMetrics = append([]MetricSpec(nil), manifest.CustomMetrics...)
+	summary.ExternalDeps = append([]ExternalSpec(nil), manifest.ExternalDeps...)
+	summary.DataStores = append([]DataStoreSpec(nil), manifest.DataStores...)
+	summary.FileStores = append([]FileStoreSpec(nil), manifest.FileStores...)
+	return json.Marshal(summary)
+}
+
 func validateManifest(manifest Manifest) error {
 	switch {
 	case manifest.SchemaVersion != SchemaVersion:
@@ -477,7 +495,75 @@ func validateManifest(manifest Manifest) error {
 		}
 		seenSecrets[secret.Name] = true
 	}
+	if err := validateNamedSpecs("event", eventSpecNames(manifest.Events)); err != nil {
+		return err
+	}
+	if err := validateNamedSpecs("custom metric", metricSpecNames(manifest.CustomMetrics)); err != nil {
+		return err
+	}
+	if err := validateNamedSpecs("background task", taskSpecNames(manifest.BackgroundTasks)); err != nil {
+		return err
+	}
+	if err := validateNamedSpecs("external dependency", externalSpecNames(manifest.ExternalDeps)); err != nil {
+		return err
+	}
 	return nil
+}
+
+func validateNamedSpecs(kind string, names []string) error {
+	seen := make(map[string]bool, len(names))
+	for _, name := range names {
+		if !schemaKeyPattern.MatchString(name) {
+			return fmt.Errorf("invalid %s name %q", kind, name)
+		}
+		if seen[name] {
+			return fmt.Errorf("duplicate %s name %q", kind, name)
+		}
+		seen[name] = true
+	}
+	return nil
+}
+
+func eventSpecNames(specs []EventSpec) []string {
+	names := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		names = append(names, spec.Name)
+		for _, field := range spec.Fields {
+			if !schemaKeyPattern.MatchString(field) {
+				names = append(names, "invalid field "+field)
+			}
+		}
+	}
+	return names
+}
+
+func metricSpecNames(specs []MetricSpec) []string {
+	names := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		names = append(names, spec.Name)
+		for _, label := range spec.Labels {
+			if !schemaKeyPattern.MatchString(label) {
+				names = append(names, "invalid label "+label)
+			}
+		}
+	}
+	return names
+}
+
+func taskSpecNames(specs []TaskSpec) []string {
+	names := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		names = append(names, spec.ID)
+	}
+	return names
+}
+
+func externalSpecNames(specs []ExternalSpec) []string {
+	names := make([]string, 0, len(specs))
+	for _, spec := range specs {
+		names = append(names, spec.Name)
+	}
+	return names
 }
 
 func validateSourceEntries(manifest Manifest, entries map[string]*zip.File) error {

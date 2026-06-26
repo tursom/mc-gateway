@@ -70,6 +70,26 @@ func main() {
 			"handler_timeout_ms":       3000,
 			"initial_write_timeout_ms": 1000,
 		},
+		"events": []map[string]any{
+			{"name": "auth.success", "fields": []string{"result", "mode"}},
+			{"name": "auth.failure", "fields": []string{"result", "mode"}},
+		},
+		"custom_metrics": []map[string]any{
+			{"name": "auth.attempts", "type": "counter", "labels": []string{"result", "mode"}},
+		},
+		"external_dependencies": []map[string]any{
+			{"name": "backend", "endpoint": "tcp://", "purpose": "auth", "required": true, "timeout": "3s", "retry": 0, "fail_policy": "fail_closed", "data_classes": []string{"operational"}},
+		},
+		"background_tasks": []map[string]any{
+			{"id": "profile-cache-gc", "name": "Profile cache GC", "mode": "manual", "manual": true, "timeout": "1s"},
+		},
+		"data_stores": []map[string]any{
+			{"name": "profile-cache", "schema_version": 1, "data_class": "profile_cache", "quota_bytes": 1048576, "retention": "24h", "exportable": false},
+		},
+		"file_stores": []map[string]any{
+			{"namespace": "cache", "data_class": "profile_cache", "quota_bytes": 1048576, "retention": "24h"},
+			{"namespace": "diagnostic", "data_class": "diagnostic", "quota_bytes": 1048576, "retention": "24h"},
+		},
 		"config_schema": map[string]any{
 			"type": "object",
 			"properties": map[string]any{

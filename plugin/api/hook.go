@@ -14,6 +14,9 @@ var (
 )
 
 type (
+	ConnectionIDContextKey struct{}
+	TraceIDContextKey      struct{}
+
 	HookType[Accept, Handler any] struct {
 		key string
 	}

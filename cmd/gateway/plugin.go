@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"net"
 	"plugin"
 	"sync"
+	"time"
 
 	"github.com/rs/zerolog/log"
 	"github.com/tursom/mc-gateway/plugin/api"
@@ -112,10 +115,85 @@ func (g *Gateway) ExitWaitGroup() *sync.WaitGroup {
 	return &exitWaitGroup
 }
 
+func (g *Gateway) EmitEvent(ctx context.Context, name string, fields map[string]string) error {
+	_ = ctx
+	_ = name
+	_ = fields
+	return nil
+}
+
+func (g *Gateway) ObserveMetric(ctx context.Context, name string, value float64, labels map[string]string) error {
+	_ = ctx
+	_ = name
+	_ = value
+	_ = labels
+	return nil
+}
+
+func (g *Gateway) Logger() api.Logger {
+	return noopPluginLogger{}
+}
+
+func (g *Gateway) DataStore() api.DataStore {
+	return noopPluginDataStore{}
+}
+
+func (g *Gateway) FileStore() api.FileStore {
+	return noopPluginFileStore{}
+}
+
+func (g *Gateway) ExternalClient(name string) api.ExternalClient {
+	_ = name
+	return noopExternalClient{}
+}
+
+func (g *Gateway) RegisterBackgroundTask(task api.BackgroundTask) error {
+	_ = task
+	return nil
+}
+
 // TestOp implements api.Gateway.
 func (g *Gateway) TestOp() {
 	panic("unimplemented")
 }
+
+type noopPluginLogger struct{}
+
+func (noopPluginLogger) Debug(context.Context, string, map[string]string) {}
+func (noopPluginLogger) Info(context.Context, string, map[string]string)  {}
+func (noopPluginLogger) Warn(context.Context, string, map[string]string)  {}
+func (noopPluginLogger) Error(context.Context, string, map[string]string) {}
+
+type noopPluginDataStore struct{}
+
+func (noopPluginDataStore) Put(context.Context, api.DataRecord) error { return nil }
+func (noopPluginDataStore) Get(context.Context, string) (api.DataRecord, error) {
+	return api.DataRecord{}, errors.New("plugin data store is unavailable")
+}
+func (noopPluginDataStore) Delete(context.Context, string) error { return nil }
+
+type noopPluginFileStore struct{}
+
+func (noopPluginFileStore) ResourcePath(string) (string, error) {
+	return "", errors.New("plugin file store is unavailable")
+}
+func (noopPluginFileStore) Write(context.Context, string, string, []byte, string, time.Duration) error {
+	return nil
+}
+func (noopPluginFileStore) Read(context.Context, string, string, int64) ([]byte, error) {
+	return nil, errors.New("plugin file store is unavailable")
+}
+func (noopPluginFileStore) Delete(context.Context, string, string) error { return nil }
+
+type noopExternalClient struct{}
+
+func (noopExternalClient) DoHTTP(context.Context, api.ExternalRequest) (api.ExternalResponse, error) {
+	return api.ExternalResponse{}, errors.New("external client is unavailable")
+}
+func (noopExternalClient) DialTCP(context.Context, string, time.Duration) (net.Conn, error) {
+	return nil, errors.New("external client is unavailable")
+}
+func (noopExternalClient) HealthCheck(context.Context) error { return nil }
 
 func Handler1[T1, R any](t1 T1) func(func(T1) R) R {
 	return func(acceptor func(T1) R) R {

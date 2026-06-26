@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,7 +16,8 @@ import (
 
 type PluginImpl struct {
 	api.AbstractPlugin
-	config Config
+	config  Config
+	gateway api.Gateway
 }
 
 type Config struct {
@@ -52,6 +54,7 @@ func (p *PluginImpl) ReloadConfig(config any) error {
 }
 
 func (p *PluginImpl) Init(gateway api.Gateway) error {
+	p.gateway = gateway
 	return api.RegisterHookHandler(
 		gateway,
 		api.HookUpstreamConnect,
@@ -79,6 +82,7 @@ func (p *PluginImpl) handleConn(req api.UpstreamConnectRequest, conn net.Conn) {
 	}
 	handshake := protocol.ParseHandshake(handshakePacket)
 	if handshake.ServerHost == "" || handshake.NextState != 2 {
+		p.emitAuthEvent(req.Context, "auth.failure", "bad_handshake")
 		_ = writeLoginDisconnect(conn, "Unsupported Minecraft handshake")
 		return
 	}
@@ -90,29 +94,45 @@ func (p *PluginImpl) handleConn(req api.UpstreamConnectRequest, conn net.Conn) {
 	}
 	login, err := parseLoginStart(loginPacket)
 	if err != nil || login.Username == "" {
+		p.emitAuthEvent(req.Context, "auth.failure", "bad_login_start")
 		_ = writeLoginDisconnect(conn, p.config.DisconnectMessage)
 		return
 	}
 
 	if !p.config.FixtureAccept {
+		p.emitAuthEvent(req.Context, "auth.failure", "fixture_reject")
 		_ = writeLoginDisconnect(conn, p.config.DisconnectMessage)
 		return
 	}
 	if p.config.Backend == "" {
+		p.emitAuthEvent(req.Context, "auth.failure", "backend_missing")
 		_ = writeLoginDisconnect(conn, "Fixture accepted but no backend is configured")
 		return
 	}
 
-	backend, err := net.Dial("tcp", p.config.Backend)
+	backend, err := p.gateway.ExternalClient("backend").DialTCP(req.Context, p.config.Backend, 3*time.Second)
 	if err != nil {
+		p.emitAuthEvent(req.Context, "auth.failure", "backend_unavailable")
 		_ = writeLoginDisconnect(conn, "Backend unavailable")
 		return
 	}
+	p.emitAuthEvent(req.Context, "auth.success", "fixture_accept")
 	defer backend.Close()
 	_, _ = backend.Write(handshakePacket)
 	_, _ = backend.Write(loginPacket)
 	copyBoth(conn, backend)
 	_ = req
+}
+
+func (p *PluginImpl) emitAuthEvent(ctx context.Context, name, result string) {
+	if p.gateway == nil {
+		return
+	}
+	_ = p.gateway.EmitEvent(ctx, name, map[string]string{
+		"result": result,
+		"mode":   "fixture",
+	})
+	p.gateway.Logger().Info(ctx, name, map[string]string{"result": result})
 }
 
 func readPacketFromConn(conn net.Conn) ([]byte, error) {
@@ -241,6 +261,26 @@ var manifestJSON = compactJSON(map[string]any{
 	"runtime_limits": map[string]any{
 		"handler_timeout_ms":       3000,
 		"initial_write_timeout_ms": 1000,
+	},
+	"events": []map[string]any{
+		{"name": "auth.success", "fields": []string{"result", "mode"}},
+		{"name": "auth.failure", "fields": []string{"result", "mode"}},
+	},
+	"custom_metrics": []map[string]any{
+		{"name": "auth.attempts", "type": "counter", "labels": []string{"result", "mode"}},
+	},
+	"external_dependencies": []map[string]any{
+		{"name": "backend", "endpoint": "tcp://", "purpose": "auth", "required": true, "timeout": "3s", "retry": 0, "fail_policy": "fail_closed", "data_classes": []string{"operational"}},
+	},
+	"background_tasks": []map[string]any{
+		{"id": "profile-cache-gc", "name": "Profile cache GC", "mode": "manual", "manual": true, "timeout": "1s"},
+	},
+	"data_stores": []map[string]any{
+		{"name": "profile-cache", "schema_version": 1, "data_class": "profile_cache", "quota_bytes": 1048576, "retention": "24h", "exportable": false},
+	},
+	"file_stores": []map[string]any{
+		{"namespace": "cache", "data_class": "profile_cache", "quota_bytes": 1048576, "retention": "24h"},
+		{"namespace": "diagnostic", "data_class": "diagnostic", "quota_bytes": 1048576, "retention": "24h"},
 	},
 })
 

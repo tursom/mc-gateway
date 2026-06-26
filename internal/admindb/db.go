@@ -284,6 +284,80 @@ CREATE TABLE IF NOT EXISTS plugin_benchmarks (
     created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS plugin_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plugin_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    fields_json TEXT NOT NULL DEFAULT '{}',
+    dropped INTEGER NOT NULL DEFAULT 0,
+    reason TEXT NOT NULL DEFAULT '',
+    trace_id TEXT NOT NULL DEFAULT '',
+    connection_id TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS plugin_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plugin_id TEXT NOT NULL,
+    level TEXT NOT NULL,
+    message TEXT NOT NULL,
+    fields_json TEXT NOT NULL DEFAULT '{}',
+    trace_id TEXT NOT NULL DEFAULT '',
+    connection_id TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS plugin_traces (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plugin_id TEXT NOT NULL DEFAULT '',
+    trace_id TEXT NOT NULL,
+    connection_id TEXT NOT NULL DEFAULT '',
+    handler_id TEXT NOT NULL DEFAULT '',
+    operation TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT '',
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    fields_json TEXT NOT NULL DEFAULT '{}',
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS plugin_data (
+    plugin_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value BLOB NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 0,
+    data_class TEXT NOT NULL DEFAULT '',
+    exportable INTEGER NOT NULL DEFAULT 0,
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    expires_at INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(plugin_id, key)
+);
+
+CREATE TABLE IF NOT EXISTS plugin_files (
+    plugin_id TEXT NOT NULL,
+    namespace TEXT NOT NULL,
+    path TEXT NOT NULL,
+    disk_path TEXT NOT NULL,
+    data_class TEXT NOT NULL DEFAULT '',
+    exportable INTEGER NOT NULL DEFAULT 0,
+    readonly INTEGER NOT NULL DEFAULT 0,
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    expires_at INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(plugin_id, namespace, path)
+);
+
+CREATE TABLE IF NOT EXISTS plugin_diagnostics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    plugin_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    sections_json TEXT NOT NULL DEFAULT '[]',
+    created_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_routes_enabled ON routes(enabled);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_plugin_artifacts_plugin_id ON plugin_artifacts(plugin_id, created_at);
@@ -299,6 +373,12 @@ CREATE INDEX IF NOT EXISTS idx_plugin_advisories_artifact ON plugin_advisories(a
 CREATE INDEX IF NOT EXISTS idx_plugin_advisories_plugin ON plugin_advisories(plugin_id, status);
 CREATE INDEX IF NOT EXISTS idx_plugin_preflight_lookup ON plugin_preflight_results(plugin_id, artifact_id, profile, created_at);
 CREATE INDEX IF NOT EXISTS idx_plugin_benchmarks_lookup ON plugin_benchmarks(plugin_id, artifact_id, profile, created_at);
+CREATE INDEX IF NOT EXISTS idx_plugin_events_lookup ON plugin_events(plugin_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_plugin_logs_lookup ON plugin_logs(plugin_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_plugin_traces_lookup ON plugin_traces(plugin_id, trace_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_plugin_data_expires ON plugin_data(expires_at);
+CREATE INDEX IF NOT EXISTS idx_plugin_files_expires ON plugin_files(expires_at);
+CREATE INDEX IF NOT EXISTS idx_plugin_diagnostics_lookup ON plugin_diagnostics(plugin_id, created_at);
 INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, strftime('%s','now'));
 `
 	if _, err := db.Exec(schema); err != nil {

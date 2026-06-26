@@ -1,9 +1,11 @@
 package api
 
 import (
+	"context"
 	"net"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestAbstractPluginDefaults(t *testing.T) {
@@ -92,3 +94,67 @@ func (g *recordingGateway) Hook(hook string, handler any) error {
 	g.hooks[hook] = handler
 	return nil
 }
+
+func (g *recordingGateway) EmitEvent(context.Context, string, map[string]string) error {
+	return nil
+}
+
+func (g *recordingGateway) ObserveMetric(context.Context, string, float64, map[string]string) error {
+	return nil
+}
+
+func (g *recordingGateway) Logger() Logger {
+	return testLogger{}
+}
+
+func (g *recordingGateway) DataStore() DataStore {
+	return testDataStore{}
+}
+
+func (g *recordingGateway) FileStore() FileStore {
+	return testFileStore{}
+}
+
+func (g *recordingGateway) ExternalClient(string) ExternalClient {
+	return testExternalClient{}
+}
+
+func (g *recordingGateway) RegisterBackgroundTask(BackgroundTask) error {
+	return nil
+}
+
+type testLogger struct{}
+
+func (testLogger) Debug(context.Context, string, map[string]string) {}
+func (testLogger) Info(context.Context, string, map[string]string)  {}
+func (testLogger) Warn(context.Context, string, map[string]string)  {}
+func (testLogger) Error(context.Context, string, map[string]string) {}
+
+type testDataStore struct{}
+
+func (testDataStore) Put(context.Context, DataRecord) error { return nil }
+func (testDataStore) Get(context.Context, string) (DataRecord, error) {
+	return DataRecord{}, nil
+}
+func (testDataStore) Delete(context.Context, string) error { return nil }
+
+type testFileStore struct{}
+
+func (testFileStore) ResourcePath(string) (string, error) { return "", nil }
+func (testFileStore) Write(context.Context, string, string, []byte, string, time.Duration) error {
+	return nil
+}
+func (testFileStore) Read(context.Context, string, string, int64) ([]byte, error) {
+	return nil, nil
+}
+func (testFileStore) Delete(context.Context, string, string) error { return nil }
+
+type testExternalClient struct{}
+
+func (testExternalClient) DoHTTP(context.Context, ExternalRequest) (ExternalResponse, error) {
+	return ExternalResponse{}, nil
+}
+func (testExternalClient) DialTCP(context.Context, string, time.Duration) (net.Conn, error) {
+	return nil, nil
+}
+func (testExternalClient) HealthCheck(context.Context) error { return nil }
