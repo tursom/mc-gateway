@@ -615,6 +615,7 @@ func validateSourceEntries(manifest Manifest, entries map[string]*zip.File) erro
 		switch {
 		case name == "manifest.json" || name == "go.mod" || name == "go.sum":
 		case strings.HasPrefix(name, "vendor/"):
+		case strings.HasPrefix(name, "testdata/"):
 		case strings.EqualFold(path.Base(name), "README.md"), strings.EqualFold(path.Base(name), "LICENSE"), strings.Contains(strings.ToLower(path.Base(name)), "sbom"):
 		case strings.HasSuffix(name, ".go"):
 		default:

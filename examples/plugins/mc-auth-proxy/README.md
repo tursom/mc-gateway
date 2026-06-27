@@ -12,7 +12,8 @@ belong inside a protocol-proxy plugin.
 Build and package:
 
 ```sh
-./build.sh
+(cd ../../.. && go run ./cmd/gateway plugin test examples/plugins/mc-auth-proxy --profile manifest)
+(cd ../../.. && go run ./cmd/gateway plugin build examples/plugins/mc-auth-proxy --type both)
 ```
 
 The binary package is written to `dist/mc-auth-proxy.mcgp`; the source package
@@ -21,7 +22,7 @@ is written to `dist/mc-auth-proxy-source.mcgp`.
 Build the source package through the gateway builder:
 
 ```sh
-go run ../../../cmd/gateway plugin source-build dist/mc-auth-proxy-source.mcgp dist/mc-auth-proxy-built.mcgp
+(cd ../../.. && go run ./cmd/gateway plugin build --from-source examples/plugins/mc-auth-proxy/dist/mc-auth-proxy-source.mcgp --out examples/plugins/mc-auth-proxy/dist/mc-auth-proxy-built.mcgp)
 ```
 
 Example config JSON:

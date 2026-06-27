@@ -1,0 +1,5 @@
+{
+  "match_host": "play.example",
+  "fixture_accept": false,
+  "disconnect_message": "Authentication fixture rejected the login"
+}

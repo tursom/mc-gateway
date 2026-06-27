@@ -6371,51 +6371,53 @@ type Gateway interface {
 - `examples/plugins/upstream-rewrite` 最小模板。
 - `examples/plugins/mc-auth-proxy` protocol-proxy 模板。
 - manifest JSON schema。
-- 构建脚本模板。
-- `.mcgp` 打包脚本。
+- 统一的 `gateway plugin init/build/test` 开发工具链。
+
+详细工具链设计见 [plugin-development-toolchain-design.md](plugin-development-toolchain-design.md)。工具链必须继续遵守 manifest-only 元数据约束：插件作者只维护 `manifest.json`，Go 代码中不再保存 `manifestJSON` 或等价重复元数据。
 
 ### CLI 工具
 
-建议提供 `mc-gateway plugin` 子命令，降低插件开发和运维成本。
+建议提供 `gateway plugin` 子命令，降低插件开发和运维成本。开发入口直接扩展在 `gateway plugin init/build/test` 下，不新增 `dev` 子命名空间。
 
 候选命令：
 
 | 命令 | 说明 |
 | --- | --- |
-| `mc-gateway plugin init` | 生成插件模板 |
-| `mc-gateway plugin validate manifest.json` | 校验 manifest schema、命名、capabilities 和 extension point |
-| `mc-gateway plugin package --type source` | 打包 source `.mcgp` |
-| `mc-gateway plugin package --type binary` | 打包 binary `.mcgp` |
-| `mc-gateway plugin inspect plugin.mcgp` | 查看 manifest、supply chain、sha256、Go/API 版本 |
-| `mc-gateway plugin compat plugin.mcgp` | 检查当前 gateway 是否可能加载该插件 |
-| `mc-gateway plugin features` | 查看当前 gateway 支持的 feature key 和版本 |
-| `mc-gateway plugin build` | 使用匹配 builder 本地构建 plugin.so |
-| `mc-gateway plugin test` | 运行插件 harness 测试 |
-| `mc-gateway plugin preflight` | 对插件包或已安装插件执行通用预检和插件 Preflight |
-| `mc-gateway plugin self-test` | 运行 quick/protocol-smoke/integration 自测 profile |
-| `mc-gateway plugin benchmark` | 运行插件 benchmark、soak 或 regression profile |
-| `mc-gateway plugin contract check` | 校验契约文件和上一 release 的兼容性 |
-| `mc-gateway plugin conformance` | 运行插件契约 conformance suite |
-| `mc-gateway plugin export` | 从 Admin API 导出 promotion bundle |
-| `mc-gateway plugin import` | 上传并校验 promotion bundle |
-| `mc-gateway plugin diff` | 对比 bundle、目标环境和当前 desired state |
-| `mc-gateway plugin drift` | 查看当前环境相对基线的漂移状态 |
-| `mc-gateway plugin dr-drill` | 触发或查看灾备演练 |
-| `mc-gateway plugin data inspect <plugin>` | 查看 plugin_data schema、data class、大小、配额和 GC candidate |
-| `mc-gateway plugin data export <plugin>` | 导出允许迁移的数据，受 data_class 和权限控制 |
-| `mc-gateway plugin data gc <plugin>` | 按 retention 清理过期或可丢弃 plugin_data |
-| `mc-gateway plugin sbom` | 生成或校验 SBOM，未来能力 |
-| `mc-gateway plugin sign` | 签名插件包，未来能力 |
+| `gateway plugin init` | 生成插件模板 |
+| `gateway plugin validate <path>` | 校验 manifest、源码目录或 `.mcgp` 包 |
+| `gateway plugin build --type source` | 打包 source `.mcgp` |
+| `gateway plugin build --type binary` | 构建并打包 binary `.mcgp` |
+| `gateway plugin build --type both` | 同时生成 source/binary `.mcgp` |
+| `gateway plugin build --from-source` | 从 source `.mcgp` 生成 binary `.mcgp`，逐步替代 `source-build` 主路径 |
+| `gateway plugin test` | 运行插件 unit、manifest、harness 或 conformance profile |
+| `gateway plugin inspect plugin.mcgp` | 查看 manifest、supply chain、sha256、Go/API 版本 |
+| `gateway plugin compat plugin.mcgp` | 检查当前 gateway 是否可能加载该插件 |
+| `gateway plugin features` | 查看当前 gateway 支持的 feature key 和版本 |
+| `gateway plugin preflight` | 对插件包或已安装插件执行通用预检和插件 Preflight |
+| `gateway plugin self-test` | 运行 quick/protocol-smoke/integration 自测 profile |
+| `gateway plugin benchmark` | 运行插件 benchmark、soak 或 regression profile |
+| `gateway plugin contract check` | 校验契约文件和上一 release 的兼容性 |
+| `gateway plugin conformance` | 运行插件契约 conformance suite |
+| `gateway plugin export` | 从 Admin API 导出 promotion bundle |
+| `gateway plugin import` | 上传并校验 promotion bundle |
+| `gateway plugin diff` | 对比 bundle、目标环境和当前 desired state |
+| `gateway plugin drift` | 查看当前环境相对基线的漂移状态 |
+| `gateway plugin dr-drill` | 触发或查看灾备演练 |
+| `gateway plugin data inspect <plugin>` | 查看 plugin_data schema、data class、大小、配额和 GC candidate |
+| `gateway plugin data export <plugin>` | 导出允许迁移的数据，受 data_class 和权限控制 |
+| `gateway plugin data gc <plugin>` | 按 retention 清理过期或可丢弃 plugin_data |
+| `gateway plugin sbom` | 生成或校验 SBOM，未来能力 |
+| `gateway plugin sign` | 签名插件包，未来能力 |
 
 CLI 规则：
 
 - CLI 校验不能替代服务端校验，服务端必须重复做安全校验。
-- package 命令必须生成稳定 zip，避免无意义 sha256 变化。
+- build 命令必须生成稳定 zip，避免无意义 sha256 变化。
 - inspect 命令不能执行插件代码。
 - compat 命令只能做 preflight，必须检查 required/optional features，但不能保证 `plugin.Open` 一定成功。
 - features 命令输出必须和 Admin `/plugins/features` API 使用同一契约。
 - diff、drift、export 和 import 必须使用同一 canonical hash 与脱敏 diff 实现。
-- build 命令应默认使用与 gateway release 匹配的 builder image。
+- build 命令应默认使用与 gateway release 匹配的 builder image；本地 Go plugin adapter 可以先使用当前 Go toolchain。
 - data inspect 默认只显示摘要，不导出 value。
 - data export 必须经过 Admin API 权限检查，且只能导出 manifest 声明 `exportable=true` 的数据。
 - data gc 必须支持 dry-run，先展示将清理的 data_class、key 数量和总大小。
@@ -6427,7 +6429,7 @@ CLI 规则：
 1. 从示例复制插件目录。
 2. 编写 `manifest.json`。
 3. 使用与 gateway 匹配的 Go toolchain。
-4. 运行示例脚本构建 `.mcgp`。
+4. 运行 `gateway plugin build` 构建 `.mcgp`。
 5. 通过 Admin 上传。
 6. 查看 ABI 校验结果、构建日志、加载状态和运行错误。
 
@@ -7130,7 +7132,7 @@ API 错误响应应包含稳定错误码，便于管理页和 CLI 处理：
 1. 查看 build log excerpt 和 builder image。
 2. 确认 Go version、GOOS/GOARCH、CGO 和 build tags。
 3. 检查 GOPROXY/vendor/private dependency 配置。
-4. 使用 CLI 在本地或 CI 复现 `mc-gateway plugin build`。
+4. 使用 CLI 在本地或 CI 复现 `gateway plugin build`。
 5. 修正源码包后重新上传，或 retry 同一 build job。
 
 构建失败不应改变 active artifact。
@@ -7202,10 +7204,12 @@ API 错误响应应包含稳定错误码，便于管理页和 CLI 处理：
 examples/plugins/upstream-rewrite/
   go.mod
   main.go
+  main_test.go
   manifest.json
   README.md
-  build.sh
-  package-source.sh
+  testdata/
+    config.json
+    fixtures/
 ```
 
 示例能力：
@@ -7231,10 +7235,12 @@ examples/plugins/upstream-rewrite/
 examples/plugins/mc-auth-proxy/
   go.mod
   main.go
+  main_test.go
   manifest.json
   README.md
-  build.sh
-  package-source.sh
+  testdata/
+    config.json
+    fixtures/
 ```
 
 示例能力：
@@ -7263,10 +7269,12 @@ examples/plugins/mc-auth-proxy/
 examples/plugins/mc-status-motd/
   go.mod
   main.go
+  main_test.go
   manifest.json
   README.md
-  build.sh
-  package-source.sh
+  testdata/
+    config.json
+    fixtures/
 ```
 
 示例能力：
@@ -7662,7 +7670,7 @@ examples/plugins/mc-status-motd/
 - 插件测试 harness 能覆盖 dialer mode 和 protocol-proxy mode。
 - 测试矩阵覆盖包格式、ABI、生命周期、配置、extension point、入口传输、上游协议、protocol-proxy、治理、secret、artifact 和 Admin 权限。
 - 运维 Runbook 覆盖连接失败、启用失败、构建失败、secret 泄漏怀疑、磁盘占用过高和多实例部分失败。
-- CLI 工具至少覆盖 manifest validate、package、inspect、compat、test、promotion export/import/diff、drift 和 dr-drill 的设计。
+- CLI 工具至少覆盖 manifest validate、build/package、inspect、compat、test、promotion export/import/diff、drift 和 dr-drill 的设计。
 - CLI 工具覆盖 plugin_data inspect/export/gc，且 data gc 支持 dry-run。
 - Admin API 错误响应有稳定 code，管理页和 CLI 不依赖错误字符串解析。
 - 文档能明确区分第一版能力、预留 extension point 和未来 runtime。
@@ -7696,7 +7704,7 @@ examples/plugins/mc-status-motd/
 | 契约文件 | 第一版手写维护 JSON schema/contract；后续可从 Go 类型和 manifest schema 生成并做 diff 校验 |
 | SDK 发布节奏 | gateway release 与 plugin SDK release 默认绑定；SDK 使用 SemVer，gateway 记录支持范围 |
 | conformance suite | release 前必须运行并产出报告；第一版可先作为 release gate，CI 阻断按模块成熟度逐步打开 |
-| CLI 形态 | 第一版作为 gateway 二进制的 `mc-gateway plugin` 子命令；独立 `mc-gateway-plugin` 作为未来分发形态 |
+| CLI 形态 | 第一版作为 gateway 二进制的 `gateway plugin` 子命令；独立 `gateway-plugin` 作为未来分发形态 |
 | 插件服务启动模式 | 第一版固定 `in-process`；Admin 可预留 desired mode 配置，`go-plugin-process`/`sandbox-process` 未来生效且切换需要重启 |
 
 ### 准入和权限

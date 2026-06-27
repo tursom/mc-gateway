@@ -15,17 +15,184 @@ import (
 )
 
 func runPluginCLI(args []string) (bool, int) {
-	if len(args) < 2 || args[0] != "plugin" {
+	if len(args) < 1 || args[0] != "plugin" {
 		return false, 0
 	}
-	if len(args) < 3 {
-		fmt.Fprintln(os.Stderr, "usage: gateway plugin inspect|validate|compat|source-validate <artifact.mcgp> | source-build <source.mcgp> [out.mcgp]")
+	if len(args) < 2 {
+		printPluginCLIUsage()
 		return true, 2
 	}
 
-	command, packagePath := args[1], args[2]
+	command := args[1]
 	switch command {
+	case "init":
+		if err := runPluginInitCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "features":
+		if err := runPluginFeaturesCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "manifest":
+		if err := runPluginManifestCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "preflight":
+		if err := runPluginPreflightCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "self-test":
+		if err := runPluginSelfTestCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "benchmark":
+		if err := runPluginBenchmarkCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "status":
+		if err := runPluginRemoteStatusCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "upload":
+		if err := runPluginRemoteUploadCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "enable":
+		if err := runPluginRemoteDesiredCLI(args[2:], pluginmanager.DesiredEnabled); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "disable":
+		if err := runPluginRemoteActionCLI(args[2:], "disable"); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "delete":
+		if err := runPluginRemoteActionCLI(args[2:], "delete"); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "rollback":
+		if err := runPluginRemoteRollbackCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "config":
+		if err := runPluginRemoteConfigCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "secret":
+		if err := runPluginRemoteSecretCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "logs", "events", "metrics":
+		if err := runPluginRemoteOperationsSectionCLI(command, args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "diagnose":
+		if err := runPluginRemoteDiagnoseCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "task":
+		if err := runPluginRemoteTaskCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "data", "files":
+		if err := runPluginRemoteResourceCLI(command, args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "gc":
+		if err := runPluginRemoteGCCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "review":
+		if err := runPluginRemoteReviewCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "advisory":
+		if err := runPluginRemoteAdvisoryCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "repo":
+		if err := runPluginRemoteRepoCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "sbom", "verify":
+		if err := runPluginRemoteSupplyChainCLI(command, args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "runtime":
+		if err := runPluginRuntimeCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "schema", "contract", "conformance", "export", "import", "diff", "drift", "dr-drill", "sign":
+		if err := runPluginReservedCLI(command, args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "build":
+		if err := runPluginBuildCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "test":
+		if err := runPluginTestCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
 	case "inspect":
+		if len(args) < 3 {
+			printPluginCLIUsage()
+			return true, 2
+		}
+		packagePath := args[2]
 		manifest, err := readPackageManifest(packagePath)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -39,18 +206,11 @@ func runPluginCLI(args []string) (bool, int) {
 		}
 		return true, 0
 	case "validate", "compat":
-		tmpRoot, err := os.MkdirTemp("", "mcgp-cli-*")
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return true, 1
+		if len(args) < 3 {
+			printPluginCLIUsage()
+			return true, 2
 		}
-		defer os.RemoveAll(tmpRoot)
-		store := pluginmanager.NewArtifactStore(tmpRoot)
-		artifact, err := store.ValidateAndStore(pluginmanager.ArtifactUpload{
-			SourcePath: packagePath,
-			FileName:   filepath.Base(packagePath),
-			Actor:      "cli",
-		})
+		artifact, err := validatePluginPathForCLI(args[2], "")
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return true, 1
@@ -59,18 +219,11 @@ func runPluginCLI(args []string) (bool, int) {
 			artifact.PluginID, artifact.Version, artifact.SHA256, artifact.APIVersion, artifact.GoVersion, artifact.GOOS, artifact.GOARCH)
 		return true, 0
 	case "source-validate":
-		tmpRoot, err := os.MkdirTemp("", "mcgp-source-cli-*")
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return true, 1
+		if len(args) < 3 {
+			printPluginCLIUsage()
+			return true, 2
 		}
-		defer os.RemoveAll(tmpRoot)
-		store := pluginmanager.NewArtifactStore(tmpRoot)
-		source, err := store.ValidateAndStoreSource(pluginmanager.ArtifactUpload{
-			SourcePath: packagePath,
-			FileName:   filepath.Base(packagePath),
-			Actor:      "cli",
-		})
+		source, err := validatePluginPathForCLI(args[2], pluginmanager.ArtifactTypeSource)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return true, 1
@@ -79,6 +232,11 @@ func runPluginCLI(args []string) (bool, int) {
 			source.PluginID, source.Version, source.SHA256, source.APIVersion, source.GoVersion, source.GOOS, source.GOARCH)
 		return true, 0
 	case "source-build":
+		if len(args) < 3 {
+			printPluginCLIUsage()
+			return true, 2
+		}
+		packagePath := args[2]
 		outPath := ""
 		if len(args) >= 4 {
 			outPath = args[3]
@@ -95,6 +253,10 @@ func runPluginCLI(args []string) (bool, int) {
 		fmt.Fprintf(os.Stderr, "unknown plugin command %q\n", command)
 		return true, 2
 	}
+}
+
+func printPluginCLIUsage() {
+	fmt.Fprintln(os.Stderr, "usage: gateway plugin init|features|manifest|build|test|preflight|self-test|benchmark|status|upload|enable|disable|delete|rollback|config|secret|logs|events|metrics|diagnose|task|data|files|gc|review|advisory|repo|sbom|verify|runtime|inspect|validate|compat|source-validate|source-build ...")
 }
 
 func buildSourcePackageForCLI(packagePath, outPath string) (pluginmanager.BuildRecord, string, error) {

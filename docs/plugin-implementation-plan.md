@@ -2,6 +2,8 @@
 
 本文以 [plugin-system-design.md](plugin-system-design.md) 作为最终目标设计文档，把插件系统拆分成多个可上线的实现阶段。每个阶段都必须在结束时保持 gateway 当前可用：可以启动、可以回滚、可以排障，且不会要求后续阶段补齐后才能恢复基本能力。
 
+插件开发工具链作为跨阶段交付项单独设计，见 [plugin-development-toolchain-design.md](plugin-development-toolchain-design.md)。工具链主入口为 `gateway plugin init/build/test`，并需要从第一批 Go plugin 示例开始预留未来 runtime adapter。
+
 ## 拆分原则
 
 - 以可用的纵向切片拆分，而不是按数据库、API、UI、SDK 等横向模块拆分。
@@ -37,6 +39,7 @@
 | Minecraft capability manifest、protocol smoke fixture | 2 | 支撑管理页展示和后续发布门禁 |
 | source `.mcgp`、builder、构建 provenance | 3 | 源码包构建成 `plugin.so` 后复用阶段 1/2 加载路径 |
 | builder 隔离、Go/module/ABI 记录、source/build log GC | 3 | 构建失败不影响 active artifact |
+| `gateway plugin init/build/test` 开发工具链 | 1-3，后续扩展 | 阶段 1/2 提供 Go plugin 模板和 harness，阶段 3 收敛 source/binary 打包；后续 runtime 通过 adapter 接入 |
 | Admin 页面基础管理闭环 | 4 | 上传、构建状态、加载、启用、禁用、删除、回滚 |
 | 配置 schema、配置快照、配置迁移入口 | 4 | 错误配置不切换 active artifact |
 | SecretStore、secret version、reload/rotation 基础 | 4 | secret 不在页面、日志、审计中明文展示 |

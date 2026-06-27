@@ -8,7 +8,8 @@ return `api.ErrPass`.
 Build and package:
 
 ```sh
-./build.sh
+(cd ../../.. && go run ./cmd/gateway plugin test examples/plugins/upstream-rewrite --profile manifest)
+(cd ../../.. && go run ./cmd/gateway plugin build examples/plugins/upstream-rewrite --type both)
 ```
 
 The binary package is written to `dist/upstream-rewrite.mcgp`; the source
@@ -17,7 +18,7 @@ package is written to `dist/upstream-rewrite-source.mcgp`.
 Build the source package through the gateway builder:
 
 ```sh
-go run ../../../cmd/gateway plugin source-build dist/upstream-rewrite-source.mcgp dist/upstream-rewrite-built.mcgp
+(cd ../../.. && go run ./cmd/gateway plugin build --from-source examples/plugins/upstream-rewrite/dist/upstream-rewrite-source.mcgp --out examples/plugins/upstream-rewrite/dist/upstream-rewrite-built.mcgp)
 ```
 
 Example config JSON:
