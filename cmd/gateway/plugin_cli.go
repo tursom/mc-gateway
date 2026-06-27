@@ -206,11 +206,7 @@ func runPluginCLI(args []string) (bool, int) {
 		}
 		return true, 0
 	case "validate", "compat":
-		if len(args) < 3 {
-			printPluginCLIUsage()
-			return true, 2
-		}
-		artifact, err := validatePluginPathForCLI(args[2], "")
+		artifact, err := runPluginValidatePathCLI(args[2:], "")
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return true, 1
@@ -219,11 +215,7 @@ func runPluginCLI(args []string) (bool, int) {
 			artifact.PluginID, artifact.Version, artifact.SHA256, artifact.APIVersion, artifact.GoVersion, artifact.GOOS, artifact.GOARCH)
 		return true, 0
 	case "source-validate":
-		if len(args) < 3 {
-			printPluginCLIUsage()
-			return true, 2
-		}
-		source, err := validatePluginPathForCLI(args[2], pluginmanager.ArtifactTypeSource)
+		source, err := runPluginValidatePathCLI(args[2:], pluginmanager.ArtifactTypeSource)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return true, 1

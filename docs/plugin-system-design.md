@@ -20,7 +20,7 @@
 - 第一版继续使用 Go `-buildmode=plugin` 的进程内 `.so` 插件。
 - 尽量支持热加载：兼容且未加载过的插件可以不重启加载并启用。
 - 明确热卸载限制：Go plugin 不能真正从进程中卸载，只能逻辑禁用。
-- 通过 `manifest.json` 记录插件 ID、版本、目标平台、构建 Go 版本、SDK/API 版本、声明的 extension point 和配置 schema。
+- 通过 manifest source 记录插件 ID、版本、目标平台、构建 Go 版本、SDK/API 版本、声明的 extension point 和配置 schema；源码目录只维护一份 `manifest.yaml/yml/toml/jsonc/json`，`.mcgp` 包内统一物化为 canonical `manifest.json`。
 - 插件能力采用 Extension Point 模型，Hook 是其中一种；第一版先落 `upstream.connect/v1`。
 - `upstream.connect/v1` 必须支持插件返回自管 `net.Conn`，用于实现完整 stream endpoint/protocol proxy。
 - MC 正版/三方登录、身份映射、forwarding 和登录后的协议处理属于插件业务逻辑，不由 gateway core 拼装。
@@ -33,7 +33,7 @@
 | 决策/功能点 | 当前设计结论 | 阶段 | 主要章节 |
 | --- | --- | --- | --- |
 | 插件信任模型 | 第一版只支持可信 native 插件，不把普通插件当不可信代码运行 | 第一版 | Runtime 与权限声明、安全与运维约束 |
-| 插件包格式 | 管理页统一上传 `.mcgp` zip 包，源码/二进制由 `manifest.json` 的 `artifact_type` 决定 | 第一版 | 包格式、源码包构建 |
+| 插件包格式 | 管理页统一上传 `.mcgp` zip 包，源码/二进制由包内 canonical `manifest.json` 的 `artifact_type` 决定 | 第一版 | 包格式、源码包构建 |
 | 自定义扩展名 | 不新增源码包扩展名；同一 `.mcgp` 格式承载 binary/source | 第一版 | 包格式 |
 | Go plugin ABI | 仅使用 `.mcgp` 内的 `manifest.json` 表示元数据，并记录 Go/API/SDK/ABI fingerprint | 第一版 | Manifest 元数据、Go Plugin ABI Fingerprint |
 | Admin 管理 | 上传、构建、加载、启用、禁用、切换版本、删除、回滚和审计都进入 Admin/SQLite | 第一版 | 数据模型、生命周期、Admin API |
@@ -67,9 +67,9 @@
 | 管理页上传、构建、加载、启用/禁用、删除和切换版本 | 全部进入 Admin/SQLite 生命周期，删除已加载 native artifact 后提示重启彻底清理 | 数据模型、生命周期、Admin API、Admin 页面 |
 | 热加载尽量支持，热卸载承认 Go plugin 限制 | 兼容且未加载过 artifact 可热加载；已加载 Go plugin 只能逻辑禁用，不能真正卸载 | 生命周期、热加载和热卸载、Runbook |
 | 多进程模型实现进程级热卸载 | 预留 `go-plugin-process` runtime，主进程只做管理和 fd 编排，子进程负责数据面；通过退出子进程回收 Go plugin | Go Plugin Process Runtime、第一版默认策略 |
-| 插件包不新增源码扩展名 | 统一 `.mcgp` zip，源码/二进制由 `manifest.json.artifact_type` 声明 | 插件包格式 |
+| 插件包不新增源码扩展名 | 统一 `.mcgp` zip，源码/二进制由包内 `manifest.json.artifact_type` 声明 | 插件包格式 |
 | 支持源码包和构建环境设计 | source `.mcgp` 经受控 builder 生成 `plugin.so`；开发 local-process，生产推荐 container builder 或外部 CI | 源码包构建环境、供应链元数据 |
-| Manifest 元数据稳定并记录 Go 构建信息 | `manifest.json` 是唯一元数据来源，记录 Go/API/SDK/ABI fingerprint、builder 和 provenance | Manifest 元数据、Go Plugin ABI Fingerprint |
+| Manifest 元数据稳定并记录 Go 构建信息 | 作者只维护一个 manifest source；包内 canonical `manifest.json` 是服务端唯一可信元数据来源，记录 Go/API/SDK/ABI fingerprint、builder 和 provenance | Manifest 元数据、Go Plugin ABI Fingerprint |
 | Hook 之外的插件技术方案 | 统一 Extension Point 模型，覆盖 hook、middleware、provider、event subscriber、rule/policy；mock/mixin/monkey patch 不作为生产机制 | Extension Point 设计、Mock 和 Mixin 的定位 |
 | 沙箱功能要有未来路线 | 第一版不提供沙箱；预留 sandbox-process、WASM、capability enforcement、stream relay 和 egress 策略 | Sandbox Runtime、Runtime Adapter、第一版默认策略 |
 | Alibaba 非侵入 Go 注入的参考价值 | 作为官方/组织 build-time instrumentation 未来能力，不作为普通运行时插件或热加载机制 | Build-Time Instrumentation |
@@ -285,7 +285,7 @@
 
 ## 插件包格式
 
-管理页上传的插件包统一使用 `.mcgp`，本质是 zip 包。包内内容由 `manifest.json` 决定，不通过扩展名区分源码包和二进制包。
+管理页上传的插件包统一使用 `.mcgp`，本质是 zip 包。包内内容由 canonical `manifest.json` 决定，不通过扩展名区分源码包和二进制包。开发目录可以维护 `manifest.yaml`、`manifest.yml`、`manifest.toml`、`manifest.jsonc` 或 `manifest.json`，但构建进入 `.mcgp` 时必须统一物化为根目录 `manifest.json`。
 
 包类型由两个字段表达：
 
@@ -313,7 +313,7 @@ upstream-rewrite.mcgp
   README.md              # 可选
 ```
 
-`manifest.json` 是加载前可读取的元数据，用于避免必须执行插件代码才能知道基础信息。上传阶段只解析 zip 和 manifest，不执行插件代码。
+包内 `manifest.json` 是加载前可读取的可信元数据，用于避免必须执行插件代码才能知道基础信息。上传阶段只解析 zip 和 manifest，不执行插件代码。
 
 二进制包 manifest 示例：
 
@@ -459,7 +459,7 @@ upstream-rewrite.mcgp
 }
 ```
 
-二进制包上传后可以直接登记为 artifact。源码包上传后必须先进入 builder，构建出 `plugin.so` 后再登记为 artifact。加载阶段始终只加载最终产物 `plugin.so`；元数据以已校验入库的 `manifest.json` 为准。
+二进制包上传后可以直接登记为 artifact。源码包上传后必须先进入 builder，构建出 `plugin.so` 后再登记为 artifact。加载阶段始终只加载最终产物 `plugin.so`；元数据以已校验入库的包内 `manifest.json` 为准。
 
 开发环境可以允许直接上传 raw `.so`，但生产推荐只接受 `.mcgp`。直接上传 `.so` 时，加载前只能展示文件名、大小和 sha256；生产路径仍应使用 `.mcgp` 提供 `manifest.json`。
 
@@ -2009,7 +2009,7 @@ index 规则：
 
 ## Manifest 元数据
 
-插件包的元数据只来自 `.mcgp` 根目录的 `manifest.json`。上传、准入、构建、兼容性检查和 Admin 展示都必须使用这份静态 manifest；gateway 不通过执行插件代码读取元数据。
+插件包的元数据只来自 `.mcgp` 根目录的 canonical `manifest.json`。上传、准入、构建、兼容性检查和 Admin 展示都必须使用这份静态 manifest；gateway 不通过执行插件代码读取元数据。源码目录可以使用 YAML、TOML、JSONC 或 JSON 作为唯一 manifest source，但进入 `.mcgp` 前必须规范化为 `manifest.json`。
 
 Go plugin 只需要导出一个 factory 符号：
 
@@ -6370,10 +6370,10 @@ type Gateway interface {
 - `plugin/api` 稳定 API 文档。
 - `examples/plugins/upstream-rewrite` 最小模板。
 - `examples/plugins/mc-auth-proxy` protocol-proxy 模板。
-- manifest JSON schema。
+- manifest source 多格式解析和 canonical JSON schema。
 - 统一的 `gateway plugin init/build/test` 开发工具链。
 
-详细工具链设计见 [plugin-development-toolchain-design.md](plugin-development-toolchain-design.md)。工具链必须继续遵守 manifest-only 元数据约束：插件作者只维护 `manifest.json`，Go 代码中不再保存 `manifestJSON` 或等价重复元数据。
+详细工具链设计见 [plugin-development-toolchain-design.md](plugin-development-toolchain-design.md)。工具链必须继续遵守 manifest-only 元数据约束：插件作者只维护一个 manifest source 文件，Go 代码中不再保存 `manifestJSON` 或等价重复元数据；`.mcgp` 包内仍以 canonical `manifest.json` 作为服务端可信边界。
 
 ### CLI 工具
 
@@ -6427,7 +6427,7 @@ CLI 规则：
 本地开发流程：
 
 1. 从示例复制插件目录。
-2. 编写 `manifest.json`。
+2. 编写唯一 manifest source，默认是 `manifest.yaml`。
 3. 使用与 gateway 匹配的 Go toolchain。
 4. 运行 `gateway plugin build` 构建 `.mcgp`。
 5. 通过 Admin 上传。
@@ -7354,7 +7354,7 @@ examples/plugins/mc-status-motd/
 - 定义 `.mcgp` 静态校验规则、大小限制和 zip slip 防护。
 - 定义插件 ID、handler ID、task ID、secret name 和 extension point 命名规范。
 - 支持 `artifact_type=binary/source` 和 `runtime.type=go-plugin`。
-- 确认插件只需要导出 `Plugin` factory，元数据只来自 `manifest.json`。
+- 确认插件只需要导出 `Plugin` factory，包内元数据只来自 canonical `manifest.json`。
 - 定义 Go plugin ABI fingerprint schema、计算规则、compat diff 和开发模式 override 语义。
 - 在 `plugin/api` 中补齐 `APIVersion`、extension point metadata、`ErrPass` 等。
 - 把 upstream hook 收敛为 request struct。

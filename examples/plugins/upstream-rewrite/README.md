@@ -14,6 +14,8 @@ Build and package:
 
 The binary package is written to `dist/upstream-rewrite.mcgp`; the source
 package is written to `dist/upstream-rewrite-source.mcgp`.
+The source manifest is maintained as `manifest.yaml`; packaged `.mcgp` artifacts
+still contain canonical `manifest.json`.
 
 Build the source package through the gateway builder:
 

@@ -2,7 +2,7 @@
 
 本文定义插件开发工具链的功能需求和实现边界。目标是让插件作者从新建、开发、测试、打包到发布前检查都使用同一套 `gateway plugin` CLI，而不是在每个示例插件里维护重复脚本。
 
-本设计以 [plugin-system-design.md](plugin-system-design.md) 和 [plugin-implementation-plan.md](plugin-implementation-plan.md) 为上游约束。插件元数据只以 `manifest.json` 为准，Go 代码中不再维护 `manifestJSON` 或等价重复元数据。
+本设计以 [plugin-system-design.md](plugin-system-design.md) 和 [plugin-implementation-plan.md](plugin-implementation-plan.md) 为上游约束。插件作者只维护一个 manifest source 文件，支持 `manifest.yaml`、`manifest.yml`、`manifest.toml`、`manifest.jsonc` 或 `manifest.json`；`.mcgp` 包内仍统一物化为 `manifest.json`。Go 代码中不再维护 `manifestJSON` 或等价重复元数据。
 
 ## 目标
 
@@ -27,12 +27,12 @@
 | 决策 | 结论 |
 | --- | --- |
 | CLI 命名 | 直接扩展 `gateway plugin init/build/test`，不新增 `dev` 子命名空间 |
-| 元数据来源 | `manifest.json` 是唯一人工维护的插件元数据来源 |
+| 元数据来源 | 插件目录只允许一个人工维护的 manifest source；包内可信元数据统一为 canonical `manifest.json` |
 | 打包入口 | `gateway plugin build` 同时承担 build 和 package，不再要求插件目录自带 zip 脚本 |
 | 示例插件 | `upstream-rewrite` 和 `mc-auth-proxy` 迁移到标准 CLI，删除重复 `build.sh` 和 `render-manifest` 逻辑 |
 | runtime 扩展 | CLI 通过 runtime build/test adapter 分发逻辑，命令名不随 runtime 改变 |
 | 校验边界 | CLI 校验不能替代 gateway 服务端上传、构建、准入和 enable 校验 |
-| source manifest | 源码目录中的 `manifest.json` 是作者输入；artifact 包内的 `manifest.json` 是构建时物化结果，不作为第二份人工维护数据 |
+| source manifest | 源码目录中的 `manifest.yaml/yml/toml/jsonc/json` 是作者输入；artifact 包内的 `manifest.json` 是构建时物化结果，不作为第二份人工维护数据 |
 
 ## 命令总览
 
@@ -113,6 +113,7 @@ gateway plugin compat dist/my-plugin.mcgp
 - 不需要手写 zip 命令。
 - 不需要手写 `render-manifest`。
 - 不需要在 Go 代码中声明 manifest 元数据。
+- 默认模板生成 `manifest.yaml`；如需其它格式可使用 `gateway plugin init --manifest-format yaml|toml|jsonc|json`。
 
 ### 本地调试
 
@@ -198,7 +199,7 @@ promotion bundle 默认不包含 secret 明文、secret 密文和 runtime state�
 
 Go plugin 模板应至少生成：
 
-- `manifest.json`
+- `manifest.yaml`（默认；也支持 `manifest.yml`、`manifest.toml`、`manifest.jsonc`、`manifest.json`）
 - `go.mod`
 - `main.go`
 - `main_test.go`
@@ -206,7 +207,7 @@ Go plugin 模板应至少生成：
 - `testdata/config.json`
 - `testdata/fixtures/`，按模板放置 harness 输入
 
-生成的 `manifest.json` 只包含作者应该维护的字段。`go_version`、`go_os`、`go_arch` 等环境相关字段可以为空或使用文档化占位；`build` 时再物化到 artifact manifest。
+生成的 manifest source 只包含作者应该维护的字段。`go_version`、`go_os`、`go_arch` 等环境相关字段可以为空或使用文档化占位；`build` 时再物化到 artifact manifest。
 
 ## `gateway plugin build`
 
@@ -222,6 +223,8 @@ Go plugin 模板应至少生成：
 | `gateway plugin build . --type both` | 同时生成 binary 和 source `.mcgp` |
 | `gateway plugin build --from-source source.mcgp --out built.mcgp` | 使用 gateway builder 从 source 包生成 binary 包 |
 
+当源码目录内存在多个 `manifest.*` 文件，`build` 必须通过 `--manifest <path>` 显式选择源文件；同一规则也适用于 `test`、`validate`、`preflight`、`self-test`、`benchmark` 和 `manifest format`。
+
 推荐默认输出：
 
 - `dist/<plugin-id>.mcgp`
@@ -231,21 +234,23 @@ Go plugin 模板应至少生成：
 
 ### Manifest 物化规则
 
-源码目录中的 `manifest.json` 是唯一人工维护文件。`build` 可以在内存中生成 artifact manifest，并写入 `.mcgp` 包内：
+源码目录中只能存在一个 manifest source 文件。`build` 读取 `manifest.yaml/yml/toml/jsonc/json` 后在内存中生成 artifact manifest，并写入 `.mcgp` 包内的 canonical `manifest.json`：
 
 - `artifact_type` 按 `--type` 写为 `binary` 或 `source`。
 - binary 包写入 `runtime.entry=plugin.so`。
 - Go plugin binary 包写入实际 `go_version`、`go_os`、`go_arch`。
 - source 包写入 `build.type=go`、`build.entry`、`build.output`、`build.tags` 和 vendor 策略。
-- 构建 provenance、module summary、artifact sha256 等写入 build report 或服务端 build record，不要求回写源码目录的 `manifest.json`。
+- 构建 provenance、module summary、artifact sha256 等写入 build report 或服务端 build record，不要求回写源码目录的 manifest source。
 
-这保证源码仓库里没有第二份需要维护的 manifest，也避免 `manifest.json` 与 Go 代码常量不一致。
+这保证源码仓库里没有第二份需要维护的 manifest，也避免 manifest source 与 Go 代码常量不一致。
+
+如果目录中同时存在多个 `manifest.*` 文件，CLI 必须失败并要求传入 `--manifest <path>` 显式选择，避免不同格式的 manifest 分叉。`gateway plugin manifest format --canonical-json --type binary|source` 可查看最终写入对应 `.mcgp` 的规范 JSON；不传 `--type` 时使用 manifest source 中的 `artifact_type`，缺省按 binary 处理。`--write` 对 YAML/TOML/JSONC 必须保留注释，无法保留时不能覆盖源文件。
 
 ### Go Plugin Adapter
 
 第一版 `go-plugin` build adapter 负责：
 
-1. 读取并校验 `manifest.json`。
+1. 读取并校验唯一 manifest source，或通过 `--manifest` 指定的 manifest source。
 2. 运行 `go test ./...`，除非传入 `--skip-tests`。
 3. 用固定命令构建 `plugin.so`：`go build -buildmode=plugin -trimpath -buildvcs=false`。
 4. 用 `go tool nm` 校验 `Plugin` 符号。
@@ -324,7 +329,7 @@ type PluginBuildAdapter interface {
 
 `validate` 应支持三类输入：
 
-- `manifest.json`
+- manifest source 文件：`manifest.yaml`、`manifest.yml`、`manifest.toml`、`manifest.jsonc` 或 `manifest.json`
 - 插件源码目录
 - `.mcgp` artifact
 
@@ -457,7 +462,7 @@ CI 产物应至少保存：
 - README 使用 `gateway plugin build . --type both`。
 - README 使用 `gateway plugin test .`。
 - 删除或降级 `build.sh` 为兼容包装；最终不再作为主路径。
-- 删除 `cmd/render-manifest`，由 CLI 根据源码 `manifest.json` 生成 artifact manifest。
+- 删除 `cmd/render-manifest`，由 CLI 根据源码 manifest source 生成 artifact manifest。
 - 示例插件的测试 fixture 进入 `testdata/fixtures/`。
 - 示例插件进入 conformance suite；构建失败视为插件 API 回归。
 
@@ -483,6 +488,6 @@ CI 产物应至少保存：
 - 新建 `protocol-proxy` 模板后，能跑通 Minecraft handshake/login smoke fixture。
 - `upstream-rewrite` 和 `mc-auth-proxy` 示例插件使用标准 CLI 生成 binary/source `.mcgp`。
 - 生成的 `.mcgp` 能通过现有上传和服务端校验。
-- `manifest.json` 与 Go 代码不重复维护插件元数据。
+- manifest source 与 Go 代码不重复维护插件元数据。
 - Go plugin adapter 之外的 runtime 可以通过 adapter 注册进入同一套 `init/build/test` 命令。
 - CLI 失败输出能定位到字段、文件或 fixture，而不是只返回通用错误。

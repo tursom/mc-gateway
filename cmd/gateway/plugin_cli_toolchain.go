@@ -30,6 +30,7 @@ type pluginBuildCLIOptions struct {
 	BuildType  string
 	Out        string
 	FromSource string
+	Manifest   string
 	SkipTests  bool
 	Vendor     bool
 }
@@ -42,10 +43,12 @@ type pluginInitCLIOptions struct {
 	Runtime   string
 	Module    string
 	Extension string
+	Format    string
 }
 
 type pluginGovernanceCLIOptions struct {
 	Target              string
+	Manifest            string
 	ConfigPath          string
 	ConfigJSON          string
 	Profile             string
@@ -77,10 +80,11 @@ type pluginBuildRuntimeRequest struct {
 
 type pluginTestCLIOptions struct {
 	Target      string
+	Manifest    string
 	Profile     string
 	ConfigPath  string
 	FixturePath string
-	Manifest    pluginmanager.Manifest
+	Source      pluginmanager.Manifest
 }
 
 type cliStaticRuntimeAdapter struct{}
@@ -119,7 +123,7 @@ func (goPluginCLIAdapter) Test(ctx context.Context, opts pluginTestCLIOptions) e
 				return err
 			}
 		case "manifest":
-			if _, err := validatePluginDirectoryForCLI(opts.Target); err != nil {
+			if _, err := validatePluginDirectoryForCLI(opts.Target, opts.Manifest); err != nil {
 				return err
 			}
 		case "harness", "protocol-smoke", "conformance":
@@ -129,7 +133,7 @@ func (goPluginCLIAdapter) Test(ctx context.Context, opts pluginTestCLIOptions) e
 			if err := validateTestFileIfSet(opts.FixturePath, "fixture"); err != nil {
 				return err
 			}
-			if _, err := validatePluginDirectoryForCLI(opts.Target); err != nil {
+			if _, err := validatePluginDirectoryForCLI(opts.Target, opts.Manifest); err != nil {
 				return err
 			}
 		default:
@@ -281,12 +285,15 @@ func runPluginManifestCLI(args []string) error {
 }
 
 func runPluginManifestFormatCLI(args []string) error {
-	target := "manifest.json"
+	target := "."
+	manifestPath := ""
+	artifactType := ""
 	write := false
+	canonicalJSON := false
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if !strings.HasPrefix(arg, "--") {
-			if target != "manifest.json" {
+			if target != "." {
 				return fmt.Errorf("unexpected argument %q", arg)
 			}
 			target = arg
@@ -300,39 +307,68 @@ func runPluginManifestFormatCLI(args []string) error {
 		switch key {
 		case "write":
 			write = parsePluginBoolFlag(value)
+		case "canonical-json":
+			canonicalJSON = parsePluginBoolFlag(value)
+		case "manifest":
+			manifestPath = value
+		case "type":
+			artifactType = value
 		default:
 			return fmt.Errorf("unknown manifest format flag --%s", key)
 		}
 	}
-	manifestPath, err := resolveManifestPath(target)
+	if write && canonicalJSON {
+		return errors.New("--write and --canonical-json are mutually exclusive")
+	}
+	source, err := readPluginManifestSource(target, manifestPath)
 	if err != nil {
 		return err
 	}
-	data, err := os.ReadFile(manifestPath)
-	if err != nil {
-		return err
-	}
-	var raw map[string]any
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return fmt.Errorf("invalid manifest.json: %w", err)
-	}
-	formatted, err := json.MarshalIndent(raw, "", "  ")
-	if err != nil {
-		return err
-	}
-	formatted = append(formatted, '\n')
-	if write {
-		if bytes.Equal(data, formatted) {
-			fmt.Fprintf(os.Stdout, "ok manifest=%s unchanged\n", manifestPath)
-			return nil
+	if canonicalJSON {
+		if artifactType == "" {
+			artifactType = source.Manifest.ArtifactType
 		}
-		if err := os.WriteFile(manifestPath, formatted, 0644); err != nil {
+		if artifactType == "" {
+			artifactType = pluginmanager.ArtifactTypeBinary
+		}
+		switch artifactType {
+		case pluginmanager.ArtifactTypeBinary, pluginmanager.ArtifactTypeSource:
+		default:
+			return fmt.Errorf("unsupported --type %q", artifactType)
+		}
+		canonical, err := materializedManifestJSON(source.Raw, source.Manifest, artifactType, false)
+		if err != nil {
 			return err
 		}
-		fmt.Fprintf(os.Stdout, "ok manifest=%s formatted\n", manifestPath)
+		_, err = os.Stdout.Write(canonical)
+		return err
+	}
+	if artifactType != "" {
+		return errors.New("--type is only valid with --canonical-json")
+	}
+	if write {
+		if source.Format != manifestFormatJSON {
+			fmt.Fprintf(os.Stdout, "ok manifest=%s validated comments_preserved=true\n", source.Path)
+			return nil
+		}
+		if bytes.Equal(source.Data, source.CanonicalJSON) {
+			fmt.Fprintf(os.Stdout, "ok manifest=%s unchanged\n", source.Path)
+			return nil
+		}
+		if err := os.WriteFile(source.Path, source.CanonicalJSON, 0644); err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stdout, "ok manifest=%s formatted\n", source.Path)
 		return nil
 	}
-	_, err = os.Stdout.Write(formatted)
+	if source.Format == manifestFormatJSON {
+		_, err = os.Stdout.Write(source.CanonicalJSON)
+		return err
+	}
+	_, err = os.Stdout.Write(source.Data)
+	if err == nil && len(source.Data) > 0 && source.Data[len(source.Data)-1] != '\n' {
+		fmt.Fprintln(os.Stdout)
+	}
 	return err
 }
 
@@ -517,6 +553,7 @@ func runPluginInitCLI(args []string) error {
 		Template:  "upstream-dialer",
 		Runtime:   pluginmanager.RuntimeGoPlugin,
 		Extension: pluginmanager.ExtensionUpstreamConnect,
+		Format:    manifestFormatYAML,
 	}
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -545,6 +582,8 @@ func runPluginInitCLI(args []string) error {
 			opts.Module = value
 		case "extension":
 			opts.Extension = value
+		case "manifest-format":
+			opts.Format = value
 		default:
 			return fmt.Errorf("unknown init flag --%s", key)
 		}
@@ -560,6 +599,9 @@ func runPluginInitCLI(args []string) error {
 	}
 	if opts.Module == "" {
 		opts.Module = "example.com/" + opts.ID
+	}
+	if err := validateManifestTemplateFormat(opts.Format); err != nil {
+		return err
 	}
 	adapter, err := pluginCLIAdapterForRuntime(opts.Runtime)
 	if err != nil {
@@ -591,6 +633,8 @@ func runPluginBuildCLI(args []string) error {
 			opts.Out = value
 		case "from-source":
 			opts.FromSource = value
+		case "manifest":
+			opts.Manifest = value
 		case "skip-tests":
 			opts.SkipTests = parsePluginBoolFlag(value)
 		case "vendor":
@@ -613,12 +657,7 @@ func runPluginBuildCLI(args []string) error {
 	default:
 		return fmt.Errorf("unsupported build --type %q", opts.BuildType)
 	}
-	if !opts.SkipTests {
-		if err := runGoCommand(context.Background(), opts.Dir, "go", "test", "./..."); err != nil {
-			return err
-		}
-	}
-	manifest, raw, err := readPluginDirManifest(opts.Dir)
+	manifest, raw, err := readPluginDirManifest(opts.Dir, opts.Manifest)
 	if err != nil {
 		return err
 	}
@@ -626,13 +665,20 @@ func runPluginBuildCLI(args []string) error {
 	if err != nil {
 		return err
 	}
+	if !opts.SkipTests {
+		if err := runGoCommand(context.Background(), opts.Dir, "go", "test", "./..."); err != nil {
+			return err
+		}
+	}
 	outDir := opts.Out
-	if outDir == "" || strings.HasSuffix(outDir, string(os.PathSeparator)) {
+	if opts.BuildType == "both" {
 		if outDir == "" {
 			outDir = filepath.Join(opts.Dir, "dist")
 		}
-	} else if opts.BuildType == "both" {
-		return errors.New("--out must be a directory when --type both")
+	} else if outDir == "" || strings.HasSuffix(outDir, string(os.PathSeparator)) {
+		if outDir == "" {
+			outDir = filepath.Join(opts.Dir, "dist")
+		}
 	}
 	if opts.BuildType == "binary" || opts.BuildType == "both" {
 		outPath := opts.Out
@@ -678,6 +724,7 @@ func runPluginTestCLI(args []string) error {
 	profile := "unit,manifest"
 	configPath := ""
 	fixturePath := ""
+	manifestPath := ""
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if !strings.HasPrefix(arg, "--") {
@@ -699,6 +746,8 @@ func runPluginTestCLI(args []string) error {
 			configPath = value
 		case "fixture":
 			fixturePath = value
+		case "manifest":
+			manifestPath = value
 		default:
 			return fmt.Errorf("unknown test flag --%s", key)
 		}
@@ -725,7 +774,7 @@ func runPluginTestCLI(args []string) error {
 		fmt.Fprintf(os.Stdout, "ok test target=%s profile=%s\n", target, profile)
 		return nil
 	}
-	manifest, _, err := readPluginDirManifest(target)
+	manifest, _, err := readPluginDirManifest(target, manifestPath)
 	if err != nil {
 		return err
 	}
@@ -735,10 +784,11 @@ func runPluginTestCLI(args []string) error {
 	}
 	if err := adapter.Test(context.Background(), pluginTestCLIOptions{
 		Target:      target,
+		Manifest:    manifestPath,
 		Profile:     profile,
 		ConfigPath:  configPath,
 		FixturePath: fixturePath,
-		Manifest:    manifest,
+		Source:      manifest,
 	}); err != nil {
 		return err
 	}
@@ -767,6 +817,8 @@ func parseGovernanceCLIOptions(args []string) (pluginGovernanceCLIOptions, error
 		}
 		i += consumed
 		switch key {
+		case "manifest":
+			opts.Manifest = value
 		case "config":
 			opts.ConfigPath = value
 		case "config-json":
@@ -836,7 +888,7 @@ func prepareLocalGovernanceManager(opts pluginGovernanceCLIOptions) (*pluginmana
 		return nil, func() {}, pluginmanager.ArtifactRecord{}, "", err
 	}
 	if info.IsDir() {
-		manifest, raw, err := readPluginDirManifest(targetPath)
+		manifest, raw, err := readPluginDirManifest(targetPath, opts.Manifest)
 		if err != nil {
 			cleanup()
 			return nil, func() {}, pluginmanager.ArtifactRecord{}, "", err
@@ -925,13 +977,50 @@ func encodePluginCLIJSON(value any) error {
 	return encoder.Encode(value)
 }
 
+func runPluginValidatePathCLI(args []string, expectedArtifactType string) (pluginmanager.ArtifactRecord, error) {
+	if len(args) == 0 {
+		return pluginmanager.ArtifactRecord{}, errors.New("plugin validate requires a plugin directory, manifest source, or .mcgp artifact")
+	}
+	target := ""
+	manifestPath := ""
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if !strings.HasPrefix(arg, "--") {
+			if target != "" {
+				return pluginmanager.ArtifactRecord{}, fmt.Errorf("unexpected argument %q", arg)
+			}
+			target = arg
+			continue
+		}
+		key, value, consumed, err := parsePluginCLIFlag(args, i)
+		if err != nil {
+			return pluginmanager.ArtifactRecord{}, err
+		}
+		i += consumed
+		switch key {
+		case "manifest":
+			manifestPath = value
+		default:
+			return pluginmanager.ArtifactRecord{}, fmt.Errorf("unknown validate flag --%s", key)
+		}
+	}
+	if target == "" {
+		return pluginmanager.ArtifactRecord{}, errors.New("plugin validate requires a plugin directory, manifest source, or .mcgp artifact")
+	}
+	return validatePluginPathForCLIWithManifest(target, expectedArtifactType, manifestPath)
+}
+
 func validatePluginPathForCLI(targetPath, expectedArtifactType string) (pluginmanager.ArtifactRecord, error) {
+	return validatePluginPathForCLIWithManifest(targetPath, expectedArtifactType, "")
+}
+
+func validatePluginPathForCLIWithManifest(targetPath, expectedArtifactType, manifestPath string) (pluginmanager.ArtifactRecord, error) {
 	info, err := os.Stat(targetPath)
 	if err != nil {
 		return pluginmanager.ArtifactRecord{}, err
 	}
 	if info.IsDir() {
-		artifact, err := validatePluginDirectoryForCLI(targetPath)
+		artifact, err := validatePluginDirectoryForCLI(targetPath, manifestPath)
 		if err != nil {
 			return pluginmanager.ArtifactRecord{}, err
 		}
@@ -940,9 +1029,9 @@ func validatePluginPathForCLI(targetPath, expectedArtifactType string) (pluginma
 		}
 		return artifact, nil
 	}
-	if filepath.Base(targetPath) == "manifest.json" {
+	if isManifestSourceFile(targetPath) {
 		dir := filepath.Dir(targetPath)
-		artifact, err := validatePluginDirectoryForCLI(dir)
+		artifact, err := validatePluginDirectoryForCLI(dir, targetPath)
 		if err != nil {
 			return pluginmanager.ArtifactRecord{}, err
 		}
@@ -967,8 +1056,8 @@ func validatePluginPathForCLI(targetPath, expectedArtifactType string) (pluginma
 	return store.ValidateAndStore(upload)
 }
 
-func validatePluginDirectoryForCLI(dir string) (pluginmanager.ArtifactRecord, error) {
-	manifest, raw, err := readPluginDirManifest(dir)
+func validatePluginDirectoryForCLI(dir, manifestPath string) (pluginmanager.ArtifactRecord, error) {
+	manifest, raw, err := readPluginDirManifest(dir, manifestPath)
 	if err != nil {
 		return pluginmanager.ArtifactRecord{}, err
 	}
@@ -1041,12 +1130,12 @@ func writeGoPluginTemplate(ctx context.Context, opts pluginInitCLIOptions) error
 		return err
 	}
 	files := map[string]string{
-		"go.mod":               goModTemplate(opts.Module, repoRoot),
-		"main.go":              goPluginMainTemplate(opts),
-		"main_test.go":         goPluginTestTemplate(),
-		"README.md":            readmeTemplate(opts),
-		"manifest.json":        manifestTemplate(opts),
-		"testdata/config.json": configTemplate(opts.Template),
+		"go.mod":                               goModTemplate(opts.Module, repoRoot),
+		"main.go":                              goPluginMainTemplate(opts),
+		"main_test.go":                         goPluginTestTemplate(),
+		"README.md":                            readmeTemplate(opts),
+		manifestFileNameForFormat(opts.Format): manifestTemplate(opts),
+		"testdata/config.json":                 configTemplate(opts.Template),
 	}
 	for name, content := range files {
 		target := filepath.Join(opts.Dir, filepath.FromSlash(name))
@@ -1059,39 +1148,6 @@ func writeGoPluginTemplate(ctx context.Context, opts pluginInitCLIOptions) error
 	}
 	fmt.Fprintf(os.Stdout, "ok init plugin=%s template=%s dir=%s\n", opts.ID, opts.Template, opts.Dir)
 	return nil
-}
-
-func readPluginDirManifest(dir string) (pluginmanager.Manifest, map[string]any, error) {
-	data, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
-	if err != nil {
-		return pluginmanager.Manifest{}, nil, err
-	}
-	var manifest pluginmanager.Manifest
-	if err := json.Unmarshal(data, &manifest); err != nil {
-		return pluginmanager.Manifest{}, nil, fmt.Errorf("invalid manifest.json: %w", err)
-	}
-	var raw map[string]any
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return pluginmanager.Manifest{}, nil, fmt.Errorf("invalid manifest.json object: %w", err)
-	}
-	if manifest.ID == "" {
-		return pluginmanager.Manifest{}, nil, errors.New("manifest id is required")
-	}
-	return manifest, raw, nil
-}
-
-func resolveManifestPath(target string) (string, error) {
-	info, err := os.Stat(target)
-	if err != nil {
-		return "", err
-	}
-	if info.IsDir() {
-		return filepath.Join(target, "manifest.json"), nil
-	}
-	if filepath.Base(target) != "manifest.json" {
-		return "", fmt.Errorf("manifest path must be manifest.json or a plugin directory, got %q", target)
-	}
-	return target, nil
 }
 
 func materializedManifestJSON(raw map[string]any, manifest pluginmanager.Manifest, artifactType string, vendor bool) ([]byte, error) {
@@ -1267,7 +1323,7 @@ func collectSourcePackageFiles(dir, vendorDir string) ([]sourcePackageFile, erro
 			}
 			return nil
 		}
-		if rel == "manifest.json" {
+		if isManifestSourceFile(rel) {
 			return nil
 		}
 		if sourcePackageEntryAllowed(rel) {
@@ -1421,7 +1477,7 @@ func parsePluginCLIFlag(args []string, index int) (string, string, int, error) {
 
 func isPluginBoolFlag(name string) bool {
 	switch name {
-	case "skip-tests", "vendor", "json", "quiet", "dry-run", "write", "source", "full-desired":
+	case "skip-tests", "vendor", "json", "quiet", "dry-run", "write", "canonical-json", "source", "full-desired":
 		return true
 	default:
 		return false
@@ -1518,12 +1574,53 @@ replace github.com/tursom/mc-gateway => %s
 `, module, filepath.ToSlash(repoRoot))
 }
 
+func validateManifestTemplateFormat(format string) error {
+	switch format {
+	case manifestFormatYAML, "yml", manifestFormatTOML, manifestFormatJSONC, manifestFormatJSON:
+		return nil
+	default:
+		return fmt.Errorf("unsupported --manifest-format %q", format)
+	}
+}
+
+func manifestFileNameForFormat(format string) string {
+	switch format {
+	case manifestFormatJSON:
+		return "manifest.json"
+	case manifestFormatJSONC:
+		return "manifest.jsonc"
+	case manifestFormatTOML:
+		return "manifest.toml"
+	case "yml":
+		return "manifest.yml"
+	default:
+		return "manifest.yaml"
+	}
+}
+
 func manifestTemplate(opts pluginInitCLIOptions) string {
+	switch opts.Format {
+	case manifestFormatJSON:
+		return manifestSourceJSONTemplate(opts, false)
+	case manifestFormatJSONC:
+		return manifestSourceJSONTemplate(opts, true)
+	case manifestFormatTOML:
+		return manifestTOMLTemplate(opts)
+	default:
+		return manifestYAMLTemplate(opts)
+	}
+}
+
+func manifestSourceJSONTemplate(opts pluginInitCLIOptions, jsonc bool) string {
 	mode := pluginmanager.UpstreamModeDialer
 	if opts.Template == "protocol-proxy" {
 		mode = pluginmanager.UpstreamModeProtocolProxy
 	}
-	manifest := fmt.Sprintf(`{
+	prefix := ""
+	if jsonc {
+		prefix = "// Human-maintained plugin manifest. Build packages normalize this into manifest.json.\n"
+	}
+	manifest := fmt.Sprintf(`%s{
   "schema_version": "mc-gateway.plugin/v1",
   "id": %q,
   "name": %q,
@@ -1563,8 +1660,102 @@ func manifestTemplate(opts pluginInitCLIOptions) string {
     }
   }
 }
-`, opts.ID, opts.Name, opts.Name+" plugin.", opts.Extension, mode)
+`, prefix, opts.ID, opts.Name, opts.Name+" plugin.", opts.Extension, mode)
 	return manifest
+}
+
+func manifestYAMLTemplate(opts pluginInitCLIOptions) string {
+	mode := pluginmanager.UpstreamModeDialer
+	if opts.Template == "protocol-proxy" {
+		mode = pluginmanager.UpstreamModeProtocolProxy
+	}
+	return fmt.Sprintf(`# Human-maintained plugin manifest. Build packages normalize this into manifest.json.
+schema_version: mc-gateway.plugin/v1
+id: %q
+name: %q
+version: 0.1.0
+description: %q
+artifact_type: source
+runtime:
+  type: go-plugin
+  entry: plugin.so
+  entry_symbol: Plugin
+build:
+  type: go
+  entry: "."
+  output: plugin.so
+  tags: []
+  vendor_required: false
+api_version: plugin-api/v1
+sdk_module: github.com/tursom/mc-gateway/plugin/api
+sdk_module_version: v0.1.0
+extension_points:
+  - type: hook
+    key: %q
+capabilities:
+  upstream_connect:
+    mode: %q
+runtime_limits:
+  handler_timeout_ms: 3000
+  initial_write_timeout_ms: 1000
+config_schema:
+  type: object
+  properties:
+    match_host:
+      type: string
+    upstream:
+      type: string
+`, opts.ID, opts.Name, opts.Name+" plugin.", opts.Extension, mode)
+}
+
+func manifestTOMLTemplate(opts pluginInitCLIOptions) string {
+	mode := pluginmanager.UpstreamModeDialer
+	if opts.Template == "protocol-proxy" {
+		mode = pluginmanager.UpstreamModeProtocolProxy
+	}
+	return fmt.Sprintf(`# Human-maintained plugin manifest. Build packages normalize this into manifest.json.
+schema_version = "mc-gateway.plugin/v1"
+id = %q
+name = %q
+version = "0.1.0"
+description = %q
+artifact_type = "source"
+api_version = "plugin-api/v1"
+sdk_module = "github.com/tursom/mc-gateway/plugin/api"
+sdk_module_version = "v0.1.0"
+
+[runtime]
+type = "go-plugin"
+entry = "plugin.so"
+entry_symbol = "Plugin"
+
+[build]
+type = "go"
+entry = "."
+output = "plugin.so"
+tags = []
+vendor_required = false
+
+[[extension_points]]
+type = "hook"
+key = %q
+
+[capabilities.upstream_connect]
+mode = %q
+
+[runtime_limits]
+handler_timeout_ms = 3000
+initial_write_timeout_ms = 1000
+
+[config_schema]
+type = "object"
+
+[config_schema.properties.match_host]
+type = "string"
+
+[config_schema.properties.upstream]
+type = "string"
+`, opts.ID, opts.Name, opts.Name+" plugin.", opts.Extension, mode)
 }
 
 func goPluginMainTemplate(opts pluginInitCLIOptions) string {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -25,12 +26,15 @@ func TestPluginInitCreatesBuildableTemplate(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("runPluginCLI(init) code = %d, want 0", code)
 	}
-	for _, name := range []string{"manifest.json", "go.mod", "main.go", "main_test.go", "README.md", "testdata/config.json"} {
+	for _, name := range []string{"manifest.yaml", "go.mod", "main.go", "main_test.go", "README.md", "testdata/config.json"} {
 		if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(name))); err != nil {
 			t.Fatalf("generated file %s stat error = %v", name, err)
 		}
 	}
-	if _, err := validatePluginDirectoryForCLI(dir); err != nil {
+	if _, err := os.Stat(filepath.Join(dir, "manifest.json")); err == nil {
+		t.Fatal("plugin init generated manifest.json by default, want manifest.yaml")
+	}
+	if _, err := validatePluginDirectoryForCLI(dir, ""); err != nil {
 		t.Fatalf("validatePluginDirectoryForCLI() error = %v", err)
 	}
 }
@@ -63,6 +67,40 @@ func TestPluginBuildSourcePackagesTemplate(t *testing.T) {
 		t.Fatalf("validatePluginPathForCLI(source) error = %v", err)
 	}
 	assertZipContains(t, out, "manifest.json", "go.mod", "main.go", "main_test.go", "README.md", "testdata/config.json")
+	assertZipNotContains(t, out, "manifest.yaml")
+}
+
+func TestPluginBuildBothAcceptsOutDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "both-plugin")
+	handled, code := runPluginCLI([]string{
+		"plugin", "init", dir,
+		"--id", "both-plugin",
+		"--module", "example.com/both-plugin",
+	})
+	if !handled || code != 0 {
+		t.Fatalf("runPluginCLI(init) = (%v, %d), want handled code 0", handled, code)
+	}
+	outDir := filepath.Join(t.TempDir(), "packages")
+	handled, code = runPluginCLI([]string{
+		"plugin", "build", dir,
+		"--type", "both",
+		"--out", outDir,
+		"--skip-tests",
+		"--vendor=false",
+	})
+	if !handled || code != 0 {
+		t.Fatalf("runPluginCLI(build both) = (%v, %d), want handled code 0", handled, code)
+	}
+	binaryOut := filepath.Join(outDir, "both-plugin.mcgp")
+	sourceOut := filepath.Join(outDir, "both-plugin-source.mcgp")
+	if _, err := validatePluginPathForCLI(binaryOut, "binary"); err != nil {
+		t.Fatalf("validatePluginPathForCLI(binary) error = %v", err)
+	}
+	if _, err := validatePluginPathForCLI(sourceOut, "source"); err != nil {
+		t.Fatalf("validatePluginPathForCLI(source) error = %v", err)
+	}
+	assertZipNotContains(t, binaryOut, "manifest.yaml")
+	assertZipNotContains(t, sourceOut, "manifest.yaml")
 }
 
 func TestPluginTestManifestProfile(t *testing.T) {
@@ -107,6 +145,7 @@ func TestPluginManifestFormatWrite(t *testing.T) {
 		"plugin", "init", dir,
 		"--id", "format-plugin",
 		"--module", "example.com/format-plugin",
+		"--manifest-format", "json",
 	})
 	if !handled || code != 0 {
 		t.Fatalf("runPluginCLI(init) = (%v, %d), want handled code 0", handled, code)
@@ -128,6 +167,157 @@ func TestPluginManifestFormatWrite(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "\n  \"schema_version\"") {
 		t.Fatalf("manifest was not formatted:\n%s", data)
+	}
+}
+
+func TestPluginManifestSourceFormats(t *testing.T) {
+	for _, format := range []string{"yaml", "toml", "jsonc", "json"} {
+		t.Run(format, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "format-"+format)
+			handled, code := runPluginCLI([]string{
+				"plugin", "init", dir,
+				"--id", "format-" + format,
+				"--module", "example.com/format-" + format,
+				"--manifest-format", format,
+			})
+			if !handled || code != 0 {
+				t.Fatalf("runPluginCLI(init %s) = (%v, %d), want handled code 0", format, handled, code)
+			}
+			source, err := readPluginManifestSource(dir, "")
+			if err != nil {
+				t.Fatalf("readPluginManifestSource(%s) error = %v", format, err)
+			}
+			if source.Manifest.ID != "format-"+format {
+				t.Fatalf("manifest id = %q, want format-%s", source.Manifest.ID, format)
+			}
+			if !json.Valid(source.CanonicalJSON) {
+				t.Fatalf("canonical JSON for %s is invalid:\n%s", format, source.CanonicalJSON)
+			}
+			packaged, err := materializedManifestJSON(source.Raw, source.Manifest, "binary", false)
+			if err != nil {
+				t.Fatalf("materializedManifestJSON(%s) error = %v", format, err)
+			}
+			var raw map[string]any
+			if err := json.Unmarshal(packaged, &raw); err != nil {
+				t.Fatalf("Unmarshal(materialized %s) error = %v", format, err)
+			}
+			if raw["artifact_type"] != "binary" || raw["go_version"] == "" || raw["go_os"] == "" || raw["go_arch"] == "" {
+				t.Fatalf("materialized %s manifest missing package fields: %s", format, packaged)
+			}
+			handled, code = runPluginCLI([]string{"plugin", "validate", dir})
+			if !handled || code != 0 {
+				t.Fatalf("runPluginCLI(validate %s) = (%v, %d), want handled code 0", format, handled, code)
+			}
+			handled, code = runPluginCLI([]string{"plugin", "test", dir, "--profile", "manifest"})
+			if !handled || code != 0 {
+				t.Fatalf("runPluginCLI(test %s) = (%v, %d), want handled code 0", format, handled, code)
+			}
+		})
+	}
+}
+
+func TestPluginManifestFormatWritePreservesComments(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		file    string
+		content string
+		comment string
+	}{
+		{
+			name:    "yaml",
+			file:    "manifest.yaml",
+			content: "# keep yaml comment\n" + manifestYAMLTemplate(pluginInitCLIOptions{ID: "comment-yaml", Name: "Comment YAML", Extension: "upstream.connect/v1"}),
+			comment: "# keep yaml comment",
+		},
+		{
+			name:    "toml",
+			file:    "manifest.toml",
+			content: "# keep toml comment\n" + manifestTOMLTemplate(pluginInitCLIOptions{ID: "comment-toml", Name: "Comment TOML", Extension: "upstream.connect/v1"}),
+			comment: "# keep toml comment",
+		},
+		{
+			name: "jsonc",
+			file: "manifest.jsonc",
+			content: strings.Replace(
+				"// keep jsonc comment\n"+strings.TrimSuffix(manifestSourceJSONTemplate(pluginInitCLIOptions{ID: "comment-jsonc", Name: "Comment JSONC", Extension: "upstream.connect/v1"}, true), "\n"),
+				"\n  }\n}",
+				"\n  },\n}",
+				1,
+			),
+			comment: "// keep jsonc comment",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			manifestPath := filepath.Join(dir, tc.file)
+			if err := os.WriteFile(manifestPath, []byte(tc.content), 0644); err != nil {
+				t.Fatalf("WriteFile(%s) error = %v", tc.file, err)
+			}
+			before, err := readPluginManifestSource(dir, "")
+			if err != nil {
+				t.Fatalf("readPluginManifestSource(before) error = %v", err)
+			}
+			handled, code := runPluginCLI([]string{"plugin", "manifest", "format", dir, "--write"})
+			if !handled || code != 0 {
+				t.Fatalf("runPluginCLI(manifest format %s) = (%v, %d), want handled code 0", tc.name, handled, code)
+			}
+			data, err := os.ReadFile(manifestPath)
+			if err != nil {
+				t.Fatalf("ReadFile(%s) error = %v", tc.file, err)
+			}
+			if !strings.Contains(string(data), tc.comment) {
+				t.Fatalf("formatted %s lost comment:\n%s", tc.file, data)
+			}
+			after, err := readPluginManifestSource(dir, "")
+			if err != nil {
+				t.Fatalf("readPluginManifestSource(after) error = %v", err)
+			}
+			if !bytes.Equal(before.CanonicalJSON, after.CanonicalJSON) {
+				t.Fatalf("canonical JSON changed after format\nbefore=%s\nafter=%s", before.CanonicalJSON, after.CanonicalJSON)
+			}
+		})
+	}
+}
+
+func TestPluginManifestMultipleSourcesRequireExplicitManifest(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "multi-manifest")
+	handled, code := runPluginCLI([]string{
+		"plugin", "init", dir,
+		"--id", "multi-manifest",
+		"--module", "example.com/multi-manifest",
+	})
+	if !handled || code != 0 {
+		t.Fatalf("runPluginCLI(init) = (%v, %d), want handled code 0", handled, code)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(manifestSourceJSONTemplate(pluginInitCLIOptions{ID: "multi-manifest", Name: "Multi Manifest", Extension: "upstream.connect/v1"}, false)), 0644); err != nil {
+		t.Fatalf("WriteFile(manifest.json) error = %v", err)
+	}
+	handled, code = runPluginCLI([]string{"plugin", "validate", dir})
+	if !handled {
+		t.Fatal("runPluginCLI(validate) handled = false")
+	}
+	if code == 0 {
+		t.Fatal("runPluginCLI(validate) code = 0, want failure for multiple manifests")
+	}
+	handled, code = runPluginCLI([]string{"plugin", "validate", dir, "--manifest", "manifest.yaml"})
+	if !handled || code != 0 {
+		t.Fatalf("runPluginCLI(validate --manifest) = (%v, %d), want handled code 0", handled, code)
+	}
+	handled, code = runPluginCLI([]string{"plugin", "test", dir, "--profile", "manifest", "--manifest", "manifest.yaml"})
+	if !handled || code != 0 {
+		t.Fatalf("runPluginCLI(test --manifest) = (%v, %d), want handled code 0", handled, code)
+	}
+	out := filepath.Join(t.TempDir(), "multi-manifest-source.mcgp")
+	handled, code = runPluginCLI([]string{"plugin", "build", dir, "--type", "source", "--out", out, "--skip-tests", "--vendor=false", "--manifest", "manifest.yaml"})
+	if !handled || code != 0 {
+		t.Fatalf("runPluginCLI(build --manifest) = (%v, %d), want handled code 0", handled, code)
+	}
+	if _, err := validatePluginPathForCLI(out, "source"); err != nil {
+		t.Fatalf("validatePluginPathForCLI(source) error = %v", err)
+	}
+	handled, code = runPluginCLI([]string{"plugin", "manifest", "format", dir, "--manifest", "manifest.yaml", "--canonical-json", "--type", "source"})
+	if !handled || code != 0 {
+		t.Fatalf("runPluginCLI(manifest format --manifest --canonical-json) = (%v, %d), want handled code 0", handled, code)
 	}
 }
 
@@ -155,6 +345,7 @@ func TestPluginGovernanceCommands(t *testing.T) {
 		{"plugin", "preflight", artifact, "--config-json", `{"upstream":"127.0.0.1:25566"}`, "--profile", "dev"},
 		{"plugin", "self-test", artifact, "--profile", "dev"},
 		{"plugin", "benchmark", artifact, "--profile", "dev", "--benchmark-profile", "local-fast", "--p95-ms", "1", "--p99-ms", "2", "--error-rate", "0", "--baseline-diff", "0.1"},
+		{"plugin", "preflight", dir, "--manifest", "manifest.yaml", "--config-json", `{"upstream":"127.0.0.1:25566"}`, "--profile", "dev"},
 	} {
 		handled, code = runPluginCLI(tc)
 		if !handled {
@@ -336,6 +527,24 @@ func assertZipContains(t *testing.T, zipPath string, names ...string) {
 	for _, name := range names {
 		if !seen[name] {
 			t.Fatalf("zip %s missing entry %s; entries=%v", zipPath, name, seen)
+		}
+	}
+}
+
+func assertZipNotContains(t *testing.T, zipPath string, names ...string) {
+	t.Helper()
+	reader, err := zip.OpenReader(zipPath)
+	if err != nil {
+		t.Fatalf("OpenReader(%s) error = %v", zipPath, err)
+	}
+	defer reader.Close()
+	seen := make(map[string]bool, len(reader.File))
+	for _, file := range reader.File {
+		seen[file.Name] = true
+	}
+	for _, name := range names {
+		if seen[name] {
+			t.Fatalf("zip %s unexpectedly contains entry %s", zipPath, name)
 		}
 	}
 }

@@ -18,6 +18,8 @@ Build and package:
 
 The binary package is written to `dist/mc-auth-proxy.mcgp`; the source package
 is written to `dist/mc-auth-proxy-source.mcgp`.
+The source manifest is maintained as `manifest.yaml`; packaged `.mcgp` artifacts
+still contain canonical `manifest.json`.
 
 Build the source package through the gateway builder:
 

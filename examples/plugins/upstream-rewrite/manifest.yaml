@@ -1,0 +1,41 @@
+# Human-maintained plugin manifest. Build packages normalize this into manifest.json.
+schema_version: mc-gateway.plugin/v1
+id: upstream-rewrite
+name: Upstream Rewrite
+version: 0.1.0
+description: Rewrite selected upstream targets before dialing.
+artifact_type: binary
+runtime:
+  type: go-plugin
+  entry: plugin.so
+  entry_symbol: Plugin
+api_version: plugin-api/v1
+sdk_module: github.com/tursom/mc-gateway/plugin/api
+sdk_module_version: v0.1.0
+go_version: go1.24.4
+go_os: linux
+go_arch: amd64
+extension_points:
+  - type: hook
+    key: upstream.connect/v1
+capabilities:
+  extension_points:
+    - upstream.connect/v1
+  network:
+    outbound:
+      - tcp:*:*
+  filesystem:
+    read: []
+    write: []
+  env: []
+runtime_limits:
+  handler_timeout_ms: 3000
+config_schema:
+  type: object
+  properties:
+    match_host:
+      type: string
+    upstream:
+      type: string
+  required:
+    - upstream
