@@ -1,3 +1,5 @@
+// cmd/gateway/plugin_cli_manifest.go 实现插件包清单的查看、校验、特性列表和格式化命令。
+
 package main
 
 import (

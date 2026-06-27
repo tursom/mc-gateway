@@ -1,3 +1,5 @@
+// internal/pluginmanager/manager_test.go 包含用于约束 manager 行为的测试。
+
 package pluginmanager
 
 import (

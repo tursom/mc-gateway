@@ -1,3 +1,5 @@
+// internal/upstreamtarget/target.go 把上游目标字符串解析为传输协议和拨号地址。
+
 package upstreamtarget
 
 import "strings"

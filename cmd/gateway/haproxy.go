@@ -1,3 +1,5 @@
+// cmd/gateway/haproxy.go 为需要 HAProxy PROXY 头的上游 TCP 连接先写入代理头，再回放 Minecraft 流量。
+
 package main
 
 import (
@@ -45,7 +47,7 @@ func haProxyUpstream(source net.Conn, host string) net.Conn {
 		SourceAddr:        sourceAddr,
 		DestinationAddr:   target,
 	}
-	// After the connection was created write the proxy headers first
+	// 连接建立后先写入 PROXY 头，再转发 Minecraft 首包。
 	_, err = header.WriteTo(conn)
 	if err != nil {
 		log.Err(err).Msg("failed to write proxy header")

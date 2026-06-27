@@ -1,3 +1,5 @@
+// internal/pluginmanager/types.go 定义仓库、管理器、Admin API 和前端共用的插件管理数据模型。
+
 package pluginmanager
 
 import (

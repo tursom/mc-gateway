@@ -1,3 +1,5 @@
+// cmd/quic/main.go 提供独立的 QUIC 到 TCP 代理工具，用于测试或演示 QUIC 传输行为。
+
 package main
 
 import (
@@ -84,7 +86,7 @@ func handlerConn(conn net.Conn) {
 	log.Info().
 		Msg("QUIC stream opened")
 
-	// read and write stream data
+	// 读写 QUIC 流数据。
 
 	buf := make([]byte, 1024)
 	n, err := conn.Read(buf)

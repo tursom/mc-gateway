@@ -1,3 +1,5 @@
+// internal/adminhttp/api.go 构建隔离的进程内 Admin API 服务，供测试和包级消费者使用。
+
 package adminhttp
 
 import (

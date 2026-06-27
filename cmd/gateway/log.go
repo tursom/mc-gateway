@@ -1,3 +1,5 @@
+// cmd/gateway/log.go 配置网关日志、日志文件、日志级别和日志轮转钩子。
+
 package main
 
 import (

@@ -1,3 +1,5 @@
+// cmd/gateway/test_helpers_test.go 包含用于约束 test helpers 行为的测试。
+
 package main
 
 import (

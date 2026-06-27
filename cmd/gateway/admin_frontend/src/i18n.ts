@@ -1,3 +1,5 @@
+// cmd/gateway/admin_frontend/src/i18n.ts 保存嵌入式管理端翻译字典，并提供语言切换辅助方法。
+
 import { el } from "./dom.js";
 import { languageStorageKey, state } from "./state.js";
 

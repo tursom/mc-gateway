@@ -1,3 +1,5 @@
+// cmd/gateway/admin_metric_handlers.go 返回管理面板状态卡片使用的轻量运行时计数器。
+
 package main
 
 import (

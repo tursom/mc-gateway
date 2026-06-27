@@ -1,3 +1,5 @@
+// cmd/gateway/config.go 加载静态网关配置，并与管理数据库提供的运行态状态组合使用。
+
 package main
 
 import (

@@ -1,3 +1,5 @@
+// internal/adminaudit/audit_test.go 包含用于约束 audit 行为的测试。
+
 package adminaudit
 
 import (

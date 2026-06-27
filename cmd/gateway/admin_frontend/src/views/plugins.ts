@@ -1,3 +1,5 @@
+// cmd/gateway/admin_frontend/src/views/plugins.ts 渲染插件清单、插件详情、配置/密钥/治理动作和运维工具。
+
 import { api } from "../api.js";
 import { showAlert } from "../alerts.js";
 import { badge, el, escapeAttr, escapeHTML, getFormInput } from "../dom.js";
@@ -50,6 +52,8 @@ interface OperationsResponse {
 
 export async function loadPlugins(): Promise<void> {
   try {
+    // 插件页首屏依赖插件记录、制品、构建、插件服务模式和观测数据；
+    // 并行请求可以减少进入页面时的等待时间。
     const [data, artifacts, builds, service, instrumentation] = await Promise.all([
       api<PluginsResponse>("/plugins"),
       api<ArtifactsResponse>("/plugin-artifacts"),
@@ -64,6 +68,7 @@ export async function loadPlugins(): Promise<void> {
     state.pluginInstrumentation = instrumentation.instrumentation || [];
     const firstPlugin = state.plugins[0];
     if (!state.selectedPluginID && firstPlugin) {
+      // 初次进入时默认选中第一个已纳管插件；未纳管制品会在列表中单独展示。
       state.selectedPluginID = firstPlugin.id;
     }
     renderPlugins();
@@ -79,6 +84,7 @@ export async function loadPlugins(): Promise<void> {
 
 export function renderPlugins(): void {
   const managed = new Set(state.plugins.map((plugin) => plugin.id));
+  // 未纳管制品还没有 plugins 表记录，但仍要展示，方便管理员创建期望状态。
   const unmanagedArtifacts = state.pluginArtifacts.filter((artifact) => !managed.has(artifact.plugin_id));
   renderPluginServicePanel();
   el("pluginsBody").innerHTML = state.plugins.map((plugin) => `
@@ -136,6 +142,7 @@ export async function loadPluginDetail(pluginID: string): Promise<void> {
   try {
     const data = await api<PluginResponse>(`/plugins/${encodeURIComponent(pluginID)}`);
     if (data.plugin) {
+      // 详情接口返回完整插件视图，用它回填列表中的摘要记录。
       state.plugins = state.plugins.map((plugin) => plugin.id === data.plugin?.id ? data.plugin : plugin);
       if (!state.plugins.some((plugin) => plugin.id === data.plugin?.id)) {
         state.plugins.push(data.plugin);
@@ -152,11 +159,13 @@ export async function loadPluginDetail(pluginID: string): Promise<void> {
 export function renderPluginDetail(plugin: PluginView | null = selectedPlugin()): void {
   const detail = el("pluginDetail");
   if (!plugin) {
+    // 没有选中纳管插件时展示制品库存和源码构建入口。
     detail.innerHTML = uploadInventoryDetail();
     bindInventoryEvents();
     return;
   }
   const canWrite = isAdmin();
+  // 插件详情拆成多个小面板，避免配置、治理、构建和运维信息混成一个长表格。
   detail.innerHTML = `
     <div class="detail-header">
       <div>
@@ -252,6 +261,7 @@ export function renderPluginDetail(plugin: PluginView | null = selectedPlugin())
 }
 
 export function bindPluginEvents(): void {
+  // 顶层插件页事件只绑定一次；详情区会在每次重绘后重新绑定动态按钮。
   el<HTMLInputElement>("pluginUploadInput").addEventListener("change", uploadPluginPackage);
   el<HTMLButtonElement>("refreshPluginsBtn").addEventListener("click", loadPlugins);
 }
@@ -263,6 +273,7 @@ function renderPluginServicePanel(): void {
   }
   const service = state.pluginService?.service;
   const canWrite = isAdmin();
+  // 插件服务模式决定插件在进程内运行还是进入未来的独立/沙箱运行模式。
   container.innerHTML = `
     <section class="panel">
       <div class="detail-header compact">
@@ -305,6 +316,7 @@ async function updatePluginServiceMode(event: Event): Promise<void> {
   event.preventDefault();
   const form = event.currentTarget as HTMLFormElement;
   try {
+    // 服务模式变更可能需要后端迁移或重启，因此保存后立即刷新插件页状态。
     await api("/plugin-service", {
       method: "PUT",
       body: { desired_mode: getFormInput(form, "desired_mode") },
@@ -342,6 +354,7 @@ async function uploadPluginPackage(event: Event): Promise<void> {
   const formData = new FormData();
   formData.set("artifact", file);
   try {
+    // 浏览器只负责上传文件；manifest 校验、哈希和制品类型判断由后端完成。
     await api("/plugin-artifacts", { method: "POST", formData });
     input.value = "";
     await loadPlugins();
@@ -352,6 +365,7 @@ async function uploadPluginPackage(event: Event): Promise<void> {
 }
 
 function bindPluginDetailEvents(plugin: PluginView): void {
+  // 详情区每次重绘都会替换 DOM，因此按钮事件必须在重绘后重新绑定。
   document.getElementById("pluginDryRunBtn")?.addEventListener("click", () => dryRunConfig(plugin));
   document.getElementById("pluginSaveConfigBtn")?.addEventListener("click", () => saveConfig(plugin));
   const secretForm = document.getElementById("pluginSecretForm");
@@ -389,6 +403,7 @@ function bindPluginDetailEvents(plugin: PluginView): void {
 
 async function dryRunConfig(plugin: PluginView): Promise<void> {
   try {
+    // dry-run 不保存配置，只返回脱敏后的校验结果、diff 和是否需要重启。
     const data = await api<DryRunResponse>(`/plugins/${encodeURIComponent(plugin.id)}/config/dry-run`, {
       method: "POST",
       body: {
@@ -405,6 +420,7 @@ async function dryRunConfig(plugin: PluginView): Promise<void> {
 
 async function saveConfig(plugin: PluginView): Promise<void> {
   try {
+    // 配置保存写入期望状态；后端会根据当前制品和运行态判断是否可热加载。
     await api(`/plugins/${encodeURIComponent(plugin.id)}/config`, {
       method: "PUT",
       body: {
@@ -425,6 +441,7 @@ async function saveSecret(event: SubmitEvent, plugin: PluginView): Promise<void>
   event.preventDefault();
   const form = event.currentTarget as HTMLFormElement;
   try {
+    // 密钥值不回显，保存后通过重新加载详情刷新版本号和 reload 标记。
     await api(`/plugins/${encodeURIComponent(plugin.id)}/secrets`, {
       method: "POST",
       body: {
@@ -448,6 +465,7 @@ async function runPluginAction(pluginID: string, action: string): Promise<void> 
     return;
   }
   try {
+    // enable/disable/load/delete 等动作都走统一动作接口，后端负责审计和操作日志。
     await api(`/plugins/${encodeURIComponent(pluginID)}/${action}`, { method: "POST", body: {} });
     if (action === "delete") {
       state.selectedPluginID = "";
@@ -463,6 +481,7 @@ async function runPluginAction(pluginID: string, action: string): Promise<void> 
 
 async function createDesiredFromArtifact(artifact: PluginArtifact): Promise<void> {
   try {
+    // 从未纳管制品创建 disabled 期望状态，管理员随后可以编辑配置再启用。
     await api(`/plugins/${encodeURIComponent(artifact.plugin_id)}`, {
       method: "PUT",
       body: {
@@ -483,6 +502,7 @@ async function createDesiredFromArtifact(artifact: PluginArtifact): Promise<void
 
 async function rollbackArtifact(pluginID: string, artifactID: string): Promise<void> {
   try {
+    // 制品回滚只改期望制品；后端仍会执行治理检查和配置 dry-run。
     await api(`/plugins/${encodeURIComponent(pluginID)}/rollback/artifact`, {
       method: "POST",
       body: { artifact_id: artifactID },
@@ -499,6 +519,7 @@ async function runBuildAction(pluginID: string, buildID: number, action: string)
     return;
   }
   try {
+    // 构建动作可能耗时，当前界面以刷新详情的方式展示最新构建状态。
     await api(`/plugin-builds/${buildID}/${encodeURIComponent(action)}`, { method: "POST", body: {} });
     await loadPluginDetail(pluginID);
     showAlert("");
@@ -512,6 +533,7 @@ async function rollbackSnapshot(pluginID: string, snapshotID: number, fullDesire
     return;
   }
   try {
+    // 配置快照回滚可只恢复配置，也可连同 artifact/desired state/priority 一起恢复。
     await api(`/plugins/${encodeURIComponent(pluginID)}/rollback/config`, {
       method: "POST",
       body: { snapshot_id: snapshotID, full_desired: fullDesired },
@@ -528,6 +550,7 @@ async function showSnapshotDiff(pluginID: string, snapshotID: number): Promise<v
     return;
   }
   try {
+    // diff 已由后端脱敏，前端只负责展示结果给管理员确认。
     const data = await api<SnapshotDiffResponse>(`/plugins/${encodeURIComponent(pluginID)}/config/snapshots/${snapshotID}/diff`);
     el("pluginDryRunResult").textContent = formatJSON(data.diff || {});
     showAlert("");
@@ -538,6 +561,7 @@ async function showSnapshotDiff(pluginID: string, snapshotID: number): Promise<v
 
 async function createGovernanceReview(plugin: PluginView): Promise<void> {
   try {
+    // 评审记录绑定当前 desired artifact 和配置哈希，用于后续启用或回滚门禁。
     await api(`/plugins/${encodeURIComponent(plugin.id)}/governance/review`, {
       method: "POST",
       body: { artifact_id: plugin.desired_artifact_id, profile: "prod", decision: "approved" },
@@ -555,6 +579,7 @@ async function createGovernanceOverride(plugin: PluginView): Promise<void> {
     return;
   }
   try {
+    // override 是带 TTL 的临时治理豁免，必须记录人工原因。
     await api(`/plugins/${encodeURIComponent(plugin.id)}/governance/override`, {
       method: "POST",
       body: { artifact_id: plugin.desired_artifact_id, profile: "prod", action: "enable", reason, ttl_seconds: 3600 },
@@ -568,6 +593,7 @@ async function createGovernanceOverride(plugin: PluginView): Promise<void> {
 
 async function runGovernancePreflight(plugin: PluginView): Promise<void> {
   try {
+    // preflight 由插件或宿主返回检查项，结果会持久化到治理面板。
     const data = await api<Record<string, unknown>>(`/plugins/${encodeURIComponent(plugin.id)}/governance/preflight`, {
       method: "POST",
       body: { artifact_id: plugin.desired_artifact_id, config_json: configEditorValue() },
@@ -582,6 +608,7 @@ async function runGovernancePreflight(plugin: PluginView): Promise<void> {
 
 async function runGovernanceSelfTest(plugin: PluginView): Promise<void> {
   try {
+    // self-test 用于验证制品自身能力，不直接修改 desired state。
     const data = await api<Record<string, unknown>>(`/plugins/${encodeURIComponent(plugin.id)}/governance/self-test`, {
       method: "POST",
       body: { artifact_id: plugin.desired_artifact_id },
@@ -600,6 +627,7 @@ async function recordGovernanceBenchmark(plugin: PluginView): Promise<void> {
     return;
   }
   try {
+    // 手动录入基准差异用于治理门禁判断，避免高风险性能回退直接启用。
     await api(`/plugins/${encodeURIComponent(plugin.id)}/governance/benchmark`, {
       method: "POST",
       body: {
@@ -630,6 +658,7 @@ async function createArtifactRevokeAdvisory(plugin: PluginView): Promise<void> {
     return;
   }
   try {
+    // 撤销公告会让命中的制品进入隔离/阻断路径，详情刷新后展示最新治理状态。
     await api("/plugin-advisories", {
       method: "POST",
       body: {
@@ -649,6 +678,7 @@ async function createArtifactRevokeAdvisory(plugin: PluginView): Promise<void> {
 
 async function loadPluginOperations(plugin: PluginView): Promise<void> {
   try {
+    // 运维快照包含事件、日志、trace、任务、外部依赖和 GC 候选项，按需刷新即可。
     const data = await api<OperationsResponse>(`/plugins/${encodeURIComponent(plugin.id)}/operations`);
     el("pluginOperationsOutput").textContent = formatJSON(data.operations || {});
     showAlert("");
@@ -659,6 +689,7 @@ async function loadPluginOperations(plugin: PluginView): Promise<void> {
 
 async function dryRunOperationsGC(plugin: PluginView): Promise<void> {
   try {
+    // GC dry-run 不删除文件，只展示哪些运行态数据会被保护或清理。
     const data = await api<OperationsResponse>(`/plugins/${encodeURIComponent(plugin.id)}/operations/gc`);
     el("pluginOperationsOutput").textContent = formatJSON(data);
     showAlert("");
@@ -669,6 +700,7 @@ async function dryRunOperationsGC(plugin: PluginView): Promise<void> {
 
 async function loadDiagnosticPackage(plugin: PluginView): Promise<void> {
   try {
+    // 诊断包由后端生成并脱敏，前端以 JSON 文本形式展示给管理员。
     const data = await api<OperationsResponse>(`/plugins/${encodeURIComponent(plugin.id)}/operations/diagnostic`);
     el("pluginOperationsOutput").textContent = formatJSON(data);
     showAlert("");
@@ -678,6 +710,7 @@ async function loadDiagnosticPackage(plugin: PluginView): Promise<void> {
 }
 
 function uploadInventoryDetail(): string {
+  // 库存视图聚合未纳管制品和构建记录，支撑上传、构建、纳管的完整流程。
   const artifact = selectedArtifact();
   if (!artifact) {
     return `
@@ -732,6 +765,7 @@ function uploadInventoryDetail(): string {
 }
 
 function bindInventoryEvents(): void {
+  // 库存视图也是动态渲染，制品详情和纳管表单事件需要在渲染后绑定。
   const artifact = selectedArtifact();
   const form = document.getElementById("artifactDesiredForm");
   if (artifact && form instanceof HTMLFormElement) {

@@ -1,3 +1,5 @@
+// cmd/gateway/admin_frontend/src/dom.ts 集中 DOM 辅助方法，包括查询、转义、徽标、去抖和表单取值。
+
 export function el<T extends HTMLElement = HTMLElement>(id: string): T {
   const node = document.getElementById(id);
   if (!node) {

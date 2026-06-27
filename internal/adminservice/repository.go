@@ -1,3 +1,5 @@
+// internal/adminservice/repository.go 把监听服务记录和选项保存到 SQLite，供管理端驱动配置。
+
 package adminservice
 
 import (
@@ -8,7 +10,8 @@ import (
 )
 
 type Repository struct {
-	db  *sql.DB
+	db *sql.DB
+	// now 可由测试注入，保证更新时间断言稳定。
 	now func() time.Time
 }
 
@@ -30,6 +33,7 @@ func NewRepositoryWithClock(db *sql.DB, now func() time.Time) Repository {
 func (r Repository) EnsureDefaults(ctx context.Context, tcpAdminPort int) error {
 	now := r.now().Unix()
 	for _, service := range DefaultRecords(tcpAdminPort) {
+		// 默认服务只在缺失时插入，避免覆盖管理员已经保存的运行态配置。
 		options, err := json.Marshal(service.Options)
 		if err != nil {
 			return err
@@ -47,6 +51,7 @@ ON CONFLICT(name) DO NOTHING`,
 }
 
 func (r Repository) List(ctx context.Context) ([]Record, error) {
+	// 固定排序让管理端列表稳定展示：核心入口在前，可选传输在后。
 	rows, err := r.db.QueryContext(ctx, `
 SELECT name, enabled, port, options_json, restart_required, created_at, updated_at, updated_by
 FROM services
@@ -83,6 +88,7 @@ func (r Repository) Update(ctx context.Context, actor, name string, enabled bool
 		return err
 	}
 
+	// 服务配置变更只标记 restart_required；当前进程不会在请求中间重启监听器。
 	optionsJSON, err := json.Marshal(NormalizeOptions(name, options))
 	if err != nil {
 		return err

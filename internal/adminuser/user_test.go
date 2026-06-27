@@ -1,3 +1,5 @@
+// internal/adminuser/user_test.go 包含用于约束 user 行为的测试。
+
 package adminuser
 
 import (

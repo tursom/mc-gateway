@@ -1,3 +1,5 @@
+// internal/pluginmanager/repository.go 持久化插件制品、插件记录、快照、构建、密钥、评审、公告和操作日志。
+
 package pluginmanager
 
 import (

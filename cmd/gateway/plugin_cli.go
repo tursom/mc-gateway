@@ -1,3 +1,5 @@
+// cmd/gateway/plugin_cli.go 分发插件相关子命令，包括本地脚手架、构建、清单和远程管理操作。
+
 package main
 
 import (

@@ -1,3 +1,5 @@
+// internal/pluginmanager/builder.go 把源码插件包构建为网关可加载制品，并记录构建元数据。
+
 package pluginmanager
 
 import (

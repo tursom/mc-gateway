@@ -1,3 +1,5 @@
+// plugin/api/api_test.go 包含用于约束 api 行为的测试。
+
 package api
 
 import (

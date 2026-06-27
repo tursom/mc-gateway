@@ -1,3 +1,5 @@
+// internal/pluginmanager/future.go 建模未来运行时和分发能力，但不把它们接入当前热路径。
+
 package pluginmanager
 
 import (

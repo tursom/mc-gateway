@@ -1,3 +1,5 @@
+// internal/adminhttp/http.go 提供 Admin API 处理器共用的 JSON、路径片段和来源 IP 辅助方法。
+
 package adminhttp
 
 import (

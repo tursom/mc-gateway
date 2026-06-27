@@ -1,3 +1,5 @@
+// internal/adminservice/service_test.go 包含用于约束 service 行为的测试。
+
 package adminservice
 
 import (

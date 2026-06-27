@@ -1,3 +1,5 @@
+// internal/pluginmanager/governance_test.go 包含用于约束 governance 行为的测试。
+
 package pluginmanager
 
 import (

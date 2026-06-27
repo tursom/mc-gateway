@@ -1,3 +1,5 @@
+// cmd/gateway/admin_static.go 嵌入构建后的管理前端，并通过网关 HTTP 处理器对外提供。
+
 package main
 
 import (

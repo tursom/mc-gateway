@@ -1,3 +1,5 @@
+# compose.yaml 定义偏生产形态的网关容器、数据卷、端口和避开代理干扰的健康检查。
+
 services:
   mc-gateway:
     image: ${MC_GATEWAY_IMAGE:-ghcr.io/tursom/mc-gateway:latest}

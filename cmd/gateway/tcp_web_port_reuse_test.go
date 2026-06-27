@@ -1,3 +1,5 @@
+// cmd/gateway/tcp_web_port_reuse_test.go 包含用于约束 tcp web port reuse 行为的测试。
+
 package main
 
 import (

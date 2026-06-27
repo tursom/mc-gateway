@@ -1,4 +1,6 @@
 #!/usr/bin/env sh
+# examples/plugins/upstream-rewrite/build.sh 是示例插件代码，用于演示托管插件接入方式。
+
 set -eu
 
 repo_root=$(cd ../../.. && pwd)

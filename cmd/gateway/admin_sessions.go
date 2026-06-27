@@ -1,3 +1,5 @@
+// cmd/gateway/admin_sessions.go 提供 Admin API 认证中间件使用的内存会话管理器。
+
 package main
 
 import (

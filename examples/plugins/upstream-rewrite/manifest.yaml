@@ -1,4 +1,6 @@
-# Human-maintained plugin manifest. Build packages normalize this into manifest.json.
+# examples/plugins/upstream-rewrite/manifest.yaml 是示例插件代码，用于演示托管插件接入方式。
+
+# 人工维护的插件清单；构建插件包时会规范化为 manifest.json。
 schema_version: mc-gateway.plugin/v1
 id: upstream-rewrite
 name: Upstream Rewrite

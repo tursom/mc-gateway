@@ -1,3 +1,5 @@
+// internal/gatewaymetrics/metrics_test.go 包含用于约束 metrics 行为的测试。
+
 package gatewaymetrics
 
 import "testing"

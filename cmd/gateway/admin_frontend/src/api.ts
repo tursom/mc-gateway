@@ -1,3 +1,5 @@
+// cmd/gateway/admin_frontend/src/api.ts 封装 fetch，统一处理 Admin API 前缀、令牌、JSON 编码和错误返回。
+
 import { state } from "./state.js";
 
 interface APIOptions {

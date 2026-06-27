@@ -1,3 +1,5 @@
+// cmd/gateway/websocket.go 把 WebSocket 会话适配为 net.Conn，让浏览器客户端复用网关请求路径。
+
 package main
 
 import (
@@ -14,7 +16,7 @@ import (
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
-		// 允许所有来源的连接（生产环境中应该更严格）
+		// 当前网关把 WebSocket 当作传输层入口，先允许所有来源；生产暴露时应在反向代理层收紧来源。
 		return true
 	},
 }
@@ -38,12 +40,14 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close()
 
 	gatewayMetrics.WebSocketConnectionStarted()
+	// WebSocket 连接包装为 net.Conn 后进入同一个 handleRequest，复用插件、路由和转发逻辑。
 	handleRequest(&webSocketConn{Conn: conn})
 }
 
 func (w *webSocketConn) Read(b []byte) (n int, err error) {
 	for {
 		if w.reader != nil {
+			// 当前消息帧没读完前持续从同一个 reader 读取，模拟流式 net.Conn。
 			n, err = w.reader.Read(b)
 			if errors.Is(err, io.EOF) {
 				w.reader = nil
@@ -60,6 +64,7 @@ func (w *webSocketConn) Read(b []byte) (n int, err error) {
 			return 0, err
 		}
 		if messageType != websocket.BinaryMessage && messageType != websocket.TextMessage {
+			// 控制帧不进入 Minecraft 协议流。
 			continue
 		}
 		w.reader = reader
@@ -67,6 +72,7 @@ func (w *webSocketConn) Read(b []byte) (n int, err error) {
 }
 
 func (w *webSocketConn) Write(b []byte) (n int, err error) {
+	// 每次 Write 输出一个二进制 WebSocket 消息，保持与 Minecraft packet 边界无关的字节流语义。
 	writer, err := w.NextWriter(websocket.BinaryMessage)
 	if err != nil {
 		return 0, err
@@ -96,6 +102,7 @@ func (w *webSocketConn) SetDeadline(t time.Time) error {
 
 func newWebSocketHandler() http.Handler {
 	mux := http.NewServeMux()
+	// 路径来自运行态服务配置，允许管理端把 WebSocket 入口挂到子路径。
 	mux.HandleFunc(normalizedWebSocketPath(), handleWebSocket)
 	return mux
 }

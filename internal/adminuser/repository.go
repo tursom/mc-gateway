@@ -1,3 +1,5 @@
+// internal/adminuser/repository.go 在 SQLite 中保存管理用户和密码哈希，并支持角色与禁用状态筛选。
+
 package adminuser
 
 import (

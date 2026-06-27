@@ -1,3 +1,5 @@
+// internal/adminservice/service.go 在原始服务仓库之上应用服务校验、默认值和更新语义。
+
 package adminservice
 
 import (
@@ -36,6 +38,8 @@ type Record struct {
 	Running         bool           `json:"running"`
 }
 
+// DefaultRecords 给新数据库写入可管理的监听服务。只有 TCP/Admin 默认启用，
+// 其他传输保留配置但不自动开放端口。
 func DefaultRecords(tcpAdminPort int) []Record {
 	return []Record{
 		{Name: NameTCPAdmin, Enabled: true, Port: tcpAdminPort, Options: map[string]any{}},
@@ -52,6 +56,7 @@ func DefaultRecords(tcpAdminPort int) []Record {
 	}
 }
 
+// DefaultPort 返回服务的默认端口；TCP/Admin 使用启动配置传入的端口。
 func DefaultPort(name string, tcpAdminPort int) int {
 	switch name {
 	case NameTCPAdmin:
@@ -67,6 +72,7 @@ func DefaultPort(name string, tcpAdminPort int) int {
 	}
 }
 
+// ValidateUpdate 校验管理端提交的服务更新。TCP/Admin 是控制面入口，不能禁用。
 func ValidateUpdate(name string, enabled bool, port int) error {
 	if !IsKnown(name) {
 		return fmt.Errorf("unknown service %q", name)
@@ -80,6 +86,7 @@ func ValidateUpdate(name string, enabled bool, port int) error {
 	return nil
 }
 
+// IsKnown 判断服务名是否属于当前网关支持的内置监听服务。
 func IsKnown(name string) bool {
 	switch name {
 	case NameTCPAdmin, NameKCP, NameQUIC, NameWebSocket:
@@ -89,6 +96,7 @@ func IsKnown(name string) bool {
 	}
 }
 
+// DecodeOptions 容错解析 JSON 选项；坏数据不会让整个服务列表不可读。
 func DecodeOptions(optionsJSON string) map[string]any {
 	options := map[string]any{}
 	if strings.TrimSpace(optionsJSON) == "" {
@@ -100,6 +108,7 @@ func DecodeOptions(optionsJSON string) map[string]any {
 	return options
 }
 
+// NormalizeOptions 为不同服务补齐选项默认值，并修正 WebSocket path 这种可恢复输入。
 func NormalizeOptions(name string, options map[string]any) map[string]any {
 	if options == nil {
 		options = map[string]any{}
@@ -132,6 +141,7 @@ func NormalizeOptions(name string, options map[string]any) map[string]any {
 	return normalized
 }
 
+// IntOption 从 JSON 解码后的 map 中读取整数，兼容 number 和字符串形式。
 func IntOption(options map[string]any, key string, fallback int) int {
 	value, ok := options[key]
 	if !ok {
@@ -158,6 +168,7 @@ func IntOption(options map[string]any, key string, fallback int) int {
 	return fallback
 }
 
+// StringOption 从 JSON 选项中读取非空字符串。
 func StringOption(options map[string]any, key, fallback string) string {
 	value, ok := options[key]
 	if !ok {
@@ -169,6 +180,7 @@ func StringOption(options map[string]any, key, fallback string) string {
 	return fallback
 }
 
+// StringSliceOption 从 JSON 选项中读取字符串数组，兼容 []any 的解码结果。
 func StringSliceOption(options map[string]any, key string) []string {
 	value, ok := options[key]
 	if !ok {

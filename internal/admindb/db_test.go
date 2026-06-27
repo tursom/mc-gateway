@@ -1,3 +1,5 @@
+// internal/admindb/db_test.go 包含用于约束 db 行为的测试。
+
 package admindb
 
 import (

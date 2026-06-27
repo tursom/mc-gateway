@@ -1,3 +1,5 @@
+// protocol/mc_test.go 包含用于约束 mc 行为的测试。
+
 package protocol
 
 import (

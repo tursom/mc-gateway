@@ -1,3 +1,5 @@
+// cmd/gateway/log_pid_test.go 包含用于约束 log pid 行为的测试。
+
 package main
 
 import (

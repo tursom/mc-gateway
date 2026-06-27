@@ -1,3 +1,5 @@
+// examples/plugins/upstream-rewrite/main.go 演示托管插件如何在网关拨号上游前改写路由决策。
+
 package main
 
 import (

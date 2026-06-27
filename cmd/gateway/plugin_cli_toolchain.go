@@ -1,3 +1,5 @@
+// cmd/gateway/plugin_cli_toolchain.go 包含插件开发者使用的本地源码模板、构建打包流程和测试辅助逻辑。
+
 package main
 
 import (
@@ -1669,7 +1671,7 @@ func manifestYAMLTemplate(opts pluginInitCLIOptions) string {
 	if opts.Template == "protocol-proxy" {
 		mode = pluginmanager.UpstreamModeProtocolProxy
 	}
-	return fmt.Sprintf(`# Human-maintained plugin manifest. Build packages normalize this into manifest.json.
+	return fmt.Sprintf(`# 人工维护的插件清单；构建插件包时会规范化为 manifest.json。
 schema_version: mc-gateway.plugin/v1
 id: %q
 name: %q
@@ -1713,7 +1715,7 @@ func manifestTOMLTemplate(opts pluginInitCLIOptions) string {
 	if opts.Template == "protocol-proxy" {
 		mode = pluginmanager.UpstreamModeProtocolProxy
 	}
-	return fmt.Sprintf(`# Human-maintained plugin manifest. Build packages normalize this into manifest.json.
+	return fmt.Sprintf(`# 人工维护的插件清单；构建插件包时会规范化为 manifest.json。
 schema_version = "mc-gateway.plugin/v1"
 id = %q
 name = %q

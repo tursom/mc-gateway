@@ -1,3 +1,5 @@
+// cmd/kcp/main.go 提供独立的 KCP 到 TCP 代理工具，用于测试或演示 KCP 传输行为。
+
 package main
 
 import (

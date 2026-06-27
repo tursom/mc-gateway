@@ -1,3 +1,5 @@
+// internal/pluginmanager/gc.go 选择并删除不再被期望状态或活动运行态引用的插件制品。
+
 package pluginmanager
 
 import (

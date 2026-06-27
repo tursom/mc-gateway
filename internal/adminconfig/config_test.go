@@ -1,3 +1,5 @@
+// internal/adminconfig/config_test.go 包含用于约束 config 行为的测试。
+
 package adminconfig
 
 import "testing"

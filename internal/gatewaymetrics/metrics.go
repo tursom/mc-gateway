@@ -1,3 +1,5 @@
+// internal/gatewaymetrics/metrics.go 用原子计数器记录连接、路由和上游错误等管理状态指标。
+
 package gatewaymetrics
 
 import (
@@ -6,6 +8,7 @@ import (
 )
 
 type Counters struct {
+	// 连接级计数使用原子值，避免转发热路径在每次连接开始/结束时争用锁。
 	totalConnections  atomic.Uint64
 	activeConnections atomic.Int64
 	tcpConnections    atomic.Uint64
@@ -13,6 +16,7 @@ type Counters struct {
 	routeMisses       atomic.Uint64
 	upstreamDialErrs  atomic.Uint64
 
+	// routeHits 按 host 聚合，需要 map，因此用一把小锁保护。
 	routeHitsMu sync.Mutex
 	routeHits   map[string]uint64
 }
@@ -62,6 +66,7 @@ func (m *Counters) Snapshot() map[string]any {
 	}
 	m.routeHitsMu.Unlock()
 
+	// 返回普通 map，方便 Admin API 直接 JSON 编码。
 	return map[string]any{
 		"total_connections":     m.totalConnections.Load(),
 		"active_connections":    m.activeConnections.Load(),

@@ -1,3 +1,5 @@
+// cmd/gateway/plugin_cli_toolchain_test.go 包含用于约束 plugin cli toolchain 行为的测试。
+
 package main
 
 import (

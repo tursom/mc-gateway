@@ -1,3 +1,5 @@
+// internal/gatewayconfig/config.go 定义运行态管理数据库可用前使用的静态 TOML 配置。
+
 package gatewayconfig
 
 type Config struct {

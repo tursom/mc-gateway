@@ -1,3 +1,5 @@
+# Dockerfile 构建网关二进制、编译管理前端，并打包带 SQLite 友好默认值的运行镜像。
+
 # syntax=docker/dockerfile:1
 
 FROM --platform=$BUILDPLATFORM node:24.11.1-alpine AS admin-frontend

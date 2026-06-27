@@ -1,3 +1,5 @@
+// cmd/gateway/tcp.go 在未与 Admin HTTP 共用端口时启动普通 TCP Minecraft 监听器。
+
 package main
 
 import (
@@ -34,13 +36,14 @@ func runTcp(wg *sync.WaitGroup) {
 			continue
 		}
 		setSocketOptions(conn)
-		// 处理连接
+		// 处理连接；后续握手解析、插件过滤和路由解析都在 handleRequest 中完成。
 		gatewayMetrics.TCPConnectionStarted()
 		go handleRequest(conn)
 	}
 }
 
 func upstreamTcp(host string) net.Conn {
+	// TCP 是默认上游传输，路由值没有协议前缀时都会走这里。
 	conn, err := tcpDialer.Dial("tcp", host)
 	if err != nil {
 		gatewayMetrics.UpstreamDialError()
@@ -53,13 +56,14 @@ func upstreamTcp(host string) net.Conn {
 }
 
 var tcpDialer = net.Dialer{
+	// 上游拨号失败应尽快返回给客户端连接处理流程，避免连接协程长期堆积。
 	Timeout:   3 * time.Second,
 	KeepAlive: 30 * time.Second,
 }
 
 func setSocketOptions(conn net.Conn) {
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
-		tcpConn.SetNoDelay(true) // 禁用 Nagle 算法
+		tcpConn.SetNoDelay(true) // 禁用 Nagle 算法，降低 Minecraft 交互延迟。
 		tcpConn.SetKeepAlive(true)
 		tcpConn.SetKeepAlivePeriod(30 * time.Second)
 	}

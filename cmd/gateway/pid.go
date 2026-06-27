@@ -1,3 +1,5 @@
+// cmd/gateway/pid.go 维护 pid 文件的写入和清理，供进程管理器按文件追踪网关进程。
+
 package main
 
 import (

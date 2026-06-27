@@ -1,3 +1,5 @@
+// internal/adminroute/snapshot_test.go 包含用于约束 snapshot 行为的测试。
+
 package adminroute
 
 import "testing"

@@ -1,3 +1,5 @@
+// cmd/gateway/admin_audit.go 把 HTTP 请求上下文转换为持久化审计记录，用于追踪管理端变更。
+
 package main
 
 import (

@@ -1,3 +1,5 @@
+// cmd/gateway/admin_user_handlers.go 提供管理员维护管理账号的接口，包括创建、更新、禁用和列表查询。
+
 package main
 
 import (

@@ -1,3 +1,5 @@
+// cmd/gateway/admin_service_handlers.go 提供监听服务配置接口，用于维护端口、启停状态和是否需要重启。
+
 package main
 
 import (

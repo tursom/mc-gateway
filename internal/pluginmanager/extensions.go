@@ -1,3 +1,5 @@
+// internal/pluginmanager/extensions.go 索引扩展点注册信息，并分发连接、路由、状态和提供方钩子。
+
 package pluginmanager
 
 import (

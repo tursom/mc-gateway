@@ -1,3 +1,5 @@
+// cmd/gateway/plugin_cli_remote.go 实现通过 Admin API 驱动插件管理操作的命令行客户端。
+
 package main
 
 import (

@@ -1,3 +1,5 @@
+// internal/adminroute/validate.go 在写入运行态状态前校验路由主机名和上游地址。
+
 package adminroute
 
 import (
@@ -12,6 +14,7 @@ func ValidateHost(host string) error {
 	if host == "" {
 		return errors.New("host is required")
 	}
+	// host 会出现在 URL path 和 Minecraft 路由键中，因此禁止空白和斜杠。
 	if strings.ContainsAny(host, " \t\r\n") {
 		return errors.New("host must not contain whitespace")
 	}
@@ -27,6 +30,7 @@ func ValidateUpstream(upstream string) error {
 		return errors.New("upstream is required")
 	}
 
+	// 传输协议前缀只影响拨号方式，去掉前缀后仍必须是 host:port。
 	for _, prefix := range []string{"kcp://", "quic://", "haproxy://"} {
 		upstream = strings.TrimPrefix(upstream, prefix)
 	}

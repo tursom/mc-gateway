@@ -1,3 +1,5 @@
+// internal/adminsession/session_test.go 包含用于约束 session 行为的测试。
+
 package adminsession
 
 import (

@@ -1,3 +1,5 @@
+// cmd/gateway/admin_frontend/src/session.ts 渲染会话用户状态，并提供管理端界面使用的角色判断。
+
 import { el } from "./dom.js";
 import { t } from "./i18n.js";
 import { state } from "./state.js";

@@ -1,3 +1,5 @@
+// cmd/gateway/admin_users.go 初始化管理用户仓库，并在没有账号时创建首次初始化用户。
+
 package main
 
 import (

@@ -1,3 +1,5 @@
+// cmd/gateway/admin_frontend/src/types.ts 声明 Admin API 返回并被各视图消费的 TypeScript 数据结构。
+
 export type Role = "admin" | "member" | "guest";
 
 export interface User {

@@ -1,3 +1,5 @@
+// cmd/gateway/quic_test.go 包含用于约束 quic 行为的测试。
+
 package main
 
 import (

@@ -1,3 +1,5 @@
+// internal/gatewayconfig/plugin_test.go 包含用于约束 plugin 行为的测试。
+
 package gatewayconfig
 
 import "testing"

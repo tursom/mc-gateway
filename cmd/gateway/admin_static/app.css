@@ -1,3 +1,5 @@
+/* cmd/gateway/admin_static/app.css 定义嵌入式管理端仪表盘、表格、表单、对话框和响应式布局样式。 */
+
 :root {
   color-scheme: light;
   --bg: #f6f7f4;

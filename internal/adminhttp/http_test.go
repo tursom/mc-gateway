@@ -1,3 +1,5 @@
+// internal/adminhttp/http_test.go 包含用于约束 http 行为的测试。
+
 package adminhttp
 
 import (

@@ -1,3 +1,5 @@
+// internal/adminhttp/requests.go 定义 Admin API 测试网关和命令处理器接受的请求载荷。
+
 package adminhttp
 
 type LoginRequest struct {

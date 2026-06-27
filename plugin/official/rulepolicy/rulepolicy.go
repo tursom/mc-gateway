@@ -1,3 +1,5 @@
+// plugin/official/rulepolicy/rulepolicy.go 实现内置 rule-policy 插件，用于 IP 允许/拒绝、维护响应和限流策略。
+
 package rulepolicy
 
 import (

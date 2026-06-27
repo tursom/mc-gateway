@@ -1,3 +1,5 @@
+// internal/adminroute/validate_test.go 包含用于约束 validate 行为的测试。
+
 package adminroute
 
 import "testing"

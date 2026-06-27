@@ -1,3 +1,5 @@
+// internal/pluginmanager/operations.go 实现插件运行时运维能力，包括事件、指标、文件/数据存储、外部客户端、任务和诊断。
+
 package pluginmanager
 
 import (
@@ -26,11 +28,13 @@ import (
 )
 
 const (
+	// 简单熔断状态使用字符串保存，便于直接落库和输出到诊断包。
 	circuitClosed = "closed"
 	circuitOpen   = "open"
 )
 
 var (
+	// 插件上报的指标名和存储 key 需要收敛到可观测系统容易消费的字符集。
 	metricNamePattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_.:-]{0,127}$`)
 	storeKeyPattern   = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,255}$`)
 )
@@ -48,9 +52,11 @@ type Operations struct {
 	repo Repository
 	root string
 
+	// plugins 保存每个插件的运行时运维上下文，按 manifest 重新配置但保留统计摘要。
 	mu      sync.RWMutex
 	plugins map[string]*PluginOperations
 
+	// eventQueue 负责把插件事件异步落库，避免连接热路径被 SQLite 写入阻塞。
 	eventQueue chan queuedEvent
 	queued     atomic.Uint64
 	dropped    atomic.Uint64
@@ -61,6 +67,7 @@ type Operations struct {
 	subscriberDropped    atomic.Uint64
 	subscriberDeadLetter atomic.Uint64
 
+	// subscribers 是当前启用插件注册的事件订阅者快照，由 Manager 发布。
 	subscriberMu sync.RWMutex
 	subscribers  []*subscriberHandler
 }
@@ -81,6 +88,7 @@ type PluginOperations struct {
 	artifactID string
 	manifest   Manifest
 
+	// 下列 schema 来自 manifest，用于在插件运行时限制事件、指标、任务和外部依赖。
 	mu              sync.Mutex
 	eventSchemas    map[string]map[string]bool
 	metricSchemas   map[string]MetricSpec
@@ -100,6 +108,7 @@ type PluginOperations struct {
 type externalRuntime struct {
 	spec ExternalSpec
 
+	// 外部依赖统计用于诊断包和熔断策略，全部用原子值减少请求路径锁竞争。
 	requests            atomic.Uint64
 	errors              atomic.Uint64
 	inflight            atomic.Int64
@@ -120,6 +129,7 @@ type taskRuntime struct {
 	task         api.BackgroundTask
 	confirmToken string
 
+	// 每个后台任务独立持有调度状态和 cancel 函数，插件停用时可逐个停止。
 	mu                  sync.Mutex
 	cancel              context.CancelFunc
 	running             bool
@@ -132,6 +142,7 @@ type taskRuntime struct {
 	consecutiveFailures uint64
 }
 
+// NewOperations 创建插件运维协调器，并启动事件落库和订阅投递两个后台消费者。
 func NewOperations(repo Repository, root string) *Operations {
 	ops := &Operations{
 		repo:            repo,
@@ -145,6 +156,8 @@ func NewOperations(repo Repository, root string) *Operations {
 	return ops
 }
 
+// SetSubscribers 用新的订阅者快照替换旧快照。Manager 在插件启停后调用它，
+// 事件消费者只读取快照副本，不直接依赖 Manager 锁。
 func (o *Operations) SetSubscribers(subscribers []*subscriberHandler) {
 	o.subscriberMu.Lock()
 	defer o.subscriberMu.Unlock()
@@ -164,6 +177,7 @@ func (o *Operations) ForPlugin(pluginID, artifactID string, manifest Manifest) *
 	defer o.mu.Unlock()
 	po := o.plugins[pluginID]
 	if po == nil {
+		// 首次看到插件时创建运维上下文；后续版本切换会复用它的近期统计。
 		po = &PluginOperations{
 			parent:          o,
 			pluginID:        pluginID,
@@ -200,6 +214,7 @@ func (o *Operations) StartTasks(pluginID string) {
 func (o *Operations) consumeEvents() {
 	for event := range o.eventQueue {
 		o.queued.Add(1)
+		// 落库使用短超时，避免后台消费者在数据库异常时堆积过久。
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		err := o.repo.SaveEvent(ctx, EventSummary{
 			PluginID: event.pluginID,
@@ -217,6 +232,7 @@ func (o *Operations) queueEvent(event queuedEvent) {
 	select {
 	case o.eventQueue <- event:
 	default:
+		// 队列满时仍写一条 dropped 记录，保留“发生过丢弃”的审计线索。
 		o.dropped.Add(1)
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		_ = o.repo.SaveEvent(ctx, EventSummary{
@@ -230,6 +246,7 @@ func (o *Operations) queueEvent(event queuedEvent) {
 }
 
 func (o *Operations) queueSubscriberEvent(event queuedEvent) {
+	// 已标记 dropped 的事件只进入持久化路径，不再交给订阅者重复处理。
 	o.subscriberMu.RLock()
 	hasSubscribers := len(o.subscribers) > 0
 	o.subscriberMu.RUnlock()
@@ -275,6 +292,7 @@ func (o *Operations) deliverSubscriberEvent(subscriber *subscriberHandler, event
 	if maxRetry <= 0 {
 		maxRetry = DefaultSubscriberMaxRetry
 	}
+	// best_effort 订阅最多投递一次；at_least_once 按订阅者配置进行有限重试。
 	for attempt := 1; attempt <= maxRetry; attempt++ {
 		req.Attempt = attempt
 		result, err := subscriber.invoke(req)
@@ -293,6 +311,8 @@ func (o *Operations) deliverSubscriberEvent(subscriber *subscriberHandler, event
 	})
 }
 
+// configure 根据 manifest 重新构建插件运维能力边界。统计对象尽量复用，
+// 但 schema、配额和外部依赖声明每次都以当前制品为准。
 func (po *PluginOperations) configure(artifactID string, manifest Manifest) {
 	po.mu.Lock()
 	defer po.mu.Unlock()
@@ -352,12 +372,15 @@ func (po *PluginOperations) configure(artifactID string, manifest Manifest) {
 		}
 	}
 	if len(po.fileSpecs) == 0 {
+		// 未声明文件存储时提供默认命名空间，方便简单插件直接使用常见分类。
 		for _, namespace := range []string{"data", "cache", "tmp", "log", "diagnostic"} {
 			po.fileSpecs[namespace] = FileStoreSpec{Namespace: namespace, QuotaBytes: DefaultPluginFileQuota}
 		}
 	}
 }
 
+// EmitEvent 校验并记录插件事件。即使字段非法，也会排队一条 dropped 事件，
+// 便于诊断插件为什么没有产出预期事件。
 func (po *PluginOperations) EmitEvent(ctx context.Context, name string, fields map[string]string) error {
 	trace := traceFromContext(ctx)
 	clean, dropReason, err := po.validateEvent(name, fields)
@@ -385,6 +408,8 @@ func (po *PluginOperations) EmitEvent(ctx context.Context, name string, fields m
 	return nil
 }
 
+// ObserveMetric 校验并更新插件自定义指标的最近摘要；这里不做时序存储，
+// 只维护管理界面需要的当前观测值。
 func (po *PluginOperations) ObserveMetric(ctx context.Context, name string, value float64, labels map[string]string) error {
 	_ = ctx
 	clean, metricType, err := po.validateMetric(name, labels)
@@ -443,6 +468,8 @@ func (po *PluginOperations) RegisterBackgroundTask(task api.BackgroundTask) erro
 	defer po.mu.Unlock()
 	spec := po.taskSpecs[task.ID]
 	if len(po.taskSpecs) > 0 && spec.ID == "" {
+		// manifest 声明了任务清单时，只允许注册清单中的任务，避免插件运行时
+		// 动态创建管理端不可见的后台任务。
 		return fmt.Errorf("background task %q is not declared by manifest", task.ID)
 	}
 	if spec.ID == "" {
@@ -471,6 +498,7 @@ func (po *PluginOperations) RegisterBackgroundTask(task api.BackgroundTask) erro
 	}
 	rt := po.tasks[task.ID]
 	if rt == nil {
+		// confirmToken 用于高风险手动任务的二次确认，避免误点直接执行。
 		rt = &taskRuntime{
 			pluginID:     po.pluginID,
 			spec:         spec,
@@ -483,6 +511,8 @@ func (po *PluginOperations) RegisterBackgroundTask(task api.BackgroundTask) erro
 	return nil
 }
 
+// StartTasks 启动当前插件注册的后台任务调度器。只在插件 ID 匹配时执行，
+// 防止调用方传错 ID 时启动其他插件的任务。
 func (po *PluginOperations) StartTasks(pluginID string) {
 	if pluginID != po.pluginID {
 		return
@@ -498,6 +528,7 @@ func (po *PluginOperations) StartTasks(pluginID string) {
 	}
 }
 
+// stopTasks 停止所有后台任务调度器。已经在执行的任务通过 cancel 感知停用。
 func (po *PluginOperations) stopTasks() {
 	po.mu.Lock()
 	tasks := make([]*taskRuntime, 0, len(po.tasks))
@@ -536,6 +567,7 @@ func (po *PluginOperations) startTask(task *taskRuntime) {
 	}
 	go func() {
 		for {
+			// 抖动值按任务 ID 确定，避免多个网关实例同一时间集中触发相同任务。
 			delay := interval + deterministicJitter(task.task.Jitter, task.task.ID)
 			task.mu.Lock()
 			if !task.schedulerOn {
@@ -560,6 +592,7 @@ func (po *PluginOperations) startTask(task *taskRuntime) {
 func (po *PluginOperations) runTask(task *taskRuntime) {
 	task.mu.Lock()
 	if task.running {
+		// 同一任务不并发执行；调度周期追上时只记录跳过次数。
 		task.skipped++
 		task.mu.Unlock()
 		return
@@ -592,6 +625,8 @@ func (po *PluginOperations) runTask(task *taskRuntime) {
 	task.mu.Unlock()
 }
 
+// TriggerTask 手动触发后台任务。confirmToken 来自任务摘要，调用方必须显式回传，
+// 用来降低误触发有副作用任务的风险。
 func (po *PluginOperations) TriggerTask(taskID, confirmToken string) (BackgroundTaskSummary, error) {
 	po.mu.Lock()
 	task := po.tasks[taskID]
@@ -609,6 +644,8 @@ func (po *PluginOperations) TriggerTask(taskID, confirmToken string) (Background
 	return task.summary(), nil
 }
 
+// Snapshot 汇总插件运行态观测信息。内存中的近期摘要和数据库中的历史摘要会合并，
+// 形成管理端和诊断包都能使用的一份视图。
 func (po *PluginOperations) Snapshot(ctx context.Context, pluginID string, handlers []DispatchHandlerSummary, builds []BuildRecord, gc []GCCandidate) OperationsSnapshot {
 	_ = ctx
 	po.mu.Lock()
@@ -632,6 +669,7 @@ func (po *PluginOperations) Snapshot(ctx context.Context, pluginID string, handl
 
 	recentEvents, _ := po.parent.repo.RecentEvents(ctx, pluginID, DefaultEventRecentLimit)
 	if len(recentEvents) > 0 {
+		// 数据库中的事件能覆盖进程重启前的近期历史，内存摘要则提供当前进程最新值。
 		events = mergeEventSummaries(events, recentEvents)
 	}
 	logs, _ := po.parent.repo.RecentLogs(ctx, pluginID, DefaultLogRecentLimit)
@@ -702,6 +740,8 @@ func (o *Operations) TriggerTask(pluginID, taskID, confirmToken string) (Backgro
 	return po.TriggerTask(taskID, confirmToken)
 }
 
+// DiagnosticPackage 生成可下载的插件诊断包。输出前会统一脱敏，避免把密钥、
+// token 或完整协议载荷写入可共享文件。
 func (o *Operations) DiagnosticPackage(ctx context.Context, plugin PluginRecord, manifest Manifest, handlers []DispatchHandlerSummary, builds []BuildRecord, gc []GCCandidate) ([]byte, DiagnosticPackageSummary, error) {
 	snapshot := o.Snapshot(ctx, plugin.ID, handlers, builds, gc)
 	operations, _ := o.repo.ListOperations(ctx, plugin.ID, 50)
@@ -745,6 +785,8 @@ func (o *Operations) runtimeRoot() string {
 func (o *Operations) GCCandidates(ctx context.Context, pluginID string) ([]GCCandidate, error) {
 	now := time.Now().Unix()
 	var candidates []GCCandidate
+	// 插件数据和文件只有在过期后才允许删除；未过期记录作为受保护候选项返回，
+	// 方便 dry-run 解释为什么没有删除它们。
 	data, err := o.repo.ListPluginData(ctx, pluginID)
 	if err != nil {
 		return nil, err
@@ -799,6 +841,7 @@ func (o *Operations) GCCandidates(ctx context.Context, pluginID string) ([]GCCan
 		if seenFiles[filePath] {
 			return nil
 		}
+		// 文件系统里存在但仓库没有记录的文件视为孤儿文件，可以由 GC 清理。
 		info, err := d.Info()
 		if err != nil {
 			return nil
@@ -842,6 +885,8 @@ func (o *Operations) GCCandidates(ctx context.Context, pluginID string) ([]GCCan
 	return candidates, nil
 }
 
+// RunGC 执行插件运维数据清理。dryRun 只返回候选项并写操作日志，
+// 真正删除时会跳过受保护项。
 func (o *Operations) RunGC(ctx context.Context, actor, pluginID string, dryRun bool) ([]GCCandidate, error) {
 	candidates, err := o.GCCandidates(ctx, pluginID)
 	if err != nil {
@@ -874,6 +919,8 @@ func (o *Operations) RunGC(ctx context.Context, actor, pluginID string, dryRun b
 	return removed, nil
 }
 
+// validateEvent 校验事件声明和字段集合，并限制字段值基数，避免插件事件把
+// 管理端和后续指标系统拖入高基数数据。
 func (po *PluginOperations) validateEvent(name string, fields map[string]string) (map[string]string, string, error) {
 	if !metricNamePattern.MatchString(name) {
 		return nil, "invalid_event_name", fmt.Errorf("invalid event name %q", name)
@@ -907,6 +954,7 @@ func (po *PluginOperations) validateEvent(name string, fields map[string]string)
 	return clean, "", nil
 }
 
+// validateMetric 校验自定义指标名和标签，确保插件只能上报 manifest 声明过的指标。
 func (po *PluginOperations) validateMetric(name string, labels map[string]string) (map[string]string, string, error) {
 	if !metricNamePattern.MatchString(name) {
 		return nil, "", fmt.Errorf("invalid metric name %q", name)
@@ -954,6 +1002,7 @@ func (l pluginLogger) write(ctx context.Context, level, message string, fields m
 	}
 	trace := traceFromContext(ctx)
 	clean, _ := sanitizeLabels(fields, nil)
+	// 插件日志只保存摘要并脱敏，避免把完整请求、密钥或 token 写入运行态数据库。
 	item := LogSummary{
 		PluginID:     l.ops.pluginID,
 		Level:        level,
@@ -989,6 +1038,7 @@ func (s pluginDataStore) Put(ctx context.Context, record api.DataRecord) error {
 	}
 	current, _ := s.ops.parent.repo.PluginDataUsage(ctx, s.ops.pluginID)
 	old, _, _ := s.ops.parent.repo.GetPluginData(ctx, s.ops.pluginID, key)
+	// 更新已有 key 时只计算净增长，避免重复写同一 key 被误判为超配额。
 	nextUsage := current - old.SizeBytes + int64(len(record.Value))
 	if nextUsage > s.ops.dataQuota {
 		return fmt.Errorf("plugin_data quota exceeded: %d > %d", nextUsage, s.ops.dataQuota)
@@ -1024,7 +1074,8 @@ func (s pluginDataStore) Get(ctx context.Context, key string) (api.DataRecord, e
 		return api.DataRecord{}, err
 	}
 	return api.DataRecord{
-		Key:           record.Key,
+		Key: record.Key,
+		// 返回副本，避免调用方修改仓库层读取出来的缓冲区。
 		Value:         append([]byte(nil), value...),
 		SchemaVersion: record.SchemaVersion,
 		DataClass:     record.DataClass,
@@ -1060,6 +1111,7 @@ func (s pluginFileStore) ResourcePath(name string) (string, error) {
 	if !isSubpath(filepath.Join(artifactDir, "resources"), resource) {
 		return "", errors.New("unsafe resource path")
 	}
+	// ResourcePath 只返回随制品发布的只读资源路径，不写运行态文件记录。
 	return resource, nil
 }
 
@@ -1091,6 +1143,7 @@ func (s pluginFileStore) Write(ctx context.Context, namespace, name string, data
 	if !isSubpath(root, target) {
 		return errors.New("unsafe file path")
 	}
+	// 路径校验后再创建目录，防止插件通过 ../ 写出自己的命名空间。
 	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 		return err
 	}
@@ -1174,6 +1227,7 @@ func (s pluginFileStore) Delete(ctx context.Context, namespace, name string) err
 func (s pluginFileStore) namespaceSpec(namespace string) (string, FileStoreSpec, error) {
 	namespace = strings.TrimSpace(namespace)
 	if namespace == "" {
+		// 默认命名空间让简单插件不必显式声明每次读写的分类。
 		namespace = "data"
 	}
 	if !metricNamePattern.MatchString(namespace) {
@@ -1217,6 +1271,7 @@ func (c pluginExternalClient) DoHTTP(ctx context.Context, req api.ExternalReques
 	if err := c.beforeRequest(); err != nil {
 		return api.ExternalResponse{}, err
 	}
+	// beforeRequest 会增加 inflight，后续必须在 defer 中成对减少。
 	start := time.Now()
 	defer c.runtime.inflight.Add(-1)
 
@@ -1239,6 +1294,7 @@ func (c pluginExternalClient) DoHTTP(ctx context.Context, req api.ExternalReques
 	if spec.Traceparent {
 		trace := traceFromContext(ctx)
 		if trace.TraceID != "" {
+			// 只透传 trace id，不暴露内部 connection id 或插件处理器 id。
 			httpReq.Header.Set("traceparent", "00-"+limitHex(trace.TraceID, 32)+"-0000000000000000-01")
 		}
 	}
@@ -1254,6 +1310,7 @@ func (c pluginExternalClient) DoHTTP(ctx context.Context, req api.ExternalReques
 		if lastErr == nil && resp.StatusCode < 500 {
 			break
 		}
+		// 需要关闭失败响应体，避免重试时泄漏连接。
 		if resp != nil && resp.Body != nil {
 			_ = resp.Body.Close()
 		}
@@ -1297,6 +1354,7 @@ func (c pluginExternalClient) DialTCP(ctx context.Context, address string, timeo
 	}
 	start := time.Now()
 	defer c.runtime.inflight.Add(-1)
+	// 外部 TCP 连接返回给插件后由插件负责关闭；这里仅记录拨号阶段的观测信息。
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
@@ -1308,6 +1366,8 @@ func (c pluginExternalClient) DialTCP(ctx context.Context, address string, timeo
 	return conn, nil
 }
 
+// HealthCheck 使用 manifest 声明的 endpoint 做轻量检查。TCP 依赖只建立后关闭，
+// HTTP 依赖优先使用 HEAD，避免拉取大响应体。
 func (c pluginExternalClient) HealthCheck(ctx context.Context) error {
 	spec, err := c.declaredSpec()
 	if err != nil {
@@ -1343,6 +1403,8 @@ func (c pluginExternalClient) declaredSpec() (ExternalSpec, error) {
 	return spec, nil
 }
 
+// beforeRequest 检查熔断窗口并记录并发请求数。成功进入请求路径后，
+// 调用方必须在结束时减少 inflight。
 func (c pluginExternalClient) beforeRequest() error {
 	c.runtime.mu.Lock()
 	defer c.runtime.mu.Unlock()
@@ -1354,6 +1416,8 @@ func (c pluginExternalClient) beforeRequest() error {
 	return nil
 }
 
+// finish 更新外部依赖统计并维护一个简单熔断器。连续三次失败会短暂打开熔断，
+// 防止插件把故障依赖打爆。
 func (c pluginExternalClient) finish(start time.Time, status string, err error) {
 	duration := time.Since(start)
 	c.runtime.durationCount.Add(1)
@@ -1376,6 +1440,7 @@ func (c pluginExternalClient) finish(start time.Time, status string, err error) 
 	c.runtime.circuitUntil = time.Time{}
 }
 
+// recordTrace 把外部依赖调用写入 trace 摘要，endpoint 和 purpose 会先脱敏。
 func (c pluginExternalClient) recordTrace(ctx context.Context, start time.Time, kind, status string) {
 	trace := traceFromContext(ctx)
 	_ = c.ops.parent.repo.SaveTrace(context.Background(), TraceSummary{
@@ -1392,6 +1457,7 @@ func (c pluginExternalClient) recordTrace(ctx context.Context, start time.Time, 
 	})
 }
 
+// summary 返回外部依赖的可展示状态，并隐藏 endpoint 中可能带账号的信息。
 func (rt *externalRuntime) summary(pluginID, name string) ExternalDependencySummary {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
@@ -1420,6 +1486,7 @@ func (rt *externalRuntime) summary(pluginID, name string) ExternalDependencySumm
 	}
 }
 
+// summary 返回后台任务的当前调度状态，供运维快照和管理端展示。
 func (rt *taskRuntime) summary() BackgroundTaskSummary {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
@@ -1450,6 +1517,8 @@ func (rt *taskRuntime) summary() BackgroundTaskSummary {
 	}
 }
 
+// WithTraceContext 把插件处理链路信息塞入 context，供日志、事件和外部依赖
+// 记录复用同一个 trace/connection 标识。
 func WithTraceContext(ctx context.Context, pluginID, traceID, connectionID, handlerID string) context.Context {
 	return context.WithValue(ctx, traceContextKey{}, traceContext{
 		PluginID:     pluginID,
@@ -1467,6 +1536,8 @@ func traceFromContext(ctx context.Context) traceContext {
 	return trace
 }
 
+// sanitizeLabels 过滤插件上报字段：数量、名称、声明范围、敏感字段和单值长度
+// 都会被限制，避免低成本插件事件变成高基数或敏感数据出口。
 func sanitizeLabels(fields map[string]string, allowed map[string]bool) (map[string]string, error) {
 	if len(fields) == 0 {
 		return map[string]string{}, nil
@@ -1497,6 +1568,7 @@ func sanitizeLabels(fields map[string]string, allowed map[string]bool) (map[stri
 	return clean, nil
 }
 
+// cleanStoreKey 校验插件数据存储 key，禁止绝对路径、反斜杠和上级目录片段。
 func cleanStoreKey(key string) (string, error) {
 	key = strings.TrimSpace(key)
 	if key == "" || !storeKeyPattern.MatchString(key) {
@@ -1508,6 +1580,7 @@ func cleanStoreKey(key string) (string, error) {
 	return key, nil
 }
 
+// cleanStorePath 校验插件文件路径，要求传入值已经是规范相对路径。
 func cleanStorePath(name string) (string, error) {
 	if name == "" || strings.Contains(name, `\`) || strings.HasPrefix(name, "/") {
 		return "", fmt.Errorf("unsafe file path %q", name)
@@ -1519,6 +1592,7 @@ func cleanStorePath(name string) (string, error) {
 	return clean, nil
 }
 
+// isSubpath 判断 target 是否仍在 root 内，作为最终路径穿越保护。
 func isSubpath(root, target string) bool {
 	root = filepath.Clean(root)
 	target = filepath.Clean(target)
@@ -1526,6 +1600,7 @@ func isSubpath(root, target string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
+// retentionDeadline 将保留时间转换为 Unix 时间戳；0 表示不过期。
 func retentionDeadline(retention time.Duration) int64 {
 	if retention <= 0 {
 		return 0
@@ -1533,6 +1608,7 @@ func retentionDeadline(retention time.Duration) int64 {
 	return time.Now().Add(retention).Unix()
 }
 
+// parseDurationDefault 在 manifest 配置缺失或非法时返回默认时长。
 func parseDurationDefault(value string, fallback time.Duration) time.Duration {
 	if value == "" {
 		return fallback
@@ -1544,6 +1620,7 @@ func parseDurationDefault(value string, fallback time.Duration) time.Duration {
 	return parsed
 }
 
+// deterministicJitter 基于任务 key 生成稳定抖动，避免每次重启后调度时间完全随机。
 func deterministicJitter(jitter time.Duration, key string) time.Duration {
 	if jitter <= 0 || key == "" {
 		return 0
@@ -1562,6 +1639,8 @@ func limitString(value string, max int) string {
 	return value[:max]
 }
 
+// redactSensitive 对明显敏感的文本做粗粒度脱敏。它不替代结构化密钥管理，
+// 只作为日志、诊断和摘要输出前的最后防线。
 func redactSensitive(value string) string {
 	if value == "" {
 		return ""
@@ -1575,6 +1654,7 @@ func redactSensitive(value string) string {
 	return value
 }
 
+// redactEndpoint 隐藏包含账号信息的 endpoint，并限制展示长度。
 func redactEndpoint(endpoint string) string {
 	if endpoint == "" {
 		return ""
@@ -1585,6 +1665,7 @@ func redactEndpoint(endpoint string) string {
 	return limitString(endpoint, 256)
 }
 
+// randomToken 生成确认令牌；随机源失败时退化为时间戳，保证调用方仍能完成流程。
 func randomToken() string {
 	var data [16]byte
 	if _, err := rand.Read(data[:]); err != nil {
@@ -1593,6 +1674,7 @@ func randomToken() string {
 	return hex.EncodeToString(data[:])
 }
 
+// limitHex 将 trace id 规范为指定长度的十六进制字符串，用于 traceparent 头。
 func limitHex(value string, max int) string {
 	value = strings.ToLower(value)
 	var out strings.Builder
@@ -1607,6 +1689,7 @@ func limitHex(value string, max int) string {
 	return out.String()[:max]
 }
 
+// readLimited 读取外部响应时设置硬上限，避免插件依赖返回超大 body 占满内存。
 func readLimited(reader io.Reader, max int64) ([]byte, error) {
 	var buf bytes.Buffer
 	if _, err := io.CopyN(&buf, reader, max+1); err != nil && !errors.Is(err, io.EOF) {
@@ -1618,6 +1701,7 @@ func readLimited(reader io.Reader, max int64) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+// mergeEventSummaries 合并内存事件摘要和数据库近期事件，按插件和事件名聚合计数。
 func mergeEventSummaries(current, recent []EventSummary) []EventSummary {
 	byKey := make(map[string]EventSummary)
 	for _, event := range current {
@@ -1643,6 +1727,7 @@ func mergeEventSummaries(current, recent []EventSummary) []EventSummary {
 	return out
 }
 
+// noop* 类型用于在插件未启用完整 Operations 时仍返回满足接口的安全空实现。
 type noopOperationsLogger struct{}
 
 func (noopOperationsLogger) Debug(context.Context, string, map[string]string) {}

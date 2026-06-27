@@ -1,3 +1,5 @@
+# compose.override.yaml 把本地 Compose 覆盖项与偏生产形态的基础服务定义分开维护。
+
 services:
   mc-gateway:
     build:

@@ -1,5 +1,7 @@
 //go:build (darwin && (amd64 || arm64)) || (freebsd && (amd64 || arm64)) || (linux && (386 || amd64 || arm || arm64 || loong64 || ppc64le || riscv64 || s390x)) || (openbsd && (amd64 || arm64)) || (windows && (386 || amd64 || arm64))
 
+// internal/admindb/db.go 打开跨平台 SQLite 数据库，并应用管理、路由和插件运行态共用的表结构。
+
 package admindb
 
 import (
@@ -7,9 +9,12 @@ import (
 	"os"
 	"path/filepath"
 
+	// modernc.org/sqlite 是纯 Go SQLite 驱动，便于容器和跨平台构建时避免 CGO 依赖。
 	_ "modernc.org/sqlite"
 )
 
+// Open 创建或打开管理运行态数据库。调用方传入的路径可以包含尚不存在的目录，
+// 这里会先创建目录，再打开 SQLite 连接。
 func Open(dbPath string) (*sql.DB, error) {
 	if dir := filepath.Dir(dbPath); dir != "." && dir != "" {
 		if err := os.MkdirAll(dir, 0755); err != nil {
@@ -21,12 +26,16 @@ func Open(dbPath string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	// SQLite 对单写者最友好；限制连接数可以避免 database/sql 在高并发下
+	// 打开多条连接后互相争用写锁。
 	db.SetMaxOpenConns(1)
 
+	// WAL 让读请求不会被普通写事务完全阻塞，适合管理端读多写少的状态库。
 	if _, err := db.Exec(`PRAGMA journal_mode=WAL`); err != nil {
 		db.Close()
 		return nil, err
 	}
+	// 写锁短暂冲突时等待一小段时间，减少管理端并发操作产生的偶发 busy 错误。
 	if _, err := db.Exec(`PRAGMA busy_timeout=5000`); err != nil {
 		db.Close()
 		return nil, err
@@ -35,6 +44,8 @@ func Open(dbPath string) (*sql.DB, error) {
 	return db, nil
 }
 
+// Migrate 以幂等方式应用当前 schema。所有 CREATE TABLE 都使用
+// IF NOT EXISTS，后续字段演进通过 ensureColumn 补齐，便于老数据库平滑升级。
 func Migrate(db *sql.DB) error {
 	const schema = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -447,6 +458,8 @@ INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, strftime
 	if _, err := db.Exec(schema); err != nil {
 		return err
 	}
+	// CREATE TABLE 不会修改已存在的表，因此历史版本新增字段需要显式补齐。
+	// 每个 ensureColumn 都是幂等的，可以安全地在每次启动迁移时执行。
 	if err := ensureColumn(db, "audit_logs", "metadata_json", "TEXT NOT NULL DEFAULT '{}'"); err != nil {
 		return err
 	}
@@ -465,6 +478,8 @@ INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, strftime
 	return nil
 }
 
+// ensureColumn 在表缺字段时执行 ALTER TABLE。table/column/definition 只由
+// 受控迁移代码传入，不接收外部输入，避免把 PRAGMA 语句做成动态用户入口。
 func ensureColumn(db *sql.DB, table, column, definition string) error {
 	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
 	if err != nil {

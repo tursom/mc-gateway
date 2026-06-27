@@ -1,3 +1,5 @@
+// cmd/gateway/admin_auth_handlers.go 处理初始化、登录、登出和当前会话查询等嵌入式管理端认证接口。
+
 package main
 
 import (

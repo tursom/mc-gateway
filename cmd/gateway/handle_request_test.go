@@ -1,3 +1,5 @@
+// cmd/gateway/handle_request_test.go 包含用于约束 handle request 行为的测试。
+
 package main
 
 import (

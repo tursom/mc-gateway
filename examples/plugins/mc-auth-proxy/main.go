@@ -1,3 +1,5 @@
+// examples/plugins/mc-auth-proxy/main.go 演示托管插件如何拦截登录流量、发出认证事件并按条件拒绝客户端。
+
 package main
 
 import (

@@ -1,3 +1,5 @@
+// cmd/gateway/admin_frontend/src/views/metrics.ts 渲染管理端成员可见的网关指标计数器。
+
 import { api } from "../api.js";
 import { showAlert } from "../alerts.js";
 import { el, escapeHTML, stat } from "../dom.js";

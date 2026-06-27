@@ -1,3 +1,5 @@
+// internal/adminroute/repository.go 持久化 Minecraft 主机路由记录，并为在线网关返回有序快照。
+
 package adminroute
 
 import (
@@ -18,7 +20,8 @@ type Record struct {
 }
 
 type Repository struct {
-	db  *sql.DB
+	db *sql.DB
+	// now 可在测试中注入固定时间，避免断言依赖真实时钟。
 	now func() time.Time
 }
 
@@ -38,6 +41,7 @@ func NewRepositoryWithClock(db *sql.DB, now func() time.Time) Repository {
 }
 
 func (r Repository) EnabledMap(ctx context.Context) (map[string]string, error) {
+	// 只读取启用路由，结果直接用于连接热路径的内存快照。
 	rows, err := r.db.QueryContext(ctx, `SELECT host, upstream FROM routes WHERE enabled = 1`)
 	if err != nil {
 		return nil, err
@@ -61,6 +65,7 @@ SELECT host, upstream, enabled, note, created_at, updated_at, updated_by
 FROM routes`
 	var args []any
 	if query = strings.TrimSpace(query); query != "" {
+		// 管理端搜索同时覆盖 host、upstream 和 note，便于按服务名或备注定位路由。
 		sqlQuery += ` WHERE host LIKE ? OR upstream LIKE ? OR note LIKE ?`
 		like := "%" + query + "%"
 		args = append(args, like, like, like)
@@ -87,6 +92,7 @@ FROM routes`
 }
 
 func (r Repository) Upsert(ctx context.Context, actor, host, upstream string, enabled bool, note string) error {
+	// 写入前统一校验，避免无效 host/upstream 进入 SQLite 后再被热路径读取。
 	if err := ValidateHost(host); err != nil {
 		return err
 	}
@@ -101,6 +107,7 @@ func (r Repository) Upsert(ctx context.Context, actor, host, upstream string, en
 	}
 	defer tx.Rollback()
 
+	// host 是主键；重复保存时只更新可变字段并保留 created_at。
 	if _, err := tx.ExecContext(ctx, `
 INSERT INTO routes(host, upstream, enabled, note, created_at, updated_at, updated_by)
 VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -117,6 +124,7 @@ ON CONFLICT(host) DO UPDATE SET
 }
 
 func (r Repository) Delete(ctx context.Context, host string) error {
+	// 删除同样校验 host，防止管理端路径参数中的非法值直接进入 SQL。
 	if err := ValidateHost(host); err != nil {
 		return err
 	}

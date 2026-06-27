@@ -1,3 +1,5 @@
+// cmd/gateway/log_unix.go 注册 Unix 信号处理，让进程无需完整重启即可重新打开日志文件。
+
 // pid_unix.go
 //go:build unix || plan9
 

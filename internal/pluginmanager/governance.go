@@ -1,3 +1,5 @@
+// internal/pluginmanager/governance.go 在涉及发布风险的操作前评估插件评审、公告、供应链和策略门禁。
+
 package pluginmanager
 
 import (

@@ -1,3 +1,5 @@
+// internal/pluginmanager/future_test.go 包含用于约束 future 行为的测试。
+
 package pluginmanager
 
 import (

@@ -1,3 +1,5 @@
+// protocol/smoke/helper.go 提供小型内存测试夹具，让协议代理测试可以使用真实 net.Conn 行为。
+
 package smoke
 
 import (

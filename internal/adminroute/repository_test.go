@@ -1,3 +1,5 @@
+// internal/adminroute/repository_test.go 包含用于约束 repository 行为的测试。
+
 package adminroute
 
 import (

@@ -1,3 +1,5 @@
+// cmd/gateway/tcp_web_port_reuse.go 启动共享 TCP/Admin 监听器，按连接首包自动区分 HTTP 流量和 Minecraft 流量。
+
 package main
 
 import (
@@ -12,11 +14,13 @@ import (
 )
 
 const (
-	defaultTCPPort             = 25565
+	defaultTCPPort = 25565
+	// 首包超时沿用 tcphttpmux 默认值，保持同端口分流逻辑的单一来源。
 	tcpWebInitialPacketTimeout = tcphttpmux.DefaultInitialPacketTimeout
 )
 
 func normalizedTCPPort() int {
+	// 静态配置未指定端口时保持 Minecraft 默认端口。
 	if config.Tcp.Port == 0 {
 		return defaultTCPPort
 	}
@@ -31,6 +35,7 @@ func normalizedWebSocketPort() int {
 }
 
 func normalizedWebSocketPath() string {
+	// WebSocket 路径为空时回退到根路径，避免生成空的 HTTP 路由。
 	if config.WebSocket.Path == "" {
 		return "/"
 	}
@@ -38,6 +43,7 @@ func normalizedWebSocketPath() string {
 }
 
 func tcpWebPortReuseEnabled() bool {
+	// 是否共用端口完全由启用状态和端口相等推导，不引入额外配置开关。
 	return config.Tcp.Enable &&
 		config.WebSocket.Enable &&
 		normalizedTCPPort() == normalizedWebSocketPort()
@@ -49,6 +55,7 @@ func runTcpWebPortReuse(wg *sync.WaitGroup) {
 	}
 
 	port := normalizedTCPPort()
+	// 同一个 listener 同时承载 Minecraft TCP 和 Admin HTTP，由 serveTcpWebPortReuse 分流。
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
 		log.Fatal().Err(err).
@@ -69,6 +76,7 @@ func runTcpWebPortReuse(wg *sync.WaitGroup) {
 }
 
 func serveTcpWebPortReuse(listener net.Listener, handler http.Handler, tcpHandler func(net.Conn)) error {
+	// tcphttpmux 只负责协议分流；指标、socket 选项和日志通过回调接回主包。
 	return tcphttpmux.Serve(listener, handler, tcpHandler, tcphttpmux.Options{
 		InitialPacketTimeout: tcpWebInitialPacketTimeout,
 		SetSocketOptions:     setSocketOptions,

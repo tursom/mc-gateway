@@ -1,3 +1,5 @@
+// cmd/gateway/admin_plugin_handlers.go 承载插件制品、期望状态、配置、密钥、运维操作和治理检查相关的 Admin API。
+
 package main
 
 import (

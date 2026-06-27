@@ -1,3 +1,5 @@
+// cmd/gateway/plugin.go 把网关运行时接入 pluginmanager，负责钩子分发和插件生命周期加载。
+
 package main
 
 import (
@@ -96,12 +98,12 @@ func loadPlugins() {
 	}
 }
 
-// HandleConn implements api.Gateway.
+// HandleConn 实现 api.Gateway，用于让插件把连接交回网关主流程。
 func (g *Gateway) HandleConn(conn net.Conn) {
 	go handleRequest(conn)
 }
 
-// Hook implements api.Gateway.
+// Hook 实现 api.Gateway，用于注册旧版内存钩子处理器。
 func (g *Gateway) Hook(hook string, handler any) error {
 	pluginLock.Lock()
 	defer pluginLock.Unlock()
@@ -110,7 +112,7 @@ func (g *Gateway) Hook(hook string, handler any) error {
 	return nil
 }
 
-// ExitWaitGroup implements api.Gateway.
+// ExitWaitGroup 实现 api.Gateway，用于把插件后台任务纳入进程退出等待。
 func (g *Gateway) ExitWaitGroup() *sync.WaitGroup {
 	return &exitWaitGroup
 }
@@ -152,7 +154,7 @@ func (g *Gateway) RegisterBackgroundTask(task api.BackgroundTask) error {
 	return nil
 }
 
-// TestOp implements api.Gateway.
+// TestOp 实现 api.Gateway，保留给测试或调试插件能力探测。
 func (g *Gateway) TestOp() {
 	panic("unimplemented")
 }

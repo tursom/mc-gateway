@@ -1,3 +1,5 @@
+// internal/adminaudit/audit.go 持久化 Admin API 变更产生的审计事件，并向管理界面提供查询。
+
 package adminaudit
 
 import (

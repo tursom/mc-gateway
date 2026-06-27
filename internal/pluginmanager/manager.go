@@ -1,3 +1,5 @@
+// internal/pluginmanager/manager.go 协调插件记录、制品加载、钩子分发快照和生命周期迁移。
+
 package pluginmanager
 
 import (
@@ -25,10 +27,13 @@ type RuntimeAdapter interface {
 	Load(ctx context.Context, artifact ArtifactRecord, pluginRecord PluginRecord, gateway *Gateway) (api.Plugin, error)
 }
 
+// ConfigDryRunAdapter 是运行时适配器的可选能力。支持该能力时，配置保存前
+// 可以真正实例化插件并调用 ReloadConfig，从而提前发现 schema 之外的错误。
 type ConfigDryRunAdapter interface {
 	DryRunConfig(ctx context.Context, artifact ArtifactRecord, pluginRecord PluginRecord) error
 }
 
+// GoPluginAdapter 加载 Go plugin 或内置插件，是当前 in-process 插件运行模式的默认实现。
 type GoPluginAdapter struct{}
 
 func (a GoPluginAdapter) Load(ctx context.Context, artifact ArtifactRecord, pluginRecord PluginRecord, gateway *Gateway) (api.Plugin, error) {
@@ -82,6 +87,8 @@ func (a GoPluginAdapter) instantiate(ctx context.Context, artifact ArtifactRecor
 	if artifact.RuntimeType == RuntimeBuiltin || artifact.PluginID == "official.rule-policy" {
 		return instantiateBuiltinPlugin(artifact, pluginRecord, gateway, init)
 	}
+	// Go plugin 只能加载与当前进程 Go 版本、架构和 ABI 匹配的 .so 文件。
+	// 这些兼容性检查在制品校验和构建阶段完成，这里只负责打开和实例化。
 	opened, err := stdplugin.Open(artifact.FilePath)
 	if err != nil {
 		return nil, err
@@ -91,6 +98,8 @@ func (a GoPluginAdapter) instantiate(ctx context.Context, artifact ArtifactRecor
 	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err == nil && manifest.Runtime.EntrySymbol != "" {
 		symbolName = manifest.Runtime.EntrySymbol
 	}
+	// 默认入口符号是 Plugin，也允许 manifest 指定自定义入口，便于未来兼容
+	// 不同构建工具生成的插件包。
 	symbol, err := opened.Lookup(symbolName)
 	if err != nil {
 		return nil, err
@@ -100,6 +109,8 @@ func (a GoPluginAdapter) instantiate(ctx context.Context, artifact ArtifactRecor
 		return nil, fmt.Errorf("plugin symbol %q has invalid signature", symbolName)
 	}
 	instance := factory()
+	// 插件配置对象由插件自己声明；宿主只负责把持久化 JSON 解入该对象，
+	// 再交给 ReloadConfig 做插件内部校验。
 	cfg := instance.NewConfigObj()
 	if cfg != nil && pluginRecord.ConfigJSON != "" && canUnmarshalInto(cfg) {
 		if err := json.Unmarshal([]byte(pluginRecord.ConfigJSON), cfg); err != nil {
@@ -117,6 +128,8 @@ func (a GoPluginAdapter) instantiate(ctx context.Context, artifact ArtifactRecor
 	return instance, nil
 }
 
+// instantiateBuiltinPlugin 让官方内置插件走同一套 Plugin 接口和配置流程，
+// 避免在调用路径上区分内置插件与外部上传插件。
 func instantiateBuiltinPlugin(artifact ArtifactRecord, pluginRecord PluginRecord, gateway *Gateway, init bool) (api.Plugin, error) {
 	var instance api.Plugin
 	switch artifact.PluginID {
@@ -166,17 +179,21 @@ type Manager struct {
 	routeCacheMu      sync.Mutex
 	routeCache        map[string]routeCacheEntry
 
+	// proxyConns 只跟踪由插件托管代理的连接，用于停用插件时的 drain 和强制关闭。
 	proxyMu     sync.Mutex
 	proxySeq    uint64
 	proxyConns  map[uint64]*proxyConnection
 	drainingIDs map[string]bool
 	operations  *Operations
 
+	// serviceMode/hosts 预留给插件运行时从进程内迁移到独立宿主的服务模式。
 	serviceMode string
 	hostMu      sync.Mutex
 	hosts       map[string]*pluginHostProcess
 }
 
+// loadedPlugin 是内存中的插件实例和它注册的扩展快照。数据库记录说明期望状态，
+// loadedPlugin 说明当前进程实际已经加载了什么。
 type loadedPlugin struct {
 	record     PluginRecord
 	artifact   ArtifactRecord
@@ -186,6 +203,7 @@ type loadedPlugin struct {
 	extensions pluginExtensions
 }
 
+// pluginExtensions 按扩展类型拆分注册结果，便于发布不可变快照给不同热路径使用。
 type pluginExtensions struct {
 	routes      []*routeHandler
 	statuses    []*statusHandler
@@ -194,6 +212,7 @@ type pluginExtensions struct {
 	providers   []ProviderSummary
 }
 
+// upstreamHandler 包装一个上游连接钩子，并保存调用、错误、超时和代理流量指标。
 type upstreamHandler struct {
 	pluginID            string
 	artifactID          string
@@ -256,6 +275,8 @@ type Options struct {
 	PolicyProfile string
 }
 
+// New 构造插件管理器并初始化内存快照。官方内置插件和插件服务模式会在这里
+// 尽力注册/应用，失败不会阻止网关启动，后续 Admin API 仍可修复状态。
 func New(options Options) *Manager {
 	adapter := options.Adapter
 	if adapter == nil {
@@ -277,6 +298,7 @@ func New(options Options) *Manager {
 	}
 	manager.operations = NewOperations(manager.repo, options.ArtifactRoot)
 	if manager.builders == nil {
+		// 默认同时提供本地进程构建和容器构建能力；部署方可在 Options 中收窄。
 		manager.builders = map[string]SourceBuilder{
 			BuilderTypeLocalProcess: LocalProcessBuilder{StoreRoot: options.ArtifactRoot},
 			BuilderTypeContainer:    ContainerBuilder{},
@@ -289,6 +311,8 @@ func New(options Options) *Manager {
 	return manager
 }
 
+// EnsureOfficialPlugins 将内置官方插件登记为普通制品记录。这样 UI、治理、
+// 配置和启停流程都可以复用同一套插件管理模型。
 func (m *Manager) EnsureOfficialPlugins(ctx context.Context, actor string) error {
 	now := time.Now().Unix()
 	manifest := Manifest{
@@ -341,6 +365,8 @@ func (m *Manager) EnsureOfficialPlugins(ctx context.Context, actor string) error
 	return nil
 }
 
+// UploadArtifact 校验并保存二进制插件制品；源码包会转交给源码保存流程，
+// 因为源码上传后还需要自动排队构建。
 func (m *Manager) UploadArtifact(ctx context.Context, upload ArtifactUpload) (ArtifactRecord, error) {
 	artifact, err := m.store.ValidateAndStore(upload)
 	if err != nil {
@@ -362,6 +388,8 @@ func (m *Manager) UploadArtifact(ctx context.Context, upload ArtifactUpload) (Ar
 	return artifact, nil
 }
 
+// UploadSource 保存源码插件包并创建构建记录。真正构建可以立即运行，也可以
+// 由管理端稍后触发 RunBuild。
 func (m *Manager) UploadSource(ctx context.Context, upload ArtifactUpload) (ArtifactRecord, error) {
 	artifact, err := m.store.ValidateAndStoreSource(upload)
 	if err != nil {
@@ -406,6 +434,7 @@ func (m *Manager) CreateBuild(ctx context.Context, actor string, req BuildReques
 		return BuildRecord{}, fmt.Errorf("artifact %s is %q, want source", source.ID, source.ArtifactType)
 	}
 	req = defaultBuildRequest(req, source)
+	// Go plugin 与宿主进程存在 ABI 约束，目前只允许构建当前网关所在平台的目标。
 	if req.GOOS != runtime.GOOS || req.GOARCH != runtime.GOARCH {
 		return BuildRecord{}, fmt.Errorf("build target %s/%s does not match gateway %s/%s", req.GOOS, req.GOARCH, runtime.GOOS, runtime.GOARCH)
 	}
@@ -449,6 +478,8 @@ func (m *Manager) CreateBuild(ctx context.Context, actor string, req BuildReques
 	return build, nil
 }
 
+// RunBuild 执行已排队的源码构建，并把产出的二进制制品重新写入制品仓库。
+// 构建记录始终会落库，失败时也会保存日志摘要，便于管理端诊断。
 func (m *Manager) RunBuild(ctx context.Context, actor string, buildID int64) (BuildRecord, error) {
 	build, err := m.repo.Build(ctx, buildID)
 	if err != nil {
@@ -559,11 +590,14 @@ func (m *Manager) RunBuild(ctx context.Context, actor string, buildID int64) (Bu
 	return m.repo.Build(ctx, build.ID)
 }
 
+// SetDesired 只修改插件的期望状态，不直接改变当前进程已加载的插件。
+// 调用方需要再执行 Enable/Disable/Reconcile 才会推动运行态收敛。
 func (m *Manager) SetDesired(ctx context.Context, actor, pluginID, artifactID, desiredState, configJSON string, priority int) (PluginRecord, error) {
 	if desiredState == "" {
 		desiredState = DesiredDisabled
 	}
 	if desiredState != DesiredDeleted {
+		// 任何非删除状态都先做配置 dry-run，避免把无法加载的配置写成新的期望状态。
 		if _, err := m.DryRunConfig(ctx, pluginID, artifactID, configJSON); err != nil {
 			_ = m.repo.RecordOperation(ctx, pluginID, artifactID, "config_dry_run", "failed", actor, err.Error(), map[string]any{
 				"active_changed": false,
@@ -584,6 +618,8 @@ func (m *Manager) SetDesired(ctx context.Context, actor, pluginID, artifactID, d
 	return pluginRecord, nil
 }
 
+// DryRunConfig 执行保存配置前的完整预检：JSON 合法性、制品归属、治理门禁、
+// schema、密钥引用以及运行时 ReloadConfig 都会在这里验证。
 func (m *Manager) DryRunConfig(ctx context.Context, pluginID, artifactID, configJSON string) (ConfigDryRunResult, error) {
 	result := ConfigDryRunResult{
 		OK:         false,
@@ -631,6 +667,7 @@ func (m *Manager) DryRunConfig(ctx context.Context, pluginID, artifactID, config
 		return result, err
 	}
 	if dryRunner, ok := m.adapter.(ConfigDryRunAdapter); ok {
+		// 运行时 dry-run 会实例化插件但不调用 Init，避免注册钩子或启动后台任务。
 		if err := dryRunner.DryRunConfig(ctx, artifact, pluginRecord); err != nil {
 			result.Error = err.Error()
 			return result, err
@@ -758,6 +795,8 @@ func (m *Manager) Load(ctx context.Context, actor, pluginID string) (PluginRecor
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// Load 只把插件实例化到内存并登记为 loaded，不发布到热路径。
+	// 管理端可用它验证制品和配置，而不立即影响在线连接。
 	pluginRecord, err := m.repo.Plugin(ctx, pluginID)
 	if err != nil {
 		return PluginRecord{}, err
@@ -771,6 +810,8 @@ func (m *Manager) Load(ctx context.Context, actor, pluginID string) (PluginRecor
 	return m.repo.Plugin(ctx, pluginID)
 }
 
+// Enable 将期望状态推进为启用，并把插件处理器发布到连接热路径。
+// 发布前会先通过治理门禁，避免高风险制品绕过评审直接生效。
 func (m *Manager) Enable(ctx context.Context, actor, pluginID string) (PluginRecord, error) {
 	pluginRecord, err := m.repo.Plugin(ctx, pluginID)
 	if err != nil {
@@ -797,6 +838,8 @@ func (m *Manager) Enable(ctx context.Context, actor, pluginID string) (PluginRec
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	// 真正加载与发布都在同一把锁内完成，保证 snapshot、extensions 和 loaded
+	// 三类内存状态不会被并发读到半更新结果。
 	loaded, err := m.loadLocked(ctx, pluginRecord)
 	if err != nil {
 		_ = m.repo.RecordOperation(ctx, pluginID, pluginRecord.DesiredArtifactID, "enable", "failed", actor, err.Error(), nil)
@@ -817,6 +860,8 @@ func (m *Manager) Enable(ctx context.Context, actor, pluginID string) (PluginRec
 	if err := m.markEnabled(ctx, loaded); err != nil {
 		return PluginRecord{}, err
 	}
+	// 数据库运行态先写成功，再发布内存快照；这样 UI 看到 enabled 时，
+	// 连接热路径也已经具备对应处理器。
 	m.markHostStarted(pluginID, loaded.artifact.ID)
 	m.clearDrainingLocked(pluginID)
 	m.publish(next)
@@ -830,6 +875,8 @@ func (m *Manager) Enable(ctx context.Context, actor, pluginID string) (PluginRec
 	return m.repo.Plugin(ctx, pluginID)
 }
 
+// Disable 从热路径移除插件并进入 drain。Go plugin 不能从进程卸载，
+// 因此这里停止任务、移除分发入口，并等待已有 protocol-proxy 连接结束。
 func (m *Manager) Disable(ctx context.Context, actor, pluginID string) (PluginRecord, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -844,6 +891,8 @@ func (m *Manager) Disable(ctx context.Context, actor, pluginID string) (PluginRe
 	}
 	m.removeFromDispatchLocked(pluginID)
 	m.removeExtensionsLocked(pluginID)
+	// 先标记 draining，再 Destroy 插件实例，确保后续管理操作能看到仍在
+	// 转发中的插件代理连接。
 	m.markDrainingLocked(pluginID)
 	m.markHostDraining(pluginID)
 	m.operations.StopPlugin(pluginID)
@@ -866,6 +915,8 @@ func (m *Manager) Disable(ctx context.Context, actor, pluginID string) (PluginRe
 	return m.repo.Plugin(ctx, pluginID)
 }
 
+// Delete 与 Disable 类似，但把期望状态写为 deleted。实际制品清理仍由 GC
+// 根据引用关系判断，避免删除仍被快照或历史操作引用的文件。
 func (m *Manager) Delete(ctx context.Context, actor, pluginID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -892,6 +943,8 @@ func (m *Manager) Delete(ctx context.Context, actor, pluginID string) error {
 	return nil
 }
 
+// Reconcile 根据数据库中的期望启用列表重建内存分发快照，主要用于进程启动
+// 或运行态状态漂移后的自愈。
 func (m *Manager) Reconcile(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -903,6 +956,7 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 	nextByPlugin := make(map[string][]*upstreamHandler)
 	extensionsByPlugin := make(map[string]pluginExtensions)
 	for _, pluginRecord := range desired {
+		// 单个插件失败不阻断其他插件收敛；失败会记录到 runtime_state 和操作日志。
 		decision, err := m.EvaluateGovernance(ctx, pluginRecord.ID, pluginRecord.DesiredArtifactID, GovernanceActionEnable, m.currentPolicyProfile(), pluginRecord.ConfigJSON)
 		if err == nil && !decision.OK {
 			err = governanceBlockedError(decision)
@@ -930,11 +984,14 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 		m.markHostStarted(pluginRecord.ID, loaded.artifact.ID)
 		m.clearDrainingLocked(pluginRecord.ID)
 	}
+	// 所有插件都处理完后一次性发布快照，避免热路径在收敛过程中看到部分插件。
 	m.publish(flattenHandlers(nextByPlugin))
 	m.publishExtensionsLocked(extensionsByPlugin)
 	return nil
 }
 
+// ConnectUpstream 依次调用当前快照中的上游连接处理器。处理器返回 ErrPass
+// 表示让下一个插件继续尝试，返回连接则由网关使用插件提供的上游。
 func (m *Manager) ConnectUpstream(ctx context.Context, req api.UpstreamConnectRequest) (UpstreamResult, error) {
 	value := m.snapshot.Load()
 	if value == nil {
@@ -949,6 +1006,7 @@ func (m *Manager) ConnectUpstream(ctx context.Context, req api.UpstreamConnectRe
 	}
 	req.InitialData = append([]byte(nil), req.InitialData...)
 	for _, handler := range handlers {
+		// accept 阶段应尽量轻量，用于快速过滤不关心的主机或上游。
 		accepted, err := handler.accepts(req)
 		if err != nil {
 			return UpstreamResult{Handled: true}, err
@@ -983,6 +1041,8 @@ func (m *Manager) ConnectUpstream(ctx context.Context, req api.UpstreamConnectRe
 			return UpstreamResult{Handled: true}, err
 		}
 		if conn != nil {
+			// protocol-proxy 模式由插件代理完整协议流；普通 dialer 模式只提供
+			// 已连接的上游 net.Conn，后续转发仍由网关主流程完成。
 			if handler.mode == UpstreamModeDialer {
 				_ = m.repo.SaveTrace(context.Background(), TraceSummary{
 					PluginID:     handler.pluginID,
@@ -1010,6 +1070,8 @@ func (m *Manager) ConnectUpstream(ctx context.Context, req api.UpstreamConnectRe
 	return UpstreamResult{}, nil
 }
 
+// startProtocolProxy 把客户端连接交给插件提供的协议代理端点。网关仍跟踪连接，
+// 以便停用插件时可以 drain 或强制关闭。
 func (m *Manager) startProtocolProxy(ctx context.Context, handler *upstreamHandler, result UpstreamResult, req api.UpstreamConnectRequest) (UpstreamResult, error) {
 	endpoint := result.Conn
 	initial := append([]byte(nil), req.InitialData...)
@@ -1454,6 +1516,7 @@ func (m *Manager) findHandler(pluginID, handlerID string) *upstreamHandler {
 }
 
 func (m *Manager) finishProxyConnection(id uint64, stats ProxyConnectionStats) {
+	// 代理连接结束时汇总字节数和耗时，供 Admin UI 展示插件代理健康情况。
 	m.proxyMu.Lock()
 	proxyConn := m.proxyConns[id]
 	delete(m.proxyConns, id)
@@ -1477,10 +1540,13 @@ func (m *Manager) finishProxyConnection(id uint64, stats ProxyConnectionStats) {
 	}
 }
 
+// loadLocked 加载或复用插件实例。调用方必须持有 m.mu，确保 loaded 缓存和
+// 运行态标记不会与 Enable/Disable/Reconcile 并发冲突。
 func (m *Manager) loadLocked(ctx context.Context, pluginRecord PluginRecord) (*loadedPlugin, error) {
 	if loaded := m.loaded[pluginRecord.ID]; loaded != nil &&
 		loaded.artifact.ID == pluginRecord.DesiredArtifactID &&
 		loaded.record.DesiredGeneration == pluginRecord.DesiredGeneration {
+		// 同一制品、同一期望代数已经加载时直接复用，避免重复 Init 和重复注册任务。
 		return loaded, nil
 	}
 	artifact, err := m.repo.Artifact(ctx, pluginRecord.DesiredArtifactID)
@@ -1503,6 +1569,7 @@ func (m *Manager) loadLocked(ctx context.Context, pluginRecord PluginRecord) (*l
 	}
 	handlers := buildHandlers(pluginRecord, artifact, gateway)
 	extensions := buildExtensions(pluginRecord, artifact, gateway)
+	// 钩子和扩展是从 gateway 注册记录中构建出来的；插件 Init 期间完成注册。
 	loaded := &loadedPlugin{
 		record:     pluginRecord,
 		artifact:   artifact,
@@ -1523,6 +1590,8 @@ func (m *Manager) loadLocked(ctx context.Context, pluginRecord PluginRecord) (*l
 	return loaded, nil
 }
 
+// validateArtifactGate 确认制品能被当前网关进程加载。Go plugin 对 Go 版本和
+// 目标平台敏感，沙箱/wasm 运行时则受插件服务模式控制。
 func (m *Manager) validateArtifactGate(artifact ArtifactRecord) error {
 	if artifact.Status == ArtifactStatusDeleted || artifact.Status == ArtifactStatusRejected {
 		return fmt.Errorf("artifact status %q is not loadable", artifact.Status)

@@ -1,3 +1,5 @@
+// cmd/gateway/admin_frontend/src/views/status.ts 渲染管理面板上的网关健康摘要。
+
 import { api } from "../api.js";
 import { showAlert } from "../alerts.js";
 import { el, stat } from "../dom.js";

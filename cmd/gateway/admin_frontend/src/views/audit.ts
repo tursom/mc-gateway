@@ -1,3 +1,5 @@
+// cmd/gateway/admin_frontend/src/views/audit.ts 渲染管理员用于复核运行态变更的审计日志。
+
 import { api } from "../api.js";
 import { showAlert } from "../alerts.js";
 import { badge, el, escapeHTML } from "../dom.js";

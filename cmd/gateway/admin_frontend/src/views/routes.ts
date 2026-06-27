@@ -1,3 +1,5 @@
+// cmd/gateway/admin_frontend/src/views/routes.ts 渲染路由列表，并通过 Admin API 保存主机到上游的变更。
+
 import { api } from "../api.js";
 import { showAlert } from "../alerts.js";
 import { badge, el, escapeAttr, escapeHTML, getFormInput } from "../dom.js";

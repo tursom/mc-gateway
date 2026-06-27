@@ -1,3 +1,5 @@
+// internal/upstreamtarget/target_test.go 包含用于约束 target 行为的测试。
+
 package upstreamtarget
 
 import "testing"

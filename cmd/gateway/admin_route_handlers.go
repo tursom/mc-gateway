@@ -1,3 +1,5 @@
+// cmd/gateway/admin_route_handlers.go 提供修改路由记录的 HTTP 接口，并在提交后立刻刷新内存路由快照。
+
 package main
 
 import (

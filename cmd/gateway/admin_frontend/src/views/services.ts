@@ -1,3 +1,5 @@
+// cmd/gateway/admin_frontend/src/views/services.ts 渲染监听服务设置，并持久化启停、端口和选项更新。
+
 import { api } from "../api.js";
 import { showAlert } from "../alerts.js";
 import { el, escapeAttr, escapeHTML, getFormInput } from "../dom.js";

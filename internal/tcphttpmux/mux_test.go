@@ -1,3 +1,5 @@
+// internal/tcphttpmux/mux_test.go 包含用于约束 mux 行为的测试。
+
 package tcphttpmux
 
 import (

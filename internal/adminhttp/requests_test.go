@@ -1,3 +1,5 @@
+// internal/adminhttp/requests_test.go 包含用于约束 requests 行为的测试。
+
 package adminhttp
 
 import (

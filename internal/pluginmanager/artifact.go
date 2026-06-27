@@ -1,3 +1,5 @@
+// internal/pluginmanager/artifact.go 校验、保存、哈希并描述上传到网关的插件制品包。
+
 package pluginmanager
 
 import (

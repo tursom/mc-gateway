@@ -1,3 +1,5 @@
+// cmd/gateway/admin_frontend/src/views/users.ts 渲染管理用户列表，并保存账号、角色、密码和禁用状态变更。
+
 import { api } from "../api.js";
 import { showAlert } from "../alerts.js";
 import { badge, el, escapeAttr, escapeHTML, getFormInput, getFormSelect } from "../dom.js";

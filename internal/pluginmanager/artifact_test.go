@@ -1,3 +1,5 @@
+// internal/pluginmanager/artifact_test.go 包含用于约束 artifact 行为的测试。
+
 package pluginmanager
 
 import (

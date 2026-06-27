@@ -1,3 +1,5 @@
+// internal/adminhttp/gateway.go 把仓库驱动的网关依赖适配为 Admin API 处理器集合。
+
 package adminhttp
 
 import (

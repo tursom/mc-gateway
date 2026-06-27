@@ -1,3 +1,5 @@
+// cmd/gateway/admin_services.go 从 SQLite 加载监听服务配置，并暴露规范化后的运行时服务选项。
+
 package main
 
 import (

@@ -1,3 +1,5 @@
+// internal/adminconfig/config.go 在 SQLite 中保存服务级运行态配置，并用类型化方法包装 JSON 选项。
+
 package adminconfig
 
 import (
