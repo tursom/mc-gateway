@@ -1,4 +1,4 @@
-# M0：事实源和状态表达未完成工作
+# M0：事实源和状态表达完成记录
 
 返回：[Roadmap 实施计划](../plugin-roadmap-implementation-plan.md)
 
