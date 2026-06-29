@@ -129,6 +129,11 @@ func ValidateStreamProxyFixture(fixture StreamProxyFixture) error {
 			}
 		case StreamFrameHalfClose:
 			seen["half_close"] = true
+			switch strings.TrimSpace(frame.Direction) {
+			case "gateway_to_plugin", "plugin_to_gateway":
+			default:
+				return fmt.Errorf("stream proxy fixture %q half_close frame direction is invalid", name)
+			}
 		case StreamFrameDeadline:
 			seen["deadline"] = true
 			if frame.DeadlineUnixMS <= 0 && fixture.DeadlineUnixMS <= 0 {
@@ -141,11 +146,20 @@ func ValidateStreamProxyFixture(fixture StreamProxyFixture) error {
 			}
 		case StreamFrameCancel:
 			seen["cancel"] = true
+			if strings.TrimSpace(frame.Reason) == "" {
+				return fmt.Errorf("stream proxy fixture %q cancel frame requires reason", name)
+			}
 		case StreamFrameAccounting:
 			seen["accounting"] = true
+			if frame.Bytes != 0 || frame.WindowBytes != 0 {
+				return fmt.Errorf("stream proxy fixture %q accounting frame must not carry data or window bytes", name)
+			}
 		default:
 			return fmt.Errorf("stream proxy fixture %q has unsupported frame type %q", name, frameType)
 		}
+	}
+	if fixture.BackpressureBytes != 0 && fixture.BackpressureBytes != bytesToPlugin {
+		return fmt.Errorf("stream proxy fixture %q backpressure_bytes = %d, computed %d", name, fixture.BackpressureBytes, bytesToPlugin)
 	}
 	if fixture.BytesToPlugin != 0 && fixture.BytesToPlugin != bytesToPlugin {
 		return fmt.Errorf("stream proxy fixture %q bytes_to_plugin = %d, computed %d", name, fixture.BytesToPlugin, bytesToPlugin)

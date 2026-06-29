@@ -50,6 +50,14 @@ func (m *IngressLifecycleManager) Start(ctx context.Context, pluginID, artifactI
 	if err := ValidateIngressCapability(Manifest{Secrets: ingressSecretSpecs(ingress)}, ingress); err != nil && len(err) > 0 {
 		return IngressListener{}, fmt.Errorf("ingress capability is invalid: %s", strings.Join(err, "; "))
 	}
+	m.mu.Lock()
+	for _, reserved := range m.reserved {
+		if ingressReservedListenerConflict(ingress, reserved) {
+			m.mu.Unlock()
+			return IngressListener{}, fmt.Errorf("ingress listener conflicts with reserved gateway listener %q on %s/%s:%d", reserved.Name, normalizedReservedListenerNetwork(reserved.Network), normalizedReservedListenerBind(reserved.Bind), reserved.Port)
+		}
+	}
+	m.mu.Unlock()
 	network := ingressListenerNetwork(ingress.Protocol)
 	addr := net.JoinHostPort(strings.TrimSpace(ingress.Bind), fmt.Sprint(ingress.Port))
 	listener, err := net.Listen(network, addr)

@@ -101,6 +101,34 @@ func normalizeSandboxPolicy(policy SandboxPolicy) SandboxPolicy {
 	return policy
 }
 
+func sandboxPolicyEmpty(policy SandboxPolicy) bool {
+	return len(policy.FilesystemRoots) == 0 &&
+		!policy.NetworkEnabled &&
+		len(policy.Env) == 0 &&
+		policy.CPUSeconds == 0 &&
+		policy.MemoryBytes == 0 &&
+		len(policy.SecretHandles) == 0
+}
+
+func validateSandboxPolicyEnforceable(policy SandboxPolicy) error {
+	if policy.NetworkEnabled {
+		return errors.New("sandbox-process network access cannot be enabled until network policy enforcement is available")
+	}
+	for key := range policy.Env {
+		lower := strings.ToLower(strings.TrimSpace(key))
+		if strings.Contains(lower, "secret") || strings.Contains(lower, "token") {
+			return fmt.Errorf("sandbox-process env key %q looks like secret material; use secret RPC handles instead", key)
+		}
+	}
+	if policy.CPUSeconds <= 0 {
+		return errors.New("sandbox-process cpu limit must be positive")
+	}
+	if policy.MemoryBytes <= 0 {
+		return errors.New("sandbox-process memory limit must be positive")
+	}
+	return nil
+}
+
 func (a SandboxProcessAdapter) Load(ctx context.Context, artifact ArtifactRecord, pluginRecord PluginRecord, gateway *Gateway) (api.Plugin, error) {
 	prepared, err := a.Prepare(ctx, artifact, pluginRecord)
 	if err != nil {
@@ -120,6 +148,14 @@ func (a SandboxProcessAdapter) ValidateArtifact(_ context.Context, artifact Arti
 	if artifact.ArtifactType != ArtifactTypeBinary {
 		return fmt.Errorf("sandbox-process adapter requires binary artifact, got %q", artifact.ArtifactType)
 	}
+	policy := a.Supervisor.Policy
+	if sandboxPolicyEmpty(policy) {
+		policy = a.Policy
+	}
+	policy = normalizeSandboxPolicy(policy)
+	if err := validateSandboxPolicyEnforceable(policy); err != nil {
+		return err
+	}
 	return validateSandboxEnforcementSupported()
 }
 
@@ -138,8 +174,12 @@ func (a SandboxProcessAdapter) Prepare(ctx context.Context, artifact ArtifactRec
 
 func (a SandboxProcessAdapter) Start(ctx context.Context, prepared RuntimePrepared, artifact ArtifactRecord, pluginRecord PluginRecord, _ *Gateway) (RuntimeInstance, error) {
 	supervisor := a.Supervisor
-	if supervisor.Policy.MemoryBytes == 0 && supervisor.Policy.CPUSeconds == 0 && len(supervisor.Policy.SecretHandles) == 0 {
+	if sandboxPolicyEmpty(supervisor.Policy) {
 		supervisor.Policy = a.Policy
+	}
+	supervisor.Policy = normalizeSandboxPolicy(supervisor.Policy)
+	if err := validateSandboxPolicyEnforceable(supervisor.Policy); err != nil {
+		return RuntimeInstance{}, err
 	}
 	process, err := supervisor.Start(ctx, pluginRecord.ID, artifact.ID, artifact.FilePath, a.Secrets)
 	if err != nil {
@@ -213,6 +253,9 @@ func (s SandboxSupervisor) Start(ctx context.Context, pluginID, artifactID, exec
 		return nil, errors.New("sandbox executable is required")
 	}
 	policy := normalizeSandboxPolicy(s.Policy)
+	if err := validateSandboxPolicyEnforceable(policy); err != nil {
+		return nil, err
+	}
 	rootDir, err := prepareSandboxRoot(executable, policy)
 	if err != nil {
 		return nil, err

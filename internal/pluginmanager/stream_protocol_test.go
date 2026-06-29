@@ -55,3 +55,65 @@ func TestValidateStreamProxyFixtureRejectsMissingSemantics(t *testing.T) {
 		t.Fatalf("ValidateStreamProxyFixture() error = %v, want missing backpressure frame", err)
 	}
 }
+
+func TestValidateStreamProxyFixtureRejectsMalformedControlFrames(t *testing.T) {
+	tests := []struct {
+		name    string
+		fixture StreamProxyFixture
+		want    string
+	}{
+		{
+			name: "half-close direction",
+			fixture: StreamProxyFixture{
+				Name:     "stream.proxy/v1.half_close",
+				Protocol: StreamProxyProtocolV1,
+				Expected: "half_close_propagated",
+				Frames:   []StreamProxyFrame{{Type: StreamFrameHalfClose}},
+			},
+			want: "half_close frame direction is invalid",
+		},
+		{
+			name: "cancel reason",
+			fixture: StreamProxyFixture{
+				Name:     "stream.proxy/v1.cancel",
+				Protocol: StreamProxyProtocolV1,
+				Expected: "cancel_closes_stream",
+				Frames:   []StreamProxyFrame{{Type: StreamFrameCancel}},
+			},
+			want: "cancel frame requires reason",
+		},
+		{
+			name: "accounting payload",
+			fixture: StreamProxyFixture{
+				Name:     "stream.proxy/v1.accounting",
+				Protocol: StreamProxyProtocolV1,
+				Expected: "byte_accounting_exact",
+				Frames:   []StreamProxyFrame{{Type: StreamFrameAccounting, Bytes: 1}},
+			},
+			want: "accounting frame must not carry data",
+		},
+		{
+			name: "backpressure accounting",
+			fixture: StreamProxyFixture{
+				Name:              "stream.proxy/v1.backpressure",
+				Protocol:          StreamProxyProtocolV1,
+				Expected:          "backpressure_window_respected",
+				BytesToPlugin:     4,
+				BackpressureBytes: 8,
+				Frames: []StreamProxyFrame{
+					{Type: StreamFrameWindow, WindowBytes: 4},
+					{Type: StreamFrameData, Direction: "gateway_to_plugin", Bytes: 4},
+				},
+			},
+			want: "backpressure_bytes",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateStreamProxyFixture(tt.fixture)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("ValidateStreamProxyFixture() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}

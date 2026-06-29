@@ -631,6 +631,46 @@ func TestSandboxFilesystemStagingRejectsEscapes(t *testing.T) {
 	}
 }
 
+func TestSandboxPolicyBlocksUnenforceableControls(t *testing.T) {
+	tests := []struct {
+		name   string
+		policy SandboxPolicy
+		want   string
+	}{
+		{
+			name:   "network enabled",
+			policy: SandboxPolicy{NetworkEnabled: true, CPUSeconds: 1, MemoryBytes: 8 * 1024 * 1024},
+			want:   "network access cannot be enabled",
+		},
+		{
+			name:   "secret env",
+			policy: SandboxPolicy{Env: map[string]string{"API_TOKEN": "raw"}, CPUSeconds: 1, MemoryBytes: 8 * 1024 * 1024},
+			want:   "secret material",
+		},
+		{
+			name:   "missing cpu",
+			policy: SandboxPolicy{MemoryBytes: 8 * 1024 * 1024},
+			want:   "cpu limit must be positive",
+		},
+		{
+			name:   "missing memory",
+			policy: SandboxPolicy{CPUSeconds: 1},
+			want:   "memory limit must be positive",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateSandboxPolicyEnforceable(tt.policy)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("validateSandboxPolicyEnforceable() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+	if err := validateSandboxPolicyEnforceable(normalizeSandboxPolicy(SandboxPolicy{})); err != nil {
+		t.Fatalf("validateSandboxPolicyEnforceable(default policy) error = %v", err)
+	}
+}
+
 func TestWASMRequiredCapabilityBlocksEnable(t *testing.T) {
 	manager := newManagerForTest(t, &fakeAdapter{initOnly: true})
 	manager.serviceMode = PluginServiceModeSandboxProcess
@@ -852,6 +892,27 @@ func TestIngressServiceReservedListenerConflictBlocksGovernance(t *testing.T) {
 	}
 	if decision.OK || !hasIssueCode(decision.Issues, "ingress_reserved_listener_conflict") || !hasIssueCode(decision.Issues, "ingress_service_disabled") {
 		t.Fatalf("decision = %+v, want reserved listener conflict plus disabled block", decision)
+	}
+}
+
+func TestIngressListenerLifecycleRejectsReservedListenerConflict(t *testing.T) {
+	ctx := context.Background()
+	manager := newManagerForTest(t, &fakeAdapter{initOnly: true})
+	manager.futureGates = FutureRuntimeGates{Ingress: true}
+	port := reserveFreeTCPPortForTest(t)
+	manager.RefreshIngressReservedListeners([]IngressReservedListener{{
+		Name:    "tcp_admin",
+		Network: "tcp",
+		Bind:    "0.0.0.0",
+		Port:    port,
+		Enabled: true,
+	}})
+	artifact := uploadTestArtifactWithManifest(t, manager, "reserved-runtime-ingress", func(manifest *Manifest) {
+		manifest.ExtensionPoints = []ExtensionPoint{{Type: "service", Key: ExtensionIngressService}}
+		manifest.Capabilities = json.RawMessage(fmt.Sprintf(`{"extension_points":["ingress.service/v1"],"ingress":{"protocol":"tcp","bind":"127.0.0.1","port":%d}}`, port))
+	})
+	if _, err := manager.StartIngressListener(ctx, "reserved-runtime-ingress", artifact.ID); err == nil || !strings.Contains(err.Error(), "reserved gateway listener") {
+		t.Fatalf("StartIngressListener(reserved conflict) error = %v, want reserved listener block", err)
 	}
 }
 
