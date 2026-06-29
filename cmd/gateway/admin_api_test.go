@@ -538,6 +538,21 @@ func TestAdminPluginPhase4API(t *testing.T) {
 	if int(secretBody["current_version"].(float64)) != 2 || int(secretBody["previous_version"].(float64)) != 1 {
 		t.Fatalf("rotated secret response = %#v, want current 2 previous 1", secretBody)
 	}
+	resp = adminTestRequest(t, handler, http.MethodGet, "/admin/api/plugins/phase4-plugin/secrets", memberToken, nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("member secret read status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if strings.Contains(resp.Body.String(), "rotated-secret-value") || strings.Contains(resp.Body.String(), "super-secret-value") {
+		t.Fatalf("member secret list leaked value: %s", resp.Body.String())
+	}
+	secrets := adminTestJSON(t, resp)["secrets"].([]any)
+	if len(secrets) != 1 {
+		t.Fatalf("member secret list = %#v, want one summary", secrets)
+	}
+	memberSecret := secrets[0].(map[string]any)
+	if int(memberSecret["current_version"].(float64)) != 2 || int(memberSecret["previous_version"].(float64)) != 1 {
+		t.Fatalf("member secret summary = %#v, want current 2 previous 1", memberSecret)
+	}
 
 	resp = adminTestRequest(t, handler, http.MethodPost, "/admin/api/plugins/phase4-plugin/config/dry-run", adminToken, map[string]any{
 		"artifact_id": artifact.ID,
@@ -578,6 +593,18 @@ func TestAdminPluginPhase4API(t *testing.T) {
 	for _, forbidden := range []string{"super-secret-value", "rotated-secret-value", `"token":"new"`, `"token": "new"`, `"token":"old"`, `"token": "old"`} {
 		if strings.Contains(resp.Body.String(), forbidden) {
 			t.Fatalf("config rollback response leaked %q: %s", forbidden, resp.Body.String())
+		}
+	}
+	resp = adminTestRequest(t, handler, http.MethodGet, "/admin/api/plugins/phase4-plugin/operations/diagnostic", adminToken, nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("diagnostic status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "recent_operations") || !strings.Contains(resp.Body.String(), "secret_update") {
+		t.Fatalf("diagnostic body missing operation context: %s", resp.Body.String())
+	}
+	for _, forbidden := range []string{"super-secret-value", "rotated-secret-value"} {
+		if strings.Contains(resp.Body.String(), forbidden) {
+			t.Fatalf("diagnostic leaked %q: %s", forbidden, resp.Body.String())
 		}
 	}
 
@@ -677,7 +704,7 @@ func TestAdminPluginConfigDryRunFailuresPreserveStateAndAuditRedacts(t *testing.
 	if _, err := pluginsManager.UpsertSecret(context.Background(), "admin", "dry-run-failure-plugin", artifact.ID, "api_token", "runtime-secret-value", true, false); err != nil {
 		t.Fatalf("UpsertSecret() error = %v", err)
 	}
-	adapter.err = errors.New("reload rejected for runtime config")
+	adapter.err = errors.New("reload rejected for runtime-secret-config")
 	resp := adminTestRequest(t, handler, http.MethodPost, "/admin/api/plugins/dry-run-failure-plugin/config/dry-run", adminToken, map[string]any{
 		"artifact_id": artifact.ID,
 		"config_json": `{"token":"runtime-secret-config","host":"b","api_secret_ref":"api_token"}`,
@@ -707,6 +734,83 @@ func TestAdminPluginConfigDryRunFailuresPreserveStateAndAuditRedacts(t *testing.
 		t.Fatalf("audit body missing plugin_config_dry_run: %s", resp.Body.String())
 	}
 	for _, forbidden := range []string{"old-secret", "bad-json-secret", "bad-schema-secret", "missing-secret-config", "runtime-secret-config", "runtime-secret-value"} {
+		if strings.Contains(resp.Body.String(), forbidden) {
+			t.Fatalf("audit leaked %q: %s", forbidden, resp.Body.String())
+		}
+	}
+}
+
+func TestAdminPluginRollbackConfigRejectsForeignSnapshot(t *testing.T) {
+	handler := newAdminTestHandlerWithAdmin(t)
+	pluginsManager = pluginmanager.New(pluginmanager.Options{
+		DB:           adminDB,
+		ArtifactRoot: filepath.Join(filepath.Dir(adminDBPath), "plugins", "artifacts"),
+		Adapter:      gatewayTestPluginAdapter{},
+	})
+	adminToken := adminTestLogin(t, handler, "admin", "secret")
+
+	artifactA := uploadGatewayPhase4Artifact(t, "rollback-plugin-a")
+	artifactB := uploadGatewayPhase4Artifact(t, "rollback-plugin-b")
+	if _, err := pluginsManager.SetDesired(context.Background(), "admin", "rollback-plugin-a", artifactA.ID, pluginmanager.DesiredEnabled, `{"token":"a-secret","host":"a"}`, 10); err != nil {
+		t.Fatalf("SetDesired(plugin-a) error = %v", err)
+	}
+	if _, err := pluginsManager.SetDesired(context.Background(), "admin", "rollback-plugin-b", artifactB.ID, pluginmanager.DesiredEnabled, `{"token":"b-old-secret","host":"old"}`, 20); err != nil {
+		t.Fatalf("SetDesired(plugin-b old) error = %v", err)
+	}
+	beforeB, err := pluginsManager.SetDesired(context.Background(), "admin", "rollback-plugin-b", artifactB.ID, pluginmanager.DesiredEnabled, `{"token":"b-new-secret","host":"new"}`, 30)
+	if err != nil {
+		t.Fatalf("SetDesired(plugin-b new) error = %v", err)
+	}
+	snapshots, err := pluginsManager.ListConfigSnapshots(context.Background(), "rollback-plugin-b")
+	if err != nil {
+		t.Fatalf("ListConfigSnapshots(plugin-b) error = %v", err)
+	}
+	if len(snapshots) != 1 {
+		t.Fatalf("plugin-b snapshots = %+v, want one snapshot", snapshots)
+	}
+	beforeA, err := pluginsManager.Plugin(context.Background(), "rollback-plugin-a")
+	if err != nil {
+		t.Fatalf("Plugin(plugin-a before) error = %v", err)
+	}
+
+	resp := adminTestRequest(t, handler, http.MethodPost, "/admin/api/plugins/rollback-plugin-a/rollback/config", adminToken, map[string]any{
+		"snapshot_id":  snapshots[0].ID,
+		"full_desired": true,
+	})
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("foreign snapshot rollback status = %d, body=%s; want not found", resp.Code, resp.Body.String())
+	}
+	afterA, err := pluginsManager.Plugin(context.Background(), "rollback-plugin-a")
+	if err != nil {
+		t.Fatalf("Plugin(plugin-a after) error = %v", err)
+	}
+	afterB, err := pluginsManager.Plugin(context.Background(), "rollback-plugin-b")
+	if err != nil {
+		t.Fatalf("Plugin(plugin-b after) error = %v", err)
+	}
+	if afterA.DesiredArtifactID != beforeA.DesiredArtifactID ||
+		afterA.DesiredGeneration != beforeA.DesiredGeneration ||
+		afterA.ConfigJSON != beforeA.ConfigJSON ||
+		afterA.Priority != beforeA.Priority {
+		t.Fatalf("plugin-a after foreign snapshot rollback = %+v, want unchanged %+v", afterA, beforeA)
+	}
+	if afterB.DesiredArtifactID != beforeB.DesiredArtifactID ||
+		afterB.DesiredGeneration != beforeB.DesiredGeneration ||
+		afterB.ConfigJSON != beforeB.ConfigJSON ||
+		afterB.Priority != beforeB.Priority {
+		t.Fatalf("plugin-b after foreign snapshot rollback = %+v, want unchanged %+v", afterB, beforeB)
+	}
+
+	resp = adminTestRequest(t, handler, http.MethodGet, "/admin/api/audit-logs", adminToken, nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("audit status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "plugin_rollback_config") ||
+		!strings.Contains(resp.Body.String(), "rollback-plugin-a") ||
+		!strings.Contains(resp.Body.String(), `"success":false`) {
+		t.Fatalf("audit body missing failed rollback for requested plugin: %s", resp.Body.String())
+	}
+	for _, forbidden := range []string{"a-secret", "b-old-secret", "b-new-secret"} {
 		if strings.Contains(resp.Body.String(), forbidden) {
 			t.Fatalf("audit leaked %q: %s", forbidden, resp.Body.String())
 		}

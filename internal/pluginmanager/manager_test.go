@@ -576,7 +576,7 @@ func TestManagerDryRunFailureMatrix(t *testing.T) {
 	adapter := &fakeAdapter{}
 	manager := newManagerForTest(t, adapter)
 	artifact := uploadTestArtifactWithManifest(t, manager, "plugin-a", func(manifest *Manifest) {
-		manifest.ConfigSchema = json.RawMessage(`{"type":"object","required":["host"],"properties":{"host":{"type":"string"},"api_secret_ref":{"type":"string"}}}`)
+		manifest.ConfigSchema = json.RawMessage(`{"type":"object","required":["host"],"properties":{"host":{"type":"string"},"api_secret_ref":{"type":"string"},"token":{"type":"string","sensitive":true}}}`)
 		manifest.Secrets = []SecretSpec{{Name: "api_token"}}
 	})
 	if _, err := manager.SetDesired(context.Background(), "admin", "plugin-a", artifact.ID, DesiredDisabled, `{"host":"old"}`, 10); err != nil {
@@ -594,9 +594,13 @@ func TestManagerDryRunFailureMatrix(t *testing.T) {
 	if _, err := manager.UpsertSecret(context.Background(), "admin", "plugin-a", artifact.ID, "api_token", "secret", true, false); err != nil {
 		t.Fatalf("UpsertSecret() error = %v", err)
 	}
-	adapter.dryRunErrs = map[string]error{"plugin-a": errors.New("reload rejected")}
-	if result, err := manager.DryRunConfig(context.Background(), "plugin-a", artifact.ID, `{"host":"new","api_secret_ref":"api_token"}`); err == nil || result.OK || !strings.Contains(err.Error(), "reload rejected") {
+	adapter.dryRunErrs = map[string]error{"plugin-a": errors.New("reload rejected for runtime-secret-config")}
+	result, err := manager.DryRunConfig(context.Background(), "plugin-a", artifact.ID, `{"host":"new","api_secret_ref":"api_token","token":"runtime-secret-config"}`)
+	if err == nil || result.OK || !strings.Contains(err.Error(), "reload rejected") {
 		t.Fatalf("DryRunConfig(reload failure) = %+v err=%v, want reload rejection", result, err)
+	}
+	if strings.Contains(err.Error(), "runtime-secret-config") || strings.Contains(result.Error, "runtime-secret-config") || !strings.Contains(result.Error, "[REDACTED]") {
+		t.Fatalf("DryRunConfig(reload failure) = %+v err=%v, want redacted sensitive config value", result, err)
 	}
 	adapter.dryRunErrs = nil
 	if result, err := manager.DryRunConfig(context.Background(), "plugin-a", artifact.ID, `{"host":"new","api_secret_ref":"api_token"}`); err != nil || !result.OK {

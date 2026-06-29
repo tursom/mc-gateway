@@ -587,6 +587,14 @@ func handleAdminPluginRollback(w http.ResponseWriter, r *http.Request, rawSegmen
 	case "artifact":
 		plugin, err = pluginsManager.RollbackArtifact(r.Context(), session.Username, pluginID, req.ArtifactID)
 	case "config":
+		var snapshot pluginmanager.ConfigSnapshotRecord
+		snapshot, err = pluginsManager.ConfigSnapshot(r.Context(), req.SnapshotID)
+		if err == nil && snapshot.PluginID != pluginID {
+			err = pluginmanager.ErrPluginNotFound
+		}
+		if err != nil {
+			break
+		}
 		plugin, err = pluginsManager.RollbackConfigSnapshot(r.Context(), session.Username, req.SnapshotID, req.FullDesired)
 	default:
 		adminhttp.WriteAPIError(w, http.StatusBadRequest, "unknown rollback action")

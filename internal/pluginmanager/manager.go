@@ -765,6 +765,7 @@ func (m *Manager) DryRunConfig(ctx context.Context, pluginID, artifactID, config
 		result.Error = err.Error()
 		return result, err
 	}
+	sensitivePaths := sensitiveConfigPaths(manifest.ConfigSchema, configJSON)
 	pluginRecord, err := m.pluginRecordForDryRun(ctx, pluginID, artifactID, configJSON)
 	if err != nil {
 		result.Error = err.Error()
@@ -773,15 +774,15 @@ func (m *Manager) DryRunConfig(ctx context.Context, pluginID, artifactID, config
 	if dryRunner, ok := m.adapter.(ConfigDryRunAdapter); ok {
 		// 运行时 dry-run 会实例化插件但不调用 Init，避免注册钩子或启动后台任务。
 		if err := dryRunner.DryRunConfig(ctx, artifact, pluginRecord); err != nil {
-			result.Error = err.Error()
-			return result, err
+			message := redactSensitiveConfigText(err.Error(), configJSON, sensitivePaths)
+			result.Error = message
+			return result, errors.New(message)
 		}
 	}
 	currentConfig := "{}"
 	if current, err := m.repo.Plugin(ctx, pluginID); err == nil {
 		currentConfig = current.ConfigJSON
 	}
-	sensitivePaths := sensitiveConfigPaths(manifest.ConfigSchema, configJSON)
 	redactedConfig, err := redactJSON(configJSON, sensitivePaths)
 	if err != nil {
 		result.Error = err.Error()
@@ -2911,6 +2912,72 @@ func redactedDiffJSON(oldConfig, newConfig string, sensitivePaths []string) (str
 		return "", err
 	}
 	return string(data), nil
+}
+
+func redactSensitiveConfigText(text, configJSON string, sensitivePaths []string) string {
+	if text == "" || len(sensitivePaths) == 0 {
+		return text
+	}
+	for _, value := range sensitiveConfigTextValues(configJSON, sensitivePaths) {
+		if value != "" {
+			text = strings.ReplaceAll(text, value, "[REDACTED]")
+		}
+	}
+	return text
+}
+
+func sensitiveConfigTextValues(configJSON string, sensitivePaths []string) []string {
+	var value any
+	if err := json.Unmarshal([]byte(defaultJSONObject(configJSON)), &value); err != nil {
+		return nil
+	}
+	pathSet := make(map[string]bool, len(sensitivePaths))
+	for _, path := range sensitivePaths {
+		pathSet[path] = true
+	}
+	redacted := redactValue(value, "$", pathSet)
+	seen := make(map[string]bool)
+	collectRedactedTextValues(value, redacted, seen)
+	values := make([]string, 0, len(seen))
+	for value := range seen {
+		values = append(values, value)
+	}
+	sort.Strings(values)
+	return values
+}
+
+func collectRedactedTextValues(original, redacted any, values map[string]bool) {
+	switch typed := redacted.(type) {
+	case string:
+		if typed != "[REDACTED]" {
+			return
+		}
+		switch raw := original.(type) {
+		case string:
+			if raw != "" {
+				values[raw] = true
+			}
+		default:
+			data, err := json.Marshal(raw)
+			if err == nil && len(data) > 0 {
+				values[string(data)] = true
+			}
+		}
+	case map[string]any:
+		rawMap, _ := original.(map[string]any)
+		for key, child := range typed {
+			collectRedactedTextValues(rawMap[key], child, values)
+		}
+	case []any:
+		rawList, _ := original.([]any)
+		for idx, child := range typed {
+			var raw any
+			if idx < len(rawList) {
+				raw = rawList[idx]
+			}
+			collectRedactedTextValues(raw, child, values)
+		}
+	}
 }
 
 func redactSecretText(text string) string {
