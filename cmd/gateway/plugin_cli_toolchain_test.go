@@ -1176,6 +1176,7 @@ func TestPluginConformanceExecutesProviderRegistryFixtures(t *testing.T) {
 		if !ok ||
 			fixture["status"] != "pass" ||
 			fixture["mode"] != "executable" ||
+			fixture["extension"] != pluginmanager.ExtensionProvider ||
 			fixture["actual_provider_name"] != "external-identity" ||
 			fixture["actual_provider_type"] != pluginmanager.ExtensionAdminAuthProvider ||
 			fixture["actual_provider_count"] != float64(1) {

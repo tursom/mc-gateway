@@ -3246,6 +3246,91 @@ func TestEventSubscriberFailureDoesNotAffectEmitter(t *testing.T) {
 	}
 }
 
+func TestEventSubscriberDeadLetterCanReplayAcrossNodes(t *testing.T) {
+	db := openPluginManagerTestDB(t)
+	root := t.TempDir()
+	var replayed atomic.Int32
+	failingAdapter := &fakeAdapter{
+		initOnly: true,
+		initHook: func(gateway *Gateway) error {
+			return api.RegisterHookHandler(gateway, api.HookEventSubscriber,
+				func(api.EventDeliveryRequest) bool { return true },
+				func(api.EventDeliveryRequest) (api.EventDeliveryResult, error) {
+					return api.EventDeliveryResult{Retry: true, Reason: "node-a sink down"}, errors.New("node-a sink down")
+				})
+		},
+	}
+	first := New(Options{
+		DB:           db,
+		ArtifactRoot: root,
+		Adapter:      failingAdapter,
+		NodeID:       "node-a",
+	})
+	artifact := uploadTestArtifactWithManifest(t, first, "subscriber-cross-node", func(manifest *Manifest) {
+		manifest.ExtensionPoints = []ExtensionPoint{{Type: "event", Key: ExtensionEventSubscriber}}
+		manifest.Capabilities = json.RawMessage(`{"extension_points":["event.subscriber/v1"],"event_subscriber":{"mode":"at_least_once","max_retry":1}}`)
+	})
+	if _, err := first.SetDesired(context.Background(), "admin", "subscriber-cross-node", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	if _, err := first.Enable(context.Background(), "admin", "subscriber-cross-node"); err != nil {
+		t.Fatalf("Enable(first) error = %v", err)
+	}
+	emitterManifest := Manifest{Events: []EventSpec{{Name: "audit.cross_node", Fields: []string{"ok"}}}}
+	if err := first.operations.ForPlugin("emitter", "artifact", emitterManifest).EmitEvent(context.Background(), "audit.cross_node", map[string]string{"ok": "true"}); err != nil {
+		t.Fatalf("EmitEvent(first) error = %v", err)
+	}
+	waitForPluginManagerTest(t, func() bool {
+		return first.SubscriberDeadLetters(context.Background()) == 1
+	})
+	var deadLetterNode string
+	if err := db.QueryRowContext(context.Background(), `SELECT node_id FROM plugin_subscriber_dead_letters WHERE subscriber_plugin_id = ? AND status = 'pending'`, "subscriber-cross-node").Scan(&deadLetterNode); err != nil {
+		t.Fatalf("pending dead letter node query error = %v", err)
+	}
+	if deadLetterNode != "node-a" {
+		t.Fatalf("dead letter node = %q, want node-a", deadLetterNode)
+	}
+
+	second := New(Options{
+		DB:           db,
+		ArtifactRoot: root,
+		Adapter: &fakeAdapter{initOnly: true, initHook: func(gateway *Gateway) error {
+			return api.RegisterHookHandler(gateway, api.HookEventSubscriber,
+				func(api.EventDeliveryRequest) bool { return true },
+				func(req api.EventDeliveryRequest) (api.EventDeliveryResult, error) {
+					if req.Name == "audit.cross_node" {
+						replayed.Add(1)
+					}
+					return api.EventDeliveryResult{OK: true}, nil
+				})
+		}},
+		NodeID: "node-b",
+	})
+	if err := second.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile(second) error = %v", err)
+	}
+	if count := second.ReplaySubscriberDeadLetters(context.Background(), "node-b-admin"); count != 1 {
+		t.Fatalf("ReplaySubscriberDeadLetters(second) = %d, want 1", count)
+	}
+	waitForPluginManagerTest(t, func() bool {
+		return second.SubscriberDeadLetters(context.Background()) == 0 && replayed.Load() == 1
+	})
+	var status string
+	if err := db.QueryRowContext(context.Background(), `SELECT status FROM plugin_subscriber_dead_letters WHERE subscriber_plugin_id = ?`, "subscriber-cross-node").Scan(&status); err != nil {
+		t.Fatalf("dead letter status query error = %v", err)
+	}
+	if status != "replayed" {
+		t.Fatalf("dead letter status = %q, want replayed", status)
+	}
+	ops, err := second.repo.ListOperations(context.Background(), "", 20)
+	if err != nil {
+		t.Fatalf("ListOperations() error = %v", err)
+	}
+	if !operationRecorded(ops, "event_subscriber_replay:succeeded") {
+		t.Fatalf("operations = %+v, want cross-node replay audit", ops)
+	}
+}
+
 func TestProviderRegistryIncludesUnavailableAdminAuthProvider(t *testing.T) {
 	adapter := &fakeAdapter{
 		initOnly: true,

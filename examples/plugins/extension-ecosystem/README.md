@@ -1,6 +1,6 @@
 # Extension Ecosystem Example
 
-This example demonstrates phase 7 extension points:
+This example demonstrates the M6 extension ecosystem fixtures:
 
 - `route.resolve/v1` returns `override`, `fallback`, `reject`, or `pass`, with cache TTL, SQLite fallback, upstream rewrite, and decision explain metadata.
 - `status.ping/v1` returns MOTD, favicon, online/max players, version text, and maintenance window fields.

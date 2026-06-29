@@ -1,4 +1,4 @@
-// examples/plugins/extension-ecosystem/main.go demonstrates the phase 7 extension points.
+// examples/plugins/extension-ecosystem/main.go demonstrates the M6 extension ecosystem fixtures.
 
 package main
 

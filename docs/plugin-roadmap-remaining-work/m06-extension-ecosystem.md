@@ -1,4 +1,4 @@
-# M6：Extension Ecosystem 收尾未完成工作
+# M6：Extension Ecosystem 完成记录
 
 返回：[Roadmap 实施计划](../plugin-roadmap-implementation-plan.md)
 
@@ -6,43 +6,55 @@
 
 按实际使用价值收尾 route、status、rule、event、middleware、provider 等扩展点，让常见需求有示例、fixture、冲突治理和 Admin 操作入口。
 
-## 未完成工作
+## 完成范围
 
-1. 给每个 extension point 补独立可执行 conformance：
-   - route decision。
-   - status ping。
-   - rule/policy evaluation。
-   - connection/handshake middleware。
-   - event subscriber。
-   - provider registry。
-2. 补 route/status/rule 示例闭环：
-   - external source refresh、cache TTL、SQLite fallback、decision explain。
-   - MOTD、favicon、online/max players、version text 和 maintenance message。
-   - host rewrite、source CIDR allow/deny、simple rate limit、upstream rewrite。
-3. 补 event subscriber 生产语义：
-   - 持久化 dead letter。
-   - replay/drop 审计。
-   - at-least-once 跨节点投递策略。
-   - subscriber 失败不影响连接路径。
-4. 补 middleware 和 provider 冲突治理：
-   - deterministic ordering、handshake rewrite 传递、fail-open/fail-closed。
-   - provider singleton、priority/fallback、dependency declaration。
-   - provider 冲突通过 priority/scope 或 disable 修复。
-5. 保持 Admin auth provider 边界：
-   - 外部 provider 不可用时，本地 break-glass 仍可登录。
-   - 未接入真实管理登录数据面前不得展示为 implemented data-plane。
-6. 补 Admin 操作入口验收：
-   - Dispatch plan 面板可触发 route refresh。
-   - subscriber dead-letter replay/drop 有返回结果和审计。
+1. 每个启用的 extension point 都有独立可执行 conformance：
+   - `route.resolve/v1`：`route.resolve/v1.override/fallback/reject/pass` 和 `route decision independent` fixture。
+   - `status.ping/v1`：`status.ping/v1.host` 和 `status ping independent` fixture。
+   - `rule.evaluate/v1`：`allow/deny/error_fail_closed/timeout_fail_closed/bad_config_fallback` fixture。
+   - `connection.filter/v1`、`handshake.filter/v1`：allow/reject/fail-open/fail-closed 和 handshake rewrite fixture。
+   - `event.subscriber/v1`：best-effort、at-least-once、dead-letter、replay、drop、cross-node at-least-once、failure non-blocking fixture。
+   - `provider/v1`：singleton、priority、fallback、dependency、scope、disable fixture，实际 provider 类型覆盖 `admin.auth.provider/v1` 但不宣称其管理登录数据面已实现。
+2. `examples/plugins/extension-ecosystem` 提供 route/status/rule/event/provider 示例闭环：
+   - route external source refresh、cache TTL、SQLite fallback、decision explain、upstream rewrite。
+   - status MOTD、favicon、online/max players、version text、maintenance message。
+   - rule/connection middleware host/source CIDR allow/deny、simple rate limit。
+3. event subscriber 具备生产语义：
+   - 死信持久化到 `plugin_subscriber_dead_letters`。
+   - replay/drop 通过 `ReplaySubscriberDeadLetters`、`DropSubscriberDeadLetters` 返回结果，并通过 `plugin_operations` 与 Admin audit 写入审计。
+   - cross-node at-least-once 策略通过共享 SQLite 死信记录和 `node_id` 证明，节点 B 可 replay 节点 A 写入的 pending dead letter。
+   - 事件投递异步执行，subscriber 失败不会阻塞 event emitter 或连接路径。
+4. middleware/provider 冲突治理已收口：
+   - middleware 按 priority 稳定排序，支持 fail-open/fail-closed。
+   - handshake rewrite 会传递给后续 handshake filter。
+   - provider registry 记录 singleton、priority、fallback、dependencies、scope metadata，并通过 disable 从 dispatch plan 移除。
+5. Admin auth provider 边界保持不变：
+   - `admin.auth.provider/v1` 只作为 provider registry/status 预留边界。
+   - feature matrix 仍标记为 reserved、`implemented=false`、`data_plane=false`。
+   - 外部 provider 不可用时，本地 admin break-glass 登录仍是唯一已实现认证路径。
+6. Admin 操作入口完成：
+   - Dispatch plan API/panel 支持 `refresh-routes`。
+   - subscriber dead-letter replay/drop 返回数量，并记录 audit。
 
-## 验收
+## 代码证据
 
-- 每个启用的 extension point 至少有一个示例和 conformance fixture。
-- `examples/plugins/extension-ecosystem` 覆盖 route/status/event/provider 行为。
-- 插件 disable 后恢复默认行为。
-- event subscriber 失败不影响连接路径，死信 replay/drop 可审计。
+- 示例与 conformance：`examples/plugins/extension-ecosystem/manifest.yaml`、`examples/plugins/extension-ecosystem/conformance.json`、`examples/plugins/extension-ecosystem/main.go`。
+- CLI conformance 执行器：`cmd/gateway/plugin_cli_toolchain.go`。
+- Admin Dispatch plan 操作入口：`cmd/gateway/admin_plugin_handlers.go`、`cmd/gateway/admin_frontend/src/views/plugins.ts`。
+- extension runtime：`internal/pluginmanager/extensions.go`。
+- subscriber persistent dead letter：`internal/pluginmanager/operations.go`、`internal/pluginmanager/repository.go`。
+- feature boundary：`internal/pluginmanager/features.go`。
+- 测试覆盖：`internal/pluginmanager/manager_test.go`、`cmd/gateway/admin_api_test.go`、`cmd/gateway/plugin_cli_toolchain_test.go`。
+
+## 验收命令
+
+```bash
+go test ./internal/pluginmanager ./cmd/gateway
+go run ./cmd/gateway plugin conformance examples/plugins/extension-ecosystem
+git diff --check
+```
 
 ## 回滚边界
 
-- rule、status、route、event 插件都必须可独立 disable。
-- extension ecosystem 失败不能影响默认 route 和已稳定的 `upstream.connect/v1` 主路径。
+- route、status、rule、event、middleware、provider 插件都可通过 disable 从 dispatch plan 移除。
+- extension ecosystem 失败不影响默认 route fallback，也不影响已稳定的 `upstream.connect/v1` 主路径。

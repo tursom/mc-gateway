@@ -1214,9 +1214,10 @@ func normalizeConformanceFixtureFileForCLI(opts pluginContractCLIOptions, file p
 	}
 	for _, item := range file.ProviderRegistry {
 		fixtures = append(fixtures, map[string]any{
-			"name":     "provider.registry." + item,
-			"status":   "pass",
-			"provider": item,
+			"name":      "provider.registry." + item,
+			"status":    "pass",
+			"extension": pluginmanager.ExtensionProvider,
+			"provider":  item,
 		})
 		executeConformanceProviderFixtureForCLI(opts, fixtures[len(fixtures)-1], executor)
 	}
