@@ -127,6 +127,12 @@ type pluginConformanceFixtureFile struct {
 	LocalAdminBreakGlass                 bool                               `json:"local_admin_break_glass"`
 }
 
+var pluginConformanceStableNow = time.Unix(1782758400, 0).UTC()
+
+func pluginConformanceNow() time.Time {
+	return pluginConformanceStableNow
+}
+
 type pluginRuntimeCLIAdapter interface {
 	RuntimeType() string
 	Init(context.Context, pluginInitCLIOptions) error
@@ -1310,6 +1316,7 @@ func (e *conformanceExecutorForCLI) prepare(adapter pluginmanager.RuntimeAdapter
 	manager := pluginmanager.New(pluginmanager.Options{
 		DB:            db,
 		ArtifactRoot:  filepath.Join(tmpRoot, "artifacts"),
+		Now:           pluginConformanceNow,
 		Adapter:       adapter,
 		PolicyProfile: e.opts.Profile,
 	})
@@ -1712,6 +1719,10 @@ func executeConformanceProviderFixtureForCLI(_ pluginContractCLIOptions, fixture
 			fixture["error"] = "manifest capabilities do not declare provider registry scenario " + want
 			return
 		}
+		if err := executeProviderRegistryHarnessFixtureForCLI(fixture, want); err != nil {
+			conformanceFail(fixture, err)
+			return
+		}
 		conformancePass(fixture)
 		return
 	}
@@ -1746,6 +1757,99 @@ func executeConformanceProviderFixtureForCLI(_ pluginContractCLIOptions, fixture
 	}
 	fixture["status"] = "fail"
 	fixture["error"] = "provider registry fixture did not find requested provider"
+}
+
+func executeProviderRegistryHarnessFixtureForCLI(fixture map[string]any, scenario string) error {
+	manager, artifact, cleanup, err := newConformanceHarnessManager("provider-registry-conformance", "provider", scenario, "", nil)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	if _, err := manager.SetDesired(context.Background(), "cli", artifact.PluginID, artifact.ID, pluginmanager.DesiredEnabled, `{}`, pluginmanager.DefaultPriority); err != nil {
+		return err
+	}
+	if _, err := manager.Enable(context.Background(), "cli", artifact.PluginID); err != nil {
+		return err
+	}
+	plan := manager.DispatchPlan(context.Background())
+	providers := providerSummariesForPlugin(plan.Providers, artifact.PluginID)
+	fixture["target_plugin"] = artifact.PluginID
+	fixture["actual_providers"] = providers
+	fixture["actual_provider_count"] = len(providers)
+	if len(providers) == 0 {
+		return errors.New("provider registry fixture did not register a provider")
+	}
+	provider := providers[0]
+	fixture["actual_provider_type"] = provider.Type
+	fixture["actual_provider_name"] = provider.Name
+	fixture["actual_provider_priority"] = provider.Priority
+	fixture["actual_provider_fallback"] = provider.Fallback
+	fixture["actual_provider_dependencies"] = append([]string(nil), provider.Dependencies...)
+	fixture["actual_provider_metadata"] = copyStringMapForCLI(provider.Metadata)
+	switch scenario {
+	case "singleton":
+		if len(providers) != 1 || provider.Type != pluginmanager.ExtensionAdminAuthProvider || provider.Name != "external-identity" {
+			return errors.New("provider registry singleton fixture did not produce exactly one external identity provider")
+		}
+	case "priority":
+		if provider.Priority != 100 {
+			return fmt.Errorf("provider registry priority = %d, want 100", provider.Priority)
+		}
+	case "fallback":
+		if !provider.Fallback {
+			return errors.New("provider registry fallback flag was not preserved")
+		}
+	case "dependency":
+		if !cliContainsString(provider.Dependencies, "local-admin-break-glass") {
+			return errors.New("provider registry dependency was not preserved")
+		}
+	case "scope":
+		if provider.Metadata["scope"] != "admin" || !strings.Contains(provider.Metadata["scope_hosts"], "blue.example") {
+			return errors.New("provider registry scope metadata was not preserved")
+		}
+	case "disable":
+		if _, err := manager.Disable(context.Background(), "cli", artifact.PluginID); err != nil {
+			return err
+		}
+		after := providerSummariesForPlugin(manager.DispatchPlan(context.Background()).Providers, artifact.PluginID)
+		fixture["actual_provider_count_after_disable"] = len(after)
+		if len(after) != 0 {
+			return errors.New("provider registry disable fixture left provider in dispatch plan")
+		}
+	default:
+		return fmt.Errorf("unsupported provider registry scenario %q", scenario)
+	}
+	return nil
+}
+
+func providerSummariesForPlugin(providers []pluginmanager.ProviderSummary, pluginID string) []pluginmanager.ProviderSummary {
+	out := make([]pluginmanager.ProviderSummary, 0, len(providers))
+	for _, provider := range providers {
+		if provider.PluginID == pluginID {
+			out = append(out, provider)
+		}
+	}
+	return out
+}
+
+func cliContainsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func copyStringMapForCLI(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }
 
 func executeConformanceGovernanceGateFixtureForCLI(_ pluginContractCLIOptions, fixture map[string]any, executor *conformanceExecutorForCLI) {
@@ -1979,9 +2083,26 @@ func (p *conformanceHarnessPlugin) Init(gateway api.Gateway) error {
 			func(api.EventDeliveryRequest) bool { return true },
 			p.handleEventSubscriber)
 	case "provider":
-		return api.RegisterHookHandler(gateway, api.HookAdminAuthProvider,
-			func(api.ProviderRegistration) bool { return true },
-			p.handleAdminAuthProvider)
+		switch p.scenario {
+		case pluginmanager.ExtensionProvider:
+			return api.RegisterHookHandler(gateway, api.HookProvider,
+				func(api.ProviderRegistration) bool { return true },
+				func() (api.ProviderRegistration, error) {
+					return p.providerRegistration(pluginmanager.ExtensionProvider), nil
+				})
+		case pluginmanager.ExtensionAuthProvider:
+			return api.RegisterHookHandler(gateway, api.HookAuthProvider,
+				func(api.ProviderRegistration) bool { return true },
+				func() (api.ProviderRegistration, error) {
+					return p.providerRegistration(pluginmanager.ExtensionAuthProvider), nil
+				})
+		default:
+			return api.RegisterHookHandler(gateway, api.HookAdminAuthProvider,
+				func(api.ProviderRegistration) bool { return true },
+				func() (api.ProviderRegistration, error) {
+					return p.providerRegistration(pluginmanager.ExtensionAdminAuthProvider), nil
+				})
+		}
 	case "task":
 		return gateway.RegisterBackgroundTask(api.BackgroundTask{
 			ID:     "conformance-task",
@@ -2118,17 +2239,20 @@ func (p *conformanceHarnessPlugin) handleEventSubscriber(req api.EventDeliveryRe
 	}
 }
 
-func (p *conformanceHarnessPlugin) handleAdminAuthProvider() (api.ProviderRegistration, error) {
+func (p *conformanceHarnessPlugin) providerRegistration(providerType string) api.ProviderRegistration {
 	return api.ProviderRegistration{
-		Type:         api.HookAdminAuthProvider.Key(),
+		Type:         providerType,
 		Name:         "external-identity",
 		Priority:     100,
 		Fallback:     true,
 		Dependencies: []string{"local-admin-break-glass"},
 		Metadata: map[string]string{
 			"break_glass": "local-admin",
+			"scenario":    p.scenario,
+			"scope":       "admin",
+			"scope_hosts": "blue.example,red.example",
 		},
-	}, nil
+	}
 }
 
 func executeProtocolProxyHarnessFixtureForCLI(fixture map[string]any) error {
@@ -2654,6 +2778,7 @@ func newConformanceHarnessManager(pluginID, mode, scenario, upstreamMode string,
 	manager := pluginmanager.New(pluginmanager.Options{
 		DB:            db,
 		ArtifactRoot:  filepath.Join(tmpRoot, "artifacts"),
+		Now:           pluginConformanceNow,
 		Adapter:       adapter,
 		PolicyProfile: pluginmanager.PolicyProfileProd,
 	})
@@ -2763,8 +2888,12 @@ func conformanceHarnessManifest(pluginID, mode, scenario, upstreamMode string) p
 		}
 		manifest.Capabilities = json.RawMessage(`{"extension_points":["event.subscriber/v1"],"event_subscriber":{"mode":"` + mode + `","max_retry":1}}`)
 	case "provider":
-		manifest.ExtensionPoints = []pluginmanager.ExtensionPoint{{Type: "provider", Key: pluginmanager.ExtensionAdminAuthProvider}}
-		manifest.Capabilities = json.RawMessage(`{"extension_points":["admin.auth.provider/v1"],"scope":{"type":"host","values":["blue.example","red.example"]},"providers":[{"type":"admin.auth.provider/v1","name":"external-identity","priority":100,"fallback":true,"dependencies":["local-admin-break-glass"]}],"provider_singletons":["admin.auth.provider/v1:external-identity"]}`)
+		providerKey := pluginmanager.ExtensionAdminAuthProvider
+		if scenario == pluginmanager.ExtensionProvider || scenario == pluginmanager.ExtensionAuthProvider || scenario == pluginmanager.ExtensionAdminAuthProvider {
+			providerKey = scenario
+		}
+		manifest.ExtensionPoints = []pluginmanager.ExtensionPoint{{Type: "provider", Key: providerKey}}
+		manifest.Capabilities = json.RawMessage(`{"extension_points":["` + providerKey + `"],"scope":{"type":"host","values":["blue.example","red.example"]},"providers":[{"type":"` + providerKey + `","name":"external-identity","priority":100,"fallback":true,"dependencies":["local-admin-break-glass"]}],"provider_singletons":["` + providerKey + `:external-identity"]}`)
 	case "task":
 		manifest.ExtensionPoints = []pluginmanager.ExtensionPoint{{Type: "middleware", Key: pluginmanager.ExtensionConnectionFilter}}
 		manifest.Capabilities = json.RawMessage(`{"extension_points":["connection.filter/v1"]}`)

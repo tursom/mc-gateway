@@ -1037,6 +1037,15 @@ func TestPluginSchemaContractAndConformanceCommands(t *testing.T) {
 		!hasFixture(fixtureReport.Fixtures, "governance.promotion_apply_gate", "pass") {
 		t.Fatalf("fixture report = %+v, want loaded golden fixtures", fixtureReport)
 	}
+	conformanceWithFixtureAgain := captureStdout(t, func() {
+		handled, code := runPluginCLI([]string{"plugin", "conformance", dir})
+		if !handled || code != 0 {
+			t.Fatalf("runPluginCLI(conformance fixture repeat) = (%v, %d), want handled code 0", handled, code)
+		}
+	})
+	if conformanceWithFixtureAgain != conformanceWithFixture {
+		t.Fatalf("conformance output is not stable across runs\nfirst:\n%s\nsecond:\n%s", conformanceWithFixture, conformanceWithFixtureAgain)
+	}
 	strictPreflightWithFixture := captureStdout(t, func() {
 		handled, code := runPluginCLI([]string{"plugin", "preflight", dir, "--require-conformance-fixture"})
 		if !handled || code != 0 {
@@ -1144,6 +1153,41 @@ func TestPluginConformanceExecutesGovernanceReviewFixture(t *testing.T) {
 		fixture["actual_issue"] != "review_required" ||
 		fixture["actual_ok"] != false {
 		t.Fatalf("governance.review_required fixture = %+v, want executed blocking review gate", fixture)
+	}
+}
+
+func TestPluginConformanceExecutesProviderRegistryFixtures(t *testing.T) {
+	output := captureStdout(t, func() {
+		handled, code := runPluginCLI([]string{"plugin", "conformance", "../../examples/plugins/extension-ecosystem"})
+		if !handled || code != 0 {
+			t.Fatalf("runPluginCLI(conformance extension ecosystem) = (%v, %d), want handled code 0", handled, code)
+		}
+	})
+	var report struct {
+		OK       bool             `json:"ok"`
+		Fixtures []map[string]any `json:"fixtures"`
+	}
+	if err := json.Unmarshal([]byte(output), &report); err != nil {
+		t.Fatalf("Unmarshal(conformance extension ecosystem) error = %v\n%s", err, output)
+	}
+	for _, scenario := range []string{"singleton", "priority", "fallback", "dependency", "scope", "disable"} {
+		name := "provider.registry." + scenario
+		fixture, ok := findFixture(report.Fixtures, name)
+		if !ok ||
+			fixture["status"] != "pass" ||
+			fixture["mode"] != "executable" ||
+			fixture["actual_provider_name"] != "external-identity" ||
+			fixture["actual_provider_type"] != pluginmanager.ExtensionAdminAuthProvider ||
+			fixture["actual_provider_count"] != float64(1) {
+			t.Fatalf("%s fixture = %+v, want executable provider registry evidence", name, fixture)
+		}
+		providers, ok := fixture["actual_providers"].([]any)
+		if !ok || len(providers) != 1 {
+			t.Fatalf("%s actual_providers = %#v, want one provider from dispatch plan", name, fixture["actual_providers"])
+		}
+		if scenario == "disable" && fixture["actual_provider_count_after_disable"] != float64(0) {
+			t.Fatalf("%s fixture = %+v, want provider removed after disable", name, fixture)
+		}
 	}
 }
 

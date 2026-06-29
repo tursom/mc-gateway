@@ -288,6 +288,7 @@ type ProxyConnectionStats struct {
 type Options struct {
 	DB                        *sql.DB
 	ArtifactRoot              string
+	Now                       func() time.Time
 	HandleConn                func(net.Conn)
 	WaitGroup                 *sync.WaitGroup
 	Adapter                   RuntimeAdapter
@@ -310,9 +311,15 @@ func New(options Options) *Manager {
 	if adapter == nil {
 		adapter, _ = RuntimeAdapterFactory{}.AdapterFor(PluginServiceModeInProcess, RuntimeGoPlugin)
 	}
+	repo := NewRepository(options.DB)
+	store := NewArtifactStore(options.ArtifactRoot)
+	if options.Now != nil {
+		repo.now = options.Now
+		store.now = options.Now
+	}
 	manager := &Manager{
-		repo:                      NewRepository(options.DB),
-		store:                     NewArtifactStore(options.ArtifactRoot),
+		repo:                      repo,
+		store:                     store,
 		adapter:                   adapter,
 		adapterManaged:            adapterManaged,
 		builders:                  options.Builders,

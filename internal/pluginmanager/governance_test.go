@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"net"
 	"runtime"
 	"strings"
 	"testing"
@@ -25,15 +26,38 @@ func TestGovernanceHighRiskProtocolProxyRequiresReview(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "review_required") {
 		t.Fatalf("Enable() error = %v, want review_required", err)
 	}
-	if _, err := manager.CreateReview(context.Background(), "admin", "proxy-review", GovernanceReviewRequest{
+	review, err := manager.CreateReview(context.Background(), "admin", "proxy-review", GovernanceReviewRequest{
 		ArtifactID: artifact.ID,
 		Profile:    PolicyProfileProd,
 		Decision:   ReviewDecisionApproved,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("CreateReview() error = %v", err)
+	}
+	for name, value := range map[string]string{
+		"artifact_hash":       review.ArtifactHash,
+		"config_hash":         review.ConfigHash,
+		"scope_hash":          review.ScopeHash,
+		"rollout_hash":        review.RolloutHash,
+		"runtime_limits_hash": review.RuntimeLimitsHash,
+		"features_hash":       review.FeaturesHash,
+		"policy_hash":         review.PolicyHash,
+	} {
+		if value == "" {
+			t.Fatalf("review %s is empty: %+v", name, review)
+		}
+	}
+	if review.ArtifactHash != artifact.SHA256 {
+		t.Fatalf("review artifact hash = %q, want artifact sha %q", review.ArtifactHash, artifact.SHA256)
 	}
 	if _, err := manager.Enable(context.Background(), "admin", "proxy-review"); err != nil {
 		t.Fatalf("Enable(after review) error = %v", err)
+	}
+	if _, err := manager.SetDesired(context.Background(), "admin", "proxy-review", artifact.ID, DesiredEnabled, `{"canary":true}`, 10); err != nil {
+		t.Fatalf("SetDesired(config change) error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", "proxy-review"); err == nil || !strings.Contains(err.Error(), "review_required") {
+		t.Fatalf("Enable(after reviewed config drift) error = %v, want review_required", err)
 	}
 }
 
@@ -230,6 +254,15 @@ func TestGovernanceAdvisoryQuarantineRemovesExtensionDispatch(t *testing.T) {
 	adapter := &fakeAdapter{
 		initOnly: true,
 		initHook: func(gateway *Gateway) error {
+			if err := api.RegisterHookHandler(gateway, api.HookUpstreamConnect,
+				func(api.UpstreamConnectRequest) bool { return true },
+				func(api.UpstreamConnectRequest) (net.Conn, error) {
+					left, right := net.Pipe()
+					_ = right.Close()
+					return left, nil
+				}); err != nil {
+				return err
+			}
 			if err := api.RegisterHookHandler(gateway, api.HookRouteResolve,
 				func(api.RouteResolveRequest) bool { return true },
 				func(req api.RouteResolveRequest) (api.RouteDecision, error) {
@@ -243,26 +276,43 @@ func TestGovernanceAdvisoryQuarantineRemovesExtensionDispatch(t *testing.T) {
 				}); err != nil {
 				return err
 			}
-			return api.RegisterHookHandler(gateway, api.HookStatusPing,
+			if err := api.RegisterHookHandler(gateway, api.HookStatusPing,
 				func(api.StatusPingRequest) bool { return true },
 				func(req api.StatusPingRequest) (api.StatusPingResponse, error) {
 					return api.StatusPingResponse{MOTD: "quarantine " + req.Host}, nil
-				})
+				}); err != nil {
+				return err
+			}
+			return gateway.RegisterBackgroundTask(api.BackgroundTask{
+				ID:     "sync",
+				Name:   "Quarantine Sync",
+				Manual: true,
+				Run: func(ctx context.Context) error {
+					<-ctx.Done()
+					return ctx.Err()
+				},
+			})
 		},
 	}
 	manager := newManagerForTest(t, adapter)
 	artifact := uploadTestArtifactWithManifest(t, manager, "quarantine-plugin", func(manifest *Manifest) {
 		manifest.ExtensionPoints = []ExtensionPoint{
+			{Type: "hook", Key: ExtensionUpstreamConnect},
 			{Type: "provider", Key: ExtensionRouteResolve},
 			{Type: "hook", Key: ExtensionStatusPing},
 		}
-		manifest.Capabilities = json.RawMessage(`{"extension_points":["route.resolve/v1","status.ping/v1"],"route":{"cache_ttl_ms":60000},"status":{"hosts":["play.example"]}}`)
+		manifest.Capabilities = json.RawMessage(`{"extension_points":["upstream.connect/v1","route.resolve/v1","status.ping/v1"],"upstream_connect":{"mode":"dialer"},"route":{"cache_ttl_ms":60000},"status":{"hosts":["play.example"]}}`)
+		manifest.BackgroundTasks = []TaskSpec{{ID: "sync", Mode: "manual", Manual: true, Timeout: "1s"}}
 	})
 	if _, err := manager.SetDesired(context.Background(), "admin", "quarantine-plugin", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
 		t.Fatalf("SetDesired() error = %v", err)
 	}
 	if _, err := manager.Enable(context.Background(), "admin", "quarantine-plugin"); err != nil {
 		t.Fatalf("Enable() error = %v", err)
+	}
+	upstream, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{Host: "play.example"})
+	if err != nil || !upstream.Handled {
+		t.Fatalf("ConnectUpstream(before quarantine) = %+v err=%v, want upstream dispatch", upstream, err)
 	}
 	route, err := manager.ResolveRoute(context.Background(), api.RouteResolveRequest{Host: "play.example"}, nil)
 	if err != nil || route.Source != "provider" || route.Decision.Upstream != "10.0.0.10:25565" {
@@ -272,6 +322,13 @@ func TestGovernanceAdvisoryQuarantineRemovesExtensionDispatch(t *testing.T) {
 	if err != nil || !status.Handled {
 		t.Fatalf("StatusPing(before quarantine) = %+v err=%v, want handled", status, err)
 	}
+	if _, err := manager.TriggerBackgroundTask(context.Background(), "admin", "quarantine-plugin", "sync", manager.operations.plugins["quarantine-plugin"].tasks["sync"].confirmToken); err != nil {
+		t.Fatalf("TriggerBackgroundTask() error = %v", err)
+	}
+	taskRuntime := manager.operations.plugins["quarantine-plugin"].tasks["sync"]
+	waitForPluginManagerTest(t, func() bool {
+		return taskRuntime.summary().Running
+	})
 	if _, err := manager.UpsertAdvisory(context.Background(), "admin", AdvisoryRequest{
 		AdvisoryID: "MCG-2026-QUARANTINE",
 		Action:     AdvisoryActionQuarantine,
@@ -279,9 +336,16 @@ func TestGovernanceAdvisoryQuarantineRemovesExtensionDispatch(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpsertAdvisory() error = %v", err)
 	}
+	waitForPluginManagerTest(t, func() bool {
+		return !taskRuntime.summary().Running
+	})
 	plan := manager.DispatchPlan(context.Background())
 	if len(plan.Routes) != 0 || len(plan.Statuses) != 0 {
 		t.Fatalf("dispatch plan after quarantine = %+v, want extension dispatch removed", plan)
+	}
+	upstream, err = manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{Host: "play.example"})
+	if err != nil || upstream.Handled {
+		t.Fatalf("ConnectUpstream(after quarantine) = %+v err=%v, want upstream dispatch removed", upstream, err)
 	}
 	status, err = manager.StatusPing(context.Background(), api.StatusPingRequest{Host: "play.example"})
 	if err != nil || status.Handled {
@@ -346,6 +410,22 @@ func TestGovernanceWarningOverrideTTL(t *testing.T) {
 	_, err = manager.Enable(context.Background(), "admin", "bench-plugin")
 	if err == nil || !strings.Contains(err.Error(), "benchmark_regression_warning") {
 		t.Fatalf("Enable(after override expiry) error = %v, want benchmark warning", err)
+	}
+	overrides, err := manager.ListWarningOverrides(context.Background(), "bench-plugin")
+	if err != nil {
+		t.Fatalf("ListWarningOverrides() error = %v", err)
+	}
+	if len(overrides) != 1 || overrides[0].ExpiresAt > now.Unix() || overrides[0].PolicyHash == "" {
+		t.Fatalf("overrides = %+v, want retained expired override audit with policy hash", overrides)
+	}
+	ops, err := manager.repo.ListOperations(context.Background(), "bench-plugin", 20)
+	if err != nil {
+		t.Fatalf("ListOperations() error = %v", err)
+	}
+	if !operationRecorded(ops, "governance_benchmark:succeeded") ||
+		!operationRecorded(ops, "governance_warning_override:succeeded") ||
+		!operationRecorded(ops, "enable_gate:failed") {
+		t.Fatalf("operations = %+v, want benchmark, override, and expired re-block audit", ops)
 	}
 }
 
