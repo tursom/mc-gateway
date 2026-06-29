@@ -107,8 +107,8 @@ func TestPluginServiceStatusIncludesModeMaturity(t *testing.T) {
 		t.Fatalf("go-plugin-process adapter = %+v, want partial process adapter", processAdapter)
 	}
 	wasmSandboxAdapter := findRuntimeAdapterStatus(status.RuntimeAdapters, PluginServiceModeSandboxProcess, RuntimeWASM)
-	if !wasmSandboxAdapter.Implemented || wasmSandboxAdapter.Maturity != FeatureMaturityPartial || !wasmSandboxAdapter.DataPlane || !wasmSandboxAdapter.RequiresRestart || !strings.Contains(wasmSandboxAdapter.UnsupportedReason, "future runtime gates") {
-		t.Fatalf("wasm sandbox adapter = %+v, want implemented adapter guarded by future runtime gates", wasmSandboxAdapter)
+	if wasmSandboxAdapter.Implemented || wasmSandboxAdapter.Maturity != FeatureMaturityReserved || wasmSandboxAdapter.DataPlane || !wasmSandboxAdapter.RequiresRestart || !strings.Contains(wasmSandboxAdapter.UnsupportedReason, "WASM data-plane") {
+		t.Fatalf("wasm sandbox adapter = %+v, want reserved non-data-plane adapter", wasmSandboxAdapter)
 	}
 }
 
@@ -181,8 +181,8 @@ func TestRuntimeAdapterFactoryProcessModeSupportsProcessDataPlane(t *testing.T) 
 	}
 
 	adapter, status = factory.AdapterFor(PluginServiceModeSandboxProcess, RuntimeWASM)
-	if !status.Implemented || status.Maturity != FeatureMaturityPartial || !status.DataPlane || status.Adapter != "wazero" || !strings.Contains(status.UnsupportedReason, "future runtime gates") {
-		t.Fatalf("wasm sandbox adapter status = %+v, want wazero adapter guarded by future gates", status)
+	if status.Implemented || status.Maturity != FeatureMaturityReserved || status.DataPlane || status.Adapter != "wazero" || !strings.Contains(status.UnsupportedReason, "WASM data-plane") {
+		t.Fatalf("wasm sandbox adapter status = %+v, want reserved wazero adapter status", status)
 	}
 	if _, ok := adapter.(RuntimeAdapterLifecycle); !ok {
 		t.Fatalf("adapter %T does not implement lifecycle", adapter)
@@ -538,8 +538,10 @@ func TestSandboxRequiredCapabilityBlocksEnable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PluginServiceStatus() error = %v", err)
 	}
-	if status.Service.DataPlaneMode != PluginServiceModeInProcess || !strings.Contains(status.Service.LastError, "future runtime gate") {
-		t.Fatalf("service status after sandbox apply = %+v, want sandbox gate fallback status", status.Service)
+	if status.Service.DataPlaneMode != PluginServiceModeInProcess ||
+		status.Service.DesiredMaturity != FeatureMaturityReserved ||
+		!strings.Contains(status.Service.LastError, "reserved") {
+		t.Fatalf("service status after sandbox apply = %+v, want reserved sandbox fallback status", status.Service)
 	}
 	if _, err := manager.SetDesired(context.Background(), "admin", "sandbox-plugin", artifact.ID, DesiredEnabled, `{}`, 10); err == nil || !strings.Contains(err.Error(), "sandbox-process runtime is disabled") {
 		t.Fatalf("SetDesired(sandbox desired mode) error = %v, want service mode block", err)

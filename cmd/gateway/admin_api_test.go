@@ -231,6 +231,13 @@ func TestAdminPluginServiceStatusReportsReservedModes(t *testing.T) {
 		!strings.Contains(processAdapter["unsupported_reason"].(string), "fd-live") {
 		t.Fatalf("go-plugin-process adapter = %#v, want partial process data plane", processAdapter)
 	}
+	sandboxMode := findAdminServiceModeFeature(t, status["service_modes"].([]any), pluginmanager.PluginServiceModeSandboxProcess)
+	if sandboxMode["implemented"] != false ||
+		sandboxMode["data_plane"] != false ||
+		sandboxMode["maturity"] != pluginmanager.FeatureMaturityReserved ||
+		!strings.Contains(sandboxMode["unsupported_reason"].(string), "current data-plane modes") {
+		t.Fatalf("sandbox service mode = %#v, want reserved non-data-plane mode", sandboxMode)
+	}
 	wasmSandboxAdapter := findAdminRuntimeAdapterStatus(t, status["runtime_adapters"].([]any), pluginmanager.PluginServiceModeSandboxProcess, pluginmanager.RuntimeWASM)
 	expectedWASMAdapter := findPluginRuntimeAdapterStatus(pluginmanager.RuntimeAdapterFactoryStatuses(), pluginmanager.PluginServiceModeSandboxProcess, pluginmanager.RuntimeWASM)
 	if wasmSandboxAdapter["implemented"] != expectedWASMAdapter.Implemented ||
@@ -242,6 +249,12 @@ func TestAdminPluginServiceStatusReportsReservedModes(t *testing.T) {
 		wasmSandboxAdapter["control_channel"] != expectedWASMAdapter.ControlChannel ||
 		wasmSandboxAdapter["unsupported_reason"] != expectedWASMAdapter.UnsupportedReason {
 		t.Fatalf("wasm sandbox adapter = %#v, want shared adapter fact source %+v", wasmSandboxAdapter, expectedWASMAdapter)
+	}
+	if wasmSandboxAdapter["implemented"] != false ||
+		wasmSandboxAdapter["data_plane"] != false ||
+		wasmSandboxAdapter["maturity"] != pluginmanager.FeatureMaturityReserved ||
+		!strings.Contains(wasmSandboxAdapter["unsupported_reason"].(string), "WASM data-plane") {
+		t.Fatalf("wasm sandbox adapter = %#v, want reserved non-data-plane adapter", wasmSandboxAdapter)
 	}
 	nodes := status["nodes"].([]any)
 	if len(nodes) != 1 {
@@ -319,6 +332,19 @@ func TestAdminPluginFeaturesExposeSharedFactSource(t *testing.T) {
 		wasm["entry"] != expectedWASM.Entry {
 		t.Fatalf("wasm feature = %#v, want shared runtime fact source %+v", wasm, expectedWASM)
 	}
+	if wasm["implemented"] != false ||
+		wasm["maturity"] != pluginmanager.FeatureMaturityReserved ||
+		wasm["data_plane"] != false ||
+		!strings.Contains(wasm["unsupported_reason"].(string), "WASM data-plane") {
+		t.Fatalf("wasm feature = %#v, want reserved non-data-plane runtime", wasm)
+	}
+	sandboxRuntime := findAdminRuntimeFeature(t, runtimeTypes, pluginmanager.RuntimeSandbox)
+	if sandboxRuntime["implemented"] != false ||
+		sandboxRuntime["maturity"] != pluginmanager.FeatureMaturityReserved ||
+		sandboxRuntime["data_plane"] != false ||
+		!strings.Contains(sandboxRuntime["unsupported_reason"].(string), "sandbox data-plane") {
+		t.Fatalf("sandbox runtime = %#v, want reserved non-data-plane runtime", sandboxRuntime)
+	}
 	extensionPoints := features["extension_points"].([]any)
 	if len(extensionPoints) != len(pluginmanager.ExtensionPointFeatures()) {
 		t.Fatalf("extension_points = %#v, want shared extension feature matrix", extensionPoints)
@@ -340,6 +366,12 @@ func TestAdminPluginFeaturesExposeSharedFactSource(t *testing.T) {
 		ingress["requires_restart"] != expectedIngress.RequiresRestart ||
 		ingress["unsupported_reason"] != expectedIngress.UnsupportedReason {
 		t.Fatalf("ingress service = %#v, want shared extension fact source %+v", ingress, expectedIngress)
+	}
+	if ingress["implemented"] != false ||
+		ingress["maturity"] != pluginmanager.FeatureMaturityReserved ||
+		ingress["data_plane"] != false ||
+		!strings.Contains(ingress["unsupported_reason"].(string), "listener data-plane") {
+		t.Fatalf("ingress service = %#v, want reserved non-data-plane extension", ingress)
 	}
 }
 

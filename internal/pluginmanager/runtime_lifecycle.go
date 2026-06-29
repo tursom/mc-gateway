@@ -157,19 +157,13 @@ func (RuntimeAdapterFactory) AdapterFor(serviceMode, runtimeType string) (Runtim
 		switch runtimeType {
 		case RuntimeSandbox:
 			status.Adapter = "sandbox-process"
-			status.Implemented = true
-			status.DataPlane = true
-			status.Lifecycle = true
 			status.ControlChannel = "sandbox-control-rpc"
-			status.UnsupportedReason = "future runtime gate sandbox_process must be enabled before activation"
+			status.UnsupportedReason = "sandbox-process runtime adapter is reserved; current gateway releases do not expose a sandbox data-plane"
 			return SandboxProcessAdapter{}, completeStatus()
 		case RuntimeWASM:
 			status.Adapter = "wazero"
-			status.Implemented = true
-			status.DataPlane = true
-			status.Lifecycle = true
 			status.ControlChannel = "wazero-host-abi"
-			status.UnsupportedReason = "future runtime gates sandbox_process and wasm must be enabled before activation"
+			status.UnsupportedReason = "wasm runtime adapter is reserved; current gateway releases do not expose a WASM data-plane"
 			return WASMAdapter{}, completeStatus()
 		default:
 			status.Adapter = "sandbox-process"

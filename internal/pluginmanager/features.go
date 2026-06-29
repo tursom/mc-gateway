@@ -20,19 +20,19 @@ func RuntimeTypeFeatures() []RuntimeFeature {
 		},
 		{
 			Type:              RuntimeSandbox,
-			Implemented:       true,
-			Maturity:          FeatureMaturityPartial,
-			DataPlane:         true,
+			Implemented:       false,
+			Maturity:          FeatureMaturityReserved,
+			DataPlane:         false,
 			RequiresRestart:   true,
-			UnsupportedReason: "sandbox-process enforcement is implemented but disabled unless future runtime gates enable sandbox_process",
+			UnsupportedReason: "sandbox-process runtime is reserved; current gateway releases do not expose a sandbox data-plane",
 		},
 		{
 			Type:              RuntimeWASM,
-			Implemented:       true,
-			Maturity:          FeatureMaturityPartial,
-			DataPlane:         true,
+			Implemented:       false,
+			Maturity:          FeatureMaturityReserved,
+			DataPlane:         false,
 			RequiresRestart:   true,
-			UnsupportedReason: "wazero runtime is implemented for low-risk validation extension points but disabled unless future runtime gates enable wasm",
+			UnsupportedReason: "wasm runtime is reserved; schema and validation checks do not provide a WASM data-plane",
 			Entry:             RuntimeWASMEntry,
 		},
 	}
@@ -57,11 +57,11 @@ func PluginServiceModeFeatures() []PluginServiceModeFeature {
 		},
 		{
 			Mode:              PluginServiceModeSandboxProcess,
-			Implemented:       true,
-			Maturity:          FeatureMaturityPartial,
-			DataPlane:         true,
+			Implemented:       false,
+			Maturity:          FeatureMaturityReserved,
+			DataPlane:         false,
 			RequiresRestart:   true,
-			UnsupportedReason: "sandbox-process service mode is implemented but disabled unless future runtime gates enable sandbox_process",
+			UnsupportedReason: "sandbox-process service mode is reserved; current data-plane modes are in-process and go-plugin-process",
 		},
 	}
 }
@@ -80,7 +80,7 @@ func ExtensionPointFeatures() []ExtensionPointFeature {
 		{Key: ExtensionProvider, Type: "provider", Implemented: true, Maturity: FeatureMaturityImplemented, DataPlane: false},
 		{Key: ExtensionAuthProvider, Type: "provider", Implemented: true, Maturity: FeatureMaturityPartial, DataPlane: false, UnsupportedReason: "auth.provider/v1 provider registration and status are implemented; Minecraft login data-plane integration is not implemented"},
 		{Key: ExtensionAdminAuthProvider, Type: "provider", Implemented: false, Maturity: FeatureMaturityReserved, DataPlane: false, UnsupportedReason: "admin.auth.provider/v1 is reserved; local admin break-glass remains the implemented authentication path"},
-		{Key: ExtensionIngressService, Type: "service", Implemented: true, Maturity: FeatureMaturityPartial, DataPlane: true, UnsupportedReason: "gateway-managed listener lifecycle is implemented but disabled unless future runtime gates enable ingress"},
+		{Key: ExtensionIngressService, Type: "service", Implemented: false, Maturity: FeatureMaturityReserved, DataPlane: false, UnsupportedReason: "ingress.service/v1 is reserved; schema and governance checks exist but gateway-managed listener data-plane is not enabled"},
 	}
 }
 

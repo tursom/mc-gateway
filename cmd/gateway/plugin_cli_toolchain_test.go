@@ -377,6 +377,15 @@ func TestPluginFeaturesAndManifestCommands(t *testing.T) {
 		wasm.Entry != expectedWASM.Entry {
 		t.Fatalf("wasm feature = %+v, want shared runtime fact source %+v", wasm, expectedWASM)
 	}
+	if wasm.Implemented || wasm.Maturity != pluginmanager.FeatureMaturityReserved || wasm.DataPlane ||
+		!strings.Contains(wasm.UnsupportedReason, "WASM data-plane") {
+		t.Fatalf("wasm feature = %+v, want reserved non-data-plane runtime", wasm)
+	}
+	sandboxRuntime := findRuntimeFeature(features.RuntimeTypes, pluginmanager.RuntimeSandbox)
+	if sandboxRuntime.Implemented || sandboxRuntime.Maturity != pluginmanager.FeatureMaturityReserved || sandboxRuntime.DataPlane ||
+		!strings.Contains(sandboxRuntime.UnsupportedReason, "sandbox data-plane") {
+		t.Fatalf("sandbox runtime feature = %+v, want reserved non-data-plane runtime", sandboxRuntime)
+	}
 	inProcess := findCLIServiceModeFeature(features.ServiceModes, pluginmanager.PluginServiceModeInProcess)
 	if !inProcess.Implemented || inProcess.Maturity != pluginmanager.FeatureMaturityImplemented || !inProcess.DataPlane || inProcess.RequiresRestart {
 		t.Fatalf("in-process feature = %+v, want implemented data-plane", inProcess)
@@ -384,6 +393,11 @@ func TestPluginFeaturesAndManifestCommands(t *testing.T) {
 	processMode := findCLIServiceModeFeature(features.ServiceModes, pluginmanager.PluginServiceModeGoPluginProcess)
 	if !processMode.Implemented || processMode.Maturity != pluginmanager.FeatureMaturityPartial || !processMode.DataPlane || !strings.Contains(processMode.UnsupportedReason, "protocol-proxy drain-only") {
 		t.Fatalf("go-plugin-process feature = %+v, want partial process data plane", processMode)
+	}
+	sandboxMode := findCLIServiceModeFeature(features.ServiceModes, pluginmanager.PluginServiceModeSandboxProcess)
+	if sandboxMode.Implemented || sandboxMode.Maturity != pluginmanager.FeatureMaturityReserved || sandboxMode.DataPlane ||
+		!strings.Contains(sandboxMode.UnsupportedReason, "current data-plane modes") {
+		t.Fatalf("sandbox service mode = %+v, want reserved non-data-plane service mode", sandboxMode)
 	}
 	inProcessAdapter := findRuntimeAdapterStatus(features.RuntimeAdapters, pluginmanager.PluginServiceModeInProcess, pluginmanager.RuntimeGoPlugin)
 	if !inProcessAdapter.Implemented || inProcessAdapter.Maturity != pluginmanager.FeatureMaturityImplemented || !inProcessAdapter.DataPlane || !inProcessAdapter.Lifecycle || inProcessAdapter.Adapter != "go-plugin-in-process" {
@@ -418,6 +432,10 @@ func TestPluginFeaturesAndManifestCommands(t *testing.T) {
 		ingressPoint.RequiresRestart != expectedIngress.RequiresRestart ||
 		ingressPoint.UnsupportedReason != expectedIngress.UnsupportedReason {
 		t.Fatalf("extension point features = %+v, want shared ingress fact source %+v", features.ExtensionPoints, expectedIngress)
+	}
+	if ingressPoint.Implemented || ingressPoint.Maturity != pluginmanager.FeatureMaturityReserved || ingressPoint.DataPlane ||
+		!strings.Contains(ingressPoint.UnsupportedReason, "listener data-plane") {
+		t.Fatalf("ingress extension point = %+v, want reserved non-data-plane extension point", ingressPoint)
 	}
 	adminAuthPoint := findExtensionPointFeature(features.ExtensionPoints, pluginmanager.ExtensionAdminAuthProvider)
 	if adminAuthPoint.Type != "provider" || adminAuthPoint.Implemented || adminAuthPoint.Maturity != pluginmanager.FeatureMaturityReserved || adminAuthPoint.DataPlane || adminAuthPoint.RequiresRestart || !strings.Contains(adminAuthPoint.UnsupportedReason, "break-glass") {
@@ -596,11 +614,11 @@ func TestPluginFeaturesAndManifestCommands(t *testing.T) {
 		!features.Ingress.DisableDrain ||
 		!features.Ingress.ReservedListenerRuntimeRefresh ||
 		!features.Ingress.FutureRuntimeGate ||
-		!features.Ingress.DataPlane {
-		t.Fatalf("ingress feature = %+v, want listener lifecycle guarded by future runtime gate", features.Ingress)
+		features.Ingress.DataPlane {
+		t.Fatalf("ingress feature = %+v, want reserved listener lifecycle without current data plane", features.Ingress)
 	}
-	if features.Sandbox.RuntimeTypeReserved ||
-		features.Sandbox.ServiceModeReserved ||
+	if !features.Sandbox.RuntimeTypeReserved ||
+		!features.Sandbox.ServiceModeReserved ||
 		!features.Sandbox.RequiredCapabilityGate ||
 		!features.Sandbox.FutureRuntimeGate ||
 		!features.Sandbox.Supervisor ||
@@ -610,12 +628,12 @@ func TestPluginFeaturesAndManifestCommands(t *testing.T) {
 		!features.Sandbox.EnvEnforcement ||
 		!features.Sandbox.CPUMemoryEnforcement ||
 		!features.Sandbox.SecretRPC ||
-		!features.Sandbox.CrashLoopPolicyDataPlane ||
+		features.Sandbox.CrashLoopPolicyDataPlane ||
 		!features.Sandbox.DiagnosticSummary ||
-		!features.Sandbox.DataPlane {
-		t.Fatalf("sandbox feature = %+v, want sandbox enforcement guarded by future runtime gate", features.Sandbox)
+		features.Sandbox.DataPlane {
+		t.Fatalf("sandbox feature = %+v, want reserved sandbox controls without current data plane", features.Sandbox)
 	}
-	if features.WASM.RuntimeTypeReserved ||
+	if !features.WASM.RuntimeTypeReserved ||
 		!features.WASM.ContainedValidation ||
 		!features.WASM.HighRiskExtensionRejected ||
 		!features.WASM.FutureRuntimeGate ||
@@ -624,8 +642,8 @@ func TestPluginFeaturesAndManifestCommands(t *testing.T) {
 		!features.WASM.ModuleCache ||
 		!features.WASM.FuelTimeMemoryLimits ||
 		!features.WASM.DefaultNoFileNetwork ||
-		!features.WASM.DataPlane {
-		t.Fatalf("wasm feature = %+v, want wazero runtime guarded by future runtime gate", features.WASM)
+		features.WASM.DataPlane {
+		t.Fatalf("wasm feature = %+v, want reserved WASM controls without current data plane", features.WASM)
 	}
 	if !features.Conformance.StableJSON ||
 		!features.Conformance.GoldenFixtureFile ||

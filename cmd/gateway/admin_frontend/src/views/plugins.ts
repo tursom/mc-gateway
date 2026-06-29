@@ -398,7 +398,7 @@ function pluginServiceModes(): PluginServiceModeFeature[] {
 	  return [
 	    { mode: "in-process", implemented: true, maturity: "implemented", data_plane: true, requires_restart: false },
 	    { mode: "go-plugin-process", implemented: true, maturity: "partial", data_plane: true, requires_restart: true, unsupported_reason: "go-plugin-process supports upstream.connect/v1 dialer mode and protocol-proxy drain-only with persisted crash policy and per-node crash isolation; fd-live migration, sandbox enforcement, full isolation, and non-Linux process-table orphan discovery are not implemented" },
-	    { mode: "sandbox-process", implemented: true, maturity: "partial", data_plane: true, requires_restart: true, unsupported_reason: "sandbox-process service mode is implemented but disabled unless future runtime gates enable sandbox_process" },
+	    { mode: "sandbox-process", implemented: false, maturity: "reserved", data_plane: false, requires_restart: true, unsupported_reason: "sandbox-process service mode is reserved; current data-plane modes are in-process and go-plugin-process" },
 	  ];
 }
 
@@ -409,7 +409,7 @@ function pluginExtensionPoints(): PluginExtensionPointFeature[] {
   }
 	  return [
 	    { key: "admin.auth.provider/v1", type: "provider", implemented: false, maturity: "reserved", data_plane: false, requires_restart: false, unsupported_reason: "admin.auth.provider/v1 is reserved; local admin break-glass remains the implemented authentication path" },
-	    { key: "ingress.service/v1", type: "service", implemented: true, maturity: "partial", data_plane: true, requires_restart: false, unsupported_reason: "gateway-managed listener lifecycle is implemented but disabled unless future runtime gates enable ingress" },
+	    { key: "ingress.service/v1", type: "service", implemented: false, maturity: "reserved", data_plane: false, requires_restart: false, unsupported_reason: "ingress.service/v1 is reserved; schema and governance checks exist but gateway-managed listener data-plane is not enabled" },
 	  ];
 }
 

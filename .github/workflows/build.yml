@@ -34,6 +34,8 @@ jobs:
       run: |
         git diff --check
         npm run check:admin
+        npm run build:admin
+        npm run test:admin-ui
         go test ./cmd/gateway ./internal/pluginmanager
         go run ./cmd/gateway plugin features >/tmp/plugin-features.json
         go run ./cmd/gateway plugin schema export --section admin-api >/tmp/plugin-admin-api-schema.json
@@ -47,6 +49,8 @@ jobs:
             raise SystemExit(f'missing {field}={value}')
         checks = [
             (find(features['service_modes'], 'mode', 'go-plugin-process'), 'partial', True),
+            (find(features['service_modes'], 'mode', 'sandbox-process'), 'reserved', False),
+            (find(features['runtime_types'], 'type', 'sandbox-process'), 'reserved', False),
             (find(features['runtime_types'], 'type', 'wasm'), 'reserved', False),
             (find(features['extension_points'], 'key', 'ingress.service/v1'), 'reserved', False),
             (find(features['extension_points'], 'key', 'admin.auth.provider/v1'), 'reserved', False),

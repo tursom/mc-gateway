@@ -72,15 +72,16 @@ state.pluginFeatures = {
   api_version: "plugin-api/v1",
 	  runtime_types: [
 	    { type: "go-plugin", implemented: true, maturity: "implemented", data_plane: true, requires_restart: false },
-	    { type: "wasm", implemented: true, maturity: "partial", data_plane: true, requires_restart: true, unsupported_reason: "wazero runtime is implemented for low-risk validation extension points but disabled unless future runtime gates enable wasm" },
+	    { type: "wasm", implemented: false, maturity: "reserved", data_plane: false, requires_restart: true, unsupported_reason: "wasm runtime is reserved; schema and validation checks do not provide a WASM data-plane" },
 	  ],
 	  service_modes: [
 	    { mode: "in-process", implemented: true, maturity: "implemented", data_plane: true, requires_restart: false },
-	    { mode: "sandbox-process", implemented: true, maturity: "partial", data_plane: true, requires_restart: true, unsupported_reason: "sandbox-process service mode is implemented but disabled unless future runtime gates enable sandbox_process" },
+	    { mode: "sandbox-process", implemented: false, maturity: "reserved", data_plane: false, requires_restart: true, unsupported_reason: "sandbox-process service mode is reserved; current data-plane modes are in-process and go-plugin-process" },
 	  ],
   runtime_adapters: [],
   extension_points: [
     { key: "admin.auth.provider/v1", type: "provider", implemented: false, maturity: "reserved", data_plane: false, requires_restart: false, unsupported_reason: "reserved auth provider" },
+    { key: "ingress.service/v1", type: "service", implemented: false, maturity: "reserved", data_plane: false, requires_restart: false, unsupported_reason: "ingress.service/v1 is reserved; schema and governance checks exist but gateway-managed listener data-plane is not enabled" },
   ],
 };
 state.pluginService = {
@@ -89,10 +90,10 @@ state.pluginService = {
     active_mode: "in-process",
     data_plane_mode: "in-process",
     implemented_adapter: true,
-	    desired_maturity: "partial",
+	    desired_maturity: "reserved",
 	    active_maturity: "implemented",
 	    restart_required: true,
-	    unsupported_reason: "sandbox-process service mode is disabled by future runtime gate",
+	    unsupported_reason: "sandbox-process service mode is reserved; current data-plane modes are in-process and go-plugin-process",
     crash_policy: { backoff_seconds: 30, max_crashes: 1, window_seconds: 300 },
     live_migration: "drain-only",
   },
@@ -203,9 +204,11 @@ for (const expected of [
   "期望成熟度",
   "在服务模式应用前仅作为未来期望",
   "当前数据面保持为 in-process",
+  "sandbox-process 服务模式已预留",
   "构建期埋点",
   "预留认证提供方",
   "admin.auth.provider/v1",
+  "ingress.service/v1",
 ]) {
   assert.match(serviceHTML, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `service panel should include ${expected}`);
 }

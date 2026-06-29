@@ -29,6 +29,8 @@
 ```bash
 git diff --check
 npm run check:admin
+npm run build:admin
+npm run test:admin-ui
 go test ./cmd/gateway ./internal/pluginmanager
 go run ./cmd/gateway plugin features
 go run ./cmd/gateway plugin schema export --section admin-api
