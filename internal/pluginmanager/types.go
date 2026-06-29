@@ -820,6 +820,7 @@ type ProxyConnectionSummary struct {
 	DurationMS          int64  `json:"duration_ms"`
 	Draining            bool   `json:"draining"`
 	ForceCloseRequested bool   `json:"force_close_requested"`
+	LastProxyError      string `json:"last_proxy_error,omitempty"`
 }
 
 type OperationRecord struct {

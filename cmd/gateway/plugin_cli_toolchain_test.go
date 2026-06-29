@@ -110,6 +110,55 @@ func TestPluginBuildBothAcceptsOutDirectory(t *testing.T) {
 	assertZipNotContains(t, sourceOut, "manifest.yaml")
 }
 
+func TestPluginExamplePackagesCoverM1SourceBinaryFixtures(t *testing.T) {
+	examples := []struct {
+		id  string
+		dir string
+	}{
+		{id: "upstream-rewrite", dir: "../../examples/plugins/upstream-rewrite"},
+		{id: "mc-auth-proxy", dir: "../../examples/plugins/mc-auth-proxy"},
+	}
+	for _, example := range examples {
+		t.Run(example.id, func(t *testing.T) {
+			dir := filepath.Clean(example.dir)
+			if _, err := os.Stat(filepath.Join(dir, "manifest.yaml")); err != nil {
+				t.Fatalf("example manifest stat error = %v", err)
+			}
+			handled, code := runPluginCLI([]string{"plugin", "test", dir, "--profile", "manifest"})
+			if !handled || code != 0 {
+				t.Fatalf("runPluginCLI(test %s) = (%v, %d), want handled code 0", example.id, handled, code)
+			}
+			outDir := filepath.Join(t.TempDir(), "packages")
+			handled, code = runPluginCLI([]string{"plugin", "build", dir, "--type", "both", "--out", outDir, "--skip-tests"})
+			if !handled || code != 0 {
+				t.Fatalf("runPluginCLI(build both %s) = (%v, %d), want handled code 0", example.id, handled, code)
+			}
+			binaryOut := filepath.Join(outDir, example.id+".mcgp")
+			sourceOut := filepath.Join(outDir, example.id+"-source.mcgp")
+			if _, err := validatePluginPathForCLI(binaryOut, pluginmanager.ArtifactTypeBinary); err != nil {
+				t.Fatalf("validatePluginPathForCLI(%s binary) error = %v", example.id, err)
+			}
+			if _, err := validatePluginPathForCLI(sourceOut, pluginmanager.ArtifactTypeSource); err != nil {
+				t.Fatalf("validatePluginPathForCLI(%s source) error = %v", example.id, err)
+			}
+			assertZipContains(t, binaryOut, "manifest.json", pluginmanager.RuntimeEntry, "README.md", "conformance.json")
+			assertZipContains(t, sourceOut, "manifest.json", "go.mod", "main.go", "main_test.go", "README.md", "conformance.json", "testdata/config.json")
+
+			if example.id == "upstream-rewrite" {
+				builtOut := filepath.Join(t.TempDir(), "upstream-rewrite-built.mcgp")
+				handled, code = runPluginCLI([]string{"plugin", "build", "--from-source", sourceOut, "--out", builtOut})
+				if !handled || code != 0 {
+					t.Fatalf("runPluginCLI(build --from-source %s) = (%v, %d), want handled code 0", example.id, handled, code)
+				}
+				if _, err := validatePluginPathForCLI(builtOut, pluginmanager.ArtifactTypeBinary); err != nil {
+					t.Fatalf("validatePluginPathForCLI(%s built binary) error = %v", example.id, err)
+				}
+				assertZipContains(t, builtOut, "manifest.json", pluginmanager.RuntimeEntry)
+			}
+		})
+	}
+}
+
 func TestPluginTestManifestProfile(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "test-plugin")
 	handled, code := runPluginCLI([]string{

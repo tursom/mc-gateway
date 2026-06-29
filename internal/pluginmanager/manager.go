@@ -1476,6 +1476,10 @@ func (m *Manager) ActiveProxyConnections(ctx context.Context, pluginID string) (
 		if pluginID != "" && conn.pluginID != pluginID {
 			continue
 		}
+		lastProxyError := ""
+		if conn.handler != nil {
+			lastProxyError, _ = conn.handler.lastProxyError.Load().(string)
+		}
 		summaries = append(summaries, ProxyConnectionSummary{
 			ID:                  conn.id,
 			PluginID:            conn.pluginID,
@@ -1485,6 +1489,7 @@ func (m *Manager) ActiveProxyConnections(ctx context.Context, pluginID string) (
 			DurationMS:          now.Sub(conn.startedAt).Milliseconds(),
 			Draining:            conn.draining,
 			ForceCloseRequested: conn.forceCloseRequested,
+			LastProxyError:      lastProxyError,
 		})
 	}
 	sort.Slice(summaries, func(i, j int) bool {

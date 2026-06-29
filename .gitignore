@@ -8,6 +8,7 @@ config.toml
 /quic*
 /logs/
 /data/
+examples/plugins/*/dist/
 
 .omc
 .tmp

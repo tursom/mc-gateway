@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -2075,6 +2076,105 @@ func TestManagerPanicDoesNotReplaceExistingDispatch(t *testing.T) {
 	}
 }
 
+func TestManagerHandlerTimeoutDoesNotBreakDefaultRouteAfterDisable(t *testing.T) {
+	latePeer := make(chan net.Conn, 1)
+	adapter := &fakeAdapter{
+		handlers: map[string]api.UpstreamConnectHandler{
+			"timeout-plugin": func(api.UpstreamConnectRequest) (net.Conn, error) {
+				time.Sleep(50 * time.Millisecond)
+				left, right := net.Pipe()
+				latePeer <- right
+				return left, nil
+			},
+		},
+	}
+	manager := newManagerForTest(t, adapter)
+	artifact := uploadTestArtifactWithManifest(t, manager, "timeout-plugin", func(manifest *Manifest) {
+		manifest.RuntimeLimits.HandlerTimeoutMS = 10
+	})
+	if _, err := manager.SetDesired(context.Background(), "admin", "timeout-plugin", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", "timeout-plugin"); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+
+	result, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{Host: "play.example", Upstream: "backend"})
+	if !errors.Is(err, context.DeadlineExceeded) || !result.Handled {
+		t.Fatalf("ConnectUpstream(timeout) = %+v err=%v, want handled deadline exceeded", result, err)
+	}
+	plan := manager.DispatchPlan(context.Background())
+	if len(plan.Handlers) != 1 || plan.Handlers[0].Timeouts != 1 || plan.Handlers[0].DurationCount != 1 {
+		t.Fatalf("dispatch after timeout = %+v, want one timeout recorded", plan.Handlers)
+	}
+
+	peer := <-latePeer
+	defer peer.Close()
+	_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := peer.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("late handler conn read error = %v, want EOF after timeout cleanup", err)
+	}
+	if _, err := manager.Disable(context.Background(), "admin", "timeout-plugin"); err != nil {
+		t.Fatalf("Disable() error = %v", err)
+	}
+	result, err = manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{Host: "play.example", Upstream: "backend"})
+	if err != nil || result.Handled {
+		t.Fatalf("ConnectUpstream(after timeout disable) = %+v err=%v, want default route pass-through", result, err)
+	}
+}
+
+func TestManagerEnableDisablePublishesIsolatedDispatchSnapshots(t *testing.T) {
+	manager := newManagerForTest(t, &fakeAdapter{})
+	artifactA := uploadTestArtifact(t, manager, "plugin-a")
+	artifactB := uploadTestArtifact(t, manager, "plugin-b")
+	if _, err := manager.SetDesired(context.Background(), "admin", "plugin-a", artifactA.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired(a) error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", "plugin-a"); err != nil {
+		t.Fatalf("Enable(a) error = %v", err)
+	}
+	snapshotA := currentDispatchSnapshotForTest(t, manager)
+	if got := dispatchSnapshotPluginIDs(snapshotA); !reflect.DeepEqual(got, []string{"plugin-a"}) {
+		t.Fatalf("snapshotA plugins = %+v, want plugin-a", got)
+	}
+
+	if _, err := manager.SetDesired(context.Background(), "admin", "plugin-b", artifactB.ID, DesiredEnabled, `{}`, 5); err != nil {
+		t.Fatalf("SetDesired(b) error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", "plugin-b"); err != nil {
+		t.Fatalf("Enable(b) error = %v", err)
+	}
+	snapshotAB := currentDispatchSnapshotForTest(t, manager)
+	if got := dispatchSnapshotPluginIDs(snapshotAB); !reflect.DeepEqual(got, []string{"plugin-b", "plugin-a"}) {
+		t.Fatalf("snapshotAB plugins = %+v, want plugin-b then plugin-a", got)
+	}
+	if got := dispatchSnapshotPluginIDs(snapshotA); !reflect.DeepEqual(got, []string{"plugin-a"}) {
+		t.Fatalf("snapshotA after enabling plugin-b = %+v, want unchanged plugin-a", got)
+	}
+
+	if _, err := manager.Disable(context.Background(), "admin", "plugin-b"); err != nil {
+		t.Fatalf("Disable(b) error = %v", err)
+	}
+	snapshotAfterDisableB := currentDispatchSnapshotForTest(t, manager)
+	if got := dispatchSnapshotPluginIDs(snapshotAfterDisableB); !reflect.DeepEqual(got, []string{"plugin-a"}) {
+		t.Fatalf("snapshot after disable b = %+v, want plugin-a", got)
+	}
+	if got := dispatchSnapshotPluginIDs(snapshotAB); !reflect.DeepEqual(got, []string{"plugin-b", "plugin-a"}) {
+		t.Fatalf("snapshotAB after disabling plugin-b = %+v, want unchanged old dispatch table", got)
+	}
+
+	if _, err := manager.Disable(context.Background(), "admin", "plugin-a"); err != nil {
+		t.Fatalf("Disable(a) error = %v", err)
+	}
+	result, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{Host: "play.example", Upstream: "backend"})
+	if err != nil || result.Handled {
+		t.Fatalf("ConnectUpstream(after all disabled) = %+v err=%v, want default route pass-through", result, err)
+	}
+	if got := dispatchSnapshotPluginIDs(snapshotAfterDisableB); !reflect.DeepEqual(got, []string{"plugin-a"}) {
+		t.Fatalf("snapshot after disable b mutated after disable a = %+v, want plugin-a", got)
+	}
+}
+
 func TestManagerLoadFailureKeepsExistingDispatch(t *testing.T) {
 	adapter := &fakeAdapter{
 		loadErrs: map[string]error{
@@ -2279,6 +2379,70 @@ func TestProtocolProxyTrackDrainAndForceClose(t *testing.T) {
 	}
 	if got := handler.lastProxyError.Load(); got == nil {
 		t.Fatal("last proxy error = nil, want force-close copy error summary")
+	}
+}
+
+func TestActiveProxyConnectionSummaryIncludesLastProxyError(t *testing.T) {
+	clientGateway, clientSide := net.Pipe()
+	defer clientSide.Close()
+	blockingPluginGateway, blockingPluginSide := net.Pipe()
+	defer blockingPluginSide.Close()
+
+	calls := 0
+	manager := newManagerForTest(t, &fakeAdapter{
+		handlers: map[string]api.UpstreamConnectHandler{
+			"plugin-a": func(api.UpstreamConnectRequest) (net.Conn, error) {
+				calls++
+				if calls == 1 {
+					return errorReadConn{Conn: newMemoryConn(), err: errors.New("previous proxy read failed")}, nil
+				}
+				return blockingPluginGateway, nil
+			},
+		},
+	})
+	enableProtocolProxyTestPlugin(t, manager, "plugin-a")
+
+	firstSource, firstClient := net.Pipe()
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{Source: firstSource})
+		firstDone <- err
+	}()
+	_ = firstClient.Close()
+	if err := <-firstDone; err != nil {
+		t.Fatalf("ConnectUpstream(first) error = %v", err)
+	}
+
+	started := make(chan error, 1)
+	go func() {
+		_, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{
+			Source:      clientGateway,
+			InitialData: []byte("hello"),
+		})
+		started <- err
+	}()
+	buf := make([]byte, len("hello"))
+	if _, err := io.ReadFull(blockingPluginSide, buf); err != nil {
+		t.Fatalf("blocking plugin initial read error = %v", err)
+	}
+	waitForPluginManagerTest(t, func() bool {
+		active, err := manager.ActiveProxyConnections(context.Background(), "plugin-a")
+		return err == nil && len(active) == 1
+	})
+	if _, err := manager.Disable(context.Background(), "admin", "plugin-a"); err != nil {
+		t.Fatalf("Disable() error = %v", err)
+	}
+	active, err := manager.ActiveProxyConnections(context.Background(), "plugin-a")
+	if err != nil {
+		t.Fatalf("ActiveProxyConnections() error = %v", err)
+	}
+	if len(active) != 1 || !active[0].Draining || !strings.Contains(active[0].LastProxyError, "previous proxy read failed") {
+		t.Fatalf("active proxy summary = %+v, want draining connection with last proxy error", active)
+	}
+	_ = clientSide.Close()
+	_ = blockingPluginSide.Close()
+	if err := <-started; err != nil {
+		t.Fatalf("ConnectUpstream(second) error = %v", err)
 	}
 }
 
@@ -3448,6 +3612,24 @@ func waitForPluginManagerTest(t *testing.T, done func() bool) {
 			}
 		}
 	}
+}
+
+func currentDispatchSnapshotForTest(t *testing.T, manager *Manager) []*upstreamHandler {
+	t.Helper()
+	value := manager.snapshot.Load()
+	handlers, ok := value.([]*upstreamHandler)
+	if !ok {
+		t.Fatalf("dispatch snapshot = %#v, want upstream handlers", value)
+	}
+	return handlers
+}
+
+func dispatchSnapshotPluginIDs(handlers []*upstreamHandler) []string {
+	ids := make([]string, 0, len(handlers))
+	for _, handler := range handlers {
+		ids = append(ids, handler.pluginID)
+	}
+	return ids
 }
 
 type fakeAdapter struct {
