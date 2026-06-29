@@ -1,4 +1,4 @@
-# M7：go-plugin-process Drain-only 未完成工作
+# M7：go-plugin-process Drain-only 完成记录
 
 返回：[Roadmap 实施计划](../plugin-roadmap-implementation-plan.md)
 
@@ -18,7 +18,7 @@
 3. 进程态回归测试：
    - `go-plugin-process` adapter 主进程只启动/控制 plugin-host，`.so` 由 `gateway plugin-host serve` 子进程加载。
    - 测试用插件 init 写入 PID，验证 `plugin.Open()` 发生在 host PID 而不是 gateway/Admin 主进程 PID。
-   - plugin-host crash 只更新 runtime health/diagnostics，不导致 gateway/Admin 主进程退出。
+   - plugin-host crash 只更新 runtime health、diagnostics、service state、node runtime state 和 operation log，不导致 gateway/Admin 主进程退出。
    - disable 后旧 host 进入 drain，连接自然结束或 force close 后 host stop，OS 回收子进程及其 `.so`/Go heap。
 4. protocol-proxy drain-only 验收：
    - disable 先从 dispatch 移除 handler，新连接 pass-through，不再进入旧 plugin-host。
@@ -35,6 +35,23 @@
 - 子进程 crash 不影响 gateway/Admin 主进程。
 - disable 后旧 host drain 并退出。
 - `go test ./internal/pluginmanager ./cmd/gateway` 通过，并包含真实子进程 handshake、supervisor start-stop、lifecycle、upstream dialer bridge 和 protocol-proxy drain-only 测试。
+
+## 证据
+
+- `internal/pluginmanager/process_runtime_test.go`
+  - `TestGoPluginProcessDoesNotOpenPluginInGatewayProcess`：构建真实 `.so` 和 gateway 测试二进制，验证 `plugin.Open()` 记录的 PID 是 plugin-host 子进程 PID，不是 gateway/Admin 主进程 PID。
+  - `TestGoPluginProcessCrashUpdatesManagerStateWithoutExitingGateway`：启动真实 plugin-host，kill 子进程后验证 host summary failed/isolated/backoff、dispatch 移除、`plugin_service_state.last_error`、`plugin_node_states` 和 plugin runtime failed 状态，同时父进程继续执行。
+  - `TestGoPluginProcessAdapterReportsRealHostCrashWithoutExitingGateway`：验证 adapter health/diagnostics 暴露 crash count、last error、drain-only、started/exited/crash timestamps。
+  - `TestGoPluginProcessUpstreamDialerBridgeUsesHostProcess`：验证 `upstream.connect/v1` dialer 模式经 plugin-host 子进程桥接返回 `net.Conn`，并保持 gateway 主流程后续转发语义。
+  - `TestGoPluginProcessProtocolProxyBridgeDrainsAndStopsHost`：验证 protocol-proxy 真实子进程桥接、disable 后新连接 pass-through、旧连接自然 drain 后 host stopped/exited。
+  - `TestGoPluginProcessProtocolProxyForceCloseStopsDrainingHost`：验证 force close draining connection 后 active proxy summary 清零、force-close 计数递增、旧 host disabled/exited。
+- `cmd/gateway/plugin_host_test.go`
+  - `TestPluginHostHandshakeSubprocess`、`TestPluginHostSupervisorStartsAndStopsHost`、`TestPluginHostSupervisorLifecycleCommands`：覆盖真实子进程 handshake、supervisor start-stop、init/reload/drain/destroy lifecycle。
+
+## 边界
+
+- `go-plugin-process` 是可信 Go plugin 的进程级加载/回收与 drain-only 能力，不是 sandbox。
+- 不承诺不可信代码隔离、fd-live migration、sandbox enforcement，也不承诺非 Linux process-table orphan discovery。
 
 ## 回滚边界
 

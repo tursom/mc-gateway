@@ -197,6 +197,74 @@ func TestGoPluginProcessDoesNotOpenPluginInGatewayProcess(t *testing.T) {
 	assertProcessExited(t, summary.PID)
 }
 
+func TestGoPluginProcessUpstreamDialerBridgeUsesHostProcess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("plugin-host stream bridge uses Unix-domain sockets")
+	}
+	gatewayBinary := buildGatewayProcessTestBinary(t)
+	pluginPath := buildProcessDialerPlugin(t)
+	pluginBytes, err := os.ReadFile(pluginPath)
+	if err != nil {
+		t.Fatalf("ReadFile(plugin) error = %v", err)
+	}
+
+	manager := newManagerForTest(t, nil)
+	manager.serviceMode = PluginServiceModeGoPluginProcess
+	manager.adapter = GoPluginProcessAdapter{Supervisor: PluginHostSupervisor{
+		Executable:   gatewayBinary,
+		RuntimeDir:   shortProcessRuntimeDir(t),
+		Protocol:     PluginHostProtocol,
+		StartTimeout: 5 * time.Second,
+	}}
+	manager.adapterManaged = true
+
+	artifact := uploadTestArtifactWithManifestBytes(t, manager, "process-dialer", pluginBytes, nil)
+	if _, err := manager.SetDesired(context.Background(), "admin", "process-dialer", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	approveGovernanceForTest(t, manager, "process-dialer", artifact.ID)
+	if _, err := manager.Enable(context.Background(), "admin", "process-dialer"); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	summary := manager.hostSummary("process-dialer")
+	hostPID := summary.PID
+	if hostPID == 0 || hostPID == os.Getpid() {
+		t.Fatalf("host summary = %+v, want child plugin-host PID", summary)
+	}
+
+	result, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{
+		Host:       "play.example",
+		Upstream:   "backend",
+		SourceAddr: "client.example:25565",
+	})
+	if err != nil {
+		t.Fatalf("ConnectUpstream() error = %v", err)
+	}
+	if !result.Handled || result.Mode != UpstreamModeDialer || result.Conn == nil || result.Proxied {
+		t.Fatalf("ConnectUpstream() = %+v, want dialer bridge conn", result)
+	}
+	defer result.Conn.Close()
+	if _, err := result.Conn.Write([]byte("ping")); err != nil {
+		t.Fatalf("dialer bridge write error = %v", err)
+	}
+	response := make([]byte, len("pong:client.example:25565"))
+	if _, err := io.ReadFull(result.Conn, response); err != nil {
+		t.Fatalf("dialer bridge read error = %v", err)
+	}
+	if !bytes.Equal(response, []byte("pong:client.example:25565")) {
+		t.Fatalf("dialer bridge response = %q, want source-address response", response)
+	}
+
+	if _, err := manager.Disable(context.Background(), "admin", "process-dialer"); err != nil {
+		t.Fatalf("Disable() error = %v", err)
+	}
+	waitForProcessRuntimeTest(t, func() bool {
+		summary := manager.hostSummary("process-dialer")
+		return summary.State == RuntimeDisabled && summary.ExitedAt != 0
+	})
+	assertProcessExited(t, hostPID)
+}
+
 func TestGoPluginProcessProtocolProxyForceCloseStopsDrainingHost(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("plugin-host stream bridge uses Unix-domain sockets")
@@ -377,6 +445,110 @@ func TestGoPluginProcessAdapterReportsRealHostCrashWithoutExitingGateway(t *test
 		diag.Details["last_crash_at"] == int64(0) {
 		t.Fatalf("Diagnostics(crashed host) = %+v, want failed crash details", diag)
 	}
+}
+
+func TestGoPluginProcessCrashUpdatesManagerStateWithoutExitingGateway(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("plugin-host supervisor uses Unix-domain sockets")
+	}
+	gatewayBinary := buildGatewayProcessTestBinary(t)
+	pidPath := filepath.Join(t.TempDir(), "plugin-open-pids.txt")
+	pluginPath := buildProcessPIDRecordingPlugin(t, pidPath)
+	pluginBytes, err := os.ReadFile(pluginPath)
+	if err != nil {
+		t.Fatalf("ReadFile(plugin) error = %v", err)
+	}
+
+	manager := newManagerForTest(t, nil)
+	manager.serviceMode = PluginServiceModeGoPluginProcess
+	manager.adapter = GoPluginProcessAdapter{Supervisor: PluginHostSupervisor{
+		Executable:   gatewayBinary,
+		RuntimeDir:   shortProcessRuntimeDir(t),
+		Protocol:     PluginHostProtocol,
+		StartTimeout: 5 * time.Second,
+	}}
+	manager.adapterManaged = true
+
+	artifact := uploadTestArtifactWithManifestBytes(t, manager, "process-crash-state", pluginBytes, nil)
+	if _, err := manager.SetDesired(context.Background(), "admin", "process-crash-state", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	approveGovernanceForTest(t, manager, "process-crash-state", artifact.ID)
+	if _, err := manager.Enable(context.Background(), "admin", "process-crash-state"); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+
+	manager.mu.Lock()
+	loaded := manager.loaded["process-crash-state"]
+	manager.mu.Unlock()
+	if loaded == nil || loaded.runtime.HostProcess == nil {
+		t.Fatalf("loaded process runtime = %+v, want host process", loaded)
+	}
+	process := loaded.runtime.HostProcess
+	hostPID := process.PID
+	if hostPID == 0 || hostPID == os.Getpid() {
+		t.Fatalf("host PID = %d, want child process distinct from gateway PID %d", hostPID, os.Getpid())
+	}
+	if err := process.Kill(); err != nil {
+		t.Fatalf("Kill(plugin-host) error = %v", err)
+	}
+	select {
+	case <-process.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("plugin-host process did not exit after kill")
+	}
+
+	waitForProcessRuntimeTest(t, func() bool {
+		for _, summary := range manager.PluginHostSummaries() {
+			if summary.PluginID == "process-crash-state" {
+				return summary.State == RuntimeFailed &&
+					summary.CrashLoop &&
+					summary.CrashCount == 1 &&
+					summary.LastError != "" &&
+					summary.ExitedAt != 0 &&
+					summary.LastCrashAt != 0
+			}
+		}
+		return false
+	})
+	summary := manager.hostSummary("process-crash-state")
+	if summary.PID != hostPID || !summary.Isolated || summary.BackoffUntil == 0 {
+		t.Fatalf("host summary after crash = %+v, want isolated failed host with backoff", summary)
+	}
+	if handlers := manager.DispatchPlan(context.Background()).Handlers; len(handlers) != 0 {
+		t.Fatalf("dispatch handlers after crash = %+v, want crashed plugin removed", handlers)
+	}
+	manager.mu.Lock()
+	_, stillLoaded := manager.loaded["process-crash-state"]
+	manager.mu.Unlock()
+	if stillLoaded {
+		t.Fatal("crashed plugin remained cached in manager.loaded")
+	}
+	plugin, err := manager.repo.Plugin(context.Background(), "process-crash-state")
+	if err != nil {
+		t.Fatalf("Plugin(process-crash-state) error = %v", err)
+	}
+	if plugin.RuntimeState != RuntimeFailed || plugin.LastError == "" || !strings.Contains(plugin.RuntimeSummaryJSON, "plugin_host") {
+		t.Fatalf("plugin after crash = %+v, want failed runtime with plugin_host summary", plugin)
+	}
+	service, err := manager.PluginServiceState(context.Background())
+	if err != nil {
+		t.Fatalf("PluginServiceState() error = %v", err)
+	}
+	if service.LastError == "" || !strings.Contains(service.LastError, summary.LastError) {
+		t.Fatalf("service state = %+v, want crash error propagated", service)
+	}
+	nodes, err := manager.repo.ListPluginNodeRuntime(context.Background(), "process-crash-state", 0)
+	if err != nil {
+		t.Fatalf("ListPluginNodeRuntime() error = %v", err)
+	}
+	if len(nodes) != 1 || nodes[0].RuntimeState != RuntimeFailed || nodes[0].Enabled || nodes[0].Error == "" {
+		t.Fatalf("node runtime states = %+v, want failed disabled node with crash error", nodes)
+	}
+	if os.Getpid() <= 0 {
+		t.Fatal("gateway/Admin parent process exited during plugin-host crash")
+	}
+	assertProcessExited(t, hostPID)
 }
 
 func TestPluginHostUpstreamRequestCarriesDeadline(t *testing.T) {
@@ -598,6 +770,77 @@ func (p *pluginImpl) Init(gateway api.Gateway) error {
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("go build process pid plugin error = %v\n%s", err, output)
+	}
+	return pluginPath
+}
+
+func buildProcessDialerPlugin(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	repoRoot, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatalf("Abs(repo root) error = %v", err)
+	}
+	goMod := "module example.com/process-dialer\n\n" +
+		"go 1.24.0\n\n" +
+		"require github.com/tursom/mc-gateway v0.0.0\n\n" +
+		"replace github.com/tursom/mc-gateway => " + filepath.ToSlash(repoRoot) + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(goMod), 0644); err != nil {
+		t.Fatalf("WriteFile(go.mod) error = %v", err)
+	}
+	source := `package main
+
+import (
+	"io"
+	"net"
+
+	"github.com/tursom/mc-gateway/plugin/api"
+)
+
+type pluginImpl struct {
+	api.AbstractPlugin
+}
+
+func Plugin() api.Plugin { return &pluginImpl{} }
+
+func (p *pluginImpl) Init(gateway api.Gateway) error {
+	return api.RegisterHookHandler(
+		gateway,
+		api.HookUpstreamConnect,
+		func(req api.UpstreamConnectRequest) bool { return req.Host == "play.example" },
+		func(req api.UpstreamConnectRequest) (net.Conn, error) {
+			gatewayEnd, pluginEnd := net.Pipe()
+			sourceAddr := req.SourceAddr
+			go func() {
+				defer pluginEnd.Close()
+				buf := make([]byte, len("ping"))
+				if _, err := io.ReadFull(pluginEnd, buf); err != nil {
+					return
+				}
+				if string(buf) != "ping" {
+					_, _ = pluginEnd.Write([]byte("bad"))
+					return
+				}
+				_, _ = pluginEnd.Write([]byte("pong:" + sourceAddr))
+			}()
+			return gatewayEnd, nil
+		},
+	)
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(source), 0644); err != nil {
+		t.Fatalf("WriteFile(main.go) error = %v", err)
+	}
+	tidyProcessPluginModule(t, dir)
+	pluginPath := filepath.Join(dir, "plugin.so")
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "build", "-buildmode=plugin", "-o", pluginPath, ".")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GOWORK=off")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("go build process dialer plugin error = %v\n%s", err, output)
 	}
 	return pluginPath
 }
