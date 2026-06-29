@@ -120,6 +120,12 @@ ghcr.io/tursom/mc-gateway:latest
 
 HAProxy 协议头会保存客户端真实 IP，适合需要在后端服务端获取真实客户端 IP 的场景。
 
+## 插件
+
+插件系统通过 `.mcgp` 包扩展网关能力，当前主路径是可信 `go-plugin` 插件和 `upstream.connect/v1` 扩展点。管理员可以通过 Admin 页面或 `gateway plugin` CLI 上传、构建、启用、禁用、回滚和排障插件；开发者可以用同一套 CLI 初始化、测试、打包和做治理检查。
+
+管理员操作见 [插件系统使用指南](docs/plugin-usage-guide.md)，插件作者见 [插件系统开发指南](docs/plugin-development-guide.md)。
+
 ## 可选服务
 
 TCP/Admin listener 是基础入口，默认启用。KCP、QUIC、WebSocket 默认禁用，可以在后台管理中启用并配置端口和参数；配置修改后第一版按重启后生效处理。
