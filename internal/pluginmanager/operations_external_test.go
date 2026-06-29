@@ -196,6 +196,14 @@ func TestOperationsExporterBoundaryFailsOpenAndValidatesOutput(t *testing.T) {
 	if _, err := operationsExportBatch(OperationsExporterPrometheus, badSnapshot); err == nil {
 		t.Fatal("operationsExportBatch(high-cardinality value) error = nil")
 	}
+	tooManyLabels := make(map[string]string)
+	for i := 0; i < 13; i++ {
+		tooManyLabels[fmt.Sprintf("label_%02d", i)] = "ok"
+	}
+	badSnapshot.Events[0].Fields = tooManyLabels
+	if _, err := operationsExportBatch(OperationsExporterPrometheus, badSnapshot); err == nil {
+		t.Fatal("operationsExportBatch(too many labels) error = nil")
+	}
 
 	rolledBack := manager.operations.RollbackExporter(OperationsExporterPrometheus)
 	if rolledBack.Enabled || rolledBack.Status != "disabled" || rolledBack.RollbackCount == 0 {

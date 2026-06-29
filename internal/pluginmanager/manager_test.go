@@ -1075,6 +1075,35 @@ func TestManagerOperationsBackgroundTaskDataQuotaExternalAndGC(t *testing.T) {
 	if err := os.WriteFile(orphanPath, []byte("orphan"), 0644); err != nil {
 		t.Fatalf("WriteFile(orphan plugin file) error = %v", err)
 	}
+	diagnosticPath := filepath.Join(manager.operations.runtimeRoot(), "diagnostics", "plugin-a", "expired.json")
+	if err := os.MkdirAll(filepath.Dir(diagnosticPath), 0755); err != nil {
+		t.Fatalf("MkdirAll(diagnostic dir) error = %v", err)
+	}
+	if err := os.WriteFile(diagnosticPath, []byte(`{"plugin":"plugin-a"}`), 0600); err != nil {
+		t.Fatalf("WriteFile(expired diagnostic package) error = %v", err)
+	}
+	if _, err := manager.repo.SaveDiagnostic(context.Background(), "plugin-a", diagnosticPath, 21, []string{"plugin"}); err != nil {
+		t.Fatalf("SaveDiagnostic(expired) error = %v", err)
+	}
+	diagnosticRecords, err := manager.repo.ListDiagnosticRecords(context.Background(), "plugin-a")
+	if err != nil {
+		t.Fatalf("ListDiagnosticRecords() error = %v", err)
+	}
+	expiredDiagnosticID := ""
+	for _, record := range diagnosticRecords {
+		if record.Path != diagnosticPath {
+			continue
+		}
+		expiredDiagnosticID = fmt.Sprintf("%d", record.ID)
+		expiredAt := time.Now().Add(-DefaultDiagnosticRetention - time.Second).Unix()
+		if _, err := manager.repo.db.ExecContext(context.Background(), `UPDATE plugin_diagnostics SET created_at = ? WHERE id = ?`, expiredAt, record.ID); err != nil {
+			t.Fatalf("expire diagnostic package error = %v", err)
+		}
+		break
+	}
+	if expiredDiagnosticID == "" {
+		t.Fatalf("diagnostic records = %+v, want expired package record", diagnosticRecords)
+	}
 	for i := 0; i < DefaultEventRecentLimit+2; i++ {
 		if err := manager.repo.SaveEvent(context.Background(), EventSummary{
 			PluginID: "plugin-a",
@@ -1119,14 +1148,17 @@ WHERE plugin_id = ? AND task_id = ? AND shard_key = ?`,
 		if candidate.Kind == "retention_rule" && candidate.RetentionRule != "" {
 			found["retention_rule:"+candidate.Category] = true
 		}
-		if candidate.Kind == "plugin_data" && candidate.ID == "expired" && candidate.SizeBytes > 0 {
+		if candidate.Kind == "plugin_data" && candidate.ID == "expired" && candidate.SizeBytes > 0 && !candidate.Protected && candidate.Reason != "" {
 			found["plugin_data"] = true
 		}
-		if candidate.Kind == "plugin_file" && candidate.ID == "cache/expired.json" && candidate.Path == expiredPath && candidate.SizeBytes > 0 {
+		if candidate.Kind == "plugin_file" && candidate.ID == "cache/expired.json" && candidate.Path == expiredPath && candidate.SizeBytes > 0 && !candidate.Protected && candidate.Reason != "" {
 			found["plugin_file"] = true
 		}
-		if candidate.Kind == "plugin_file_orphan" && candidate.Path == orphanPath && candidate.SizeBytes > 0 {
+		if candidate.Kind == "plugin_file_orphan" && candidate.Path == orphanPath && candidate.SizeBytes > 0 && !candidate.Protected && candidate.Reason != "" {
 			found["plugin_file_orphan"] = true
+		}
+		if candidate.Kind == "diagnostic_package" && candidate.ID == expiredDiagnosticID && candidate.Path == diagnosticPath && candidate.SizeBytes > 0 && !candidate.Protected && candidate.Reason == "diagnostic package retention expired" {
+			found["diagnostic_package"] = true
 		}
 		if candidate.Kind == "event" && candidate.Category == "event" && candidate.SizeBytes > 0 && candidate.Reason != "" {
 			found["event"] = true
@@ -1143,6 +1175,9 @@ WHERE plugin_id = ? AND task_id = ? AND shard_key = ?`,
 	}
 	if !found["plugin_data"] || !found["plugin_file"] || !found["plugin_file_orphan"] {
 		t.Fatalf("gc candidates = %+v, want expired data/file and orphan file", candidates)
+	}
+	if !found["diagnostic_package"] {
+		t.Fatalf("gc candidates = %+v, want expired diagnostic package candidate", candidates)
 	}
 	for _, category := range []string{"diagnostic", "event", "metric", "trace", "background_task", "data", "file"} {
 		if !found["retention_rule:"+category] {
@@ -1165,6 +1200,7 @@ WHERE plugin_id = ? AND task_id = ? AND shard_key = ?`,
 	if !removedKinds["plugin_data:expired"] ||
 		!removedKinds["plugin_file:cache/expired.json"] ||
 		!removedKinds["plugin_file_orphan:plugin-a/cache/orphan.json"] ||
+		!removedKinds["diagnostic_package:"+expiredDiagnosticID] ||
 		!removedKinds["background_task_lease:expired-sync/shard-a"] ||
 		!removedKinds["event:plugin-a/overflow:1000"] ||
 		!removedKinds["plugin_log:plugin-a/overflow:500"] ||
@@ -1196,6 +1232,9 @@ WHERE plugin_id = ? AND task_id = ? AND shard_key = ?`,
 	if _, err := os.Stat(orphanPath); !os.IsNotExist(err) {
 		t.Fatalf("Stat(orphan file) error = %v, want not exist", err)
 	}
+	if _, err := os.Stat(diagnosticPath); !os.IsNotExist(err) {
+		t.Fatalf("Stat(expired diagnostic package) error = %v, want not exist", err)
+	}
 	if _, err := os.Stat(protectedPath); err != nil {
 		t.Fatalf("Stat(protected file) error = %v, want retained", err)
 	}
@@ -1212,6 +1251,52 @@ WHERE plugin_id = ? AND task_id = ? AND shard_key = ?`,
 	}
 	if !auditFound {
 		t.Fatalf("operations = %+v, want plugin_operations_gc succeeded audit", operations)
+	}
+}
+
+func TestManagerDisableStopsBackgroundTask(t *testing.T) {
+	var started atomic.Int32
+	manager := newManagerForTest(t, &fakeAdapter{init: func(g *Gateway) {
+		_ = g.RegisterBackgroundTask(api.BackgroundTask{
+			ID:      "sync",
+			Manual:  true,
+			Timeout: 5 * time.Second,
+			Run: func(ctx context.Context) error {
+				started.Add(1)
+				<-ctx.Done()
+				return ctx.Err()
+			},
+		})
+	}})
+	artifact := uploadTestArtifactWithManifest(t, manager, "plugin-a", func(manifest *Manifest) {
+		manifest.BackgroundTasks = []TaskSpec{{
+			ID:      "sync",
+			Mode:    "manual",
+			Manual:  true,
+			Timeout: "5s",
+		}}
+	})
+	if _, err := manager.SetDesired(context.Background(), "admin", "plugin-a", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", "plugin-a"); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	task := manager.operations.plugins["plugin-a"].tasks["sync"]
+	if _, err := manager.TriggerBackgroundTask(context.Background(), "admin", "plugin-a", "sync", task.confirmToken); err != nil {
+		t.Fatalf("TriggerBackgroundTask() error = %v", err)
+	}
+	waitForPluginManagerTest(t, func() bool {
+		return started.Load() == 1 && task.summary().Running
+	})
+	if _, err := manager.Disable(context.Background(), "admin", "plugin-a"); err != nil {
+		t.Fatalf("Disable() error = %v", err)
+	}
+	waitForPluginManagerTest(t, func() bool {
+		return !task.summary().Running
+	})
+	if summary := task.summary(); !strings.Contains(summary.LastError, "context canceled") {
+		t.Fatalf("task summary after disable = %+v, want cancellation error", summary)
 	}
 }
 
@@ -1414,6 +1499,36 @@ func TestManagerBackgroundTaskSingletonLeaseSkipsSecondNode(t *testing.T) {
 		summary := firstTask.summary()
 		return summary.Running && summary.LeaseAcquired && summary.LeaseOwner == "node-a" && len(firstStarted) == 1
 	})
+	gcCandidates, err := second.RunOperationsGC(context.Background(), "admin", "plugin-a", true)
+	if err != nil {
+		t.Fatalf("RunOperationsGC(second dry-run) error = %v", err)
+	}
+	protectedLeaseFound := false
+	for _, candidate := range gcCandidates {
+		if candidate.Kind == "background_task_lease" && candidate.ID == "sync/global" && candidate.Protected && candidate.Reason == "background task lease retained" {
+			protectedLeaseFound = true
+			break
+		}
+	}
+	if !protectedLeaseFound {
+		t.Fatalf("gc candidates = %+v, want node-a singleton lease protected on node-b dry-run", gcCandidates)
+	}
+	removed, err := second.RunOperationsGC(context.Background(), "admin", "plugin-a", false)
+	if err != nil {
+		t.Fatalf("RunOperationsGC(second apply) error = %v", err)
+	}
+	for _, candidate := range removed {
+		if candidate.Kind == "background_task_lease" && candidate.ID == "sync/global" {
+			t.Fatalf("removed gc candidates = %+v, active node-a lease must be protected", removed)
+		}
+	}
+	leases, err := first.repo.ListTaskLeases(context.Background(), "plugin-a")
+	if err != nil {
+		t.Fatalf("ListTaskLeases() error = %v", err)
+	}
+	if len(leases) != 1 || leases[0].OwnerNodeID != "node-a" || leases[0].TaskID != "sync" || leases[0].ShardKey != "global" {
+		t.Fatalf("task leases after node-b gc = %+v, want active node-a singleton lease retained", leases)
+	}
 	if _, err := second.TriggerBackgroundTask(context.Background(), "admin", "plugin-a", "sync", secondTask.confirmToken); err != nil {
 		t.Fatalf("TriggerBackgroundTask(second) error = %v", err)
 	}
