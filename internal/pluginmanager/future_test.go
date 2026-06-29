@@ -1484,6 +1484,64 @@ func TestPromotionApplyRequiresConfigHashAndUpdatesDesiredOnly(t *testing.T) {
 	}
 }
 
+func TestPromotionApplyWarningGovernanceDoesNotAdvanceDesired(t *testing.T) {
+	manager := newManagerForTest(t, &fakeAdapter{})
+	artifact := uploadTestArtifactWithManifest(t, manager, "promotion-warning", func(manifest *Manifest) {
+		manifest.RuntimeLimits.HandlerTimeoutMS = int(DefaultHandlerTimeout.Milliseconds()) + 1
+	})
+	plugin, err := manager.SetDesired(context.Background(), "admin", "promotion-warning", artifact.ID, DesiredDisabled, `{}`, 10)
+	if err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	if _, err := manager.CreateWarningOverride(context.Background(), "admin", "promotion-warning", WarningOverrideRequest{
+		ArtifactID: artifact.ID,
+		Profile:    PolicyProfileDev,
+		Action:     GovernanceActionPromotion,
+		Reason:     "documented runtime-limit review",
+		TTLSeconds: int64(time.Hour / time.Second),
+	}); err != nil {
+		t.Fatalf("CreateWarningOverride() error = %v", err)
+	}
+	bundle, err := manager.ExportPromotionBundle(context.Background(), "test", PolicyProfileDev, "promotion-warning", artifact.ID, `{}`)
+	if err != nil {
+		t.Fatalf("ExportPromotionBundle() error = %v", err)
+	}
+
+	result, err := manager.ApplyPromotionBundle(context.Background(), "admin", bundle, map[string]string{
+		"promotion-warning": `{}`,
+	}, false)
+	if err != nil {
+		t.Fatalf("ApplyPromotionBundle(warning) error = %v", err)
+	}
+	if result.OK || !hasPromotionCheckCode(result.Checks, "governance_gate") || !hasPromotionGovernanceIssueCode(result.Checks, "runtime_limits_warning") {
+		t.Fatalf("apply warning result = %+v, want governance warning block", result)
+	}
+	afterApply, err := manager.Plugin(context.Background(), "promotion-warning")
+	if err != nil {
+		t.Fatalf("Plugin(after warning apply) error = %v", err)
+	}
+	if afterApply.DesiredGeneration != plugin.DesiredGeneration || afterApply.DesiredState != DesiredDisabled || afterApply.ActiveArtifactID != "" {
+		t.Fatalf("plugin after warning apply = %+v, want unchanged disabled desired state", afterApply)
+	}
+
+	drill, err := manager.RunPromotionDRDrill(context.Background(), bundle, map[string]string{
+		"promotion-warning": `{}`,
+	})
+	if err != nil {
+		t.Fatalf("RunPromotionDRDrill(warning) error = %v", err)
+	}
+	if drill.OK || !hasPromotionCheckCode(drill.Checks, "governance_gate") || !hasPromotionGovernanceIssueCode(drill.Checks, "runtime_limits_warning") {
+		t.Fatalf("DR drill warning result = %+v, want governance warning block", drill)
+	}
+	afterDrill, err := manager.Plugin(context.Background(), "promotion-warning")
+	if err != nil {
+		t.Fatalf("Plugin(after warning drill) error = %v", err)
+	}
+	if afterDrill.DesiredGeneration != plugin.DesiredGeneration || afterDrill.DesiredState != DesiredDisabled || afterDrill.ActiveArtifactID != "" {
+		t.Fatalf("plugin after warning drill = %+v, want unchanged disabled desired state", afterDrill)
+	}
+}
+
 func TestPromotionApplyUnsupportedPolicyProfileDoesNotCreateDesired(t *testing.T) {
 	manager := newManagerForTest(t, &fakeAdapter{})
 	artifact := uploadTestArtifact(t, manager, "promotion-policy-unsupported")

@@ -1150,7 +1150,7 @@ func (m *Manager) ApplyPromotionBundle(ctx context.Context, actor string, bundle
 			}
 			continue
 		}
-		if !decision.OK {
+		if !decision.OK || hasWarningIssue(decision.Issues) {
 			checks = append(checks, PromotionCheck{
 				Code:     "governance_gate",
 				Severity: GateSeverityBlocking,
@@ -1342,7 +1342,7 @@ func (m *Manager) RunPromotionDRDrill(ctx context.Context, bundle PromotionBundl
 			}
 			continue
 		}
-		if !decision.OK {
+		if !decision.OK || hasWarningIssue(decision.Issues) {
 			checks = append(checks, PromotionCheck{
 				Code:     "governance_gate",
 				Severity: GateSeverityBlocking,
