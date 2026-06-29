@@ -12,7 +12,7 @@ on:
       go-version:
         description: Go toolchain version without the go prefix
         required: true
-        default: "1.24.4"
+        default: "1.25.0"
         type: string
       plugin-api-version:
         description: Plugin API version bound into the builder image tag
@@ -23,6 +23,8 @@ on:
 permissions:
   contents: read
   packages: write
+  attestations: write
+  id-token: write
 
 env:
   REGISTRY: ghcr.io
@@ -57,7 +59,10 @@ jobs:
             release="${GITHUB_REF_NAME}"
           fi
           if [ -z "$go_version" ]; then
-            go_version="1.24.4"
+            go_version="$(awk '$1 == "go" { print $2; exit }' go.mod)"
+          fi
+          if [ -z "$go_version" ]; then
+            go_version="1.25.0"
           fi
           if [ -z "$plugin_api" ]; then
             plugin_api="plugin-api/v1"

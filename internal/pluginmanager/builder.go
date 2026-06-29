@@ -248,28 +248,68 @@ func (b ContainerBuilder) Build(ctx context.Context, source ArtifactRecord, req 
 }
 
 func buildEnvironment(req BuildRequest) []string {
-	env := os.Environ()
-	env = append(env,
-		"GOOS="+req.GOOS,
-		"GOARCH="+req.GOARCH,
-		"CGO_ENABLED="+req.CGOEnabled,
-	)
+	env := whitelistedHostBuildEnvironment()
+	env = appendBuildEnv(env, "GOOS", req.GOOS)
+	env = appendBuildEnv(env, "GOARCH", req.GOARCH)
+	env = appendBuildEnv(env, "CGO_ENABLED", req.CGOEnabled)
 	if req.GOAMD64 != "" {
-		env = append(env, "GOAMD64="+req.GOAMD64)
+		env = appendBuildEnv(env, "GOAMD64", req.GOAMD64)
 	}
 	if req.GOARM64 != "" {
-		env = append(env, "GOARM64="+req.GOARM64)
+		env = appendBuildEnv(env, "GOARM64", req.GOARM64)
 	}
 	if req.GOPROXY != "" {
-		env = append(env, "GOPROXY="+req.GOPROXY)
+		env = appendBuildEnv(env, "GOPROXY", req.GOPROXY)
 	}
 	if req.GONOSUMDB != "" {
-		env = append(env, "GONOSUMDB="+req.GONOSUMDB)
+		env = appendBuildEnv(env, "GONOSUMDB", req.GONOSUMDB)
 	}
 	if req.GOPRIVATE != "" {
-		env = append(env, "GOPRIVATE="+req.GOPRIVATE)
+		env = appendBuildEnv(env, "GOPRIVATE", req.GOPRIVATE)
 	}
 	return env
+}
+
+func whitelistedHostBuildEnvironment() []string {
+	keys := []string{
+		"PATH",
+		"GOROOT",
+		"GOPATH",
+		"GOCACHE",
+		"GOMODCACHE",
+		"GOTMPDIR",
+		"TMPDIR",
+		"TEMP",
+		"TMP",
+		"HOME",
+		"XDG_CACHE_HOME",
+		"GOWORK",
+		"GOTOOLCHAIN",
+		"SSL_CERT_FILE",
+		"SSL_CERT_DIR",
+		"CC",
+		"CXX",
+		"AR",
+		"PKG_CONFIG",
+	}
+	env := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if value, ok := os.LookupEnv(key); ok {
+			env = append(env, key+"="+value)
+		}
+	}
+	return env
+}
+
+func appendBuildEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	for idx, item := range env {
+		if strings.HasPrefix(item, prefix) {
+			env[idx] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
 }
 
 func containerBuildEnvironment(req BuildRequest) []string {
@@ -318,7 +358,12 @@ func commandOutput(ctx context.Context, dir string, env []string, name string, a
 }
 
 func dockerRunOutput(ctx context.Context, docker, image string, mounts, env []string, workdir string, args ...string) (string, string, error) {
-	dockerArgs := []string{"run", "--rm"}
+	dockerArgs := dockerRunArgs(image, mounts, env, workdir, args...)
+	return commandOutput(ctx, "", nil, docker, dockerArgs...)
+}
+
+func dockerRunArgs(image string, mounts, env []string, workdir string, args ...string) []string {
+	dockerArgs := []string{"run", "--rm", "--read-only", "--tmpfs", "/tmp:rw,exec,nosuid,size=1g"}
 	for _, mount := range mounts {
 		dockerArgs = append(dockerArgs, "-v", mount)
 	}
@@ -330,7 +375,7 @@ func dockerRunOutput(ctx context.Context, docker, image string, mounts, env []st
 	}
 	dockerArgs = append(dockerArgs, image)
 	dockerArgs = append(dockerArgs, args...)
-	return commandOutput(ctx, "", nil, docker, dockerArgs...)
+	return dockerArgs
 }
 
 func dockerImageDigest(ctx context.Context, docker, image string) (string, string) {
@@ -501,7 +546,7 @@ func sourceBuildModMode(source ArtifactRecord, req BuildRequest) string {
 	if info, err := os.Stat(filepath.Join(source.FilePath, "vendor")); err == nil && info.IsDir() {
 		return "vendor"
 	}
-	return "mod"
+	return "readonly"
 }
 
 func extensionPointsFingerprint(manifest Manifest) string {
@@ -578,7 +623,7 @@ func defaultContainerBuilderImage() string {
 	}
 	version := strings.TrimPrefix(runtime.Version(), "go")
 	if version == "" || strings.Contains(version, "devel") || strings.ContainsAny(version, " \t\n") {
-		version = "1.24.4"
+		version = "1.25.0"
 	}
 	return strings.Join([]string{
 		"ghcr.io/tursom/mc-gateway-plugin-builder:release",

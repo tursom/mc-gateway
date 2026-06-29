@@ -2010,8 +2010,8 @@ func supplyChainIssues(artifact ArtifactRecord, manifest Manifest, metadata map[
 	if requiredBool(signature, "required") && !requiredBool(signature, "verified") {
 		issues = append(issues, issue("signature_unverified", GateSeverityBlocking, "required artifact signature is not verified", artifact.PluginID, artifact.ID, nil))
 	}
-	issues = append(issues, externalCITrustIssues(artifact, signature, jsonMapFromAny(metadata["external_ci"]))...)
 	sbom := jsonMapFromAny(metadata["sbom"])
+	issues = append(issues, externalCITrustIssues(artifact, signature, sbom, jsonMapFromAny(metadata["external_ci"]))...)
 	if requiredBool(sbom, "required") && !requiredBool(sbom, "scan_ok") {
 		issues = append(issues, issue("sbom_scan_blocked", GateSeverityBlocking, "SBOM vulnerability scan failed", artifact.PluginID, artifact.ID, nil))
 	}
@@ -2053,7 +2053,7 @@ func normalizeExternalCIArtifactMetadata(artifact ArtifactRecord, metadata map[s
 		externalCI["package_sha256_matches"] = strings.EqualFold(packageSHA, artifact.PackageSHA256)
 	}
 	if externalCIRequired(externalCI) {
-		missing := missingExternalCIProvenanceFields(externalCI)
+		missing := missingExternalCIProvenanceMetadataFields(metadata, externalCI)
 		externalCI["provenance_complete"] = len(missing) == 0
 		if len(missing) > 0 {
 			externalCI["missing_fields"] = missing
@@ -2063,7 +2063,7 @@ func normalizeExternalCIArtifactMetadata(artifact ArtifactRecord, metadata map[s
 	return metadata
 }
 
-func externalCITrustIssues(artifact ArtifactRecord, signature, externalCI map[string]any) []GovernanceIssue {
+func externalCITrustIssues(artifact ArtifactRecord, signature, sbom, externalCI map[string]any) []GovernanceIssue {
 	if externalCI == nil {
 		return nil
 	}
@@ -2084,17 +2084,27 @@ func externalCITrustIssues(artifact ArtifactRecord, signature, externalCI map[st
 	if !required {
 		return issues
 	}
-	if missing := missingExternalCIProvenanceFields(externalCI); len(missing) > 0 {
+	if missing := missingExternalCIProvenanceMetadataFields(map[string]any{"signature": signature, "sbom": sbom}, externalCI); len(missing) > 0 {
 		issues = append(issues, issue("external_ci_provenance_incomplete", GateSeverityBlocking, "external CI provenance is missing required fields", artifact.PluginID, artifact.ID, map[string]any{"missing": missing}))
 	}
-	signatureVerified := requiredBool(externalCI, "signature_verified") || requiredBool(signature, "verified")
-	if !signatureVerified {
+	if !requiredBool(signature, "verified") {
 		issues = append(issues, issue("external_ci_signature_unverified", GateSeverityBlocking, "external CI artifact signature is not verified", artifact.PluginID, artifact.ID, nil))
 	}
 	if !requiredBool(externalCI, "trusted") {
 		issues = append(issues, issue("external_ci_untrusted", GateSeverityBlocking, "external CI provenance is not trusted by the target policy", artifact.PluginID, artifact.ID, nil))
 	}
 	return issues
+}
+
+func missingExternalCIProvenanceMetadataFields(metadata map[string]any, externalCI map[string]any) []string {
+	missing := missingExternalCIProvenanceFields(externalCI)
+	if !metadataFieldPresent(metadata["signature"]) {
+		missing = append(missing, "signature")
+	}
+	if !metadataFieldPresent(metadata["sbom"]) {
+		missing = append(missing, "sbom_metadata")
+	}
+	return missing
 }
 
 func externalCIRequired(externalCI map[string]any) bool {

@@ -3587,7 +3587,7 @@ func (p *pluginImpl) Init(gateway api.Gateway) error {
 `
 	packagePath := writeTestMCGP(t, map[string][]byte{
 		"manifest.json": manifestBytes,
-		"go.mod":        []byte("module example.com/" + pluginID + "\n\ngo 1.24.0\n\nrequire github.com/tursom/mc-gateway v0.0.0\n\nreplace github.com/tursom/mc-gateway => " + filepath.ToSlash(repoRoot) + "\n"),
+		"go.mod":        []byte("module example.com/" + pluginID + "\n\ngo 1.25.0\n\nrequire github.com/tursom/mc-gateway v0.0.0\n\nreplace github.com/tursom/mc-gateway => " + filepath.ToSlash(repoRoot) + "\n"),
 		"main.go":       []byte(mainSource),
 	})
 	source, err := manager.UploadSource(context.Background(), ArtifactUpload{

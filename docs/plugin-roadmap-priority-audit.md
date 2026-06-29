@@ -35,8 +35,8 @@
 | desired/runtime state 和 dispatch | 已落地 | `SetDesired`、`Load`、`Enable`、`Disable`、`Delete` 推动状态和只读分发快照。见 `internal/pluginmanager/manager.go:593-930` | 需要持续验证失败不污染旧 dispatch table |
 | `upstream.connect/v1` dialer mode | 已落地 | `ConnectUpstream` 调用 handler，dialer mode 返回插件提供的 `net.Conn`。见 `internal/pluginmanager/manager.go:993-1070` | 需要保持和 legacy hook 的兼容测试 |
 | protocol-proxy mode | 已落地但需加固 | initial data replay、双向 copy、copy-loop panic recovery、active proxy tracking、drain/force close 已有；CLI conformance 的 `conformance.json` 已能声明 protocol-proxy golden scenarios；`protocol/smoke` 和 manager/example 测试已覆盖真实 MC handshake/login/payload backpressure fixture。见 `internal/pluginmanager/manager.go:1073-1105`、`1875-1947`、`1477-1491`、`cmd/gateway/plugin_cli_toolchain.go`、`protocol/smoke` | 仍需要更完整真实 MC smoke fixture、异常路径和跨版本示例验收 |
-| source `.mcgp` 和 builder | 可用但需加固 | source 上传创建 build；local-process 和 container builder 都能产出 binary artifact，记录 source/artifact sha、module/provenance、Go version、ABI fingerprint；prod governance 会阻断 local-process、warning 缺失 builder digest、浮动 builder image 或未绑定 plugin API/Go release 的 builder image，并把 pinning/API/Go/平台匹配写入 supply-chain assessment；external CI assessment 已要求签名验证、source/artifact sha、run/builder identity 和 trusted 标记；GC 会保护 queued/running build 的 source package 并可清空 completed build log。见 `internal/pluginmanager/manager.go:441-631`、`internal/pluginmanager/builder.go`、`internal/pluginmanager/governance.go`、`internal/pluginmanager/gc.go` | 仍需官方 release-pinned builder image 发布、完整 CI artifact 发布链和跨环境验收 |
-| container builder | 可用但需加固 | `ContainerBuilder.Build()` 通过 `docker run --rm` 只读挂载 source、输出目录并执行 `go build -mod=readonly -buildmode=plugin`，同时记录 builder image digest；prod governance 会要求浮动 image tag 或未绑定 plugin API/Go release 的 image 走 warning override。见 `internal/pluginmanager/builder.go:128-244`、`internal/pluginmanager/governance.go` | 需要官方 builder image 发布和 CI 环境验收 |
+| source `.mcgp` 和 builder | 生产边界已落地 | source 上传创建 build；local-process 和 container builder 都能产出 binary artifact，记录 source/artifact sha、module/provenance、Go version、ABI fingerprint；prod governance 会阻断 local-process、warning 缺失 builder digest、浮动 builder image 或未绑定 gateway release/plugin API/Go/platform 的 builder image；external CI assessment 要求顶层签名/SBOM、source/artifact sha、run/builder identity、attestation、release provenance 和 trusted 标记；GC 会保护 queued/running build 的 source package 并可清空 completed build log。见 `internal/pluginmanager/manager.go:441-631`、`internal/pluginmanager/builder.go`、`internal/pluginmanager/future.go`、`internal/pluginmanager/gc.go` | M3 已有 release-pinned builder workflow、external CI 阻断测试和跨环境 source build 验收；后续只剩 M4+ governance/conformance 扩展 |
+| container builder | 生产边界已落地 | `ContainerBuilder.Build()` 通过 `docker run --rm --read-only` 只读挂载 source、独立输出目录和 `/tmp` tmpfs 执行 `go build -mod=readonly -buildmode=plugin`，同时记录 builder image digest；prod governance 会要求浮动 image tag 或未绑定 release/API/Go/platform 的 image 走 warning override；官方 builder image 由 `.github/workflows/plugin-builder-image.yml` 输出 digest-pinned artifact。见 `internal/pluginmanager/builder.go`、`internal/pluginmanager/governance.go`、`.github/workflows/plugin-builder-image.yml` | 真实 Docker 构建保留 opt-in smoke，不作为默认本机验收 |
 | Admin UI 管理闭环 | 已落地但需加固 | 插件列表、详情、上传、配置、secret、rollback、governance、operations、plugin-service 面板已有；runtime service mode 面板已分开展示 desired/active/effective data-plane、adapter、desired/active support、restart/pending 状态和 crash policy；governance 面板已展示 policy strict fixture gate。见 `cmd/gateway/admin_frontend/src/views/plugins.ts` | 仍需补更多 UI 自动化验收和高风险能力失败路径 |
 | 配置、secret、rollback | 已落地 | `DryRunConfig` 做 JSON/schema/secret/runtime dry-run，artifact/config rollback 重新走 governance 和 dry-run。见 `internal/pluginmanager/manager.go:621-792` | secret 仍是本地最小 SecretStore，不是外部 KMS |
 | governance/release gates | 可用但需加固 | review、warning override、preflight、self-test、benchmark、advisory、本地漏洞库、外部 feed sync/scheduler、conflict、supply-chain issue 接入 enable/rollback；repository import 保存同一治理路径的 admission preview，repository import apply 会重新 dry-run/governance 后只写 disabled desired state；CLI conformance 会用真实 config schema 和 required secret 声明判断 `invalid_config`/`missing_secret` 负向 fixture，并已支持 governance gate golden scenarios；packaged conformance fixture 失败会进入默认 preflight/governance blocking gate；`gateway plugin preflight --require-conformance-fixture` 和服务端 `MC_GATEWAY_PLUGIN_REQUIRE_CONFORMANCE_FIXTURE=true` 已能把缺失 packaged fixture 升级为 `conformance_fixture_missing` blocking。见 `internal/pluginmanager/governance.go`、`internal/pluginmanager/future.go`、`cmd/gateway/plugin_cli_toolchain.go` | 缺失 conformance fixture 默认仍保持兼容不阻断；完整外部 CVE/SBOM 自动扫描链仍未落地 |
@@ -58,7 +58,7 @@
 | --- | --- | --- | --- |
 | 阶段 1：Managed Binary Plugin MVP | 明确要求 binary `.mcgp`、Plugin Manager、desired/runtime state、`upstream.connect/v1` dialer、Admin API/CLI、示例 | 大部分已落地 | 应进入验收加固：端到端 fixture、重启恢复、失败路径、dispatch 不回归 |
 | 阶段 2：Protocol Proxy MVP | 明确要求 protocol-proxy、initial data replay、drain/force close、MC capability、`mc-auth-proxy` 示例 | 核心数据面已落地 | 下一步不是再扩展 MC core，而是补 smoke fixture、异常路径和示例验收 |
-| 阶段 3：Source Package Builder | 明确要求 source `.mcgp`、builder、provenance、build log、GC；生产推荐 container builder | local-process/container builder 已落地，prod 默认 container，local-process source-built artifact 在治理门禁阻断，provenance 已进入 supply-chain assessment metadata，GC 已覆盖 in-flight source 保护和 completed build log 清理 | 接下来应补 release-pinned builder image、external CI 信任和跨环境验收证据 |
+| 阶段 3：Source Package Builder | 明确要求 source `.mcgp`、builder、provenance、build log、GC；生产推荐 container builder | release-pinned builder workflow、prod container 默认、local-process prod 阻断、external CI provenance gate、构建日志脱敏、环境白名单、GC protected references 和 completed build log 清理均已有 focused tests | M3 可关闭；不要把 M4+ conformance/governance 扩展混入本阶段 |
 | 阶段 4：Admin UI、配置、Secret、回滚 | 明确要求 UI 管理闭环、schema/dry-run、secret ref、artifact/config rollback | UI/API/管理闭环已落地 | 需要做 UI truthfulness，尤其 runtime service mode 不能暗示未实现能力可用 |
 | 阶段 5：Governance And Release Gates | 明确要求 review、risk、conflict、preflight/self-test、benchmark、advisory | 主体已落地 | 需要把治理从“有模型”推进到“release gate 证据”：conformance、fixtures、策略快照验收 |
 | 阶段 6：Observability And Operations | 明确要求 metrics/events/trace/logger/diagnostic/background task/data/file/external/GC | 内部模型和 API 已落地较多 | 需要补生产验收：脱敏诊断、队列/GC/配额、外部依赖、任务超时和多实例边界 |
@@ -98,9 +98,9 @@
 
 ### 3. Source build 的生产边界
 
-- container builder 已有真实实现，但还需要发布级 builder image 绑定、digest 策略和 CI 环境验收。
-- 构建环境需要证明不泄露 GOPRIVATE/token/secret，不执行包内脚本，不污染 gateway 主进程。
-- provenance 已接入 prod governance/preflight 和 supply-chain assessment metadata，后续还要接入 external CI 签名/SBOM 自动扫描链。
+- container builder 已有真实实现和官方发布入口：workflow 输出 release/API/Go/platform 绑定 tag，并上传 digest-pinned 文本 artifact。
+- 构建环境已有 focused test 证明 token/secret/private path 脱敏、Go private policy 摘要展示、白名单环境和 container 只读 source/独立输出目录边界。
+- provenance 已接入 prod governance/preflight 和 supply-chain assessment metadata；external CI 要求顶层 signature/SBOM、attestation、source/artifact sha、run/builder identity 和 release provenance，hash 或 provenance 不完整会阻断 enable、rollback、repository apply 和 promotion apply。
 
 ### 4. Admin/UI 的真实性
 
@@ -201,13 +201,13 @@
 
 ### R3：source build 从开发能力升级为生产能力
 
-source package 已有 local-process 和 container 路径，prod 默认 container，且 local-process source-built artifact 已被 governance 阻断。container provenance 已能区分 digest-pinned builder image、浮动 tag 和 plugin API/Go release 绑定，并把浮动 tag 或 release 未绑定作为 prod warning/override 条件。external CI binary artifact 已有 assessment gate，要求签名验证、source/artifact sha、run/builder identity 和 trusted 标记；剩余缺口比很多未来 runtime 更靠近当前可上线边界：官方 builder image 发布、完整 CI artifact 发布链和跨环境验收证据。
+source package 已有 local-process 和 container 路径，prod 默认 container，且 local-process source-built artifact 已被 build policy 和 governance 阻断。container provenance 已能区分 digest-pinned builder image、浮动 tag 和 gateway release/plugin API/Go/platform 绑定，并把浮动 tag 或 release 未绑定作为 prod warning/override 条件。external CI binary artifact 已有 assessment gate，要求顶层签名/SBOM、source/artifact sha、run/builder identity、attestation、release provenance 和 trusted 标记；官方 builder image workflow 与跨环境 focused tests 已补齐，M3 可以关闭。
 
-应做：
+已完成：
 
-1. 发布官方 builder image；当前准入已检查 gateway plugin API version 和 Go version 绑定，但镜像发布流程仍需落地。
-2. 把 external CI binary artifact 的签名、source/artifact sha 和 provenance 信任策略从本地 assessment gate 扩展到官方 CI 发布流程。
-3. build log 脱敏和环境变量白名单验收。
+1. 发布官方 builder image 的 workflow 契约和 digest-pinned artifact 输出。
+2. external CI binary artifact 的签名、source/artifact sha、attestation、SBOM 和 release provenance 阻断链。
+3. build log 脱敏、环境变量白名单、container read-only/output 边界、build cancel/retry 和 GC 失败路径验收。
 4. provenance gate 继续覆盖 promotion/repository import 等跨环境路径。
 5. build cancel/retry、source/build log/artifact GC 的失败路径和跨环境验证。
 

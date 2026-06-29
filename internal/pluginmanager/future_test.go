@@ -1717,8 +1717,11 @@ func TestExternalCIProvenanceBlocksRepositoryAndPromotionApply(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ApplyRepositoryImport() error = %v", err)
 	}
-	if repoResult.OK || !hasPromotionCheckCode(repoResult.Checks, "governance_gate") {
-		t.Fatalf("repository apply result = %+v, want governance gate block", repoResult)
+	if repoResult.OK ||
+		!hasPromotionCheckCode(repoResult.Checks, "governance_gate") ||
+		!hasPromotionGovernanceIssueCode(repoResult.Checks, "external_ci_artifact_hash_mismatch") ||
+		!hasPromotionGovernanceIssueCode(repoResult.Checks, "external_ci_provenance_incomplete") {
+		t.Fatalf("repository apply result = %+v, want external CI governance gate block", repoResult)
 	}
 	bundle := NewPromotionBundle("test", PolicyProfileProd, artifact, mustManifestFromArtifact(t, artifact), `{}`)
 	promotionResult, err := manager.ApplyPromotionBundle(context.Background(), "admin", bundle, map[string]string{
@@ -1727,8 +1730,11 @@ func TestExternalCIProvenanceBlocksRepositoryAndPromotionApply(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ApplyPromotionBundle() error = %v", err)
 	}
-	if promotionResult.OK || !hasPromotionCheckCode(promotionResult.Checks, "governance_gate") {
-		t.Fatalf("promotion apply result = %+v, want governance gate block", promotionResult)
+	if promotionResult.OK ||
+		!hasPromotionCheckCode(promotionResult.Checks, "governance_gate") ||
+		!hasPromotionGovernanceIssueCode(promotionResult.Checks, "external_ci_artifact_hash_mismatch") ||
+		!hasPromotionGovernanceIssueCode(promotionResult.Checks, "external_ci_provenance_incomplete") {
+		t.Fatalf("promotion apply result = %+v, want external CI governance gate block", promotionResult)
 	}
 }
 
@@ -1755,6 +1761,44 @@ func TestExternalCIProvenanceMetadataBlocksEnableWithoutRequiredFlag(t *testing.
 	}
 	if !governanceIssueCodes(decision.Issues)["external_ci_provenance_incomplete"] {
 		t.Fatalf("decision = %+v, want external_ci_provenance_incomplete", decision)
+	}
+}
+
+func TestExternalCIProvenanceRequiresTopLevelSignatureAndSBOM(t *testing.T) {
+	manager := newManagerForTest(t, &fakeAdapter{})
+	artifact := uploadTestArtifact(t, manager, "external-ci-metadata-required")
+	if _, err := manager.SetDesired(context.Background(), "admin", "external-ci-metadata-required", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() before assessment error = %v", err)
+	}
+	assessment, err := manager.AssessSupplyChain(context.Background(), "admin", "external-ci-metadata-required", artifact.ID, map[string]any{
+		"external_ci": map[string]any{
+			"required":           true,
+			"trusted":            true,
+			"signature_verified": true,
+			"source_sha256":      "src-sha",
+			"artifact_sha256":    artifact.SHA256,
+			"package_sha256":     artifact.PackageSHA256,
+			"run_id":             "github-actions/run-metadata",
+			"builder_id":         "github-actions/mc-gateway-plugin-build",
+			"attestation":        "slsa-v1",
+			"sbom":               "sbom.spdx.json",
+			"release_provenance": map[string]any{"gateway_release": "v0.1.0"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("AssessSupplyChain() error = %v", err)
+	}
+	if assessment.Status != SupplyChainStatusBlocked ||
+		!hasIssueCode(assessment.Issues, "external_ci_provenance_incomplete") ||
+		!hasIssueCode(assessment.Issues, "external_ci_signature_unverified") {
+		t.Fatalf("assessment = %+v, want missing top-level signature/SBOM to block external CI provenance", assessment)
+	}
+	externalCI := jsonMapFromAny(assessment.Metadata["external_ci"])
+	missing := stringSlice(externalCI["missing_fields"])
+	if externalCI["provenance_complete"] != false ||
+		!containsString(missing, "signature") ||
+		!containsString(missing, "sbom_metadata") {
+		t.Fatalf("external CI metadata = %+v, want signature and sbom_metadata missing fields", externalCI)
 	}
 }
 
@@ -2203,6 +2247,22 @@ func hasIssueCode(issues []GovernanceIssue, code string) bool {
 func hasPromotionCheckCode(checks []PromotionCheck, code string) bool {
 	for _, check := range checks {
 		if check.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
+func hasPromotionGovernanceIssueCode(checks []PromotionCheck, code string) bool {
+	for _, check := range checks {
+		if check.Code != "governance_gate" || check.Details == nil {
+			continue
+		}
+		decision, ok := check.Details["decision"].(GovernanceDecision)
+		if !ok {
+			continue
+		}
+		if hasIssueCode(decision.Issues, code) {
 			return true
 		}
 	}

@@ -138,8 +138,12 @@ func TestArtifactStoreMergesProvenanceMetadata(t *testing.T) {
 	metadata := jsonMap(artifact.MetadataJSON)
 	externalCI := jsonMapFromAny(metadata["external_ci"])
 	signature := jsonMapFromAny(metadata["signature"])
-	if externalCI == nil || externalCI["run_id"] != "github-actions/run-1" || signature["verified"] != true {
-		t.Fatalf("metadata = %+v, want merged provenance.json external_ci and signature", metadata)
+	sbom := jsonMapFromAny(metadata["sbom"])
+	if externalCI == nil ||
+		externalCI["run_id"] != "github-actions/run-1" ||
+		signature["verified"] != true ||
+		sbom["scan_ok"] != true {
+		t.Fatalf("metadata = %+v, want merged provenance.json external_ci, signature and SBOM", metadata)
 	}
 }
 

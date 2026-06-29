@@ -24,7 +24,7 @@ func TestContainerBuilderBuildsUpstreamRewriteSourcePackageSmoke(t *testing.T) {
 	}
 	goVersion := os.Getenv("MC_GATEWAY_PLUGIN_CONTAINER_SMOKE_GO_VERSION")
 	if goVersion == "" {
-		goVersion = "go1.24.4"
+		goVersion = "go1.25.0"
 	}
 	root := repoRootForSmokeTest(t)
 	sourcePath := filepath.Join(root, "examples/plugins/upstream-rewrite/dist/upstream-rewrite-source.mcgp")

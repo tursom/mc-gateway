@@ -159,6 +159,64 @@ func TestPluginExamplePackagesCoverM1SourceBinaryFixtures(t *testing.T) {
 	}
 }
 
+func TestPluginBuilderImageWorkflowReleaseContract(t *testing.T) {
+	root := filepath.Clean("../..")
+	workflowBytes, err := os.ReadFile(filepath.Join(root, ".github/workflows/plugin-builder-image.yml"))
+	if err != nil {
+		t.Fatalf("ReadFile(plugin-builder-image.yml) error = %v", err)
+	}
+	dockerfileBytes, err := os.ReadFile(filepath.Join(root, "Dockerfile.plugin-builder"))
+	if err != nil {
+		t.Fatalf("ReadFile(Dockerfile.plugin-builder) error = %v", err)
+	}
+	workflow := string(workflowBytes)
+	dockerfile := string(dockerfileBytes)
+	for _, want := range []string{
+		`tags: ["v*"]`,
+		`gateway-release:`,
+		`plugin-api-version:`,
+		`default: "1.25.0"`,
+		`attestations: write`,
+		`id-token: write`,
+		`go_version="$(awk '$1 == "go" { print $2; exit }' go.mod)"`,
+		`tag="release-${release_token}-${api_token}-${go_token}-${{ matrix.goos }}-${{ matrix.goarch }}"`,
+		`platform: linux/amd64`,
+		`platform: linux/arm64`,
+		`GATEWAY_RELEASE=${{ steps.release.outputs.gateway_release }}`,
+		`PLUGIN_API_VERSION=${{ steps.release.outputs.plugin_api_version }}`,
+		`GO_VERSION=${{ steps.release.outputs.go_version }}`,
+		`io.mc-gateway.builder.gateway-release=${{ steps.release.outputs.gateway_release }}`,
+		`io.mc-gateway.builder.plugin-api-version=${{ steps.release.outputs.plugin_api_version }}`,
+		`io.mc-gateway.builder.go-version=${{ steps.release.outputs.go_version }}`,
+		`io.mc-gateway.builder.goos=${{ matrix.goos }}`,
+		`io.mc-gateway.builder.goarch=${{ matrix.goarch }}`,
+		`provenance: true`,
+		`sbom: true`,
+		`@${{ steps.build.outputs.digest }}`,
+		`actions/upload-artifact@v4`,
+		`plugin-builder-image-${{ matrix.goos }}-${{ matrix.goarch }}.txt`,
+	} {
+		if !strings.Contains(workflow, want) {
+			t.Fatalf("plugin-builder-image.yml missing %q", want)
+		}
+	}
+	if strings.Contains(workflow, "1.24.4") {
+		t.Fatalf("plugin-builder-image.yml still contains stale Go 1.24.4 default")
+	}
+	for _, want := range []string{
+		`ARG GO_VERSION=1.25.0`,
+		`LABEL io.mc-gateway.builder.gateway-release="${GATEWAY_RELEASE}"`,
+		`LABEL io.mc-gateway.builder.plugin-api-version="${PLUGIN_API_VERSION}"`,
+		`LABEL io.mc-gateway.builder.go-version="${GO_VERSION}"`,
+		`LABEL io.mc-gateway.builder.goos="${TARGETOS}"`,
+		`LABEL io.mc-gateway.builder.goarch="${TARGETARCH}"`,
+	} {
+		if !strings.Contains(dockerfile, want) {
+			t.Fatalf("Dockerfile.plugin-builder missing %q", want)
+		}
+	}
+}
+
 func TestPluginTestManifestProfile(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "test-plugin")
 	handled, code := runPluginCLI([]string{

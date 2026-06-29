@@ -3041,18 +3041,18 @@ Admin 上传 .mcgp
 生产环境推荐 container builder。builder image 应与 gateway release 绑定，避免 Go plugin ABI 不一致：
 
 ```text
-ghcr.io/tursom/mc-gateway-plugin-builder:<gateway-version>-go<go-version>
+ghcr.io/tursom/mc-gateway-plugin-builder:release-<gateway-release>-<plugin-api>-go<go-version>-<goos>-<goarch>@sha256:<digest>
 ```
 
 示例：
 
 ```text
-ghcr.io/tursom/mc-gateway-plugin-builder:v0.1.0-go1.24.4
+ghcr.io/tursom/mc-gateway-plugin-builder:release-v0-1-0-plugin-api-v1-go1.25.0-linux-amd64@sha256:<digest>
 ```
 
-当前实现会在 prod governance/preflight 中检查 source build 的 container provenance：缺失 builder image digest、builder image 未使用 `@sha256:` digest-pinned 引用，或 builder image tag/path 未绑定当前 plugin API 版本和 Go 版本，都会产生 warning，非 preview enable 需要 warning override。`AssessSupplyChain` 会记录 `builder_image_pinned`、`builder_image_go_version_bound`、`builder_image_api_version_bound`、`builder_image_release_bound`、gateway Go version、builder Go version match 和 GOOS/GOARCH match，用于后续把官方 builder image 发布策略接入 release gate。当前只是准入侧的 release 绑定检查，不代表官方 builder image 已经发布。
+当前实现会在 prod governance/preflight 中检查 source build 的 container provenance：缺失 builder image digest、builder image 未使用 `@sha256:` digest-pinned 引用，或 builder image tag/path 未绑定当前 gateway release、plugin API 版本、Go 版本和 GOOS/GOARCH，都会产生 warning，非 preview enable 需要 warning override。官方 builder image 由 `.github/workflows/plugin-builder-image.yml` 发布；workflow 每个平台输出 release-bound tag 和 digest-pinned 文本 artifact。`AssessSupplyChain` 会记录 `builder_image_pinned`、`builder_image_go_version_bound`、`builder_image_api_version_bound`、`builder_image_release_bound`、gateway Go version、builder Go version match 和 GOOS/GOARCH match。
 
-external CI 产出的 binary `.mcgp` 不在 gateway 内执行构建，因此必须通过 supply-chain assessment 提供可审计 metadata。当前实现支持 `metadata.external_ci.required=true` 的本地门禁：目标环境必须看到 `source_sha256`、`artifact_sha256`、`run_id`、`builder_id`，并且 `signature.verified=true` 或 `external_ci.signature_verified=true`，同时 `external_ci.trusted=true`。`artifact_sha256` 或可选 `package_sha256` 与本地 artifact 不匹配会直接产生 blocking issue；缺失 provenance、签名未验证或 trusted 标记缺失也会阻断后续 enable、rollback 和 promotion apply。完整 CI 发布链仍需把这些字段与组织签名、attestation、SBOM 和官方 release 流程绑定。
+external CI 产出的 binary `.mcgp` 不在 gateway 内执行构建，因此必须通过 `provenance.json` 和 supply-chain assessment 提供可审计 metadata。目标环境必须看到顶层 `signature.verified=true`、顶层 SBOM metadata、`external_ci.source_sha256`、`external_ci.artifact_sha256`、`external_ci.run_id`、`external_ci.builder_id`、`external_ci.attestation`、`external_ci.sbom`、`external_ci.release_provenance` 和 `external_ci.trusted=true`。`artifact_sha256` 或可选 `package_sha256` 与本地 artifact 不匹配会直接产生 blocking issue；缺失 provenance、签名未验证或 trusted 标记缺失会阻断 enable、rollback、repository apply 和 promotion apply。
 
 构建环境必须固定以下维度：
 
