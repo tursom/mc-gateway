@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 )
@@ -64,16 +65,17 @@ func TestParseStartupConfigDefaultsAndEnv(t *testing.T) {
 	}
 
 	env := map[string]string{
-		adminEnvDB:           "/tmp/mc.db",
-		adminEnvTCPAdminPort: "25575",
-		adminEnvPath:         "/ops",
-		adminEnvAPIPrefix:    "/ops/api/",
+		adminEnvDB:                              "/tmp/mc.db",
+		adminEnvTCPAdminPort:                    "25575",
+		adminEnvPath:                            "/ops",
+		adminEnvAPIPrefix:                       "/ops/api/",
+		adminEnvPluginRequireConformanceFixture: "true",
 	}
 	cfg, err = parseStartupConfig(func(key string) string { return env[key] })
 	if err != nil {
 		t.Fatalf("parseStartupConfig(env) error = %v", err)
 	}
-	if cfg.DBPath != "/tmp/mc.db" || cfg.TCPAdminPort != 25575 || cfg.AdminPath != "/ops/" || cfg.AdminAPIPrefix != "/ops/api" {
+	if cfg.DBPath != "/tmp/mc.db" || cfg.TCPAdminPort != 25575 || cfg.AdminPath != "/ops/" || cfg.AdminAPIPrefix != "/ops/api" || !cfg.PluginRequireConformanceFixture {
 		t.Fatalf("startup config = %+v", cfg)
 	}
 }
@@ -110,6 +112,10 @@ func TestParseStartupConfigReturnsErrors(t *testing.T) {
 			name: "api prefix under config asset path",
 			env:  map[string]string{adminEnvAPIPrefix: "/admin/config.js/api"},
 		},
+		{
+			name: "invalid plugin conformance gate",
+			env:  map[string]string{adminEnvPluginRequireConformanceFixture: "maybe"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -131,6 +137,7 @@ func TestLoadConfigInitializesSQLiteDefaults(t *testing.T) {
 	t.Setenv(adminEnvTCPAdminPort, "25575")
 	t.Setenv(adminEnvPath, "/ops")
 	t.Setenv(adminEnvAPIPrefix, "/ops/api")
+	t.Setenv(adminEnvPluginRequireConformanceFixture, "true")
 
 	if err := loadConfig(); err != nil {
 		t.Fatalf("loadConfig() error = %v", err)
@@ -145,7 +152,7 @@ func TestLoadConfigInitializesSQLiteDefaults(t *testing.T) {
 	if config.Kcp.Port != defaultKCPPort || config.Kcp.DataShards != defaultKCPDataShards || config.Kcp.ParityShards != defaultKCPParityShards {
 		t.Fatalf("kcp config = %+v", config.Kcp)
 	}
-	if adminStartup.DBPath != dbPath || adminStartup.AdminPath != "/ops/" || adminStartup.AdminAPIPrefix != "/ops/api" {
+	if adminStartup.DBPath != dbPath || adminStartup.AdminPath != "/ops/" || adminStartup.AdminAPIPrefix != "/ops/api" || !adminStartup.PluginRequireConformanceFixture {
 		t.Fatalf("adminStartup = %+v", adminStartup)
 	}
 	if adminDB == nil {
@@ -158,6 +165,13 @@ func TestLoadConfigInitializesSQLiteDefaults(t *testing.T) {
 	}
 	if enabled != 1 || port != 25575 {
 		t.Fatalf("tcp_admin service enabled=%d port=%d, want enabled=1 port=25575", enabled, port)
+	}
+	listeners, err := pluginIngressReservedListeners(context.Background(), adminDB)
+	if err != nil {
+		t.Fatalf("pluginIngressReservedListeners() error = %v", err)
+	}
+	if len(listeners) != 1 || listeners[0].Name != serviceNameTCPAdmin || listeners[0].Network != "tcp" || listeners[0].Port != 25575 || !listeners[0].Enabled {
+		t.Fatalf("reserved listeners = %+v, want tcp_admin tcp/25575", listeners)
 	}
 }
 

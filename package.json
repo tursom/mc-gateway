@@ -1,7 +1,8 @@
 {
   "scripts": {
     "build:admin": "tsc -p tsconfig.admin.json",
-    "check:admin": "tsc -p tsconfig.admin.json --noEmit"
+    "check:admin": "tsc -p tsconfig.admin.json --noEmit",
+    "test:admin-ui": "npm run build:admin && node cmd/gateway/admin_frontend/test/plugin-ui-acceptance.mjs"
   },
   "devDependencies": {
     "typescript": "6.0.3"

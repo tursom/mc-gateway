@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,6 +34,30 @@ type SelfTestAdapter interface {
 func (m *Manager) EvaluateGovernance(ctx context.Context, pluginID, artifactID, action, profile, configJSON string) (GovernanceDecision, error) {
 	decision, _, err := m.evaluateGovernance(ctx, pluginID, artifactID, action, profile, configJSON, false)
 	return decision, err
+}
+
+func (m *Manager) EvaluateReleaseGate(ctx context.Context, pluginID, artifactID, action, profile, configJSON string) (GovernanceDecision, error) {
+	decision, _, err := m.evaluateGovernance(ctx, pluginID, artifactID, action, profile, configJSON, true)
+	if err != nil {
+		return decision, err
+	}
+	if hasBlockingIssue(decision.Issues) {
+		decision.OK = false
+		return decision, governanceBlockedError(decision)
+	}
+	if hasWarningIssue(decision.Issues) {
+		if _, ok, err := m.repo.ActiveWarningOverride(ctx, pluginID, artifactID, normalizeProfile(profile), action, decision.PolicyHash); err != nil {
+			return decision, err
+		} else if !ok {
+			decision.OK = false
+			return decision, governanceBlockedError(decision)
+		}
+		decision.WarningOverrideUsed = true
+	}
+	if !decision.OK {
+		return decision, governanceBlockedError(decision)
+	}
+	return decision, nil
 }
 
 func (m *Manager) SetPolicyProfile(profile string) error {
@@ -91,7 +117,7 @@ func (m *Manager) GovernanceStatus(ctx context.Context, pluginID, artifactID, pr
 	}
 	return GovernanceStatus{
 		Decision:         decision,
-		Policy:           policyForProfile(profile, m.repo.now()),
+		Policy:           m.policySnapshot(profile),
 		Reviews:          reviews,
 		WarningOverrides: overrides,
 		Preflights:       preflights,
@@ -124,10 +150,11 @@ func (m *Manager) CreateReview(ctx context.Context, actor, pluginID string, req 
 	if err != nil {
 		return ReviewRecord{}, err
 	}
-	fingerprint := governanceFingerprint(plugin, artifact, manifest, policyHash(policyForProfile(req.Profile, m.repo.now())))
+	fingerprint := governanceFingerprint(plugin, artifact, manifest, policyHash(m.policySnapshot(req.Profile)))
 	review := ReviewRecord{
 		PluginID:          pluginID,
 		ArtifactID:        req.ArtifactID,
+		ArtifactHash:      fingerprint.ArtifactHash,
 		Profile:           normalizeProfile(req.Profile),
 		RiskLevel:         riskLevel(manifest, artifact),
 		ConfigHash:        fingerprint.ConfigHash,
@@ -145,10 +172,16 @@ func (m *Manager) CreateReview(ctx context.Context, actor, pluginID string, req 
 		return ReviewRecord{}, err
 	}
 	_ = m.repo.RecordOperation(ctx, pluginID, req.ArtifactID, "governance_review", "succeeded", actor, "plugin governance review recorded", map[string]any{
-		"profile":     review.Profile,
-		"risk_level":  review.RiskLevel,
-		"decision":    review.Decision,
-		"policy_hash": review.PolicyHash,
+		"profile":       review.Profile,
+		"risk_level":    review.RiskLevel,
+		"decision":      review.Decision,
+		"artifact_hash": review.ArtifactHash,
+		"config_hash":   review.ConfigHash,
+		"scope_hash":    review.ScopeHash,
+		"rollout_hash":  review.RolloutHash,
+		"runtime_hash":  review.RuntimeLimitsHash,
+		"features_hash": review.FeaturesHash,
+		"policy_hash":   review.PolicyHash,
 	})
 	return review, nil
 }
@@ -170,7 +203,7 @@ func (m *Manager) CreateWarningOverride(ctx context.Context, actor, pluginID str
 	if strings.TrimSpace(req.Reason) == "" {
 		return WarningOverrideRecord{}, errors.New("reason is required")
 	}
-	policy := policyForProfile(req.Profile, m.repo.now())
+	policy := m.policySnapshot(req.Profile)
 	if req.TTLSeconds <= 0 || req.TTLSeconds > policy.WarningOverrideTTLSeconds {
 		req.TTLSeconds = policy.WarningOverrideTTLSeconds
 	}
@@ -369,6 +402,304 @@ func (m *Manager) UpsertAdvisory(ctx context.Context, actor string, req Advisory
 	return record, nil
 }
 
+func (m *Manager) SyncAdvisoryFeed(ctx context.Context, actor string, req AdvisoryFeedRequest) (AdvisoryFeedResult, error) {
+	if strings.TrimSpace(req.Source) == "" {
+		req.Source = "local-json"
+	}
+	if len(req.Advisories) == 0 {
+		return AdvisoryFeedResult{}, errors.New("advisory feed contains no advisories")
+	}
+	records := make([]AdvisoryRecord, 0, len(req.Advisories))
+	for _, advisoryReq := range req.Advisories {
+		record, err := m.UpsertAdvisory(ctx, actor, advisoryReq)
+		if err != nil {
+			return AdvisoryFeedResult{}, err
+		}
+		records = append(records, record)
+	}
+	rescan, err := m.RescanAdvisories(ctx, actor, "", "")
+	if err != nil {
+		return AdvisoryFeedResult{}, err
+	}
+	result := AdvisoryFeedResult{
+		Source:     req.Source,
+		Imported:   len(records),
+		Advisories: records,
+		Rescan:     rescan,
+		CreatedBy:  actor,
+		CreatedAt:  m.repo.now().Unix(),
+	}
+	_ = m.repo.RecordOperation(ctx, "", "", "governance_advisory_feed", "succeeded", actor, "plugin advisory feed synced", map[string]any{
+		"source":   result.Source,
+		"imported": result.Imported,
+		"matches":  len(result.Rescan.Matches),
+		"blocking": result.Rescan.Blocking,
+		"warnings": result.Rescan.Warnings,
+	})
+	return result, nil
+}
+
+func (m *Manager) RescanAdvisories(ctx context.Context, actor, pluginID, artifactID string) (AdvisoryRescanReport, error) {
+	artifacts, err := m.repo.ListArtifacts(ctx, pluginID)
+	if err != nil {
+		return AdvisoryRescanReport{}, err
+	}
+	advisories, err := m.repo.ListAdvisories(ctx, pluginID)
+	if err != nil {
+		return AdvisoryRescanReport{}, err
+	}
+	plugins, err := m.repo.ListPlugins(ctx)
+	if err != nil {
+		return AdvisoryRescanReport{}, err
+	}
+	activeByArtifact := make(map[string]PluginRecord, len(plugins))
+	for _, plugin := range plugins {
+		if plugin.ActiveArtifactID != "" {
+			activeByArtifact[plugin.ActiveArtifactID] = plugin
+		}
+	}
+	report := AdvisoryRescanReport{
+		PluginID:   pluginID,
+		ArtifactID: artifactID,
+		Advisories: len(advisories),
+		OK:         true,
+	}
+	quarantined := map[string]bool{}
+	for _, artifact := range artifacts {
+		if artifactID != "" && artifact.ID != artifactID {
+			continue
+		}
+		var manifest Manifest
+		if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err != nil {
+			continue
+		}
+		report.Scanned++
+		activePlugin, active := activeByArtifact[artifact.ID]
+		for _, advisory := range advisories {
+			if advisoryIgnored(advisory) || !advisoryMatches(advisory, artifact, manifest) {
+				continue
+			}
+			severity := advisorySeverity(advisory)
+			if severity == GateSeverityBlocking {
+				report.Blocking++
+				report.OK = false
+			} else {
+				report.Warnings++
+			}
+			runtimeState := ""
+			if active {
+				runtimeState = activePlugin.RuntimeState
+			}
+			report.Matches = append(report.Matches, AdvisoryRescanMatch{
+				AdvisoryID:     advisory.AdvisoryID,
+				Status:         advisory.Status,
+				Action:         advisory.Action,
+				Severity:       severity,
+				PluginID:       artifact.PluginID,
+				ArtifactID:     artifact.ID,
+				ArtifactSHA256: artifact.SHA256,
+				Version:        artifact.Version,
+				RuntimeState:   runtimeState,
+				Active:         active,
+			})
+			if active && (advisory.Action == AdvisoryActionQuarantine || advisory.Action == AdvisoryActionRevoke || advisory.Status == AdvisoryStatusRevoked) && !quarantined[advisory.AdvisoryID] {
+				m.quarantineAffected(ctx, advisory)
+				quarantined[advisory.AdvisoryID] = true
+				report.QuarantineRuns++
+			}
+		}
+	}
+	sort.Slice(report.Matches, func(i, j int) bool {
+		if report.Matches[i].PluginID != report.Matches[j].PluginID {
+			return report.Matches[i].PluginID < report.Matches[j].PluginID
+		}
+		if report.Matches[i].ArtifactID != report.Matches[j].ArtifactID {
+			return report.Matches[i].ArtifactID < report.Matches[j].ArtifactID
+		}
+		return report.Matches[i].AdvisoryID < report.Matches[j].AdvisoryID
+	})
+	if strings.TrimSpace(actor) == "" {
+		actor = "system"
+	}
+	_ = m.repo.RecordOperation(ctx, pluginID, artifactID, "governance_advisory_rescan", "succeeded", actor, "plugin advisories rescanned", map[string]any{
+		"scanned":         report.Scanned,
+		"advisories":      report.Advisories,
+		"matches":         len(report.Matches),
+		"blocking":        report.Blocking,
+		"warnings":        report.Warnings,
+		"quarantine_runs": report.QuarantineRuns,
+	})
+	return report, nil
+}
+
+func (m *Manager) UpsertVulnerability(ctx context.Context, actor string, req VulnerabilityRequest) (VulnerabilityRecord, error) {
+	record, err := m.repo.UpsertVulnerability(ctx, actor, req)
+	if err != nil {
+		return VulnerabilityRecord{}, err
+	}
+	if record.Action == AdvisoryActionQuarantine || record.Action == AdvisoryActionRevoke || record.Status == AdvisoryStatusRevoked {
+		m.quarantineAffectedByVulnerability(ctx, record)
+	}
+	_ = m.repo.RecordOperation(ctx, "", "", "governance_vulnerability", "succeeded", actor, "plugin vulnerability upserted", map[string]any{
+		"vulnerability_id": record.VulnerabilityID,
+		"source":           record.Source,
+		"status":           record.Status,
+		"package_name":     record.PackageName,
+		"version_range":    record.VersionRange,
+		"severity":         record.Severity,
+		"action":           record.Action,
+		"fixed_version":    record.FixedVersion,
+	})
+	return record, nil
+}
+
+func (m *Manager) ImportVulnerabilityDB(ctx context.Context, actor string, req VulnerabilityDBRequest) (VulnerabilityDBResult, error) {
+	if strings.TrimSpace(req.Source) == "" {
+		req.Source = "local-json"
+	}
+	if len(req.Vulnerabilities) == 0 {
+		return VulnerabilityDBResult{}, errors.New("vulnerability database contains no vulnerabilities")
+	}
+	records := make([]VulnerabilityRecord, 0, len(req.Vulnerabilities))
+	for _, vulnerabilityReq := range req.Vulnerabilities {
+		if vulnerabilityReq.Source == "" {
+			vulnerabilityReq.Source = req.Source
+		}
+		record, err := m.repo.UpsertVulnerability(ctx, actor, vulnerabilityReq)
+		if err != nil {
+			return VulnerabilityDBResult{}, err
+		}
+		records = append(records, record)
+	}
+	scan, err := m.ScanVulnerabilities(ctx, actor, "", "")
+	if err != nil {
+		return VulnerabilityDBResult{}, err
+	}
+	result := VulnerabilityDBResult{
+		Source:          req.Source,
+		Imported:        len(records),
+		Vulnerabilities: records,
+		Scan:            scan,
+		CreatedBy:       actor,
+		CreatedAt:       m.repo.now().Unix(),
+	}
+	_ = m.repo.RecordOperation(ctx, "", "", "governance_vulnerability_db", "succeeded", actor, "plugin vulnerability database imported", map[string]any{
+		"source":          result.Source,
+		"imported":        result.Imported,
+		"matches":         len(result.Scan.Matches),
+		"blocking":        result.Scan.Blocking,
+		"warnings":        result.Scan.Warnings,
+		"quarantine_runs": result.Scan.QuarantineRuns,
+	})
+	return result, nil
+}
+
+func (m *Manager) ScanVulnerabilities(ctx context.Context, actor, pluginID, artifactID string) (VulnerabilityScanReport, error) {
+	pluginID = strings.TrimSpace(pluginID)
+	artifactID = strings.TrimSpace(artifactID)
+	artifacts, err := m.repo.ListArtifacts(ctx, pluginID)
+	if err != nil {
+		return VulnerabilityScanReport{}, err
+	}
+	vulnerabilities, err := m.repo.ListVulnerabilities(ctx, "")
+	if err != nil {
+		return VulnerabilityScanReport{}, err
+	}
+	plugins, err := m.repo.ListPlugins(ctx)
+	if err != nil {
+		return VulnerabilityScanReport{}, err
+	}
+	activeByArtifact := make(map[string]PluginRecord, len(plugins))
+	for _, plugin := range plugins {
+		if plugin.ActiveArtifactID != "" {
+			activeByArtifact[plugin.ActiveArtifactID] = plugin
+		}
+	}
+	report := VulnerabilityScanReport{
+		PluginID:        pluginID,
+		ArtifactID:      artifactID,
+		Vulnerabilities: len(vulnerabilities),
+		OK:              true,
+	}
+	quarantined := map[string]bool{}
+	for _, artifact := range artifacts {
+		if artifactID != "" && artifact.ID != artifactID {
+			continue
+		}
+		var manifest Manifest
+		if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err != nil {
+			continue
+		}
+		report.Scanned++
+		activePlugin, active := activeByArtifact[artifact.ID]
+		runtimeState := ""
+		if active {
+			runtimeState = activePlugin.RuntimeState
+		}
+		for _, dep := range sbomDependencies(manifest) {
+			for _, vulnerability := range vulnerabilities {
+				if vulnerabilityIgnored(vulnerability) || !vulnerabilityMatchesDependency(vulnerability, dep) {
+					continue
+				}
+				severity := vulnerabilityGateSeverity(vulnerability)
+				if severity == GateSeverityBlocking {
+					report.Blocking++
+					report.OK = false
+				} else {
+					report.Warnings++
+				}
+				report.Matches = append(report.Matches, VulnerabilityScanMatch{
+					VulnerabilityID: vulnerability.VulnerabilityID,
+					Source:          vulnerability.Source,
+					Status:          vulnerability.Status,
+					PackageName:     vulnerability.PackageName,
+					PackageVersion:  dep.Version,
+					VersionRange:    vulnerability.VersionRange,
+					Severity:        vulnerability.Severity,
+					Action:          vulnerability.Action,
+					PluginID:        artifact.PluginID,
+					ArtifactID:      artifact.ID,
+					ArtifactSHA256:  artifact.SHA256,
+					RuntimeState:    runtimeState,
+					Active:          active,
+					FixedVersion:    vulnerability.FixedVersion,
+					Summary:         vulnerability.Summary,
+				})
+				key := vulnerability.VulnerabilityID + "|" + vulnerability.PackageName
+				if active && (vulnerability.Action == AdvisoryActionQuarantine || vulnerability.Action == AdvisoryActionRevoke || vulnerability.Status == AdvisoryStatusRevoked) && !quarantined[key] {
+					m.quarantineAffectedByVulnerability(ctx, vulnerability)
+					quarantined[key] = true
+					report.QuarantineRuns++
+				}
+			}
+		}
+	}
+	sort.Slice(report.Matches, func(i, j int) bool {
+		if report.Matches[i].PluginID != report.Matches[j].PluginID {
+			return report.Matches[i].PluginID < report.Matches[j].PluginID
+		}
+		if report.Matches[i].ArtifactID != report.Matches[j].ArtifactID {
+			return report.Matches[i].ArtifactID < report.Matches[j].ArtifactID
+		}
+		if report.Matches[i].PackageName != report.Matches[j].PackageName {
+			return report.Matches[i].PackageName < report.Matches[j].PackageName
+		}
+		return report.Matches[i].VulnerabilityID < report.Matches[j].VulnerabilityID
+	})
+	if strings.TrimSpace(actor) == "" {
+		actor = "system"
+	}
+	_ = m.repo.RecordOperation(ctx, pluginID, artifactID, "governance_vulnerability_scan", "succeeded", actor, "plugin vulnerability database scanned", map[string]any{
+		"scanned":         report.Scanned,
+		"vulnerabilities": report.Vulnerabilities,
+		"matches":         len(report.Matches),
+		"blocking":        report.Blocking,
+		"warnings":        report.Warnings,
+		"quarantine_runs": report.QuarantineRuns,
+	})
+	return report, nil
+}
+
 func (m *Manager) ListReviews(ctx context.Context, pluginID string) ([]ReviewRecord, error) {
 	return m.repo.ListReviews(ctx, pluginID)
 }
@@ -379,6 +710,10 @@ func (m *Manager) ListWarningOverrides(ctx context.Context, pluginID string) ([]
 
 func (m *Manager) ListAdvisories(ctx context.Context, pluginID string) ([]AdvisoryRecord, error) {
 	return m.repo.ListAdvisories(ctx, pluginID)
+}
+
+func (m *Manager) ListVulnerabilities(ctx context.Context, packageName string) ([]VulnerabilityRecord, error) {
+	return m.repo.ListVulnerabilities(ctx, packageName)
 }
 
 func (m *Manager) ListPreflights(ctx context.Context, pluginID string) ([]PreflightRecord, error) {
@@ -394,17 +729,32 @@ func (m *Manager) evaluateGovernance(ctx context.Context, pluginID, artifactID, 
 		action = GovernanceActionEnable
 	}
 	profile = normalizeProfile(profile)
-	policy := policyForProfile(profile, m.repo.now())
+	policy := m.policySnapshot(profile)
 	policyHash := policyHash(policy)
 	plugin, err := m.repo.Plugin(ctx, pluginID)
 	if err != nil {
-		return GovernanceDecision{}, ConflictAnalysis{}, err
-	}
-	if artifactID == "" {
-		artifactID = plugin.DesiredArtifactID
-	}
-	if configJSON == "" {
-		configJSON = plugin.ConfigJSON
+		if !preview || !errors.Is(err, ErrPluginNotFound) {
+			return GovernanceDecision{}, ConflictAnalysis{}, err
+		}
+		if configJSON == "" {
+			configJSON = "{}"
+		}
+		plugin = PluginRecord{
+			ID:                pluginID,
+			DesiredArtifactID: artifactID,
+			DesiredState:      DesiredDisabled,
+			RuntimeState:      RuntimeDisabled,
+			Priority:          DefaultPriority,
+			ConfigJSON:        configJSON,
+			DesiredGeneration: 1,
+		}
+	} else {
+		if artifactID == "" {
+			artifactID = plugin.DesiredArtifactID
+		}
+		if configJSON == "" {
+			configJSON = plugin.ConfigJSON
+		}
 	}
 	artifact, manifest, err := m.artifactManifest(ctx, pluginID, artifactID)
 	if err != nil {
@@ -433,6 +783,11 @@ func (m *Manager) evaluateGovernance(ctx context.Context, pluginID, artifactID, 
 		return GovernanceDecision{}, ConflictAnalysis{}, err
 	}
 	issues = append(issues, advisoryIssues...)
+	vulnerabilityIssues, err := m.vulnerabilityIssues(ctx, artifact, manifest)
+	if err != nil {
+		return GovernanceDecision{}, ConflictAnalysis{}, err
+	}
+	issues = append(issues, vulnerabilityIssues...)
 	supplyChainIssues, err := m.supplyChainGovernanceIssues(ctx, artifact)
 	if err != nil {
 		return GovernanceDecision{}, ConflictAnalysis{}, err
@@ -504,19 +859,65 @@ func (m *Manager) preflightChecks(ctx context.Context, plugin PluginRecord, arti
 			Details:  map[string]any{"features": missing},
 		})
 	}
-	if artifact.RuntimeType == RuntimeSandbox && m.serviceMode != PluginServiceModeSandboxProcess {
+	if check, ok := conformancePreflightCheck(artifact.MetadataJSON, m.policySnapshot(profile)); ok {
+		result.Checks = append(result.Checks, check)
+	}
+	if artifact.RuntimeType == RuntimeSandbox && (m.serviceMode != PluginServiceModeSandboxProcess || !m.futureGates.SandboxEnabled()) {
 		result.Checks = append(result.Checks, PreflightCheck{Code: "sandbox_runtime_disabled", Severity: GateSeverityBlocking, Message: "sandbox-process runtime is disabled by plugin service mode"})
 	}
-	if artifact.RuntimeType == RuntimeWASM && m.serviceMode != PluginServiceModeSandboxProcess {
+	if artifact.RuntimeType == RuntimeWASM && (m.serviceMode != PluginServiceModeSandboxProcess || !m.futureGates.SandboxEnabled() || !m.futureGates.WASMEnabled()) {
 		result.Checks = append(result.Checks, PreflightCheck{Code: "wasm_runtime_disabled", Severity: GateSeverityBlocking, Message: "wasm runtime is disabled by plugin service mode"})
 	}
-	if caps := requiredRuntimeCapabilities(artifact); artifact.RuntimeType == RuntimeSandbox && len(caps) > 0 {
+	if caps := requiredRuntimeCapabilities(artifact); runtimeRequiredCapabilitiesUnsupported(artifact.RuntimeType) && len(caps) > 0 {
 		result.Checks = append(result.Checks, PreflightCheck{
 			Code:     "capability_enforcement_unavailable",
 			Severity: GateSeverityBlocking,
-			Message:  "sandbox-process required capabilities cannot be enforced by this gateway",
-			Details:  map[string]any{"capabilities": caps},
+			Message:  "runtime required capabilities cannot be enforced by this gateway",
+			Details:  map[string]any{"runtime_type": artifact.RuntimeType, "capabilities": caps},
 		})
+	}
+	if manifestHasExtensionPoint(manifest, ExtensionIngressService) {
+		var summary CapabilitySummary
+		ingressDetails := IngressCapabilityDetails(nil)
+		if err := json.Unmarshal([]byte(defaultJSONObject(artifact.CapabilitiesSummaryJSON)), &summary); err != nil {
+			result.Checks = append(result.Checks, PreflightCheck{
+				Code:     "ingress_service_invalid",
+				Severity: GateSeverityBlocking,
+				Message:  "ingress.service/v1 capability summary could not be parsed",
+				Details:  map[string]any{"extension_point": ExtensionIngressService, "error": err.Error()},
+			})
+		} else {
+			ingressDetails = IngressCapabilityDetails(summary.Ingress)
+			if problems := ValidateIngressCapability(manifest, summary.Ingress); len(problems) > 0 {
+				details := IngressCapabilityDetails(summary.Ingress)
+				details["errors"] = problems
+				result.Checks = append(result.Checks, PreflightCheck{
+					Code:     "ingress_service_invalid",
+					Severity: GateSeverityBlocking,
+					Message:  "ingress.service/v1 capability declaration is invalid",
+					Details:  details,
+				})
+			} else {
+				result.Checks = append(result.Checks, PreflightCheck{
+					Code:     "ingress_service_schema_valid",
+					Severity: GateSeverityInfo,
+					Message:  "ingress.service/v1 capability declaration passed reserved schema checks",
+					Details:  ingressDetails,
+				})
+			}
+		}
+		if !m.futureGates.IngressEnabled() {
+			result.Checks = append(result.Checks, PreflightCheck{
+				Code:     "ingress_service_disabled",
+				Severity: GateSeverityBlocking,
+				Message:  "ingress.service/v1 data plane is disabled by feature gate",
+				Details:  ingressDetails,
+			})
+		}
+	}
+	if normalizeProfile(profile) == PolicyProfileProd {
+		result.Checks = append(result.Checks, m.sourceBuildProvenancePreflightChecks(ctx, artifact)...)
+		result.Checks = append(result.Checks, m.externalCIProvenancePreflightChecks(ctx, artifact)...)
 	}
 	if manifest.RuntimeLimits.HandlerTimeoutMS > int(DefaultHandlerTimeout.Milliseconds()) {
 		result.Checks = append(result.Checks, PreflightCheck{
@@ -566,52 +967,565 @@ func (m *Manager) preflightChecks(ctx context.Context, plugin PluginRecord, arti
 	if external := externalDependencies(manifest); len(external) > 0 {
 		result.Checks = append(result.Checks, PreflightCheck{Code: "external_dependencies_declared", Severity: GateSeverityInfo, Message: "plugin declares external dependencies", Details: map[string]any{"dependencies": external}})
 	}
+	for _, dep := range manifest.ExternalDeps {
+		policy := normalizeExternalFailPolicy(dep)
+		details := map[string]any{
+			"dependency":  dep.Name,
+			"purpose":     dep.Purpose,
+			"required":    dep.Required,
+			"fail_policy": policy,
+		}
+		if !validExternalFailPolicy(policy) {
+			result.Checks = append(result.Checks, PreflightCheck{Code: "external_dependency_policy_invalid", Severity: GateSeverityBlocking, Message: "external dependency fail policy is invalid", Details: details})
+			continue
+		}
+		if dep.Required && policy == ExternalFailPolicyOpen {
+			result.Checks = append(result.Checks, PreflightCheck{Code: "external_dependency_fail_open_required", Severity: GateSeverityWarning, Message: "required external dependency is configured fail-open", Details: details})
+		}
+		if dep.Name == "" || m.operations == nil {
+			continue
+		}
+		summary, err := m.operations.ForPlugin(plugin.ID, artifact.ID, manifest).ExternalDependencySummary(dep.Name)
+		if err != nil {
+			continue
+		}
+		if summary.CircuitState == circuitOpen || summary.LastStatus == "health_failed" {
+			details["last_status"] = summary.LastStatus
+			details["circuit_state"] = summary.CircuitState
+			details["recent_error"] = summary.RecentError
+			severity := GateSeverityWarning
+			code := "external_dependency_unhealthy"
+			if dep.Required && policy == ExternalFailPolicyClosed {
+				severity = GateSeverityBlocking
+				code = "external_dependency_fail_closed_unhealthy"
+			}
+			result.Checks = append(result.Checks, PreflightCheck{Code: code, Severity: severity, Message: "external dependency is not healthy", Details: details})
+		}
+	}
 	result.OK = !preflightHasBlocking(result.Checks)
 	return result
 }
 
+func conformancePreflightCheck(metadataJSON string, policy PolicySnapshot) (PreflightCheck, bool) {
+	summary, ok, err := conformanceSummaryFromMetadata(metadataJSON)
+	if err != nil {
+		return PreflightCheck{
+			Code:     "conformance_fixture_invalid",
+			Severity: GateSeverityBlocking,
+			Message:  "packaged conformance evidence could not be parsed",
+			Details:  map[string]any{"error": err.Error()},
+		}, true
+	}
+	if !ok {
+		if policy.RequireConformanceFixture {
+			return PreflightCheck{
+				Code:     "conformance_fixture_missing",
+				Severity: GateSeverityBlocking,
+				Message:  "packaged conformance fixture is required by policy",
+				Details:  map[string]any{"profile": policy.Profile},
+			}, true
+		}
+		return PreflightCheck{}, false
+	}
+	details := map[string]any{
+		"source":  summary.Source,
+		"total":   summary.Total,
+		"passed":  summary.Passed,
+		"skipped": summary.Skipped,
+		"failed":  summary.Failed,
+	}
+	if len(summary.FailedFixtures) > 0 {
+		details["failed_fixtures"] = summary.FailedFixtures
+	}
+	if !summary.OK {
+		return PreflightCheck{
+			Code:     "conformance_fixture_failed",
+			Severity: GateSeverityBlocking,
+			Message:  "packaged conformance fixture failed",
+			Details:  details,
+		}, true
+	}
+	return PreflightCheck{
+		Code:     "conformance_fixture_passed",
+		Severity: GateSeverityInfo,
+		Message:  "packaged conformance fixtures passed",
+		Details:  details,
+	}, true
+}
+
+func conformanceSummaryFromMetadata(metadataJSON string) (ConformanceSummary, bool, error) {
+	var metadata map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(defaultJSONObject(metadataJSON)), &metadata); err != nil {
+		return ConformanceSummary{}, false, err
+	}
+	raw, ok := metadata["conformance"]
+	if !ok || len(raw) == 0 || string(raw) == "null" {
+		return ConformanceSummary{}, false, nil
+	}
+	var summary ConformanceSummary
+	if err := json.Unmarshal(raw, &summary); err != nil {
+		return ConformanceSummary{}, true, err
+	}
+	return summary, true, nil
+}
+
+func (m *Manager) sourceBuildProvenancePreflightChecks(ctx context.Context, artifact ArtifactRecord) []PreflightCheck {
+	build, ok, err := m.sourceBuildForArtifact(ctx, artifact)
+	if err != nil {
+		return []PreflightCheck{{
+			Code:     "source_build_provenance_unavailable",
+			Severity: GateSeverityBlocking,
+			Message:  "source build provenance could not be read",
+			Details:  map[string]any{"error": err.Error()},
+		}}
+	}
+	if !ok {
+		return nil
+	}
+	details := map[string]any{
+		"build_id":     build.ID,
+		"source_id":    build.SourceID,
+		"builder_type": build.BuilderType,
+	}
+	if build.BuilderImage != "" {
+		details["builder_image"] = build.BuilderImage
+	}
+	if build.SourceSHA256 != "" {
+		details["source_sha256"] = build.SourceSHA256
+	}
+	if build.ArtifactSHA256 != "" {
+		details["artifact_sha256"] = build.ArtifactSHA256
+	}
+	if build.ABIFingerprint != "" {
+		details["abi_fingerprint"] = build.ABIFingerprint
+	}
+	builderIdentity := sourceBuildBuilderIdentity(build)
+	for k, v := range builderIdentity {
+		details[k] = v
+	}
+
+	var checks []PreflightCheck
+	switch build.BuilderType {
+	case BuilderTypeLocalProcess:
+		checks = append(checks, PreflightCheck{
+			Code:     "source_build_local_process_prod",
+			Severity: GateSeverityBlocking,
+			Message:  "prod profile does not admit artifacts built by local-process source builder",
+			Details:  details,
+		})
+	case BuilderTypeContainer:
+		if strings.TrimSpace(build.BuilderImage) == "" {
+			checks = append(checks, PreflightCheck{
+				Code:     "source_build_provenance_incomplete",
+				Severity: GateSeverityBlocking,
+				Message:  "source build provenance is missing required fields for prod admission",
+				Details:  map[string]any{"missing": []string{"builder_image"}, "build_id": build.ID, "builder_type": build.BuilderType},
+			})
+		}
+		metadata := sourceBuildMetadata(build)
+		digest, _ := metadata["builder_image_digest"].(string)
+		if strings.TrimSpace(digest) == "" {
+			checks = append(checks, PreflightCheck{
+				Code:     "source_build_builder_digest_missing",
+				Severity: GateSeverityWarning,
+				Message:  "container source build does not include a builder image digest",
+				Details:  details,
+			})
+		}
+		if pinned, _ := builderIdentity["builder_image_pinned"].(bool); !pinned {
+			checks = append(checks, PreflightCheck{
+				Code:     "source_build_builder_image_not_pinned",
+				Severity: GateSeverityWarning,
+				Message:  "container source build does not use a digest-pinned builder image reference",
+				Details:  details,
+			})
+		}
+		if releaseBound, _ := builderIdentity["builder_image_release_bound"].(bool); !releaseBound {
+			checks = append(checks, PreflightCheck{
+				Code:     "source_build_builder_image_release_unbound",
+				Severity: GateSeverityWarning,
+				Message:  "container source build is not bound to the gateway plugin API and Go release",
+				Details:  details,
+			})
+		}
+	case "":
+		checks = append(checks, PreflightCheck{
+			Code:     "source_build_provenance_incomplete",
+			Severity: GateSeverityBlocking,
+			Message:  "source build provenance is missing required fields for prod admission",
+			Details:  map[string]any{"missing": []string{"builder_type"}, "build_id": build.ID},
+		})
+	default:
+		checks = append(checks, PreflightCheck{
+			Code:     "source_build_builder_unsupported",
+			Severity: GateSeverityBlocking,
+			Message:  "source build uses an unsupported builder type for prod admission",
+			Details:  details,
+		})
+	}
+	if missing := missingSourceBuildProvenanceFields(build); len(missing) > 0 {
+		checks = append(checks, PreflightCheck{
+			Code:     "source_build_provenance_incomplete",
+			Severity: GateSeverityBlocking,
+			Message:  "source build provenance is missing required fields for prod admission",
+			Details:  map[string]any{"missing": missing, "build_id": build.ID, "builder_type": build.BuilderType},
+		})
+	}
+	if build.ArtifactSHA256 != "" && artifact.SHA256 != "" && build.ArtifactSHA256 != artifact.SHA256 {
+		checks = append(checks, PreflightCheck{
+			Code:     "source_build_artifact_hash_mismatch",
+			Severity: GateSeverityBlocking,
+			Message:  "source build artifact hash does not match stored artifact",
+			Details: map[string]any{
+				"build_id":              build.ID,
+				"build_artifact_sha256": build.ArtifactSHA256,
+				"artifact_sha256":       artifact.SHA256,
+			},
+		})
+	}
+	return checks
+}
+
+func (m *Manager) sourceBuildForArtifact(ctx context.Context, artifact ArtifactRecord) (BuildRecord, bool, error) {
+	builds, err := m.repo.ListBuilds(ctx, artifact.PluginID)
+	if err != nil {
+		return BuildRecord{}, false, err
+	}
+	for _, build := range builds {
+		if build.ArtifactID == artifact.ID && build.Status == BuildStatusSucceeded {
+			return build, true, nil
+		}
+	}
+	return BuildRecord{}, false, nil
+}
+
+func missingSourceBuildProvenanceFields(build BuildRecord) []string {
+	var missing []string
+	if strings.TrimSpace(build.SourceSHA256) == "" {
+		missing = append(missing, "source_sha256")
+	}
+	if strings.TrimSpace(build.ArtifactSHA256) == "" {
+		missing = append(missing, "artifact_sha256")
+	}
+	if strings.TrimSpace(build.GoVersion) == "" {
+		missing = append(missing, "go_version")
+	}
+	if strings.TrimSpace(build.ModuleSummary) == "" {
+		missing = append(missing, "module_summary")
+	}
+	if strings.TrimSpace(build.ABIFingerprint) == "" {
+		missing = append(missing, "abi_fingerprint")
+	}
+	return missing
+}
+
+func sourceBuildBuilderIdentity(build BuildRecord) map[string]any {
+	identity := map[string]any{
+		"builder_image_pinned":                builderImageDigestPinned(build.BuilderImage),
+		"builder_image_gateway_release_bound": builderImageReferencesGatewayRelease(build.BuilderImage),
+		"builder_image_go_version_bound":      builderImageReferencesGoVersion(build.BuilderImage, build.GoVersion),
+		"builder_image_api_version_bound":     builderImageReferencesAPIVersion(build.BuilderImage),
+		"builder_image_target_bound":          builderImageReferencesTarget(build.BuilderImage, runtime.GOOS, runtime.GOARCH),
+		"builder_image_release_bound":         builderImageReleaseBound(build.BuilderImage, build.GoVersion),
+		"builder_image_official_name":         builderImageOfficialName(build.BuilderImage),
+		"gateway_go_version":                  runtime.Version(),
+		"gateway_go_os":                       runtime.GOOS,
+		"gateway_go_arch":                     runtime.GOARCH,
+	}
+	if build.GoVersion != "" {
+		identity["builder_go_version"] = build.GoVersion
+		identity["builder_go_version_matches_gateway"] = build.GoVersion == runtime.Version()
+	}
+	if build.GOOS != "" || build.GOARCH != "" {
+		identity["builder_target_go_os"] = build.GOOS
+		identity["builder_target_go_arch"] = build.GOARCH
+		identity["builder_target_matches_gateway"] = build.GOOS == runtime.GOOS && build.GOARCH == runtime.GOARCH
+	}
+	return identity
+}
+
+func builderImageDigestPinned(image string) bool {
+	image = strings.TrimSpace(image)
+	const marker = "@sha256:"
+	idx := strings.LastIndex(image, marker)
+	if idx < 0 {
+		return false
+	}
+	digest := image[idx+len(marker):]
+	if len(digest) != 64 {
+		return false
+	}
+	for _, r := range digest {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func builderImageReferencesGoVersion(image, goVersion string) bool {
+	image = strings.TrimSpace(image)
+	goVersion = strings.TrimSpace(goVersion)
+	if image == "" || goVersion == "" {
+		return false
+	}
+	if before, _, ok := strings.Cut(image, "@"); ok {
+		image = before
+	}
+	normalized := strings.TrimPrefix(goVersion, "go")
+	if normalized == "" {
+		return false
+	}
+	lower := strings.ToLower(image)
+	return strings.Contains(lower, "go"+strings.ToLower(normalized)) ||
+		strings.Contains(lower, ":"+strings.ToLower(normalized)) ||
+		strings.Contains(lower, "-"+strings.ToLower(normalized)) ||
+		strings.Contains(builderImageToken(image), builderImageToken("go"+normalized))
+}
+
+func builderImageReferencesAPIVersion(image string) bool {
+	image = builderImageWithoutDigest(image)
+	apiToken := builderImageToken(APIVersion)
+	return image != "" && apiToken != "" && strings.Contains(builderImageToken(image), apiToken)
+}
+
+func builderImageReferencesGatewayRelease(image string) bool {
+	image = builderImageWithoutDigest(image)
+	releaseToken := builderImageToken(GatewayRelease)
+	return image != "" && releaseToken != "" && strings.Contains(builderImageToken(image), releaseToken)
+}
+
+func builderImageReleaseBound(image, goVersion string) bool {
+	return builderImageDigestPinned(image) &&
+		builderImageReferencesGatewayRelease(image) &&
+		builderImageReferencesGoVersion(image, goVersion) &&
+		builderImageReferencesAPIVersion(image) &&
+		builderImageReferencesTarget(image, runtime.GOOS, runtime.GOARCH)
+}
+
+func builderImageOfficialName(image string) bool {
+	image = strings.ToLower(builderImageWithoutDigest(image))
+	return strings.Contains(image, "mc-gateway-plugin-builder")
+}
+
+func builderImageReferencesTarget(image, goos, goarch string) bool {
+	imageToken := builderImageToken(builderImageWithoutDigest(image))
+	return imageToken != "" &&
+		strings.Contains(imageToken, builderImageToken(goos)) &&
+		strings.Contains(imageToken, builderImageToken(goarch))
+}
+
+func builderImageWithoutDigest(image string) string {
+	image = strings.TrimSpace(image)
+	if before, _, ok := strings.Cut(image, "@"); ok {
+		return before
+	}
+	return image
+}
+
+func builderImageToken(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var out strings.Builder
+	lastDash := false
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			out.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			out.WriteByte('-')
+			lastDash = true
+		}
+	}
+	return strings.Trim(out.String(), "-")
+}
+
+func sourceBuildMetadata(build BuildRecord) map[string]any {
+	var metadata map[string]any
+	if json.Unmarshal([]byte(defaultJSONObject(build.MetadataJSON)), &metadata) != nil {
+		return nil
+	}
+	return metadata
+}
+
+func (m *Manager) attachSourceBuildAssessmentMetadata(ctx context.Context, artifact ArtifactRecord, metadata map[string]any) (map[string]any, error) {
+	build, ok, err := m.sourceBuildForArtifact(ctx, artifact)
+	if err != nil || !ok {
+		return metadata, err
+	}
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	sourceBuild := jsonMapFromAny(metadata["source_build"])
+	if sourceBuild == nil {
+		sourceBuild = map[string]any{}
+	}
+	buildMetadata := sourceBuildMetadata(build)
+	digest, _ := buildMetadata["builder_image_digest"].(string)
+	sourceBuild["build_id"] = build.ID
+	sourceBuild["source_id"] = build.SourceID
+	sourceBuild["builder_type"] = build.BuilderType
+	sourceBuild["builder_image"] = build.BuilderImage
+	sourceBuild["builder_image_digest"] = digest
+	sourceBuild["builder_version"] = build.BuilderVersion
+	sourceBuild["source_sha256"] = build.SourceSHA256
+	sourceBuild["artifact_sha256"] = build.ArtifactSHA256
+	sourceBuild["go_version"] = build.GoVersion
+	sourceBuild["go_os"] = build.GOOS
+	sourceBuild["go_arch"] = build.GOARCH
+	sourceBuild["module_summary"] = json.RawMessage(defaultJSONArray(build.ModuleSummary))
+	sourceBuild["abi_fingerprint"] = build.ABIFingerprint
+	builderIdentity := sourceBuildBuilderIdentity(build)
+	for k, v := range builderIdentity {
+		sourceBuild[k] = v
+	}
+	missing := missingSourceBuildProvenanceFields(build)
+	sourceBuild["provenance_complete"] = len(missing) == 0
+	if len(missing) > 0 {
+		sourceBuild["missing_fields"] = missing
+	}
+	builderImagePinned, _ := builderIdentity["builder_image_pinned"].(bool)
+	builderImageReleaseBound, _ := builderIdentity["builder_image_release_bound"].(bool)
+	switch {
+	case build.BuilderType == BuilderTypeLocalProcess:
+		sourceBuild["prod_admission"] = "blocked"
+	case len(missing) > 0:
+		sourceBuild["prod_admission"] = "blocked"
+	case build.BuilderType == BuilderTypeContainer && (strings.TrimSpace(digest) == "" || !builderImagePinned || !builderImageReleaseBound):
+		sourceBuild["prod_admission"] = "warning"
+	default:
+		sourceBuild["prod_admission"] = "allowed"
+	}
+	metadata["source_build"] = sourceBuild
+	return metadata, nil
+}
+
+func (m *Manager) externalCIProvenancePreflightChecks(ctx context.Context, artifact ArtifactRecord) []PreflightCheck {
+	assessments, err := m.repo.ListSupplyChainAssessments(ctx, artifact.PluginID, artifact.ID)
+	if err != nil {
+		return []PreflightCheck{{
+			Code:     "external_ci_assessment_unavailable",
+			Severity: GateSeverityBlocking,
+			Message:  "external CI supply-chain assessment could not be read",
+			Details:  map[string]any{"error": err.Error()},
+		}}
+	}
+	var latest *SupplyChainAssessment
+	for idx := range assessments {
+		assessment := assessments[idx]
+		if jsonMapFromAny(assessment.Metadata["external_ci"]) != nil {
+			latest = &assessment
+			break
+		}
+	}
+	artifactMetadata := jsonMap(artifact.MetadataJSON)
+	if latest == nil {
+		if externalCI := jsonMapFromAny(artifactMetadata["external_ci"]); externalCI != nil {
+			var manifest Manifest
+			_ = json.Unmarshal([]byte(defaultJSONObject(artifact.MetadataJSON)), &manifest)
+			issues := supplyChainIssues(artifact, manifest, map[string]any{
+				"signature":   jsonMapFromAny(artifactMetadata["signature"]),
+				"sbom":        jsonMapFromAny(artifactMetadata["sbom"]),
+				"external_ci": externalCI,
+			})
+			return preflightChecksFromGovernanceIssues(issues)
+		}
+		return nil
+	}
+	return preflightChecksFromGovernanceIssues(latest.Issues)
+}
+
 func (m *Manager) conflictAnalysis(ctx context.Context, target PluginRecord, artifact ArtifactRecord, manifest Manifest) (ConflictAnalysis, error) {
 	analysis := ConflictAnalysis{CreatedAt: m.repo.now().Unix(), Plan: m.DispatchPlan(ctx)}
-	if upstreamModeFromArtifact(artifact) != UpstreamModeProtocolProxy {
+	targetProtocolProxy := upstreamModeFromArtifact(artifact) == UpstreamModeProtocolProxy
+	targetIngress := manifestHasExtensionPoint(manifest, ExtensionIngressService)
+	if !targetProtocolProxy && !targetIngress {
 		analysis.OK = true
 		return analysis, nil
 	}
-	targetScope := manifestScope(manifest)
 	plugins, err := m.repo.ListPlugins(ctx)
 	if err != nil {
 		return ConflictAnalysis{}, err
 	}
-	for _, plugin := range plugins {
-		if plugin.ID == target.ID || plugin.RuntimeState != RuntimeEnabled || plugin.ActiveArtifactID == "" {
-			continue
+	if targetProtocolProxy {
+		targetScope := manifestScope(manifest)
+		for _, plugin := range plugins {
+			if plugin.ID == target.ID || plugin.RuntimeState != RuntimeEnabled || plugin.ActiveArtifactID == "" {
+				continue
+			}
+			otherArtifact, err := m.repo.Artifact(ctx, plugin.ActiveArtifactID)
+			if err != nil {
+				continue
+			}
+			if upstreamModeFromArtifact(otherArtifact) != UpstreamModeProtocolProxy {
+				continue
+			}
+			var otherManifest Manifest
+			if json.Unmarshal([]byte(otherArtifact.MetadataJSON), &otherManifest) != nil {
+				continue
+			}
+			otherScope := manifestScope(otherManifest)
+			if scopesOverlap(targetScope, otherScope) {
+				analysis.Issues = append(analysis.Issues, issue("scope_overlap", GateSeverityBlocking, "protocol-proxy scope overlaps enabled plugin", target.ID, artifact.ID, map[string]any{
+					"other_plugin_id":   plugin.ID,
+					"other_artifact_id": otherArtifact.ID,
+					"scope":             targetScope.Values,
+				}))
+				analysis.Issues = append(analysis.Issues, issue("protocol_proxy_singleton", GateSeverityBlocking, "only one protocol-proxy plugin can own an overlapping scope", target.ID, artifact.ID, map[string]any{
+					"other_plugin_id": plugin.ID,
+				}))
+			} else if target.Priority >= plugin.Priority {
+				analysis.Issues = append(analysis.Issues, issue("shadowed_handler", GateSeverityWarning, "protocol-proxy handler may be shadowed by a higher priority plugin", target.ID, artifact.ID, map[string]any{
+					"other_plugin_id": plugin.ID,
+					"other_priority":  plugin.Priority,
+					"priority":        target.Priority,
+				}))
+			}
 		}
-		otherArtifact, err := m.repo.Artifact(ctx, plugin.ActiveArtifactID)
-		if err != nil {
-			continue
+	}
+	if targetIngress {
+		targetIngressCapability := ingressCapabilityFromArtifact(artifact, manifest)
+		for _, listener := range m.ingressReservedListeners {
+			if ingressReservedListenerConflict(targetIngressCapability, listener) {
+				analysis.Issues = append(analysis.Issues, issue("ingress_reserved_listener_conflict", GateSeverityBlocking, "ingress.service/v1 port overlaps reserved gateway listener", target.ID, artifact.ID, map[string]any{
+					"service":          listener.Name,
+					"listener_network": normalizedReservedListenerNetwork(listener.Network),
+					"bind":             strings.TrimSpace(targetIngressCapability.Bind),
+					"port":             targetIngressCapability.Port,
+					"reserved_bind":    normalizedReservedListenerBind(listener.Bind),
+					"reserved_port":    listener.Port,
+				}))
+			}
 		}
-		if upstreamModeFromArtifact(otherArtifact) != UpstreamModeProtocolProxy {
-			continue
-		}
-		var otherManifest Manifest
-		if json.Unmarshal([]byte(otherArtifact.MetadataJSON), &otherManifest) != nil {
-			continue
-		}
-		otherScope := manifestScope(otherManifest)
-		if scopesOverlap(targetScope, otherScope) {
-			analysis.Issues = append(analysis.Issues, issue("scope_overlap", GateSeverityBlocking, "protocol-proxy scope overlaps enabled plugin", target.ID, artifact.ID, map[string]any{
-				"other_plugin_id":   plugin.ID,
-				"other_artifact_id": otherArtifact.ID,
-				"scope":             targetScope.Values,
-			}))
-			analysis.Issues = append(analysis.Issues, issue("protocol_proxy_singleton", GateSeverityBlocking, "only one protocol-proxy plugin can own an overlapping scope", target.ID, artifact.ID, map[string]any{
-				"other_plugin_id": plugin.ID,
-			}))
-		} else if target.Priority >= plugin.Priority {
-			analysis.Issues = append(analysis.Issues, issue("shadowed_handler", GateSeverityWarning, "protocol-proxy handler may be shadowed by a higher priority plugin", target.ID, artifact.ID, map[string]any{
-				"other_plugin_id": plugin.ID,
-				"other_priority":  plugin.Priority,
-				"priority":        target.Priority,
-			}))
+		for _, plugin := range plugins {
+			if plugin.ID == target.ID || plugin.RuntimeState != RuntimeEnabled || plugin.ActiveArtifactID == "" {
+				continue
+			}
+			otherArtifact, err := m.repo.Artifact(ctx, plugin.ActiveArtifactID)
+			if err != nil {
+				continue
+			}
+			var otherManifest Manifest
+			if json.Unmarshal([]byte(otherArtifact.MetadataJSON), &otherManifest) != nil {
+				continue
+			}
+			if !manifestHasExtensionPoint(otherManifest, ExtensionIngressService) {
+				continue
+			}
+			otherIngressCapability := ingressCapabilityFromArtifact(otherArtifact, otherManifest)
+			if ingressCapabilitiesConflict(targetIngressCapability, otherIngressCapability) {
+				analysis.Issues = append(analysis.Issues, issue("ingress_port_conflict", GateSeverityBlocking, "ingress.service/v1 port overlaps enabled plugin ingress declaration", target.ID, artifact.ID, map[string]any{
+					"other_plugin_id":   plugin.ID,
+					"other_artifact_id": otherArtifact.ID,
+					"protocol":          strings.TrimSpace(targetIngressCapability.Protocol),
+					"bind":              strings.TrimSpace(targetIngressCapability.Bind),
+					"port":              targetIngressCapability.Port,
+					"other_bind":        strings.TrimSpace(otherIngressCapability.Bind),
+					"listener_network":  ingressListenerNetwork(targetIngressCapability.Protocol),
+				}))
+			}
 		}
 	}
 	providers := providerSingletons(manifest)
@@ -644,6 +1558,74 @@ func (m *Manager) conflictAnalysis(ctx context.Context, target PluginRecord, art
 	return analysis, nil
 }
 
+func ingressCapabilityFromArtifact(artifact ArtifactRecord, manifest Manifest) *IngressCapability {
+	var summary CapabilitySummary
+	if json.Unmarshal([]byte(defaultJSONObject(artifact.CapabilitiesSummaryJSON)), &summary) == nil && summary.Ingress != nil {
+		return summary.Ingress
+	}
+	if summary, err := ManifestCapabilitySummary(manifest); err == nil {
+		return summary.Ingress
+	}
+	return nil
+}
+
+func ingressCapabilitiesConflict(a, b *IngressCapability) bool {
+	if a == nil || b == nil || a.Port <= 0 || b.Port <= 0 || a.Port != b.Port {
+		return false
+	}
+	if ingressListenerNetwork(a.Protocol) != ingressListenerNetwork(b.Protocol) {
+		return false
+	}
+	return ingressBindOverlaps(a.Bind, b.Bind)
+}
+
+func ingressReservedListenerConflict(ingress *IngressCapability, listener IngressReservedListener) bool {
+	if ingress == nil || !listener.Enabled || ingress.Port <= 0 || listener.Port <= 0 || ingress.Port != listener.Port {
+		return false
+	}
+	if ingressListenerNetwork(ingress.Protocol) != normalizedReservedListenerNetwork(listener.Network) {
+		return false
+	}
+	return ingressBindOverlaps(ingress.Bind, normalizedReservedListenerBind(listener.Bind))
+}
+
+func ingressListenerNetwork(protocol string) string {
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "udp":
+		return "udp"
+	default:
+		return "tcp"
+	}
+}
+
+func normalizedReservedListenerNetwork(network string) string {
+	switch strings.ToLower(strings.TrimSpace(network)) {
+	case "udp":
+		return "udp"
+	default:
+		return "tcp"
+	}
+}
+
+func normalizedReservedListenerBind(bind string) string {
+	if strings.TrimSpace(bind) == "" {
+		return "0.0.0.0"
+	}
+	return strings.TrimSpace(bind)
+}
+
+func ingressBindOverlaps(a, b string) bool {
+	aIP := net.ParseIP(strings.TrimSpace(a))
+	bIP := net.ParseIP(strings.TrimSpace(b))
+	if aIP == nil || bIP == nil {
+		return false
+	}
+	if aIP.IsUnspecified() || bIP.IsUnspecified() {
+		return true
+	}
+	return aIP.Equal(bIP)
+}
+
 func (m *Manager) advisoryIssues(ctx context.Context, artifact ArtifactRecord, manifest Manifest) ([]GovernanceIssue, error) {
 	advisories, err := m.repo.ListAdvisories(ctx, artifact.PluginID)
 	if err != nil {
@@ -651,21 +1633,16 @@ func (m *Manager) advisoryIssues(ctx context.Context, artifact ArtifactRecord, m
 	}
 	var issues []GovernanceIssue
 	for _, advisory := range advisories {
-		if advisory.Status == AdvisoryStatusAcked || advisory.Status == "" && advisory.Action == AdvisoryActionMitigate {
+		if advisoryIgnored(advisory) {
 			continue
 		}
 		if !advisoryMatches(advisory, artifact, manifest) {
 			continue
 		}
-		severity := GateSeverityWarning
-		switch advisory.Action {
-		case AdvisoryActionDenylist, AdvisoryActionQuarantine, AdvisoryActionRevoke:
-			severity = GateSeverityBlocking
-		}
+		severity := advisorySeverity(advisory)
 		code := "advisory_" + advisory.Action
-		if advisory.Status == AdvisoryStatusRevoked {
+		if severity == GateSeverityBlocking && advisory.Status == AdvisoryStatusRevoked {
 			code = "advisory_revoke"
-			severity = GateSeverityBlocking
 		}
 		issues = append(issues, issue(code, severity, "artifact matches local security advisory", artifact.PluginID, artifact.ID, map[string]any{
 			"advisory_id":        advisory.AdvisoryID,
@@ -675,6 +1652,77 @@ func (m *Manager) advisoryIssues(ctx context.Context, artifact ArtifactRecord, m
 		}))
 	}
 	return issues, nil
+}
+
+func (m *Manager) vulnerabilityIssues(ctx context.Context, artifact ArtifactRecord, manifest Manifest) ([]GovernanceIssue, error) {
+	vulnerabilities, err := m.repo.ListVulnerabilities(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	deps := sbomDependencies(manifest)
+	if len(deps) == 0 || len(vulnerabilities) == 0 {
+		return nil, nil
+	}
+	var issues []GovernanceIssue
+	for _, dep := range deps {
+		for _, vulnerability := range vulnerabilities {
+			if vulnerabilityIgnored(vulnerability) || !vulnerabilityMatchesDependency(vulnerability, dep) {
+				continue
+			}
+			severity := vulnerabilityGateSeverity(vulnerability)
+			code := "vulnerability_" + vulnerability.Action
+			if vulnerability.Action == "" {
+				code = "vulnerability_database"
+			}
+			if severity == GateSeverityBlocking && vulnerability.Status == AdvisoryStatusRevoked {
+				code = "vulnerability_revoke"
+			}
+			issues = append(issues, issue(code, severity, "artifact dependency matches local vulnerability database", artifact.PluginID, artifact.ID, map[string]any{
+				"vulnerability_id": vulnerability.VulnerabilityID,
+				"source":           vulnerability.Source,
+				"package_name":     vulnerability.PackageName,
+				"package_version":  dep.Version,
+				"version_range":    vulnerability.VersionRange,
+				"severity":         vulnerability.Severity,
+				"fixed_version":    vulnerability.FixedVersion,
+				"summary":          vulnerability.Summary,
+				"references":       vulnerability.References,
+			}))
+		}
+	}
+	return issues, nil
+}
+
+func advisoryIgnored(advisory AdvisoryRecord) bool {
+	return advisory.Status == AdvisoryStatusAcked || advisory.Status == "" && advisory.Action == AdvisoryActionMitigate
+}
+
+func advisorySeverity(advisory AdvisoryRecord) string {
+	if advisory.Status == AdvisoryStatusRevoked {
+		return GateSeverityBlocking
+	}
+	switch advisory.Action {
+	case AdvisoryActionDenylist, AdvisoryActionQuarantine, AdvisoryActionRevoke:
+		return GateSeverityBlocking
+	default:
+		return GateSeverityWarning
+	}
+}
+
+func vulnerabilityIgnored(record VulnerabilityRecord) bool {
+	return record.Status == AdvisoryStatusAcked || record.Status == "" && record.Action == AdvisoryActionMitigate
+}
+
+func vulnerabilityGateSeverity(record VulnerabilityRecord) string {
+	if record.Status == AdvisoryStatusRevoked {
+		return GateSeverityBlocking
+	}
+	switch record.Action {
+	case AdvisoryActionDenylist, AdvisoryActionQuarantine, AdvisoryActionRevoke:
+		return GateSeverityBlocking
+	default:
+		return GateSeverityWarning
+	}
 }
 
 func (m *Manager) benchmarkIssues(ctx context.Context, artifact ArtifactRecord, manifest Manifest, policy PolicySnapshot) ([]GovernanceIssue, error) {
@@ -750,7 +1798,8 @@ func (m *Manager) hasMatchingReview(ctx context.Context, pluginID, artifactID, p
 		if review.PluginID != pluginID || review.ArtifactID != artifactID || review.Profile != profile || review.Decision != ReviewDecisionApproved {
 			continue
 		}
-		if review.ConfigHash == fingerprint.ConfigHash &&
+		if review.ArtifactHash == fingerprint.ArtifactHash &&
+			review.ConfigHash == fingerprint.ConfigHash &&
 			review.ScopeHash == fingerprint.ScopeHash &&
 			review.RolloutHash == fingerprint.RolloutHash &&
 			review.RuntimeLimitsHash == fingerprint.RuntimeLimitsHash &&
@@ -778,6 +1827,7 @@ func (m *Manager) artifactManifest(ctx context.Context, pluginID, artifactID str
 }
 
 type governanceFingerprintValue struct {
+	ArtifactHash      string
 	ConfigHash        string
 	ScopeHash         string
 	RolloutHash       string
@@ -787,8 +1837,8 @@ type governanceFingerprintValue struct {
 }
 
 func governanceFingerprint(plugin PluginRecord, artifact ArtifactRecord, manifest Manifest, policyHash string) governanceFingerprintValue {
-	_ = artifact
 	return governanceFingerprintValue{
+		ArtifactHash:      artifact.SHA256,
 		ConfigHash:        stableHashJSONRaw(defaultJSONObject(plugin.ConfigJSON)),
 		ScopeHash:         stableHash(manifestScope(manifest).Values),
 		RolloutHash:       stableHash(manifestRollout(manifest)),
@@ -796,6 +1846,12 @@ func governanceFingerprint(plugin PluginRecord, artifact ArtifactRecord, manifes
 		FeaturesHash:      stableHash(requiredFeatures(manifest)),
 		PolicyHash:        policyHash,
 	}
+}
+
+func (m *Manager) policySnapshot(profile string) PolicySnapshot {
+	policy := policyForProfile(profile, m.repo.now())
+	policy.RequireConformanceFixture = m.requireConformanceFixture
+	return policy
 }
 
 func policyForProfile(profile string, now time.Time) PolicySnapshot {
@@ -954,6 +2010,15 @@ func supportedFeature(feature string) bool {
 	}
 }
 
+func manifestHasExtensionPoint(manifest Manifest, key string) bool {
+	for _, point := range manifest.ExtensionPoints {
+		if point.Key == key {
+			return true
+		}
+	}
+	return false
+}
+
 func externalDependencies(manifest Manifest) []string {
 	var caps map[string]any
 	_ = json.Unmarshal(manifest.Capabilities, &caps)
@@ -962,6 +2027,35 @@ func externalDependencies(manifest Manifest) []string {
 		deps = append(deps, stringSlice(caps[key])...)
 	}
 	return uniqueSortedStrings(deps)
+}
+
+func normalizeExternalFailPolicy(spec ExternalSpec) string {
+	policy := strings.TrimSpace(spec.FailPolicy)
+	if policy != "" {
+		return policy
+	}
+	switch strings.ToLower(strings.TrimSpace(spec.Purpose)) {
+	case "auth", "authentication", "authorization", "entitlement", "security", "repository":
+		return ExternalFailPolicyClosed
+	case "route":
+		return ExternalFailPolicyFallback
+	case "audit", "log", "logging", "metric", "metrics", "observability":
+		return ExternalFailPolicyOpen
+	default:
+		if spec.Required {
+			return ExternalFailPolicyClosed
+		}
+		return ExternalFailPolicyOpen
+	}
+}
+
+func validExternalFailPolicy(policy string) bool {
+	switch policy {
+	case ExternalFailPolicyOpen, ExternalFailPolicyClosed, ExternalFailPolicyDegraded, ExternalFailPolicyFallback:
+		return true
+	default:
+		return false
+	}
 }
 
 func providerSingletons(manifest Manifest) []string {
@@ -1033,6 +2127,10 @@ func advisoryMatches(advisory AdvisoryRecord, artifact ArtifactRecord, manifest 
 		}
 	}
 	return false
+}
+
+func vulnerabilityMatchesDependency(record VulnerabilityRecord, dep dependencySpec) bool {
+	return record.PackageName == dep.Name && versionInRange(dep.Version, record.VersionRange)
 }
 
 type dependencySpec struct {

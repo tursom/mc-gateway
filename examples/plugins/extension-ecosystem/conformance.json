@@ -1,8 +1,87 @@
 {
+  "fixtures": [
+    {
+      "name": "pass",
+      "status": "pass",
+      "extension": "route.resolve/v1"
+    },
+    {
+      "name": "route decision independent",
+      "status": "pass",
+      "extension": "route.resolve/v1",
+      "expected": "override_fallback_reject_pass_explain"
+    },
+    {
+      "name": "status ping independent",
+      "status": "pass",
+      "extension": "status.ping/v1",
+      "expected": "motd_favicon_players_version_maintenance"
+    },
+    {
+      "name": "rule policy independent",
+      "status": "pass",
+      "extension": "rule.evaluate/v1",
+      "expected": "allow_deny_fail_closed"
+    },
+    {
+      "name": "connection middleware independent",
+      "status": "pass",
+      "extension": "connection.filter/v1",
+      "expected": "cidr_and_rate_limit"
+    },
+    {
+      "name": "handshake middleware independent",
+      "status": "pass",
+      "extension": "handshake.filter/v1",
+      "expected": "rewrite_visible_to_later_filters"
+    },
+    {
+      "name": "event subscriber independent",
+      "status": "pass",
+      "extension": "event.subscriber/v1",
+      "expected": "at_least_once_dead_letter_replay_drop"
+    },
+    {
+      "name": "provider registry independent",
+      "status": "pass",
+      "extension": "provider/v1",
+      "expected": "singleton_priority_fallback_dependency"
+    },
+    {
+      "name": "blocked",
+      "status": "pass",
+      "expected": "blocked",
+      "extension": "governance"
+    },
+    {
+      "name": "invalid_config",
+      "status": "pass",
+      "expected": "dry_run_rejected",
+      "extension": "config.validate/v1"
+    }
+  ],
   "route_decisions": ["override", "fallback", "reject", "pass"],
   "status_hosts": ["blue.example", "red.example"],
-  "event_delivery": ["best_effort", "at_least_once", "dead_letter"],
-  "provider_registry": ["singleton", "priority", "fallback", "admin.auth.provider/v1"],
+  "rule_evaluation_outcomes": [
+    "allow",
+    "deny",
+    "error_fail_closed",
+    "timeout_fail_closed",
+    "bad_config_fallback"
+  ],
+  "connection_filter_scenarios": ["allow", "reject", "error_fail_open", "error_fail_closed"],
+  "handshake_filter_scenarios": ["allow", "reject", "rewrite_host", "error_fail_open", "error_fail_closed"],
+  "governance_gate_scenarios": [
+    "review_required",
+    "warning_override",
+    "advisory_block",
+    "supply_chain_block",
+    "rollback_gate",
+    "repository_apply_gate",
+    "promotion_apply_gate"
+  ],
+  "event_delivery": ["best_effort", "at_least_once", "dead_letter", "replay", "drop", "cross_node_at_least_once", "subscriber_failure_non_blocking"],
+  "provider_registry": ["singleton", "priority", "fallback", "dependency", "scope", "disable", "admin.auth.provider/v1"],
   "default_route_must_survive_bad_rule_config": true,
   "local_admin_break_glass": true
 }

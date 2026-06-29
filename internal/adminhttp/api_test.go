@@ -55,10 +55,13 @@ func TestNewAPIHandlerRoutesRequests(t *testing.T) {
 		{name: "plugin draining force close", method: http.MethodPost, path: "/admin/api/plugins/mc-auth-proxy/draining/force-close", wantCall: "plugin_draining", wantSegment: "mc-auth-proxy"},
 		{name: "plugin dispatch", method: http.MethodGet, path: "/admin/api/plugins/dispatch-plan", wantCall: "plugin_dispatch"},
 		{name: "plugin advisories", method: http.MethodGet, path: "/admin/api/plugin-advisories", wantCall: "plugin_advisories"},
+		{name: "plugin vulnerabilities", method: http.MethodGet, path: "/admin/api/plugin-vulnerabilities", wantCall: "plugin_vulnerabilities"},
+		{name: "plugin features", method: http.MethodGet, path: "/admin/api/plugin-features", wantCall: "plugin_features"},
 		{name: "plugin service", method: http.MethodGet, path: "/admin/api/plugin-service", wantCall: "plugin_service"},
 		{name: "plugin repositories", method: http.MethodGet, path: "/admin/api/plugin-repositories/imports", wantCall: "plugin_repositories"},
 		{name: "plugin supply chain", method: http.MethodGet, path: "/admin/api/plugin-supply-chain", wantCall: "plugin_supply_chain"},
 		{name: "plugin instrumentation", method: http.MethodGet, path: "/admin/api/plugin-instrumentation", wantCall: "plugin_instrumentation"},
+		{name: "plugin promotions", method: http.MethodPost, path: "/admin/api/plugin-promotions", wantCall: "plugin_promotions"},
 	}
 
 	for _, tt := range tests {
@@ -104,11 +107,14 @@ func TestNewAPIHandlerRoutesRequests(t *testing.T) {
 				PluginDispatch:        recordCall(&gotCall, "plugin_dispatch"),
 				PluginGovernance:      recordSegmentCall(&gotCall, &gotSegment, "plugin_governance"),
 				PluginAdvisories:      recordCall(&gotCall, "plugin_advisories"),
+				PluginVulnerabilities: recordCall(&gotCall, "plugin_vulnerabilities"),
 				PluginDiagnostics:     recordSegmentCall(&gotCall, &gotSegment, "plugin_diagnostics"),
+				PluginFeatures:        recordCall(&gotCall, "plugin_features"),
 				PluginService:         recordCall(&gotCall, "plugin_service"),
 				PluginRepositories:    recordCall(&gotCall, "plugin_repositories"),
 				PluginSupplyChain:     recordCall(&gotCall, "plugin_supply_chain"),
 				PluginInstrumentation: recordCall(&gotCall, "plugin_instrumentation"),
+				PluginPromotions:      recordCall(&gotCall, "plugin_promotions"),
 			})
 
 			resp := httptest.NewRecorder()

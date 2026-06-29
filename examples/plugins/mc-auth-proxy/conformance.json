@@ -1,0 +1,36 @@
+{
+  "fixtures": [
+    {
+      "name": "protocol proxy initial data",
+      "status": "pass",
+      "expected": "initial_data_replayed_once",
+      "extension": "upstream.connect/v1"
+    },
+    {
+      "name": "protocol proxy panic",
+      "status": "pass",
+      "expected": "panic_recovered",
+      "extension": "upstream.connect/v1"
+    },
+    {
+      "name": "protocol proxy timeout",
+      "status": "pass",
+      "expected": "deadline_enforced",
+      "extension": "upstream.connect/v1"
+    }
+  ],
+  "protocol_proxy_scenarios": [
+    "initial_data_once",
+    "panic_recovered",
+    "timeout_deadline",
+    "endpoint_close",
+    "client_close",
+    "backpressure_large_packet",
+    "drain_disable_new_connections",
+    "force_close_draining"
+  ],
+  "governance_gate_scenarios": [
+    "review_required",
+    "rollback_gate"
+  ]
+}

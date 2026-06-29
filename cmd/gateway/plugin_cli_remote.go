@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -23,6 +24,8 @@ import (
 type pluginRemoteOptions struct {
 	Gateway             string
 	Token               string
+	TargetGateway       string
+	TargetToken         string
 	Target              string
 	Extra               []string
 	ArtifactID          string
@@ -41,11 +44,14 @@ type pluginRemoteOptions struct {
 	ConfirmToken        string
 	DryRun              bool
 	RepositoryType      string
+	ImportID            int64
 	IndexPath           string
 	Version             string
 	TrustPolicy         string
 	MetadataPath        string
 	MetadataJSON        string
+	FeedURL             string
+	FeedSource          string
 	BenchmarkProfile    string
 	P95MS               float64
 	P99MS               float64
@@ -59,6 +65,22 @@ type pluginRemoteClient struct {
 	baseURL string
 	token   string
 	client  *http.Client
+}
+
+const pluginRepositoryIndexMaxBytesCLI = 4 * 1024 * 1024
+
+type pluginRepositoryIndexCLI struct {
+	Name      string                         `json:"name"`
+	Artifacts []pluginRepositoryCandidateCLI `json:"artifacts"`
+}
+
+type pluginRepositoryCandidateCLI struct {
+	ID           string `json:"id"`
+	PluginID     string `json:"plugin_id"`
+	Version      string `json:"version"`
+	ArtifactPath string `json:"artifact_path"`
+	SHA256       string `json:"sha256,omitempty"`
+	RuntimeType  string `json:"runtime_type,omitempty"`
 }
 
 func runPluginRemoteStatusCLI(args []string) error {
@@ -94,6 +116,41 @@ func runPluginRemoteUploadCLI(args []string) error {
 		endpoint = "/plugin-sources"
 	}
 	return client.uploadArtifact(endpoint, opts.Target)
+}
+
+func runPluginRemoteTransferCLI(args []string) error {
+	opts, err := parsePluginRemoteOptions(args)
+	if err != nil {
+		return err
+	}
+	if opts.Target == "" {
+		return errors.New("transfer requires a source artifact id")
+	}
+	if opts.TargetGateway == "" {
+		return errors.New("transfer requires --target-gateway")
+	}
+	source, err := newPluginRemoteClient(opts)
+	if err != nil {
+		return err
+	}
+	targetOpts := opts
+	targetOpts.Gateway = opts.TargetGateway
+	if opts.TargetToken != "" {
+		targetOpts.Token = opts.TargetToken
+	}
+	target, err := newPluginRemoteClient(targetOpts)
+	if err != nil {
+		return err
+	}
+	packageBytes, fileName, err := source.downloadArtifactPackage(opts.Target)
+	if err != nil {
+		return err
+	}
+	response, err := target.uploadArtifactBytes("/plugin-artifacts", fileName, packageBytes)
+	if err != nil {
+		return err
+	}
+	return writePluginRemoteData(response)
 }
 
 func runPluginRemoteDesiredCLI(args []string, desiredState string) error {
@@ -308,9 +365,66 @@ func runPluginRemoteTaskCLI(args []string) error {
 		body := map[string]any{"confirm_token": opts.ConfirmToken}
 		return client.doToStdout(http.MethodPost, "/plugins/"+url.PathEscape(opts.Target)+"/operations/tasks/"+url.PathEscape(taskID)+"/trigger", body)
 	case "cancel":
-		return runPluginReservedCLI("task cancel", args[1:])
+		opts, err := parsePluginRemoteOptionsWithPositionals(args[1:], 2)
+		if err != nil {
+			return err
+		}
+		if opts.Target == "" || len(opts.Extra) == 0 {
+			return errors.New("task cancel requires a plugin id and task id")
+		}
+		client, err := newPluginRemoteClient(opts)
+		if err != nil {
+			return err
+		}
+		taskID := opts.Extra[0]
+		return client.doToStdout(http.MethodPost, "/plugins/"+url.PathEscape(opts.Target)+"/operations/tasks/"+url.PathEscape(taskID)+"/cancel", nil)
 	default:
 		return fmt.Errorf("unknown task command %q", args[0])
+	}
+}
+
+func runPluginRemoteExternalCLI(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: gateway plugin external list|health-check ...")
+	}
+	switch args[0] {
+	case "list":
+		opts, err := parsePluginRemoteOptions(args[1:])
+		if err != nil {
+			return err
+		}
+		if opts.Target == "" {
+			return errors.New("external list requires a plugin id")
+		}
+		client, err := newPluginRemoteClient(opts)
+		if err != nil {
+			return err
+		}
+		body, err := client.doJSON(http.MethodGet, "/plugins/"+url.PathEscape(opts.Target)+"/operations", nil)
+		if err != nil {
+			return err
+		}
+		operations, _ := body["operations"].(map[string]any)
+		return encodePluginCLIJSON(map[string]any{
+			"plugin_id":             opts.Target,
+			"external_dependencies": operations["external_dependencies"],
+		})
+	case "health-check":
+		opts, err := parsePluginRemoteOptionsWithPositionals(args[1:], 2)
+		if err != nil {
+			return err
+		}
+		if opts.Target == "" || len(opts.Extra) == 0 {
+			return errors.New("external health-check requires a plugin id and dependency name")
+		}
+		client, err := newPluginRemoteClient(opts)
+		if err != nil {
+			return err
+		}
+		dependency := opts.Extra[0]
+		return client.doToStdout(http.MethodPost, "/plugins/"+url.PathEscape(opts.Target)+"/operations/external/"+url.PathEscape(dependency)+"/health-check", nil)
+	default:
+		return fmt.Errorf("unknown external command %q", args[0])
 	}
 }
 
@@ -474,7 +588,7 @@ func runPluginRemoteReviewCLI(args []string) error {
 
 func runPluginRemoteAdvisoryCLI(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: gateway plugin advisory scan|import ...")
+		return errors.New("usage: gateway plugin advisory scan|import|sync|rescan ...")
 	}
 	switch args[0] {
 	case "scan":
@@ -504,15 +618,133 @@ func runPluginRemoteAdvisoryCLI(args []string) error {
 		if err != nil {
 			return err
 		}
+		if opts.FeedURL != "" {
+			body["feed_url"] = opts.FeedURL
+		}
+		if opts.FeedSource != "" {
+			body["source"] = opts.FeedSource
+		}
+		return client.doToStdout(http.MethodPost, "/plugin-advisories", body)
+	case "sync":
+		opts, err := parsePluginRemoteOptions(args[1:])
+		if err != nil {
+			return err
+		}
+		if opts.FeedURL == "" {
+			return errors.New("advisory sync requires --feed-url")
+		}
+		client, err := newPluginRemoteClient(opts)
+		if err != nil {
+			return err
+		}
+		body := map[string]any{"feed_url": opts.FeedURL}
+		if opts.FeedSource != "" {
+			body["source"] = opts.FeedSource
+		}
+		return client.doToStdout(http.MethodPost, "/plugin-advisories", body)
+	case "rescan":
+		opts, err := parsePluginRemoteOptions(args[1:])
+		if err != nil {
+			return err
+		}
+		client, err := newPluginRemoteClient(opts)
+		if err != nil {
+			return err
+		}
+		body := map[string]any{"rescan": true}
+		if opts.Target != "" {
+			body["plugin_id"] = opts.Target
+		}
+		if opts.ArtifactID != "" {
+			body["artifact_id"] = opts.ArtifactID
+		}
 		return client.doToStdout(http.MethodPost, "/plugin-advisories", body)
 	default:
 		return fmt.Errorf("unknown advisory command %q", args[0])
 	}
 }
 
+func runPluginRemoteVulnerabilityCLI(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: gateway plugin vulnerability scan|import|sync|rescan ...")
+	}
+	switch args[0] {
+	case "scan":
+		opts, err := parsePluginRemoteOptions(args[1:])
+		if err != nil {
+			return err
+		}
+		client, err := newPluginRemoteClient(opts)
+		if err != nil {
+			return err
+		}
+		endpoint := "/plugin-vulnerabilities"
+		if opts.Target != "" {
+			endpoint += "?package_name=" + url.QueryEscape(opts.Target)
+		}
+		return client.doToStdout(http.MethodGet, endpoint, nil)
+	case "import":
+		opts, err := parsePluginRemoteOptions(args[1:])
+		if err != nil {
+			return err
+		}
+		client, err := newPluginRemoteClient(opts)
+		if err != nil {
+			return err
+		}
+		body, err := remoteMetadataJSON(opts)
+		if err != nil {
+			return err
+		}
+		if opts.FeedURL != "" {
+			body["feed_url"] = opts.FeedURL
+		}
+		if opts.FeedSource != "" {
+			body["source"] = opts.FeedSource
+		}
+		return client.doToStdout(http.MethodPost, "/plugin-vulnerabilities", body)
+	case "sync":
+		opts, err := parsePluginRemoteOptions(args[1:])
+		if err != nil {
+			return err
+		}
+		if opts.FeedURL == "" {
+			return errors.New("vulnerability sync requires --feed-url")
+		}
+		client, err := newPluginRemoteClient(opts)
+		if err != nil {
+			return err
+		}
+		body := map[string]any{"feed_url": opts.FeedURL}
+		if opts.FeedSource != "" {
+			body["source"] = opts.FeedSource
+		}
+		return client.doToStdout(http.MethodPost, "/plugin-vulnerabilities", body)
+	case "rescan":
+		opts, err := parsePluginRemoteOptions(args[1:])
+		if err != nil {
+			return err
+		}
+		client, err := newPluginRemoteClient(opts)
+		if err != nil {
+			return err
+		}
+		body := map[string]any{"rescan": true}
+		if opts.Target != "" {
+			body["plugin_id"] = opts.Target
+		}
+		if opts.ArtifactID != "" {
+			body["artifact_id"] = opts.ArtifactID
+		}
+		return client.doToStdout(http.MethodPost, "/plugin-vulnerabilities", body)
+	default:
+		return fmt.Errorf("unknown vulnerability command %q", args[0])
+	}
+}
+
 func runPluginRemoteRepoCLI(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: gateway plugin repo list|import|search|show ...")
+		return errors.New("usage: gateway plugin repo list|import|apply|updates|search|show ...")
 	}
 	switch args[0] {
 	case "list":
@@ -543,11 +775,260 @@ func runPluginRemoteRepoCLI(args []string) error {
 			"trust_policy":    opts.TrustPolicy,
 		}
 		return client.doToStdout(http.MethodPost, "/plugin-repositories/imports", body)
-	case "search", "show":
-		return runPluginReservedCLI("repo "+args[0], args[1:])
+	case "updates":
+		opts, err := parsePluginRemoteOptions(args[1:])
+		if err != nil {
+			return err
+		}
+		client, err := newPluginRemoteClient(opts)
+		if err != nil {
+			return err
+		}
+		body := map[string]any{
+			"action":          "updates",
+			"repository_type": opts.RepositoryType,
+			"index_path":      opts.IndexPath,
+			"artifact_id":     opts.ArtifactID,
+			"plugin_id":       opts.Target,
+			"version":         opts.Version,
+		}
+		return client.doToStdout(http.MethodPost, "/plugin-repositories/imports", body)
+	case "apply":
+		opts, err := parsePluginRemoteOptionsWithPositionals(args[1:], 0)
+		if err != nil {
+			return err
+		}
+		if opts.ImportID <= 0 {
+			return errors.New("repo apply requires --import-id")
+		}
+		client, err := newPluginRemoteClient(opts)
+		if err != nil {
+			return err
+		}
+		configJSON, err := remoteConfigJSON(opts)
+		if err != nil {
+			return err
+		}
+		body := map[string]any{
+			"action":        "apply",
+			"import_id":     opts.ImportID,
+			"desired_state": pluginmanager.DesiredDisabled,
+			"config_json":   configJSON,
+			"priority":      opts.Priority,
+			"dry_run":       opts.DryRun,
+		}
+		return client.doToStdout(http.MethodPost, "/plugin-repositories/imports", body)
+	case "search":
+		opts, err := parsePluginRemoteOptions(args[1:])
+		if err != nil {
+			return err
+		}
+		index, err := readPluginRepositoryIndexCLI(opts.IndexPath)
+		if err != nil {
+			return err
+		}
+		candidates := filterPluginRepositoryCandidates(index.Artifacts, opts)
+		return encodePluginCLIJSON(map[string]any{
+			"repository": index.Name,
+			"candidates": candidates,
+		})
+	case "show":
+		opts, err := parsePluginRemoteOptions(args[1:])
+		if err != nil {
+			return err
+		}
+		index, err := readPluginRepositoryIndexCLI(opts.IndexPath)
+		if err != nil {
+			return err
+		}
+		candidates := filterPluginRepositoryCandidates(index.Artifacts, opts)
+		if len(candidates) == 0 {
+			return errors.New("repository candidate not found")
+		}
+		return encodePluginCLIJSON(map[string]any{
+			"repository": index.Name,
+			"candidate":  candidates[0],
+		})
 	default:
 		return fmt.Errorf("unknown repo command %q", args[0])
 	}
+}
+
+func readPluginRepositoryIndexCLI(indexPath string) (pluginRepositoryIndexCLI, error) {
+	if indexPath == "" {
+		return pluginRepositoryIndexCLI{}, errors.New("repo search/show requires --index")
+	}
+	data, err := readPluginRepositoryIndexDataCLI(indexPath)
+	if err != nil {
+		return pluginRepositoryIndexCLI{}, err
+	}
+	var index pluginRepositoryIndexCLI
+	if err := json.Unmarshal(data, &index); err != nil {
+		return pluginRepositoryIndexCLI{}, err
+	}
+	if index.Name == "" {
+		index.Name = "local"
+	}
+	return index, nil
+}
+
+func readPluginRepositoryIndexDataCLI(indexPath string) ([]byte, error) {
+	if !isPluginRepositoryIndexURLCLI(indexPath) {
+		return os.ReadFile(indexPath)
+	}
+	req, err := http.NewRequest(http.MethodGet, indexPath, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("repository index %s returned status %d", indexPath, resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, pluginRepositoryIndexMaxBytesCLI+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > pluginRepositoryIndexMaxBytesCLI {
+		return nil, fmt.Errorf("repository index %s exceeds limit %d", indexPath, pluginRepositoryIndexMaxBytesCLI)
+	}
+	return data, nil
+}
+
+func isPluginRepositoryIndexURLCLI(indexPath string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(indexPath))
+	return err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != ""
+}
+
+func filterPluginRepositoryCandidates(candidates []pluginRepositoryCandidateCLI, opts pluginRemoteOptions) []pluginRepositoryCandidateCLI {
+	filtered := make([]pluginRepositoryCandidateCLI, 0, len(candidates))
+	for _, candidate := range candidates {
+		if opts.Target != "" && candidate.PluginID != opts.Target && candidate.ID != opts.Target {
+			continue
+		}
+		if opts.ArtifactID != "" && candidate.ID != opts.ArtifactID {
+			continue
+		}
+		if opts.Version != "" && candidate.Version != opts.Version {
+			continue
+		}
+		filtered = append(filtered, candidate)
+	}
+	return filtered
+}
+
+func runPluginRemotePromotionApplyCLI(args []string) error {
+	opts, err := parsePluginRemoteOptions(args)
+	if err != nil {
+		return err
+	}
+	if opts.Target == "" {
+		return errors.New("promotion apply requires a promotion bundle path")
+	}
+	bundle, err := readPromotionBundle(opts.Target)
+	if err != nil {
+		return err
+	}
+	configJSON, err := remoteConfigJSON(opts)
+	if err != nil {
+		return err
+	}
+	if opts.TargetGateway != "" {
+		return runPluginRemoteCrossGatewayPromotionApplyCLI(opts, bundle, configJSON)
+	}
+	client, err := newPluginRemoteClient(opts)
+	if err != nil {
+		return err
+	}
+	body := map[string]any{
+		"action":      "apply",
+		"bundle":      bundle,
+		"config_json": configJSON,
+		"dry_run":     opts.DryRun,
+	}
+	if len(bundle.Plugins) == 1 {
+		body["plugin_id"] = bundle.Plugins[0].PluginID
+	}
+	return client.doToStdout(http.MethodPost, "/plugin-promotions", body)
+}
+
+func runPluginRemoteCrossGatewayPromotionApplyCLI(opts pluginRemoteOptions, bundle pluginmanager.PromotionBundle, configJSON string) error {
+	source, err := newPluginRemoteClient(opts)
+	if err != nil {
+		return err
+	}
+	targetOpts := opts
+	targetOpts.Gateway = opts.TargetGateway
+	if opts.TargetToken != "" {
+		targetOpts.Token = opts.TargetToken
+	}
+	target, err := newPluginRemoteClient(targetOpts)
+	if err != nil {
+		return err
+	}
+	transfers := make([]map[string]any, 0, len(bundle.Plugins))
+	seenArtifacts := map[string]bool{}
+	for _, plugin := range bundle.Plugins {
+		artifactID := strings.TrimSpace(plugin.ArtifactSHA256)
+		if artifactID == "" {
+			return fmt.Errorf("promotion plugin %s is missing artifact_sha256; cross-gateway apply cannot transfer its package", plugin.PluginID)
+		}
+		if seenArtifacts[artifactID] {
+			continue
+		}
+		seenArtifacts[artifactID] = true
+		packageBytes, fileName, err := source.downloadArtifactPackage(artifactID)
+		if err != nil {
+			return fmt.Errorf("download promotion artifact %s for plugin %s: %w", artifactID, plugin.PluginID, err)
+		}
+		response, err := target.uploadArtifactBytes("/plugin-artifacts", fileName, packageBytes)
+		if err != nil {
+			return fmt.Errorf("upload promotion artifact %s to target gateway: %w", artifactID, err)
+		}
+		transfer := map[string]any{
+			"plugin_id":       plugin.PluginID,
+			"artifact_sha256": artifactID,
+			"file_name":       fileName,
+		}
+		var decoded map[string]any
+		if json.Unmarshal(response, &decoded) == nil {
+			if artifact, ok := decoded["artifact"].(map[string]any); ok {
+				transfer["target_artifact"] = artifact
+			}
+		}
+		transfers = append(transfers, transfer)
+	}
+	body := map[string]any{
+		"action":      "apply",
+		"bundle":      bundle,
+		"config_json": configJSON,
+		"dry_run":     opts.DryRun,
+	}
+	if len(bundle.Plugins) == 1 {
+		body["plugin_id"] = bundle.Plugins[0].PluginID
+	}
+	response, err := target.doBytes(http.MethodPost, "/plugin-promotions", body)
+	if err != nil {
+		return err
+	}
+	return writePluginRemoteCrossGatewayPromotionApplyOutput(response, transfers)
+}
+
+func writePluginRemoteCrossGatewayPromotionApplyOutput(response []byte, transfers []map[string]any) error {
+	var decoded map[string]any
+	if len(response) > 0 && json.Unmarshal(response, &decoded) == nil {
+		decoded["cross_gateway"] = true
+		decoded["artifact_transfers"] = transfers
+		data, err := json.Marshal(decoded)
+		if err != nil {
+			return err
+		}
+		return writePluginRemoteData(data)
+	}
+	return writePluginRemoteData(response)
 }
 
 func runPluginRemoteSupplyChainCLI(command string, args []string) error {
@@ -559,7 +1040,7 @@ func runPluginRemoteSupplyChainCLI(command string, args []string) error {
 		case "verify":
 			return runPluginRemoteSupplyChainAssessCLI(args[1:])
 		case "generate":
-			return runPluginReservedCLI("sbom generate", args[1:])
+			return runPluginSBOMGenerateCLI(args[1:])
 		default:
 			return fmt.Errorf("unknown sbom command %q", args[0])
 		}
@@ -676,6 +1157,10 @@ func parsePluginRemoteOptionsWithPositionals(args []string, maxPositionals int) 
 			opts.Gateway = value
 		case "token":
 			opts.Token = value
+		case "target-gateway":
+			opts.TargetGateway = value
+		case "target-token":
+			opts.TargetToken = value
 		case "artifact":
 			opts.ArtifactID = value
 		case "config":
@@ -720,6 +1205,12 @@ func parsePluginRemoteOptionsWithPositionals(args []string, maxPositionals int) 
 			opts.DryRun = parsePluginBoolFlag(value)
 		case "repository-type":
 			opts.RepositoryType = value
+		case "import-id", "import":
+			parsed, err := strconv.ParseInt(value, 10, 64)
+			if err != nil {
+				return pluginRemoteOptions{}, fmt.Errorf("invalid --%s %q: %w", key, value, err)
+			}
+			opts.ImportID = parsed
 		case "index":
 			opts.IndexPath = value
 		case "version":
@@ -730,6 +1221,10 @@ func parsePluginRemoteOptionsWithPositionals(args []string, maxPositionals int) 
 			opts.MetadataPath = value
 		case "metadata-json":
 			opts.MetadataJSON = value
+		case "feed-url":
+			opts.FeedURL = value
+		case "feed-source":
+			opts.FeedSource = value
 		case "benchmark-profile":
 			opts.BenchmarkProfile = value
 		case "p95-ms":
@@ -901,6 +1396,60 @@ func (c pluginRemoteClient) uploadArtifact(endpoint, filePath string) error {
 		return err
 	}
 	return writePluginRemoteData(data)
+}
+
+func (c pluginRemoteClient) uploadArtifactBytes(endpoint, fileName string, data []byte) ([]byte, error) {
+	var payload bytes.Buffer
+	writer := multipart.NewWriter(&payload)
+	part, err := writer.CreateFormFile("artifact", fileName)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := part.Write(data); err != nil {
+		return nil, err
+	}
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodPost, c.baseURL+endpoint, &payload)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return readPluginRemoteResponse(resp)
+}
+
+func (c pluginRemoteClient) downloadArtifactPackage(artifactID string) ([]byte, string, error) {
+	endpoint := "/plugin-artifacts/" + url.PathEscape(artifactID) + "/package"
+	req, err := http.NewRequest(http.MethodGet, c.baseURL+endpoint, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("Accept", "application/octet-stream")
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	data, err := readPluginRemoteResponse(resp)
+	if err != nil {
+		return nil, "", err
+	}
+	fileName := artifactID + ".mcgp"
+	if _, params, err := mime.ParseMediaType(resp.Header.Get("Content-Disposition")); err == nil {
+		if name := strings.TrimSpace(params["filename"]); name != "" {
+			fileName = filepath.Base(name)
+		}
+	}
+	return data, fileName, nil
 }
 
 func readPluginRemoteResponse(resp *http.Response) ([]byte, error) {

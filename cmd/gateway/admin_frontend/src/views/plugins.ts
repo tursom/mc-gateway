@@ -2,10 +2,10 @@
 
 import { api } from "../api.js";
 import { showAlert } from "../alerts.js";
-import { badge, el, escapeAttr, escapeHTML, getFormInput } from "../dom.js";
+import { badge, el, escapeAttr, escapeHTML, getFormInput, getFormSelect } from "../dom.js";
 import { isAdmin } from "../session.js";
 import { state } from "../state.js";
-import type { PluginArtifact, PluginBuild, PluginDryRunResult, PluginInstrumentation, PluginOperations, PluginProxyConnection, PluginSecret, PluginServiceStatus, PluginSnapshot, PluginView } from "../types.js";
+import type { PluginArtifact, PluginBuild, PluginDryRunResult, PluginExtensionPointFeature, PluginFeatureFacts, PluginHostRuntimeSummary, PluginInstrumentation, PluginNodeRuntimeState, PluginNodeState, PluginOperations, PluginProxyConnection, PluginRuntimeAdapterStatus, PluginRuntimeFeature, PluginSecret, PluginServiceModeFeature, PluginServiceStatus, PluginSnapshot, PluginView, RepositoryUpdateReport } from "../types.js";
 
 interface PluginsResponse {
   plugins?: PluginView[];
@@ -23,6 +23,10 @@ interface PluginServiceResponse {
   plugin_service?: PluginServiceStatus;
 }
 
+interface PluginFeaturesResponse {
+  plugin_features?: PluginFeatureFacts;
+}
+
 interface InstrumentationResponse {
   instrumentation?: PluginInstrumentation[];
 }
@@ -33,6 +37,10 @@ interface PluginResponse {
 
 interface DryRunResponse {
   result?: PluginDryRunResult;
+}
+
+interface RepositoryUpdatesResponse {
+  updates?: RepositoryUpdateReport;
 }
 
 interface SnapshotDiffResponse {
@@ -54,16 +62,18 @@ export async function loadPlugins(): Promise<void> {
   try {
     // 插件页首屏依赖插件记录、制品、构建、插件服务模式和观测数据；
     // 并行请求可以减少进入页面时的等待时间。
-    const [data, artifacts, builds, service, instrumentation] = await Promise.all([
+    const [data, artifacts, builds, features, service, instrumentation] = await Promise.all([
       api<PluginsResponse>("/plugins"),
       api<ArtifactsResponse>("/plugin-artifacts"),
       api<BuildsResponse>("/plugin-builds"),
+      api<PluginFeaturesResponse>("/plugin-features"),
       api<PluginServiceResponse>("/plugin-service"),
       api<InstrumentationResponse>("/plugin-instrumentation"),
     ]);
     state.plugins = data.plugins || [];
     state.pluginArtifacts = artifacts.artifacts || [];
     state.pluginBuilds = builds.builds || [];
+    state.pluginFeatures = features.plugin_features || null;
     state.pluginService = service.plugin_service || null;
     state.pluginInstrumentation = instrumentation.instrumentation || [];
     const firstPlugin = state.plugins[0];
@@ -189,7 +199,9 @@ export function renderPluginDetail(plugin: PluginView | null = selectedPlugin())
       <section class="panel">
         <h3>Manifest</h3>
         <dl class="kv">
+          <dt>Artifact</dt><dd>${artifactMaturityBadge(plugin.artifact_type)} ${escapeHTML(plugin.artifact_type || "")}</dd>
           <dt>Runtime</dt><dd>${escapeHTML(plugin.runtime_type || "")}</dd>
+          <dt>Runtime maturity</dt><dd>${runtimeMaturityBadge(plugin.runtime_type)}</dd>
           <dt>Extensions</dt><dd>${escapeHTML((plugin.extension_points || []).join(", "))}</dd>
           <dt>Scope</dt><dd>${escapeHTML(formatJSON(plugin.scope))}</dd>
           <dt>Rollout</dt><dd>${escapeHTML(formatJSON(plugin.rollout))}</dd>
@@ -201,7 +213,12 @@ export function renderPluginDetail(plugin: PluginView | null = selectedPlugin())
         ${governancePanel(plugin, canWrite)}
       </section>
       <section class="panel">
+        <h3>Rollout</h3>
+        ${rolloutPanel(plugin)}
+      </section>
+      <section class="panel">
         <h3>Config</h3>
+        ${configMaturityPanel()}
         <textarea id="pluginConfigEditor" ${canWrite ? "" : "readonly"}>${escapeHTML(prettyJSON(plugin.config_json || "{}"))}</textarea>
         <div class="row-actions">${canWrite ? `
           <button type="button" id="pluginDryRunBtn">Dry run</button>
@@ -211,6 +228,7 @@ export function renderPluginDetail(plugin: PluginView | null = selectedPlugin())
       </section>
       <section class="panel">
         <h3>Secrets</h3>
+        ${secretMaturityPanel(plugin)}
         <div class="chips">${(plugin.secrets || []).map(secretChip).join("") || `<span class="chip">No secrets</span>`}</div>
         ${canWrite ? `
           <form id="pluginSecretForm" class="inline-form">
@@ -227,16 +245,42 @@ export function renderPluginDetail(plugin: PluginView | null = selectedPlugin())
         ${artifactList(plugin.artifacts || [], plugin)}
       </section>
       <section class="panel">
+        <h3>Repository</h3>
+        <form id="pluginRepositoryUpdatesForm" class="inline-form">
+          <label>Type
+            <select name="repository_type">
+              <option value="file">file</option>
+              <option value="url">url</option>
+              <option value="official">official</option>
+              <option value="internal">internal</option>
+            </select>
+          </label>
+          <input name="index_path" placeholder="index path or URL" required>
+          <input name="artifact_id" placeholder="candidate id">
+          <input name="version" placeholder="version">
+          <button class="secondary" type="submit">Check updates</button>
+        </form>
+        <pre id="pluginRepositoryUpdatesOutput" class="log-output"></pre>
+      </section>
+      <section class="panel">
         <h3>Builds</h3>
         ${buildList(plugin.builds || [], plugin, canWrite)}
       </section>
       <section class="panel">
         <h3>Snapshots</h3>
+        ${rollbackMaturityPanel()}
         ${snapshotList(plugin.snapshots || [], canWrite)}
       </section>
       <section class="panel">
         <h3>Dispatch plan</h3>
-        <pre class="log-output">${escapeHTML(formatJSON(plugin.dispatch_summary || []))}</pre>
+        ${canWrite ? `
+          <div class="row-actions">
+            <button class="secondary" type="button" id="pluginDispatchRefreshRoutesBtn">Refresh routes</button>
+            <button class="secondary" type="button" id="pluginDispatchReplaySubscribersBtn">Replay dead letters</button>
+            <button class="secondary" type="button" id="pluginDispatchDropSubscribersBtn">Drop dead letters</button>
+          </div>
+        ` : ""}
+        <pre id="pluginDispatchOutput" class="log-output">${escapeHTML(formatJSON(plugin.dispatch_summary || []))}</pre>
       </section>
       <section class="panel">
         <h3>Extension status</h3>
@@ -272,30 +316,49 @@ function renderPluginServicePanel(): void {
     return;
   }
   const service = state.pluginService?.service;
+  const modes = pluginServiceModes();
   const canWrite = isAdmin();
-  // 插件服务模式决定插件在进程内运行还是进入未来的独立/沙箱运行模式。
+  const desiredMode = service ? serviceModeFeature(service.desired_mode, modes) : null;
+  const activeMode = service ? serviceModeFeature(service.active_mode, modes) : null;
+  // 插件服务模式决定当前数据面适配器；未来模式只允许保存为期望状态。
   container.innerHTML = `
     <section class="panel">
       <div class="detail-header compact">
         <div>
           <h3>Plugin Service</h3>
-          <p>${service ? `active ${escapeHTML(service.active_mode)} · desired ${escapeHTML(service.desired_mode)}` : "not loaded"}</p>
+          <p>${service ? escapeHTML(pluginServiceSummary(service)) : "not loaded"}</p>
         </div>
-        ${service ? badge(service.restart_required ? "restart required" : "applied", service.restart_required) : ""}
+        ${service ? pluginServiceStateBadge(service) : ""}
       </div>
       ${service ? `
         <div class="status-grid dense">
           ${detailStat("Desired mode", service.desired_mode)}
           ${detailStat("Active mode", service.active_mode)}
+          ${detailStat("Effective data plane", service.data_plane_mode || service.active_mode)}
+          ${detailStat("Adapter", service.implemented_adapter ? "implemented" : "not implemented")}
+          ${detailStat("Desired maturity", service.desired_maturity || "")}
+          ${detailStat("Desired support", serviceModeSupportSummary(desiredMode))}
+          ${detailStat("Active support", serviceModeSupportSummary(activeMode))}
           ${detailStat("Migration", service.live_migration || "drain-only")}
+          ${detailStat("Crash policy", `${service.crash_policy?.max_crashes || 1} in ${service.crash_policy?.window_seconds || 300}s / ${service.crash_policy?.backoff_seconds || 30}s backoff`)}
           ${detailStat("Restart", service.restart_required ? "required" : "not required")}
         </div>
-        ${service.last_error ? `<div class="alert inline-alert">${escapeHTML(service.last_error)}</div>` : ""}
+        ${pluginServiceStateAlerts(service, desiredMode)}
+        ${service.unsupported_reason ? `<div class="alert inline-alert">${escapeHTML(service.unsupported_reason)}</div>` : ""}
+        ${service.last_error && service.last_error !== service.unsupported_reason ? `<div class="alert inline-alert">${escapeHTML(service.last_error)}</div>` : ""}
+        ${serviceModeAvailability(modes)}
+        ${extensionPointAvailability(pluginExtensionPoints())}
+        ${runtimeAdapterAvailability(state.pluginService?.runtime_adapters || [])}
+        ${pluginHostList(state.pluginService?.hosts || [])}
+        ${pluginNodeList(state.pluginService?.nodes || [])}
         ${canWrite ? `
           <form id="pluginServiceForm" class="inline-form">
             <select name="desired_mode">
-              ${["in-process", "go-plugin-process", "sandbox-process"].map((mode) => `<option value="${mode}" ${mode === service.desired_mode ? "selected" : ""}>${mode}</option>`).join("")}
+              ${modes.map((mode) => `<option value="${escapeAttr(mode.mode)}" ${mode.mode === service.desired_mode ? "selected" : ""}>${escapeHTML(serviceModeOptionLabel(mode))}</option>`).join("")}
             </select>
+            <input name="crash_backoff_seconds" type="number" min="1" max="3600" step="1" value="${escapeAttr(String(service.crash_policy?.backoff_seconds || 30))}">
+            <input name="crash_max_crashes" type="number" min="1" max="100" step="1" value="${escapeAttr(String(service.crash_policy?.max_crashes || 1))}">
+            <input name="crash_window_seconds" type="number" min="1" max="86400" step="1" value="${escapeAttr(String(service.crash_policy?.window_seconds || 300))}">
             <button type="submit">Set desired</button>
           </form>
         ` : ""}
@@ -312,6 +375,291 @@ function renderPluginServicePanel(): void {
   }
 }
 
+function pluginNodeList(nodes: PluginNodeState[]): string {
+  if (!nodes.length) {
+    return "";
+  }
+  return `
+    <div class="status-grid dense">
+      ${nodes.map((node) => detailStat(
+        node.node_id,
+        `${node.status || "unknown"} · ${node.data_plane_mode || node.service_mode || ""}${node.stale ? " · stale" : ""}`,
+      )).join("")}
+    </div>
+  `;
+}
+
+function pluginServiceModes(): PluginServiceModeFeature[] {
+  const modes = state.pluginFeatures?.service_modes || state.pluginService?.service_modes || [];
+  if (modes.length) {
+    return modes;
+  }
+	  return [
+	    { mode: "in-process", implemented: true, maturity: "implemented", data_plane: true, requires_restart: false },
+	    { mode: "go-plugin-process", implemented: true, maturity: "partial", data_plane: true, requires_restart: true, unsupported_reason: "go-plugin-process supports upstream.connect/v1 dialer mode and protocol-proxy drain-only with persisted crash policy and per-node crash isolation; fd-live migration, sandbox enforcement, full isolation, and non-Linux process-table orphan discovery are not implemented" },
+	    { mode: "sandbox-process", implemented: true, maturity: "partial", data_plane: true, requires_restart: true, unsupported_reason: "sandbox-process service mode is implemented but disabled unless future runtime gates enable sandbox_process" },
+	  ];
+}
+
+function pluginExtensionPoints(): PluginExtensionPointFeature[] {
+  const points = state.pluginFeatures?.extension_points || [];
+  if (points.length) {
+    return points;
+  }
+	  return [
+	    { key: "admin.auth.provider/v1", type: "provider", implemented: false, maturity: "reserved", data_plane: false, requires_restart: false, unsupported_reason: "admin.auth.provider/v1 is reserved; local admin break-glass remains the implemented authentication path" },
+	    { key: "ingress.service/v1", type: "service", implemented: true, maturity: "partial", data_plane: true, requires_restart: false, unsupported_reason: "gateway-managed listener lifecycle is implemented but disabled unless future runtime gates enable ingress" },
+	  ];
+}
+
+function serviceModeFeature(modeName: string, modes: PluginServiceModeFeature[]): PluginServiceModeFeature | null {
+  return modes.find((mode) => mode.mode === modeName) || null;
+}
+
+function pluginServiceSummary(service: NonNullable<PluginServiceStatus["service"]>): string {
+  const dataPlane = service.data_plane_mode || service.active_mode || "unknown";
+  return `effective ${dataPlane} · active ${service.active_mode} · desired ${service.desired_mode}`;
+}
+
+function pluginServiceStateBadge(service: NonNullable<PluginServiceStatus["service"]>): string {
+  if (service.unsupported_reason) {
+    return badge("reserved", true);
+  }
+  if (service.data_plane_mode && service.data_plane_mode !== service.desired_mode) {
+    return badge("desired pending", true);
+  }
+  if (service.restart_required) {
+    return badge("restart required", true);
+  }
+  return badge("applied", false);
+}
+
+function serviceModeSupportSummary(mode: PluginServiceModeFeature | null): string {
+  if (!mode) {
+    return "unknown";
+  }
+  if (!mode.implemented || !mode.data_plane) {
+    return `${mode.maturity} · future desired only · no current data plane`;
+  }
+  const dataPlane = mode.data_plane ? "data plane" : "no data plane";
+  const restart = mode.requires_restart ? "restart required" : "hot";
+  return `${mode.maturity} · ${dataPlane} · ${restart}`;
+}
+
+function pluginServiceStateAlerts(service: NonNullable<PluginServiceStatus["service"]>, desiredMode: PluginServiceModeFeature | null): string {
+  const alerts: string[] = [];
+  const dataPlane = service.data_plane_mode || service.active_mode;
+  if (dataPlane && dataPlane !== service.desired_mode) {
+    alerts.push(`Current data plane remains ${dataPlane}; desired mode is ${service.desired_mode}.`);
+    alerts.push("future desired only until the service mode is applied; current data plane is unchanged.");
+  }
+  if (desiredMode && (!desiredMode.implemented || !desiredMode.data_plane) && desiredMode.unsupported_reason) {
+    alerts.push(`Future desired mode only; current data plane is unchanged. ${desiredMode.unsupported_reason}`);
+  }
+  return alerts.map((item) => `<div class="alert inline-alert">${escapeHTML(item)}</div>`).join("");
+}
+
+function serviceModeOptionLabel(mode: PluginServiceModeFeature): string {
+  const restart = mode.requires_restart ? ", restart" : "";
+  const dataPlane = mode.implemented && mode.data_plane ? "data plane" : "future desired only";
+  return `${mode.mode} (${mode.maturity}, ${dataPlane}${restart})`;
+}
+
+function serviceModeAvailability(modes: PluginServiceModeFeature[]): string {
+  return `<table class="mini-table">
+    <thead><tr><th>Mode</th><th>Maturity</th><th>Data plane</th><th>Restart</th><th>Reason</th></tr></thead>
+    <tbody>${modes.map((mode) => `
+      <tr>
+        <td>${escapeHTML(mode.mode)}</td>
+        <td>${badge(mode.maturity, !mode.implemented)}</td>
+        <td>${badge(mode.implemented && mode.data_plane ? "yes" : "future desired only", !mode.data_plane)}</td>
+        <td>${escapeHTML(mode.requires_restart ? "required" : "not required")}</td>
+        <td>${escapeHTML(mode.unsupported_reason || "")}</td>
+      </tr>
+    `).join("")}</tbody>
+  </table>`;
+}
+
+function runtimeAdapterAvailability(adapters: PluginRuntimeAdapterStatus[]): string {
+  if (!adapters.length) {
+    return "";
+  }
+  return `<table class="mini-table">
+    <thead><tr><th>Service</th><th>Runtime</th><th>Adapter</th><th>Maturity</th><th>Lifecycle</th><th>Data plane</th><th>Control</th><th>Reason</th></tr></thead>
+    <tbody>${adapters.map((adapter) => `
+      <tr>
+        <td>${escapeHTML(adapter.service_mode)}</td>
+        <td>${escapeHTML(adapter.runtime_type)}</td>
+        <td>${escapeHTML(adapter.adapter)}</td>
+        <td>${badge(adapter.maturity || "unknown", adapter.maturity !== "implemented")}</td>
+        <td>${badge(adapter.lifecycle ? "yes" : "no", !adapter.lifecycle)}</td>
+        <td>${badge(adapter.data_plane ? "yes" : "no", !adapter.data_plane)}</td>
+        <td>${escapeHTML(adapter.host_protocol ? `${adapter.host_protocol} · ${adapter.control_channel || ""}` : "")}</td>
+        <td>${escapeHTML(adapter.unsupported_reason || "")}</td>
+      </tr>
+    `).join("")}</tbody>
+  </table>`;
+}
+
+function extensionPointAvailability(points: PluginExtensionPointFeature[]): string {
+  if (!points.length) {
+    return "";
+  }
+  return `<table class="mini-table">
+    <thead><tr><th>Extension</th><th>Type</th><th>Maturity</th><th>Data plane</th><th>Restart</th><th>Reason</th></tr></thead>
+    <tbody>${points.map((point) => `
+      <tr>
+        <td>${escapeHTML(point.key)}</td>
+        <td>${escapeHTML(point.type)}</td>
+        <td>${badge(point.maturity, !point.implemented || point.maturity !== "implemented")}</td>
+        <td>${badge(point.data_plane ? "yes" : "no", !point.data_plane)}</td>
+        <td>${escapeHTML(point.requires_restart ? "required" : "not required")}</td>
+        <td>${escapeHTML(point.unsupported_reason || "")}</td>
+      </tr>
+    `).join("")}</tbody>
+  </table>`;
+}
+
+function pluginHostList(hosts: PluginHostRuntimeSummary[]): string {
+  if (!hosts.length) {
+    return "";
+  }
+  return `<table class="mini-table">
+    <thead><tr><th>Plugin</th><th>PID</th><th>State</th><th>Drain</th><th>Crashes</th><th>Backoff</th><th>Started</th><th>Error</th></tr></thead>
+    <tbody>${hosts.map((host) => `
+      <tr>
+        <td>${escapeHTML(host.plugin_id)}</td>
+        <td>${escapeHTML(String(host.pid || ""))}</td>
+        <td>${badge(host.isolated ? "isolated" : host.state || "unknown", Boolean(host.isolated || host.crash_loop || host.last_error))}</td>
+        <td>${escapeHTML(host.drain_mode || "")}</td>
+        <td>${escapeHTML(String(host.crash_count || 0))}</td>
+        <td>${escapeHTML(formatPluginTimestamp(host.backoff_until))}</td>
+        <td>${escapeHTML(formatPluginTimestamp(host.started_at))}</td>
+        <td>${escapeHTML(host.last_error || "")}</td>
+      </tr>
+    `).join("")}</tbody>
+  </table>`;
+}
+
+function formatPluginTimestamp(value?: number): string {
+  if (!value) {
+    return "";
+  }
+  return new Date(value * 1000).toLocaleString();
+}
+
+function runtimeFeature(runtimeType?: string): PluginRuntimeFeature | null {
+  if (!runtimeType) {
+    return null;
+  }
+  return (state.pluginFeatures?.runtime_types || state.pluginService?.runtime_types || []).find((feature) => feature.type === runtimeType) || null;
+}
+
+function runtimeMaturityBadge(runtimeType?: string): string {
+  const feature = runtimeFeature(runtimeType);
+  if (!feature) {
+    return badge(runtimeType ? "stub" : "unknown", true);
+  }
+  return badge(feature.maturity, !feature.implemented || !feature.data_plane);
+}
+
+function artifactMaturityBadge(artifactType?: string): string {
+  switch (artifactType) {
+    case "binary":
+      return badge("implemented", false);
+    case "source":
+      return badge("partial", true);
+    default:
+      return badge("stub", true);
+  }
+}
+
+function buildMaturityBadge(builderType?: string): string {
+  switch (builderType) {
+    case "local-process":
+      return badge("partial", true);
+    case "container":
+      return badge("implemented", false);
+    default:
+      return badge("reserved", true);
+  }
+}
+
+function governanceMaturityBadge(plugin: PluginView): string {
+	if (plugin.governance?.decision) {
+		return badge("implemented", false);
+	}
+	if (plugin.governance_error) {
+    return badge("partial", true);
+  }
+	return badge("partial", true);
+}
+
+function configMaturityPanel(): string {
+  return `<dl class="kv compact">
+    <dt>Maturity</dt><dd>${badge("implemented", false)}</dd>
+    <dt>Dry-run</dt><dd>JSON · schema · secret refs · ReloadConfig</dd>
+    <dt>Failure state</dt><dd>active and desired generation unchanged</dd>
+  </dl>`;
+}
+
+function secretMaturityPanel(plugin: PluginView): string {
+  const secrets = plugin.secrets || [];
+  const reloadRequired = secrets.filter((secret) => secret.reload_required).length;
+  const hotReload = secrets.filter((secret) => secret.hot_reload).length;
+  return `<dl class="kv compact">
+    <dt>Maturity</dt><dd>${badge("implemented", false)}</dd>
+    <dt>Versions</dt><dd>current/previous summaries only</dd>
+    <dt>Reload policy</dt><dd>${escapeHTML(`${hotReload} hot reload · ${reloadRequired} reload required`)}</dd>
+    <dt>Value visibility</dt><dd>redacted in API, audit, operations and diagnostics</dd>
+  </dl>`;
+}
+
+function rollbackMaturityPanel(): string {
+  return `<dl class="kv compact">
+    <dt>Maturity</dt><dd>${badge("implemented", false)}</dd>
+    <dt>Gates</dt><dd>dry-run and governance rechecked</dd>
+    <dt>Modes</dt><dd>config-only and full desired rollback</dd>
+    <dt>Diff</dt><dd>sensitive values redacted</dd>
+  </dl>`;
+}
+
+function rolloutPanel(plugin: PluginView): string {
+	if (plugin.rollout_error) {
+		return `<div class="alert inline-alert">${escapeHTML(plugin.rollout_error)}</div>`;
+	}
+  const rollout = plugin.rollout_status;
+  if (!rollout) {
+    return `<div class="empty">No rollout state</div>`;
+  }
+  const nodes = rollout.node_runtime_states || plugin.node_runtime_states || [];
+  return `
+    <div class="status-grid dense">
+      ${detailStat("Status", rollout.partial_failure ? "partial failure" : rollout.ok ? "ok" : "pending")}
+      ${detailStat("Nodes", `${rollout.nodes_ready}/${rollout.nodes_total}`)}
+      ${detailStat("Failed", rollout.nodes_failed)}
+      ${detailStat("Stale", rollout.nodes_stale)}
+      ${detailStat("Artifact package", rollout.artifact_distribution_status || (rollout.artifact_distribution ? "available" : "not configured"))}
+      ${detailStat("Cross-node apply", rollout.cross_node_apply ? "enabled" : "manual")}
+    </div>
+    ${rollout.artifact_distribution_error ? `<div class="alert inline-alert">${escapeHTML(rollout.artifact_distribution_error)}</div>` : ""}
+    ${nodes.length ? `<div class="list compact-list">${nodes.map(nodeRuntimeItem).join("")}</div>` : `<div class="empty">No node runtime state</div>`}
+  `;
+}
+
+function nodeRuntimeItem(node: PluginNodeRuntimeState): string {
+  const state = `${node.runtime_state || "unknown"} · ${shortID(node.artifact_id || "")}${node.stale ? " · stale" : ""}`;
+  return `
+    <div class="list-item">
+      <div>
+        <strong>${escapeHTML(node.node_id)}</strong>
+        <span>${escapeHTML(state)}</span>
+      </div>
+      ${badge(node.error ? "failed" : node.enabled ? "enabled" : node.loaded ? "loaded" : "idle", Boolean(node.error || node.stale))}
+    </div>
+  `;
+}
+
 async function updatePluginServiceMode(event: Event): Promise<void> {
   event.preventDefault();
   const form = event.currentTarget as HTMLFormElement;
@@ -319,7 +667,14 @@ async function updatePluginServiceMode(event: Event): Promise<void> {
     // 服务模式变更可能需要后端迁移或重启，因此保存后立即刷新插件页状态。
     await api("/plugin-service", {
       method: "PUT",
-      body: { desired_mode: getFormInput(form, "desired_mode") },
+      body: {
+        desired_mode: getFormInput(form, "desired_mode"),
+        crash_policy: {
+          backoff_seconds: Number(getFormInput(form, "crash_backoff_seconds") || 30),
+          max_crashes: Number(getFormInput(form, "crash_max_crashes") || 1),
+          window_seconds: Number(getFormInput(form, "crash_window_seconds") || 300),
+        },
+      },
     });
     await loadPlugins();
   } catch (err) {
@@ -332,17 +687,44 @@ function instrumentationList(records: PluginInstrumentation[]): string {
     return `<p class="muted">No instrumentation metadata</p>`;
   }
   return `<table class="mini-table">
-    <thead><tr><th>Name</th><th>Profile</th><th>Status</th><th>Diff</th><th>Rollback</th></tr></thead>
+    <thead><tr><th>Name</th><th>Profile</th><th>Status</th><th>Diff</th><th>Binding</th><th>Conformance</th><th>Benchmark</th><th>Smoke</th><th>Rollback</th></tr></thead>
     <tbody>${records.map((record) => `
       <tr>
         <td>${escapeHTML(record.name)} ${escapeHTML(record.version || "")}</td>
         <td>${escapeHTML(record.profile || "")}</td>
         <td>${badge(record.status || "available", record.status === "blocked")}</td>
         <td>${escapeHTML(shortID(record.generated_diff_hash || ""))}</td>
+        <td>${instrumentationBinding(record)}</td>
+        <td>${instrumentationEvidenceBadge(record.conformance_json)}</td>
+        <td>${instrumentationEvidenceBadge(record.benchmark_json)}</td>
+        <td>${instrumentationEvidenceBadge(record.smoke_json)}</td>
         <td>${escapeHTML(record.runbook_rollback || "")}</td>
       </tr>
     `).join("")}</tbody>
   </table>`;
+}
+
+function instrumentationBinding(record: PluginInstrumentation): string {
+  if (!record.gateway_binary_sha256 || !record.ci_artifact_sha256) {
+    return badge("missing", true);
+  }
+  return escapeHTML(`gw ${shortID(record.gateway_binary_sha256)} · ci ${shortID(record.ci_artifact_sha256)}`);
+}
+
+function instrumentationEvidenceBadge(raw?: string): string {
+  if (!raw) {
+    return badge("missing", true);
+  }
+  try {
+    const value = JSON.parse(raw) as { ok?: unknown };
+    if (value && typeof value === "object" && "ok" in value) {
+      const passed = value.ok === true;
+      return badge(passed ? "ok" : "failed", !passed);
+    }
+  } catch {
+    return badge("missing", true);
+  }
+  return badge("missing", true);
 }
 
 async function uploadPluginPackage(event: Event): Promise<void> {
@@ -396,9 +778,29 @@ function bindPluginDetailEvents(plugin: PluginView): void {
   document.getElementById("pluginGovernanceSelfTestBtn")?.addEventListener("click", () => runGovernanceSelfTest(plugin));
   document.getElementById("pluginGovernanceBenchmarkBtn")?.addEventListener("click", () => recordGovernanceBenchmark(plugin));
   document.getElementById("pluginGovernanceAdvisoryBtn")?.addEventListener("click", () => createArtifactRevokeAdvisory(plugin));
+  document.getElementById("pluginDispatchRefreshRoutesBtn")?.addEventListener("click", () => runDispatchAction("refresh-routes"));
+  document.getElementById("pluginDispatchReplaySubscribersBtn")?.addEventListener("click", () => runDispatchAction("replay-subscribers"));
+  document.getElementById("pluginDispatchDropSubscribersBtn")?.addEventListener("click", () => runDispatchAction("drop-subscriber-dead-letter"));
   document.getElementById("pluginOperationsLoadBtn")?.addEventListener("click", () => loadPluginOperations(plugin));
   document.getElementById("pluginOperationsGCDryRunBtn")?.addEventListener("click", () => dryRunOperationsGC(plugin));
   document.getElementById("pluginDiagnosticBtn")?.addEventListener("click", () => loadDiagnosticPackage(plugin));
+  const repositoryUpdatesForm = document.getElementById("pluginRepositoryUpdatesForm");
+  if (repositoryUpdatesForm instanceof HTMLFormElement) {
+    repositoryUpdatesForm.addEventListener("submit", (event) => checkRepositoryUpdates(event, plugin));
+  }
+}
+
+async function runDispatchAction(action: string): Promise<void> {
+  try {
+    const data = await api<unknown>("/plugins/dispatch-plan", {
+      method: "POST",
+      body: { action },
+    });
+    el("pluginDispatchOutput").textContent = formatJSON(data || {});
+    showAlert("");
+  } catch (err) {
+    showAlert((err as Error).message);
+  }
 }
 
 async function dryRunConfig(plugin: PluginView): Promise<void> {
@@ -431,6 +833,28 @@ async function saveConfig(plugin: PluginView): Promise<void> {
       },
     });
     await loadPluginDetail(plugin.id);
+    showAlert("");
+  } catch (err) {
+    showAlert((err as Error).message);
+  }
+}
+
+async function checkRepositoryUpdates(event: SubmitEvent, plugin: PluginView): Promise<void> {
+  event.preventDefault();
+  const form = event.currentTarget as HTMLFormElement;
+  try {
+    const data = await api<RepositoryUpdatesResponse>("/plugin-repositories/imports", {
+      method: "POST",
+      body: {
+        action: "updates",
+        repository_type: getFormSelect(form, "repository_type").value,
+        index_path: getFormInput(form, "index_path").value,
+        artifact_id: getFormInput(form, "artifact_id").value,
+        plugin_id: plugin.id,
+        version: getFormInput(form, "version").value,
+      },
+    });
+    el("pluginRepositoryUpdatesOutput").textContent = formatJSON(data.updates || {});
     showAlert("");
   } catch (err) {
     showAlert((err as Error).message);
@@ -739,7 +1163,9 @@ function uploadInventoryDetail(): string {
         <h3>Artifact</h3>
         <dl class="kv">
           <dt>Status</dt><dd>${escapeHTML(artifact.status)}</dd>
+          <dt>Maturity</dt><dd>${artifactMaturityBadge(artifact.artifact_type)}</dd>
           <dt>Runtime</dt><dd>${escapeHTML(artifact.runtime_type || "")}</dd>
+          <dt>Runtime maturity</dt><dd>${runtimeMaturityBadge(artifact.runtime_type)}</dd>
           <dt>Go/API</dt><dd>${escapeHTML(`${artifact.go_version || ""} ${artifact.api_version || ""}`)}</dd>
           <dt>SHA256</dt><dd>${escapeHTML(artifact.sha256)}</dd>
           <dt>Extensions</dt><dd>${escapeHTML(jsonList(artifact.extension_points_json))}</dd>
@@ -790,7 +1216,7 @@ function artifactInventoryList(artifacts: PluginArtifact[]): string {
   return `<div class="mini-list">${artifacts.map((artifact) => `
     <div class="mini-row">
       <span>${escapeHTML(artifact.plugin_id)}</span>
-      <span>${escapeHTML(artifact.version)} · ${escapeHTML(artifact.artifact_type)} · ${escapeHTML(artifact.status)}</span>
+      <span>${escapeHTML(artifact.version)} · ${escapeHTML(artifact.artifact_type)} · ${artifactMaturityBadge(artifact.artifact_type)} · ${escapeHTML(artifact.status)}</span>
       <span>${escapeHTML(shortID(artifact.id))}</span>
       <button class="secondary" type="button" data-artifact-detail="${escapeAttr(artifact.id)}">Open</button>
     </div>
@@ -805,7 +1231,10 @@ function buildInventoryList(builds: PluginBuild[]): string {
     <div class="mini-row">
       <span>${escapeHTML(build.plugin_id)} #${escapeHTML(build.id)}</span>
       <span>${badge(build.status, build.status !== "succeeded")}</span>
+      <span>${buildMaturityBadge(build.builder_type)}</span>
+      <span>${escapeHTML(buildBuilderLabel(build))}</span>
       <span>${escapeHTML(shortID(build.artifact_id || build.source_id))}</span>
+      <span>${escapeHTML(buildPolicyLabel(build))}</span>
       <span>${escapeHTML(build.log_summary || build.error || "")}</span>
     </div>
   `).join("")}</div>`;
@@ -834,12 +1263,15 @@ function governancePanel(plugin: PluginView, canWrite: boolean): string {
   }
   const governance = plugin.governance;
   const decision = governance?.decision;
+  const policy = governance?.policy;
   const issues = decision?.issues || [];
   return `
     <dl class="kv">
       <dt>Profile</dt><dd>${escapeHTML(decision?.profile || "")}</dd>
       <dt>Risk</dt><dd>${escapeHTML(decision?.risk_level || "")}</dd>
       <dt>Policy</dt><dd>${escapeHTML(shortID(decision?.policy_hash || ""))}</dd>
+      <dt>Fixture gate</dt><dd>${badge(policy?.require_conformance_fixture ? "required" : "not required", Boolean(policy?.require_conformance_fixture))}</dd>
+      <dt>Maturity</dt><dd>${governanceMaturityBadge(plugin)}</dd>
       <dt>Decision</dt><dd>${badge(decision?.ok ? "allowed" : "blocked", !decision?.ok)}</dd>
       <dt>Review</dt><dd>${badge(decision?.review_required ? "required" : "not required", Boolean(decision?.review_required))}</dd>
       <dt>Override</dt><dd>${badge(decision?.warning_override_used ? "used" : "not used", Boolean(decision?.warning_override_used))}</dd>
@@ -862,6 +1294,7 @@ function governancePanel(plugin: PluginView, canWrite: boolean): string {
       </div>
     ` : ""}
     <pre class="log-output">${escapeHTML(formatJSON({
+      policy: governance?.policy,
       conflicts: governance?.conflicts,
       reviews: governance?.reviews || [],
       warning_overrides: governance?.warning_overrides || [],
@@ -879,7 +1312,7 @@ function artifactList(artifacts: PluginArtifact[], plugin: PluginView): string {
   return `<div class="mini-list">${artifacts.map((artifact) => `
     <div class="mini-row">
       <span>${escapeHTML(shortID(artifact.id))}</span>
-      <span>${escapeHTML(artifact.version)} · ${escapeHTML(artifact.artifact_type)} · ${escapeHTML(artifact.status)}</span>
+      <span>${escapeHTML(artifact.version)} · ${escapeHTML(artifact.artifact_type)} · ${artifactMaturityBadge(artifact.artifact_type)} · ${escapeHTML(artifact.status)}</span>
       <span>${escapeHTML(artifact.go_version || "")}</span>
       ${isAdmin() && artifact.artifact_type === "binary" && artifact.id !== plugin.desired_artifact_id ? `<button class="secondary" type="button" data-artifact-rollback="${escapeAttr(artifact.id)}">Rollback</button>` : ""}
     </div>
@@ -894,11 +1327,40 @@ function buildList(builds: PluginBuild[], plugin: PluginView, canWrite: boolean)
     <div class="mini-row">
       <span>#${escapeHTML(build.id)}</span>
       <span>${badge(build.status, build.status !== "succeeded")}</span>
+      <span>${buildMaturityBadge(build.builder_type)}</span>
+      <span>${escapeHTML(buildBuilderLabel(build))}</span>
       <span>${escapeHTML(shortID(build.artifact_id || build.source_id))}</span>
+      <span>${escapeHTML(buildProvenanceLabel(build))}</span>
+      <span>${escapeHTML(buildPolicyLabel(build))}</span>
       <span>${escapeHTML(build.log_summary || build.error || "")}</span>
       ${canWrite ? buildActions(build, plugin) : ""}
     </div>
   `).join("")}</div>`;
+}
+
+function buildBuilderLabel(build: PluginBuild): string {
+  const image = build.builder_image ? ` ${build.builder_image}` : "";
+  const version = build.builder_version ? ` ${build.builder_version}` : "";
+  return `${build.builder_type}${image}${version}`;
+}
+
+function buildProvenanceLabel(build: PluginBuild): string {
+  const parts = [
+    build.go_version || "",
+    build.abi_fingerprint ? `abi ${shortID(build.abi_fingerprint)}` : "",
+    build.artifact_sha256 ? `artifact ${shortID(build.artifact_sha256)}` : "",
+  ].filter(Boolean);
+  return parts.join(" · ");
+}
+
+function buildPolicyLabel(build: PluginBuild): string {
+  const policies = [
+    build.go_proxy ? "GOPROXY" : "",
+    build.go_no_sumdb ? "GONOSUMDB" : "",
+    build.go_private ? "GOPRIVATE" : "",
+    build.vendor_required ? "vendor" : "",
+  ].filter(Boolean);
+  return policies.length ? `policy ${policies.join(", ")}` : "";
 }
 
 function buildActions(build: PluginBuild, plugin: PluginView): string {

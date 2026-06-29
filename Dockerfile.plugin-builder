@@ -1,0 +1,33 @@
+# Dockerfile.plugin-builder publishes the official source-package builder image.
+
+# syntax=docker/dockerfile:1
+
+ARG GO_VERSION=1.24.4
+FROM golang:${GO_VERSION}-bookworm
+
+ARG GO_VERSION=1.24.4
+ARG GATEWAY_RELEASE
+ARG PLUGIN_API_VERSION
+ARG TARGETOS
+ARG TARGETARCH
+
+LABEL org.opencontainers.image.title="mc-gateway plugin source builder"
+LABEL org.opencontainers.image.description="Official mc-gateway source .mcgp builder image"
+LABEL org.opencontainers.image.version="${GATEWAY_RELEASE}"
+LABEL org.opencontainers.image.vendor="tursom"
+LABEL org.opencontainers.image.source="https://github.com/tursom/mc-gateway"
+LABEL io.mc-gateway.builder.gateway-release="${GATEWAY_RELEASE}"
+LABEL io.mc-gateway.builder.plugin-api-version="${PLUGIN_API_VERSION}"
+LABEL io.mc-gateway.builder.go-version="${GO_VERSION}"
+LABEL io.mc-gateway.builder.goos="${TARGETOS}"
+LABEL io.mc-gateway.builder.goarch="${TARGETARCH}"
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates git \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV GOTOOLCHAIN=local
+ENV CGO_ENABLED=1
+ENV GOFLAGS=-trimpath
+
+WORKDIR /src

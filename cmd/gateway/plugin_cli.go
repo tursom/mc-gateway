@@ -75,6 +75,12 @@ func runPluginCLI(args []string) (bool, int) {
 			return true, 1
 		}
 		return true, 0
+	case "transfer":
+		if err := runPluginRemoteTransferCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
 	case "enable":
 		if err := runPluginRemoteDesiredCLI(args[2:], pluginmanager.DesiredEnabled); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -129,6 +135,12 @@ func runPluginCLI(args []string) (bool, int) {
 			return true, 1
 		}
 		return true, 0
+	case "external":
+		if err := runPluginRemoteExternalCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
 	case "data", "files":
 		if err := runPluginRemoteResourceCLI(command, args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -153,6 +165,12 @@ func runPluginCLI(args []string) (bool, int) {
 			return true, 1
 		}
 		return true, 0
+	case "vulnerability":
+		if err := runPluginRemoteVulnerabilityCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
 	case "repo":
 		if err := runPluginRemoteRepoCLI(args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -171,8 +189,38 @@ func runPluginCLI(args []string) (bool, int) {
 			return true, 1
 		}
 		return true, 0
-	case "schema", "contract", "conformance", "export", "import", "diff", "drift", "dr-drill", "sign":
-		if err := runPluginReservedCLI(command, args[2:]); err != nil {
+	case "schema":
+		if err := runPluginSchemaCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "contract":
+		if err := runPluginContractCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "conformance":
+		if err := runPluginConformanceCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "export", "import", "diff", "drift", "dr-drill":
+		if err := runPluginPromotionCLI(command, args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "apply":
+		if err := runPluginRemotePromotionApplyCLI(args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return true, 1
+		}
+		return true, 0
+	case "sign":
+		if err := runPluginSignCLI(args[2:]); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return true, 1
 		}
@@ -250,7 +298,7 @@ func runPluginCLI(args []string) (bool, int) {
 }
 
 func printPluginCLIUsage() {
-	fmt.Fprintln(os.Stderr, "usage: gateway plugin init|features|manifest|build|test|preflight|self-test|benchmark|status|upload|enable|disable|delete|rollback|config|secret|logs|events|metrics|diagnose|task|data|files|gc|review|advisory|repo|sbom|verify|runtime|inspect|validate|compat|source-validate|source-build ...")
+	fmt.Fprintln(os.Stderr, "usage: gateway plugin init|features|manifest|build|test|schema|contract|conformance|preflight|self-test|benchmark|status|upload|transfer|enable|disable|delete|rollback|config|secret|logs|events|metrics|diagnose|task|external|data|files|gc|review|advisory|vulnerability|repo|sbom|verify|runtime|inspect|validate|compat|source-validate|source-build|apply ...")
 }
 
 func buildSourcePackageForCLI(packagePath, outPath string) (pluginmanager.BuildRecord, string, error) {
@@ -265,8 +313,9 @@ func buildSourcePackageForCLI(packagePath, outPath string) (pluginmanager.BuildR
 	}
 	defer db.Close()
 	manager := pluginmanager.New(pluginmanager.Options{
-		DB:           db,
-		ArtifactRoot: filepath.Join(tmpRoot, "artifacts"),
+		DB:            db,
+		ArtifactRoot:  filepath.Join(tmpRoot, "artifacts"),
+		PolicyProfile: pluginmanager.PolicyProfileDev,
 	})
 	source, err := manager.UploadSource(context.Background(), pluginmanager.ArtifactUpload{
 		SourcePath: packagePath,

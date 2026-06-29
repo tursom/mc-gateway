@@ -9,6 +9,9 @@ The example is intentionally small: gateway core does not parse authentication
 results, identity mapping, forwarding, or play packets. Those responsibilities
 belong inside a protocol-proxy plugin.
 
+The fixture emits `auth.success` / `auth.failure` events and an `auth.attempts`
+counter with low-cardinality `result` and `mode` labels.
+
 Build and package:
 
 ```sh

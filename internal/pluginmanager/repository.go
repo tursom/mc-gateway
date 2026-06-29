@@ -310,15 +310,15 @@ WHERE id = ?`,
 
 func (r Repository) PluginServiceState(ctx context.Context) (PluginServiceState, error) {
 	row := r.db.QueryRowContext(ctx, `
-SELECT desired_mode, active_mode, applied_at, live_migration, last_error, updated_by, updated_at
+SELECT desired_mode, active_mode, applied_at, live_migration, crash_backoff_seconds, crash_max_count, crash_window_seconds, last_error, updated_by, updated_at
 FROM plugin_service_state WHERE id = 1`)
 	state, err := scanPluginServiceState(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		now := r.now().Unix()
 		_, err = r.db.ExecContext(ctx, `
-INSERT OR IGNORE INTO plugin_service_state(id, desired_mode, active_mode, applied_at, live_migration, updated_by, updated_at)
-VALUES (1, ?, ?, ?, ?, ?, ?)`,
-			PluginServiceModeInProcess, PluginServiceModeInProcess, now, PluginMigrationDrainOnly, "system", now)
+INSERT OR IGNORE INTO plugin_service_state(id, desired_mode, active_mode, applied_at, live_migration, crash_backoff_seconds, crash_max_count, crash_window_seconds, updated_by, updated_at)
+VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			PluginServiceModeInProcess, PluginServiceModeInProcess, now, PluginMigrationDrainOnly, DefaultPluginHostCrashBackoffSeconds, DefaultPluginHostCrashMaxCrashes, DefaultPluginHostCrashWindowSeconds, "system", now)
 		if err != nil {
 			return PluginServiceState{}, err
 		}
@@ -327,6 +327,7 @@ VALUES (1, ?, ?, ?, ?, ?, ?)`,
 			ActiveMode:    PluginServiceModeInProcess,
 			AppliedAt:     now,
 			LiveMigration: PluginMigrationDrainOnly,
+			CrashPolicy:   normalizePluginHostCrashPolicy(PluginHostCrashPolicy{}),
 			UpdatedBy:     "system",
 			UpdatedAt:     now,
 		}, nil
@@ -338,10 +339,10 @@ VALUES (1, ?, ?, ?, ?, ?, ?)`,
 func (r Repository) SetPluginServiceDesired(ctx context.Context, actor, mode string) (PluginServiceState, error) {
 	now := r.now().Unix()
 	if _, err := r.db.ExecContext(ctx, `
-INSERT INTO plugin_service_state(id, desired_mode, active_mode, applied_at, live_migration, updated_by, updated_at)
-VALUES (1, ?, ?, ?, ?, ?, ?)
+INSERT INTO plugin_service_state(id, desired_mode, active_mode, applied_at, live_migration, crash_backoff_seconds, crash_max_count, crash_window_seconds, updated_by, updated_at)
+VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET desired_mode = excluded.desired_mode, updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
-		mode, PluginServiceModeInProcess, 0, PluginMigrationDrainOnly, actor, now); err != nil {
+		mode, PluginServiceModeInProcess, 0, PluginMigrationDrainOnly, DefaultPluginHostCrashBackoffSeconds, DefaultPluginHostCrashMaxCrashes, DefaultPluginHostCrashWindowSeconds, actor, now); err != nil {
 		return PluginServiceState{}, err
 	}
 	return r.PluginServiceState(ctx)
@@ -350,18 +351,181 @@ ON CONFLICT(id) DO UPDATE SET desired_mode = excluded.desired_mode, updated_by =
 func (r Repository) ApplyPluginServiceActive(ctx context.Context, mode string) (PluginServiceState, error) {
 	now := r.now().Unix()
 	if _, err := r.db.ExecContext(ctx, `
-INSERT INTO plugin_service_state(id, desired_mode, active_mode, applied_at, live_migration, last_error, updated_by, updated_at)
-VALUES (1, ?, ?, ?, ?, '', 'system', ?)
+INSERT INTO plugin_service_state(id, desired_mode, active_mode, applied_at, live_migration, crash_backoff_seconds, crash_max_count, crash_window_seconds, last_error, updated_by, updated_at)
+VALUES (1, ?, ?, ?, ?, ?, ?, ?, '', 'system', ?)
 ON CONFLICT(id) DO UPDATE SET active_mode = excluded.active_mode, applied_at = excluded.applied_at, last_error = '', updated_at = excluded.updated_at`,
-		mode, mode, now, PluginMigrationDrainOnly, now); err != nil {
+		mode, mode, now, PluginMigrationDrainOnly, DefaultPluginHostCrashBackoffSeconds, DefaultPluginHostCrashMaxCrashes, DefaultPluginHostCrashWindowSeconds, now); err != nil {
 		return PluginServiceState{}, err
 	}
 	return r.PluginServiceState(ctx)
 }
 
 func (r Repository) SetPluginServiceError(ctx context.Context, message string) error {
-	_, err := r.db.ExecContext(ctx, `UPDATE plugin_service_state SET last_error = ?, updated_at = ? WHERE id = 1`, message, r.now().Unix())
+	now := r.now().Unix()
+	_, err := r.db.ExecContext(ctx, `
+INSERT INTO plugin_service_state(id, desired_mode, active_mode, applied_at, live_migration, crash_backoff_seconds, crash_max_count, crash_window_seconds, last_error, updated_by, updated_at)
+VALUES (1, ?, ?, 0, ?, ?, ?, ?, ?, 'system', ?)
+ON CONFLICT(id) DO UPDATE SET last_error = excluded.last_error, updated_at = excluded.updated_at`,
+		PluginServiceModeInProcess, PluginServiceModeInProcess, PluginMigrationDrainOnly, DefaultPluginHostCrashBackoffSeconds, DefaultPluginHostCrashMaxCrashes, DefaultPluginHostCrashWindowSeconds, message, now)
 	return err
+}
+
+func (r Repository) SetPluginServiceCrashPolicy(ctx context.Context, actor string, policy PluginHostCrashPolicy) (PluginServiceState, error) {
+	policy = normalizePluginHostCrashPolicy(policy)
+	now := r.now().Unix()
+	if _, err := r.db.ExecContext(ctx, `
+INSERT INTO plugin_service_state(id, desired_mode, active_mode, applied_at, live_migration, crash_backoff_seconds, crash_max_count, crash_window_seconds, updated_by, updated_at)
+VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET crash_backoff_seconds = excluded.crash_backoff_seconds, crash_max_count = excluded.crash_max_count, crash_window_seconds = excluded.crash_window_seconds, updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
+		PluginServiceModeInProcess, PluginServiceModeInProcess, 0, PluginMigrationDrainOnly, policy.BackoffSeconds, policy.MaxCrashes, policy.WindowSeconds, actor, now); err != nil {
+		return PluginServiceState{}, err
+	}
+	return r.PluginServiceState(ctx)
+}
+
+func (r Repository) UpsertPluginNode(ctx context.Context, node PluginNodeState) error {
+	if strings.TrimSpace(node.NodeID) == "" {
+		return errors.New("node_id is required")
+	}
+	now := r.now().Unix()
+	if node.StartedAt == 0 {
+		node.StartedAt = now
+	}
+	if node.HeartbeatAt == 0 {
+		node.HeartbeatAt = now
+	}
+	if node.ServiceMode == "" {
+		node.ServiceMode = PluginServiceModeInProcess
+	}
+	if node.DataPlaneMode == "" {
+		node.DataPlaneMode = PluginServiceModeInProcess
+	}
+	if node.Status == "" {
+		node.Status = PluginNodeStatusOnline
+	}
+	_, err := r.db.ExecContext(ctx, `
+INSERT INTO plugin_nodes(node_id, hostname, pid, service_mode, data_plane_mode, status, started_at, heartbeat_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(node_id) DO UPDATE SET
+    hostname = excluded.hostname,
+    pid = excluded.pid,
+    service_mode = excluded.service_mode,
+    data_plane_mode = excluded.data_plane_mode,
+    status = excluded.status,
+    started_at = excluded.started_at,
+    heartbeat_at = excluded.heartbeat_at`,
+		node.NodeID, node.Hostname, node.PID, node.ServiceMode, node.DataPlaneMode, node.Status, node.StartedAt, node.HeartbeatAt)
+	return err
+}
+
+func (r Repository) ListPluginNodes(ctx context.Context, staleAfter time.Duration) ([]PluginNodeState, error) {
+	rows, err := r.db.QueryContext(ctx, `
+SELECT node_id, hostname, pid, service_mode, data_plane_mode, status, started_at, heartbeat_at
+FROM plugin_nodes
+ORDER BY heartbeat_at DESC, node_id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	now := r.now().Unix()
+	var staleBefore int64
+	if staleAfter > 0 {
+		staleBefore = now - int64(staleAfter/time.Second)
+	}
+	var nodes []PluginNodeState
+	for rows.Next() {
+		var node PluginNodeState
+		if err := rows.Scan(&node.NodeID, &node.Hostname, &node.PID, &node.ServiceMode, &node.DataPlaneMode, &node.Status, &node.StartedAt, &node.HeartbeatAt); err != nil {
+			return nil, err
+		}
+		if staleBefore > 0 && node.HeartbeatAt < staleBefore {
+			node.Stale = true
+			node.Status = PluginNodeStatusStale
+		}
+		nodes = append(nodes, node)
+	}
+	return nodes, rows.Err()
+}
+
+func (r Repository) UpsertPluginNodeRuntime(ctx context.Context, state PluginNodeRuntimeState) error {
+	if strings.TrimSpace(state.NodeID) == "" || strings.TrimSpace(state.PluginID) == "" {
+		return errors.New("node_id and plugin_id are required")
+	}
+	now := r.now().Unix()
+	if state.UpdatedAt == 0 {
+		state.UpdatedAt = now
+	}
+	_, err := r.db.ExecContext(ctx, `
+INSERT INTO plugin_node_states(
+    node_id, plugin_id, artifact_id, desired_state, runtime_state, desired_generation,
+    applied_generation, loaded, enabled, health, error, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(node_id, plugin_id) DO UPDATE SET
+    artifact_id = excluded.artifact_id,
+    desired_state = excluded.desired_state,
+    runtime_state = excluded.runtime_state,
+    desired_generation = excluded.desired_generation,
+    applied_generation = excluded.applied_generation,
+    loaded = excluded.loaded,
+    enabled = excluded.enabled,
+    health = excluded.health,
+    error = excluded.error,
+    updated_at = excluded.updated_at`,
+		state.NodeID, state.PluginID, state.ArtifactID, state.DesiredState, state.RuntimeState, state.DesiredGeneration,
+		state.AppliedGeneration, boolInt(state.Loaded), boolInt(state.Enabled), state.Health, state.Error, state.UpdatedAt)
+	return err
+}
+
+func (r Repository) DeletePluginNodeRuntime(ctx context.Context, nodeID, pluginID string) error {
+	if strings.TrimSpace(nodeID) == "" || strings.TrimSpace(pluginID) == "" {
+		return errors.New("node_id and plugin_id are required")
+	}
+	_, err := r.db.ExecContext(ctx, `DELETE FROM plugin_node_states WHERE node_id = ? AND plugin_id = ?`, nodeID, pluginID)
+	return err
+}
+
+func (r Repository) ListPluginNodeRuntime(ctx context.Context, pluginID string, staleAfter time.Duration) ([]PluginNodeRuntimeState, error) {
+	query := `
+SELECT s.node_id, s.plugin_id, s.artifact_id, s.desired_state, s.runtime_state,
+       s.desired_generation, s.applied_generation, s.loaded, s.enabled, s.health,
+       s.error, s.updated_at, COALESCE(n.heartbeat_at, 0)
+FROM plugin_node_states s
+LEFT JOIN plugin_nodes n ON n.node_id = s.node_id`
+	var args []any
+	if pluginID != "" {
+		query += ` WHERE s.plugin_id = ?`
+		args = append(args, pluginID)
+	}
+	query += ` ORDER BY s.plugin_id ASC, s.node_id ASC`
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	now := r.now().Unix()
+	var staleBefore int64
+	if staleAfter > 0 {
+		staleBefore = now - int64(staleAfter/time.Second)
+	}
+	var states []PluginNodeRuntimeState
+	for rows.Next() {
+		var state PluginNodeRuntimeState
+		var loaded, enabled int
+		if err := rows.Scan(
+			&state.NodeID, &state.PluginID, &state.ArtifactID, &state.DesiredState, &state.RuntimeState,
+			&state.DesiredGeneration, &state.AppliedGeneration, &loaded, &enabled, &state.Health,
+			&state.Error, &state.UpdatedAt, &state.NodeHeartbeatAt,
+		); err != nil {
+			return nil, err
+		}
+		state.Loaded = loaded != 0
+		state.Enabled = enabled != 0
+		if state.NodeHeartbeatAt == 0 || (staleBefore > 0 && state.NodeHeartbeatAt < staleBefore) {
+			state.Stale = true
+		}
+		states = append(states, state)
+	}
+	return states, rows.Err()
 }
 
 func (r Repository) UpdateArtifactStatus(ctx context.Context, artifactID, status, message string) error {
@@ -510,6 +674,15 @@ func (r Repository) RetryBuild(ctx context.Context, id int64, actor string) (Bui
 	return r.CreateBuild(ctx, previous)
 }
 
+func (r Repository) ClearBuildLog(ctx context.Context, id int64) error {
+	_, err := r.db.ExecContext(ctx, `
+UPDATE plugin_builds
+SET log_summary = '', updated_at = ?
+WHERE id = ? AND status NOT IN (?, ?)`,
+		r.now().Unix(), id, BuildStatusQueued, BuildStatusRunning)
+	return err
+}
+
 func (r Repository) ReferencedArtifactIDs(ctx context.Context) (map[string]bool, error) {
 	refs := make(map[string]bool)
 	rows, err := r.db.QueryContext(ctx, `
@@ -535,6 +708,23 @@ WHERE desired_state <> 'deleted'`)
 		return nil, err
 	}
 	rows, err = r.db.QueryContext(ctx, `SELECT artifact_id FROM plugin_config_snapshots WHERE artifact_id <> ''`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if id != "" {
+			refs[id] = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	rows, err = r.db.QueryContext(ctx, `SELECT source_id FROM plugin_builds WHERE source_id <> '' AND status IN (?, ?)`, BuildStatusQueued, BuildStatusRunning)
 	if err != nil {
 		return nil, err
 	}
@@ -674,10 +864,10 @@ func (r Repository) SaveReview(ctx context.Context, review ReviewRecord) (Review
 	}
 	_, err := r.db.ExecContext(ctx, `
 INSERT INTO plugin_reviews(
-    plugin_id, artifact_id, profile, risk_level, config_hash, scope_hash, rollout_hash,
+    plugin_id, artifact_id, artifact_hash, profile, risk_level, config_hash, scope_hash, rollout_hash,
     runtime_limits_hash, features_hash, policy_hash, decision, notes, reviewed_by, created_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		review.PluginID, review.ArtifactID, review.Profile, review.RiskLevel, review.ConfigHash, review.ScopeHash, review.RolloutHash,
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		review.PluginID, review.ArtifactID, review.ArtifactHash, review.Profile, review.RiskLevel, review.ConfigHash, review.ScopeHash, review.RolloutHash,
 		review.RuntimeLimitsHash, review.FeaturesHash, review.PolicyHash, review.Decision, review.Notes, review.ReviewedBy, review.CreatedAt)
 	if err != nil {
 		return ReviewRecord{}, err
@@ -693,7 +883,7 @@ INSERT INTO plugin_reviews(
 func (r Repository) ListReviews(ctx context.Context, pluginID string) ([]ReviewRecord, error) {
 	query := `
 SELECT id, plugin_id, artifact_id, profile, risk_level, config_hash, scope_hash, rollout_hash,
-       runtime_limits_hash, features_hash, policy_hash, decision, notes, reviewed_by, created_at
+       artifact_hash, runtime_limits_hash, features_hash, policy_hash, decision, notes, reviewed_by, created_at
 FROM plugin_reviews`
 	var args []any
 	if pluginID != "" {
@@ -720,7 +910,7 @@ FROM plugin_reviews`
 func (r Repository) ApprovedReview(ctx context.Context, pluginID, artifactID, profile, policyHash, configHash, scopeHash, rolloutHash, runtimeHash, featuresHash string) (ReviewRecord, error) {
 	row := r.db.QueryRowContext(ctx, `
 SELECT id, plugin_id, artifact_id, profile, risk_level, config_hash, scope_hash, rollout_hash,
-       runtime_limits_hash, features_hash, policy_hash, decision, notes, reviewed_by, created_at
+       artifact_hash, runtime_limits_hash, features_hash, policy_hash, decision, notes, reviewed_by, created_at
 FROM plugin_reviews
 WHERE plugin_id = ? AND artifact_id = ? AND profile = ? AND policy_hash = ?
   AND config_hash = ? AND scope_hash = ? AND rollout_hash = ? AND runtime_limits_hash = ? AND features_hash = ?
@@ -876,6 +1066,89 @@ FROM plugin_advisories`
 	return advisories, rows.Err()
 }
 
+func (r Repository) UpsertVulnerability(ctx context.Context, actor string, req VulnerabilityRequest) (VulnerabilityRecord, error) {
+	now := r.now().Unix()
+	req.VulnerabilityID = strings.TrimSpace(req.VulnerabilityID)
+	req.PackageName = strings.TrimSpace(req.PackageName)
+	if req.VulnerabilityID == "" {
+		return VulnerabilityRecord{}, errors.New("vulnerability_id is required")
+	}
+	if req.PackageName == "" {
+		return VulnerabilityRecord{}, errors.New("package_name is required")
+	}
+	if req.Status == "" {
+		req.Status = AdvisoryStatusActive
+	}
+	if req.Action == "" {
+		req.Action = AdvisoryActionDenylist
+	}
+	references, err := json.Marshal(req.References)
+	if err != nil {
+		return VulnerabilityRecord{}, err
+	}
+	result, err := r.db.ExecContext(ctx, `
+UPDATE plugin_vulnerabilities
+SET source = ?, status = ?, version_range = ?, severity = ?, action = ?, fixed_version = ?,
+    summary = ?, references_json = ?, created_by = ?, updated_at = ?
+WHERE vulnerability_id = ? AND package_name = ?`,
+		req.Source, req.Status, req.VersionRange, strings.ToLower(req.Severity), req.Action, req.FixedVersion,
+		req.Summary, string(references), actor, now, req.VulnerabilityID, req.PackageName)
+	if err != nil {
+		return VulnerabilityRecord{}, err
+	}
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		_, err = r.db.ExecContext(ctx, `
+INSERT INTO plugin_vulnerabilities(
+    vulnerability_id, source, status, package_name, version_range, severity, action,
+    fixed_version, summary, references_json, created_by, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			req.VulnerabilityID, req.Source, req.Status, req.PackageName, req.VersionRange, strings.ToLower(req.Severity), req.Action,
+			req.FixedVersion, req.Summary, string(references), actor, now, now)
+		if err != nil {
+			return VulnerabilityRecord{}, err
+		}
+	}
+	return r.VulnerabilityByKey(ctx, req.VulnerabilityID, req.PackageName)
+}
+
+func (r Repository) VulnerabilityByKey(ctx context.Context, vulnerabilityID, packageName string) (VulnerabilityRecord, error) {
+	row := r.db.QueryRowContext(ctx, `
+SELECT id, vulnerability_id, source, status, package_name, version_range, severity, action,
+       fixed_version, summary, references_json, created_by, created_at, updated_at
+FROM plugin_vulnerabilities
+WHERE vulnerability_id = ? AND package_name = ?
+ORDER BY id DESC
+LIMIT 1`, vulnerabilityID, packageName)
+	return scanVulnerability(row)
+}
+
+func (r Repository) ListVulnerabilities(ctx context.Context, packageName string) ([]VulnerabilityRecord, error) {
+	query := `
+SELECT id, vulnerability_id, source, status, package_name, version_range, severity, action,
+       fixed_version, summary, references_json, created_by, created_at, updated_at
+FROM plugin_vulnerabilities`
+	var args []any
+	if strings.TrimSpace(packageName) != "" {
+		query += ` WHERE package_name = ?`
+		args = append(args, strings.TrimSpace(packageName))
+	}
+	query += ` ORDER BY updated_at DESC, id DESC`
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var records []VulnerabilityRecord
+	for rows.Next() {
+		record, err := scanVulnerability(rows)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	return records, rows.Err()
+}
+
 func (r Repository) SaveRepositoryImport(ctx context.Context, record RepositoryImportRecord) (RepositoryImportRecord, error) {
 	now := r.now().Unix()
 	if record.CreatedAt == 0 {
@@ -927,6 +1200,85 @@ FROM plugin_repository_imports ORDER BY created_at DESC, id DESC`)
 		imports = append(imports, record)
 	}
 	return imports, rows.Err()
+}
+
+func (r Repository) SaveRepositoryIndexSync(ctx context.Context, record RepositoryIndexSyncRecord) (RepositoryIndexSyncRecord, error) {
+	now := r.now().Unix()
+	if record.CreatedAt == 0 {
+		record.CreatedAt = now
+	}
+	if record.Status == "" {
+		record.Status = RepositorySyncStatusSucceeded
+	}
+	_, err := r.db.ExecContext(ctx, `
+INSERT INTO plugin_repository_index_syncs(
+    repository_type, index_path, repository_name, status, cache_key, candidate_count, error, synced_by, created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		record.RepositoryType, record.IndexPath, record.RepositoryName, record.Status, record.CacheKey,
+		record.CandidateCount, record.Error, record.SyncedBy, record.CreatedAt)
+	if err != nil {
+		return RepositoryIndexSyncRecord{}, err
+	}
+	id, err := lastInsertID(ctx, r.db)
+	if err != nil {
+		return RepositoryIndexSyncRecord{}, err
+	}
+	return r.RepositoryIndexSync(ctx, id)
+}
+
+func (r Repository) RepositoryIndexSync(ctx context.Context, id int64) (RepositoryIndexSyncRecord, error) {
+	row := r.db.QueryRowContext(ctx, `
+SELECT id, repository_type, index_path, repository_name, status, cache_key, candidate_count, error, synced_by, created_at
+FROM plugin_repository_index_syncs WHERE id = ?`, id)
+	return scanRepositoryIndexSync(row)
+}
+
+func (r Repository) LatestRepositoryIndexSync(ctx context.Context, repositoryType, indexPath string) (RepositoryIndexSyncRecord, error) {
+	row := r.db.QueryRowContext(ctx, `
+SELECT id, repository_type, index_path, repository_name, status, cache_key, candidate_count, error, synced_by, created_at
+FROM plugin_repository_index_syncs
+WHERE repository_type = ? AND index_path = ? AND status IN (?, ?)
+ORDER BY created_at DESC, id DESC
+LIMIT 1`, repositoryType, indexPath, RepositorySyncStatusSucceeded, RepositorySyncStatusDegraded)
+	return scanRepositoryIndexSync(row)
+}
+
+func (r Repository) ListRepositoryIndexSyncs(ctx context.Context, repositoryType, indexPath string, limit int) ([]RepositoryIndexSyncRecord, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	query := `
+SELECT id, repository_type, index_path, repository_name, status, cache_key, candidate_count, error, synced_by, created_at
+FROM plugin_repository_index_syncs`
+	var args []any
+	var clauses []string
+	if repositoryType != "" {
+		clauses = append(clauses, "repository_type = ?")
+		args = append(args, repositoryType)
+	}
+	if indexPath != "" {
+		clauses = append(clauses, "index_path = ?")
+		args = append(args, indexPath)
+	}
+	if len(clauses) > 0 {
+		query += " WHERE " + strings.Join(clauses, " AND ")
+	}
+	query += ` ORDER BY created_at DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var records []RepositoryIndexSyncRecord
+	for rows.Next() {
+		record, err := scanRepositoryIndexSync(rows)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	return records, rows.Err()
 }
 
 func (r Repository) SaveSupplyChainAssessment(ctx context.Context, assessment SupplyChainAssessment) (SupplyChainAssessment, error) {
@@ -1019,6 +1371,105 @@ FROM plugin_supply_chain_assessments`
 		assessments = append(assessments, assessment)
 	}
 	return assessments, rows.Err()
+}
+
+func (r Repository) SaveTrustRoot(ctx context.Context, actor string, record TrustRootRecord) (TrustRootRecord, error) {
+	now := r.now().Unix()
+	if record.Algorithm == "" {
+		record.Algorithm = SignatureAlgorithmEd25519
+	}
+	if record.Status == "" {
+		record.Status = TrustRootStatusTrusted
+	}
+	if record.PolicyJSON == "" || !json.Valid([]byte(record.PolicyJSON)) {
+		record.PolicyJSON = "{}"
+	}
+	if record.RotatedAt == 0 {
+		record.RotatedAt = now
+	}
+	record.UpdatedAt = now
+	record.CreatedBy = actor
+	_, err := r.db.ExecContext(ctx, `
+INSERT INTO plugin_trust_roots(
+    root_id, key_id, algorithm, public_key, public_key_sha256, status, policy_json,
+    created_by, rotated_at, revoked_at, revocation_reason, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(root_id, key_id) DO UPDATE SET
+    algorithm = excluded.algorithm,
+    public_key = excluded.public_key,
+    public_key_sha256 = excluded.public_key_sha256,
+    status = excluded.status,
+    policy_json = excluded.policy_json,
+    created_by = excluded.created_by,
+    rotated_at = excluded.rotated_at,
+    revoked_at = CASE WHEN plugin_trust_roots.status = 'revoked' THEN plugin_trust_roots.revoked_at ELSE excluded.revoked_at END,
+    revocation_reason = CASE WHEN plugin_trust_roots.status = 'revoked' THEN plugin_trust_roots.revocation_reason ELSE excluded.revocation_reason END,
+    updated_at = excluded.updated_at`,
+		record.RootID, record.KeyID, record.Algorithm, record.PublicKey, record.PublicKeySHA256, record.Status,
+		record.PolicyJSON, record.CreatedBy, record.RotatedAt, record.RevokedAt, record.RevocationReason, record.UpdatedAt)
+	if err != nil {
+		return TrustRootRecord{}, err
+	}
+	return r.TrustRoot(ctx, record.RootID, record.KeyID)
+}
+
+func (r Repository) RevokeTrustRoot(ctx context.Context, actor, rootID, keyID, reason string) (TrustRootRecord, error) {
+	now := r.now().Unix()
+	res, err := r.db.ExecContext(ctx, `
+UPDATE plugin_trust_roots
+SET status = 'revoked', revoked_at = ?, revocation_reason = ?, created_by = ?, updated_at = ?
+WHERE root_id = ? AND key_id = ?`,
+		now, reason, actor, now, rootID, keyID)
+	if err != nil {
+		return TrustRootRecord{}, err
+	}
+	if rows, _ := res.RowsAffected(); rows == 0 {
+		return TrustRootRecord{}, sql.ErrNoRows
+	}
+	return r.TrustRoot(ctx, rootID, keyID)
+}
+
+func (r Repository) TrustRoot(ctx context.Context, rootID, keyID string) (TrustRootRecord, error) {
+	query := `
+SELECT id, root_id, key_id, algorithm, public_key, public_key_sha256, status, policy_json,
+       created_by, rotated_at, revoked_at, revocation_reason, updated_at
+FROM plugin_trust_roots
+WHERE root_id = ?`
+	args := []any{rootID}
+	if keyID != "" {
+		query += ` AND key_id = ?`
+		args = append(args, keyID)
+	}
+	query += ` ORDER BY status = 'trusted' DESC, rotated_at DESC, id DESC LIMIT 1`
+	row := r.db.QueryRowContext(ctx, query, args...)
+	return scanTrustRoot(row)
+}
+
+func (r Repository) ListTrustRoots(ctx context.Context, rootID string) ([]TrustRootRecord, error) {
+	query := `
+SELECT id, root_id, key_id, algorithm, public_key, public_key_sha256, status, policy_json,
+       created_by, rotated_at, revoked_at, revocation_reason, updated_at
+FROM plugin_trust_roots`
+	var args []any
+	if rootID != "" {
+		query += ` WHERE root_id = ?`
+		args = append(args, rootID)
+	}
+	query += ` ORDER BY root_id ASC, status = 'trusted' DESC, rotated_at DESC, id DESC`
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var records []TrustRootRecord
+	for rows.Next() {
+		record, err := scanTrustRoot(rows)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	return records, rows.Err()
 }
 
 func (r Repository) SavePreflight(ctx context.Context, record PreflightRecord) (PreflightRecord, error) {
@@ -1179,11 +1630,12 @@ func (r Repository) SaveInstrumentation(ctx context.Context, actor string, req I
 	}
 	_, err = r.db.ExecContext(ctx, `
 INSERT INTO plugin_instrumentation(
-    name, version, profile, generated_diff_hash, provenance_json, conformance_json,
-    benchmark_json, smoke_json, runbook_rollback, status, created_by, created_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		req.Name, req.Version, req.Profile, req.GeneratedDiffHash, provenance, conformance,
-		benchmark, smoke, req.RunbookRollback, req.Status, actor, now)
+    name, version, profile, generated_diff_hash, gateway_binary_sha256, ci_artifact_sha256,
+    provenance_json, conformance_json, benchmark_json, smoke_json, runbook_rollback, status,
+    created_by, created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		req.Name, req.Version, req.Profile, req.GeneratedDiffHash, req.GatewayBinarySHA256, req.CIArtifactSHA256,
+		provenance, conformance, benchmark, smoke, req.RunbookRollback, req.Status, actor, now)
 	if err != nil {
 		return InstrumentationRecord{}, err
 	}
@@ -1196,16 +1648,18 @@ INSERT INTO plugin_instrumentation(
 
 func (r Repository) Instrumentation(ctx context.Context, id int64) (InstrumentationRecord, error) {
 	row := r.db.QueryRowContext(ctx, `
-SELECT id, name, version, profile, generated_diff_hash, provenance_json, conformance_json,
-       benchmark_json, smoke_json, runbook_rollback, status, created_by, created_at
+SELECT id, name, version, profile, generated_diff_hash, gateway_binary_sha256,
+       ci_artifact_sha256, provenance_json, conformance_json, benchmark_json,
+       smoke_json, runbook_rollback, status, created_by, created_at
 FROM plugin_instrumentation WHERE id = ?`, id)
 	return scanInstrumentation(row)
 }
 
 func (r Repository) ListInstrumentation(ctx context.Context) ([]InstrumentationRecord, error) {
 	rows, err := r.db.QueryContext(ctx, `
-SELECT id, name, version, profile, generated_diff_hash, provenance_json, conformance_json,
-       benchmark_json, smoke_json, runbook_rollback, status, created_by, created_at
+SELECT id, name, version, profile, generated_diff_hash, gateway_binary_sha256,
+       ci_artifact_sha256, provenance_json, conformance_json, benchmark_json,
+       smoke_json, runbook_rollback, status, created_by, created_at
 FROM plugin_instrumentation ORDER BY created_at DESC, id DESC`)
 	if err != nil {
 		return nil, err
@@ -1223,14 +1677,14 @@ FROM plugin_instrumentation ORDER BY created_at DESC, id DESC`)
 }
 
 func (r Repository) RecordOperation(ctx context.Context, pluginID, artifactID, operation, status, actor, message string, metadata any) error {
-	metadataJSON, err := marshalDefaultObject(metadata)
+	metadataJSON, err := marshalDefaultObject(diagnosticSafeValue(metadata))
 	if err != nil {
 		return err
 	}
 	_, err = r.db.ExecContext(ctx, `
 INSERT INTO plugin_operations(plugin_id, artifact_id, operation, status, actor, message, metadata_json, created_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		pluginID, artifactID, operation, status, actor, message, metadataJSON, r.now().Unix())
+		pluginID, artifactID, operation, status, actor, redactSensitive(message), metadataJSON, r.now().Unix())
 	return err
 }
 
@@ -1319,6 +1773,110 @@ func (r Repository) RecentEvents(ctx context.Context, pluginID string, limit int
 	return events, rows.Err()
 }
 
+func (r Repository) SaveSubscriberDeadLetter(ctx context.Context, record SubscriberDeadLetterRecord) (int64, error) {
+	fields, err := marshalDefaultObject(record.Fields)
+	if err != nil {
+		return 0, err
+	}
+	now := r.now().Unix()
+	if record.CreatedAt == 0 {
+		record.CreatedAt = now
+	}
+	if record.UpdatedAt == 0 {
+		record.UpdatedAt = record.CreatedAt
+	}
+	if record.Status == "" {
+		record.Status = "pending"
+	}
+	result, err := r.db.ExecContext(ctx, `
+INSERT INTO plugin_subscriber_dead_letters(
+    subscriber_plugin_id, subscriber_artifact_id, event_plugin_id, event_name, fields_json,
+    trace_id, connection_id, delivery_mode, attempts, node_id, status, reason, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		record.SubscriberPluginID, record.SubscriberArtifactID, record.EventPluginID, record.EventName, fields,
+		record.TraceID, record.ConnectionID, record.DeliveryMode, record.Attempts, record.NodeID, record.Status, record.Reason,
+		record.CreatedAt, record.UpdatedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
+}
+
+func (r Repository) PendingSubscriberDeadLetters(ctx context.Context, limit int) ([]SubscriberDeadLetterRecord, error) {
+	if limit <= 0 {
+		limit = DefaultSubscriberDeadLetterLimit
+	}
+	rows, err := r.db.QueryContext(ctx, `
+SELECT id, subscriber_plugin_id, subscriber_artifact_id, event_plugin_id, event_name, fields_json,
+       trace_id, connection_id, delivery_mode, attempts, node_id, status, reason, created_at, updated_at
+FROM plugin_subscriber_dead_letters
+WHERE status = 'pending'
+ORDER BY created_at ASC, id ASC
+LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var records []SubscriberDeadLetterRecord
+	for rows.Next() {
+		record, err := scanSubscriberDeadLetter(rows)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	return records, rows.Err()
+}
+
+func (r Repository) CountPendingSubscriberDeadLetters(ctx context.Context) (uint64, error) {
+	row := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM plugin_subscriber_dead_letters WHERE status = 'pending'`)
+	var count uint64
+	if err := row.Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (r Repository) MarkSubscriberDeadLetter(ctx context.Context, id int64, status, reason string) error {
+	if id <= 0 {
+		return errors.New("dead letter id is required")
+	}
+	switch status {
+	case "pending", "replayed", "dropped":
+	default:
+		return fmt.Errorf("invalid subscriber dead letter status %q", status)
+	}
+	_, err := r.db.ExecContext(ctx, `
+UPDATE plugin_subscriber_dead_letters
+SET status = ?, reason = ?, updated_at = ?
+WHERE id = ?`,
+		status, reason, r.now().Unix(), id)
+	return err
+}
+
+func scanSubscriberDeadLetter(row rowScanner) (SubscriberDeadLetterRecord, error) {
+	var record SubscriberDeadLetterRecord
+	var fieldsJSON string
+	err := row.Scan(
+		&record.ID, &record.SubscriberPluginID, &record.SubscriberArtifactID, &record.EventPluginID, &record.EventName,
+		&fieldsJSON, &record.TraceID, &record.ConnectionID, &record.DeliveryMode, &record.Attempts, &record.NodeID,
+		&record.Status, &record.Reason, &record.CreatedAt, &record.UpdatedAt,
+	)
+	if err != nil {
+		return SubscriberDeadLetterRecord{}, err
+	}
+	_ = json.Unmarshal([]byte(defaultJSONObject(fieldsJSON)), &record.Fields)
+	return record, nil
+}
+
+func (r Repository) EventRetentionOverflow(ctx context.Context, pluginID string, keep int) (GCCandidate, bool, error) {
+	return r.recentTableOverflow(ctx, "plugin_events", pluginID, keep, "event", "event", "plugin event recent retention exceeded")
+}
+
+func (r Repository) DeleteEventRetentionOverflow(ctx context.Context, pluginID string, keep int) (int64, error) {
+	return r.deleteRecentTableOverflow(ctx, "plugin_events", pluginID, keep)
+}
+
 func (r Repository) SaveLog(ctx context.Context, log LogSummary) error {
 	fields, err := marshalDefaultObject(log.Fields)
 	if err != nil {
@@ -1361,6 +1919,14 @@ func (r Repository) RecentLogs(ctx context.Context, pluginID string, limit int) 
 	return logs, rows.Err()
 }
 
+func (r Repository) LogRetentionOverflow(ctx context.Context, pluginID string, keep int) (GCCandidate, bool, error) {
+	return r.recentTableOverflow(ctx, "plugin_logs", pluginID, keep, "plugin_log", "log", "log summary exceeds recent retention")
+}
+
+func (r Repository) DeleteLogRetentionOverflow(ctx context.Context, pluginID string, keep int) (int64, error) {
+	return r.deleteRecentTableOverflow(ctx, "plugin_logs", pluginID, keep)
+}
+
 func (r Repository) SaveTrace(ctx context.Context, trace TraceSummary, fields map[string]string) error {
 	fieldsJSON, err := marshalDefaultObject(fields)
 	if err != nil {
@@ -1399,6 +1965,274 @@ func (r Repository) RecentTraces(ctx context.Context, pluginID string, limit int
 		traces = append(traces, trace)
 	}
 	return traces, rows.Err()
+}
+
+func (r Repository) TraceRetentionOverflow(ctx context.Context, pluginID string, keep int) (GCCandidate, bool, error) {
+	return r.recentTableOverflow(ctx, "plugin_traces", pluginID, keep, "trace", "trace", "trace summary recent retention exceeded")
+}
+
+func (r Repository) DeleteTraceRetentionOverflow(ctx context.Context, pluginID string, keep int) (int64, error) {
+	return r.deleteRecentTableOverflow(ctx, "plugin_traces", pluginID, keep)
+}
+
+func (r Repository) recentTableOverflow(ctx context.Context, table, pluginID string, keep int, kind, category, reason string) (GCCandidate, bool, error) {
+	if keep <= 0 {
+		keep = 1
+	}
+	if table != "plugin_events" && table != "plugin_logs" && table != "plugin_traces" {
+		return GCCandidate{}, false, fmt.Errorf("unsupported retention table %q", table)
+	}
+	query := fmt.Sprintf(`
+SELECT COUNT(*), COALESCE(SUM(size_bytes), 0), COALESCE(MIN(created_at), 0)
+FROM (
+  SELECT id, created_at, LENGTH(plugin_id) + LENGTH(%s) AS size_bytes
+  FROM %s
+  WHERE plugin_id = ? AND id NOT IN (
+    SELECT id FROM %s WHERE plugin_id = ? ORDER BY created_at DESC, id DESC LIMIT ?
+  )
+)`, recentTableSizeExpression(table), table, table)
+	var count, size, oldest int64
+	if err := r.db.QueryRowContext(ctx, query, pluginID, pluginID, keep).Scan(&count, &size, &oldest); err != nil {
+		return GCCandidate{}, false, err
+	}
+	if count == 0 {
+		return GCCandidate{}, false, nil
+	}
+	return GCCandidate{
+		Kind:             kind,
+		Category:         category,
+		ID:               fmt.Sprintf("%s/overflow:%d", pluginID, keep),
+		PluginID:         pluginID,
+		Protected:        false,
+		Reason:           reason,
+		RetentionRule:    fmt.Sprintf("keep latest %d %s records per plugin", keep, category),
+		RetentionSeconds: 0,
+		SizeBytes:        size,
+		CreatedAt:        oldest,
+	}, true, nil
+}
+
+func (r Repository) deleteRecentTableOverflow(ctx context.Context, table, pluginID string, keep int) (int64, error) {
+	if keep <= 0 {
+		keep = 1
+	}
+	if table != "plugin_events" && table != "plugin_logs" && table != "plugin_traces" {
+		return 0, fmt.Errorf("unsupported retention table %q", table)
+	}
+	result, err := r.db.ExecContext(ctx, fmt.Sprintf(`
+DELETE FROM %s
+WHERE plugin_id = ? AND id NOT IN (
+  SELECT id FROM %s WHERE plugin_id = ? ORDER BY created_at DESC, id DESC LIMIT ?
+)`, table, table), pluginID, pluginID, keep)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+func recentTableSizeExpression(table string) string {
+	switch table {
+	case "plugin_events":
+		return "name) + LENGTH(fields_json) + LENGTH(reason) + LENGTH(trace_id) + LENGTH(connection_id"
+	case "plugin_logs":
+		return "level) + LENGTH(message) + LENGTH(fields_json) + LENGTH(trace_id) + LENGTH(connection_id"
+	case "plugin_traces":
+		return "trace_id) + LENGTH(connection_id) + LENGTH(handler_id) + LENGTH(operation) + LENGTH(status) + LENGTH(fields_json"
+	default:
+		return "''"
+	}
+}
+
+func (r Repository) AcquireTaskLease(ctx context.Context, pluginID, taskID, shardKey, owner string, ttl time.Duration) (TaskLeaseRecord, bool, error) {
+	if pluginID == "" || taskID == "" || owner == "" {
+		return TaskLeaseRecord{}, false, errors.New("plugin_id, task_id and owner_node_id are required")
+	}
+	if ttl <= 0 {
+		ttl = time.Minute
+	}
+	now := r.now()
+	nowUnix := now.Unix()
+	expiresAt := now.Add(ttl).Unix()
+	if expiresAt <= nowUnix {
+		expiresAt = nowUnix + 1
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return TaskLeaseRecord{}, false, err
+	}
+	defer tx.Rollback()
+
+	row := tx.QueryRowContext(ctx, `
+SELECT plugin_id, task_id, shard_key, owner_node_id, expires_at, acquired_at, updated_at
+FROM plugin_task_leases
+WHERE plugin_id = ? AND task_id = ? AND shard_key = ?`, pluginID, taskID, shardKey)
+	current, err := scanTaskLease(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		record := TaskLeaseRecord{
+			PluginID:    pluginID,
+			TaskID:      taskID,
+			ShardKey:    shardKey,
+			OwnerNodeID: owner,
+			ExpiresAt:   expiresAt,
+			AcquiredAt:  nowUnix,
+			UpdatedAt:   nowUnix,
+		}
+		result, err := tx.ExecContext(ctx, `
+INSERT OR IGNORE INTO plugin_task_leases(plugin_id, task_id, shard_key, owner_node_id, expires_at, acquired_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			record.PluginID, record.TaskID, record.ShardKey, record.OwnerNodeID, record.ExpiresAt, record.AcquiredAt, record.UpdatedAt)
+		if err != nil {
+			return TaskLeaseRecord{}, false, err
+		}
+		affected, _ := result.RowsAffected()
+		if affected == 1 {
+			if err := tx.Commit(); err != nil {
+				return TaskLeaseRecord{}, false, err
+			}
+			return record, true, nil
+		}
+		current, err = scanTaskLease(tx.QueryRowContext(ctx, `
+SELECT plugin_id, task_id, shard_key, owner_node_id, expires_at, acquired_at, updated_at
+FROM plugin_task_leases
+WHERE plugin_id = ? AND task_id = ? AND shard_key = ?`, pluginID, taskID, shardKey))
+		if err != nil {
+			return TaskLeaseRecord{}, false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return TaskLeaseRecord{}, false, err
+		}
+		return current, false, nil
+	}
+	if err != nil {
+		return TaskLeaseRecord{}, false, err
+	}
+	if current.OwnerNodeID != owner && current.ExpiresAt > nowUnix {
+		if err := tx.Commit(); err != nil {
+			return TaskLeaseRecord{}, false, err
+		}
+		return current, false, nil
+	}
+
+	acquiredAt := current.AcquiredAt
+	if current.OwnerNodeID != owner {
+		acquiredAt = nowUnix
+	}
+	record := TaskLeaseRecord{
+		PluginID:    pluginID,
+		TaskID:      taskID,
+		ShardKey:    shardKey,
+		OwnerNodeID: owner,
+		ExpiresAt:   expiresAt,
+		AcquiredAt:  acquiredAt,
+		UpdatedAt:   nowUnix,
+	}
+	result, err := tx.ExecContext(ctx, `
+UPDATE plugin_task_leases
+SET owner_node_id = ?, expires_at = ?, acquired_at = ?, updated_at = ?
+WHERE plugin_id = ? AND task_id = ? AND shard_key = ? AND (owner_node_id = ? OR expires_at <= ?)`,
+		record.OwnerNodeID, record.ExpiresAt, record.AcquiredAt, record.UpdatedAt,
+		pluginID, taskID, shardKey, owner, nowUnix)
+	if err != nil {
+		return TaskLeaseRecord{}, false, err
+	}
+	affected, _ := result.RowsAffected()
+	if affected != 1 {
+		current, err = scanTaskLease(tx.QueryRowContext(ctx, `
+SELECT plugin_id, task_id, shard_key, owner_node_id, expires_at, acquired_at, updated_at
+FROM plugin_task_leases
+WHERE plugin_id = ? AND task_id = ? AND shard_key = ?`, pluginID, taskID, shardKey))
+		if err != nil {
+			return TaskLeaseRecord{}, false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return TaskLeaseRecord{}, false, err
+		}
+		return current, false, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return TaskLeaseRecord{}, false, err
+	}
+	return record, true, nil
+}
+
+func (r Repository) RenewTaskLease(ctx context.Context, pluginID, taskID, shardKey, owner string, ttl time.Duration) (TaskLeaseRecord, bool, error) {
+	if pluginID == "" || taskID == "" || owner == "" {
+		return TaskLeaseRecord{}, false, errors.New("plugin_id, task_id and owner_node_id are required")
+	}
+	if ttl <= 0 {
+		ttl = time.Minute
+	}
+	now := r.now()
+	nowUnix := now.Unix()
+	expiresAt := now.Add(ttl).Unix()
+	if expiresAt <= nowUnix {
+		expiresAt = nowUnix + 1
+	}
+	result, err := r.db.ExecContext(ctx, `
+UPDATE plugin_task_leases
+SET expires_at = ?, updated_at = ?
+WHERE plugin_id = ? AND task_id = ? AND shard_key = ? AND owner_node_id = ? AND expires_at > ?`,
+		expiresAt, nowUnix, pluginID, taskID, shardKey, owner, nowUnix)
+	if err != nil {
+		return TaskLeaseRecord{}, false, err
+	}
+	affected, _ := result.RowsAffected()
+	row := r.db.QueryRowContext(ctx, `
+SELECT plugin_id, task_id, shard_key, owner_node_id, expires_at, acquired_at, updated_at
+FROM plugin_task_leases
+WHERE plugin_id = ? AND task_id = ? AND shard_key = ?`, pluginID, taskID, shardKey)
+	record, scanErr := scanTaskLease(row)
+	if errors.Is(scanErr, sql.ErrNoRows) {
+		return TaskLeaseRecord{}, false, nil
+	}
+	if scanErr != nil {
+		return TaskLeaseRecord{}, false, scanErr
+	}
+	return record, affected == 1, nil
+}
+
+func (r Repository) ReleaseTaskLease(ctx context.Context, pluginID, taskID, shardKey, owner string) error {
+	if pluginID == "" || taskID == "" || owner == "" {
+		return errors.New("plugin_id, task_id and owner_node_id are required")
+	}
+	_, err := r.db.ExecContext(ctx, `
+DELETE FROM plugin_task_leases
+WHERE plugin_id = ? AND task_id = ? AND shard_key = ? AND owner_node_id = ?`,
+		pluginID, taskID, shardKey, owner)
+	return err
+}
+
+func (r Repository) ListTaskLeases(ctx context.Context, pluginID string) ([]TaskLeaseRecord, error) {
+	query := `
+SELECT plugin_id, task_id, shard_key, owner_node_id, expires_at, acquired_at, updated_at
+FROM plugin_task_leases`
+	var args []any
+	if pluginID != "" {
+		query += ` WHERE plugin_id = ?`
+		args = append(args, pluginID)
+	}
+	query += ` ORDER BY expires_at ASC, plugin_id ASC, task_id ASC, shard_key ASC`
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var records []TaskLeaseRecord
+	for rows.Next() {
+		record, err := scanTaskLease(rows)
+		if err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	return records, rows.Err()
+}
+
+func (r Repository) DeleteTaskLease(ctx context.Context, pluginID, taskID, shardKey string) error {
+	_, err := r.db.ExecContext(ctx, `
+DELETE FROM plugin_task_leases
+WHERE plugin_id = ? AND task_id = ? AND shard_key = ?`, pluginID, taskID, shardKey)
+	return err
 }
 
 func (r Repository) PutPluginData(ctx context.Context, record PluginDataSummary, value []byte) error {
@@ -1537,6 +2371,46 @@ VALUES (?, ?, ?, ?, ?)`, pluginID, path, size, sectionsJSON, now)
 	return DiagnosticPackageSummary{PluginID: pluginID, CreatedAt: now, SizeBytes: size, Sections: sections}, nil
 }
 
+type diagnosticPackageRecord struct {
+	ID        int64
+	PluginID  string
+	Path      string
+	SizeBytes int64
+	Sections  []string
+	CreatedAt int64
+}
+
+func (r Repository) ListDiagnosticRecords(ctx context.Context, pluginID string) ([]diagnosticPackageRecord, error) {
+	query := `SELECT id, plugin_id, path, size_bytes, sections_json, created_at FROM plugin_diagnostics`
+	var args []any
+	if pluginID != "" {
+		query += ` WHERE plugin_id = ?`
+		args = append(args, pluginID)
+	}
+	query += ` ORDER BY created_at DESC, id DESC`
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var records []diagnosticPackageRecord
+	for rows.Next() {
+		var record diagnosticPackageRecord
+		var sectionsJSON string
+		if err := rows.Scan(&record.ID, &record.PluginID, &record.Path, &record.SizeBytes, &sectionsJSON, &record.CreatedAt); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal([]byte(defaultJSONArray(sectionsJSON)), &record.Sections)
+		records = append(records, record)
+	}
+	return records, rows.Err()
+}
+
+func (r Repository) DeleteDiagnostic(ctx context.Context, id int64) error {
+	_, err := r.db.ExecContext(ctx, `DELETE FROM plugin_diagnostics WHERE id = ?`, id)
+	return err
+}
+
 func (r Repository) ListDiagnostics(ctx context.Context, pluginID string, limit int) ([]DiagnosticPackageSummary, error) {
 	if limit <= 0 {
 		limit = 20
@@ -1593,6 +2467,7 @@ func scanPluginServiceState(row rowScanner) (PluginServiceState, error) {
 	var state PluginServiceState
 	err := row.Scan(
 		&state.DesiredMode, &state.ActiveMode, &state.AppliedAt, &state.LiveMigration,
+		&state.CrashPolicy.BackoffSeconds, &state.CrashPolicy.MaxCrashes, &state.CrashPolicy.WindowSeconds,
 		&state.LastError, &state.UpdatedBy, &state.UpdatedAt,
 	)
 	state = normalizePluginServiceState(state)
@@ -1661,7 +2536,7 @@ func scanReview(row rowScanner) (ReviewRecord, error) {
 	var review ReviewRecord
 	err := row.Scan(
 		&review.ID, &review.PluginID, &review.ArtifactID, &review.Profile, &review.RiskLevel,
-		&review.ConfigHash, &review.ScopeHash, &review.RolloutHash, &review.RuntimeLimitsHash,
+		&review.ConfigHash, &review.ScopeHash, &review.RolloutHash, &review.ArtifactHash, &review.RuntimeLimitsHash,
 		&review.FeaturesHash, &review.PolicyHash, &review.Decision, &review.Notes, &review.ReviewedBy, &review.CreatedAt,
 	)
 	return review, err
@@ -1687,6 +2562,21 @@ func scanAdvisory(row rowScanner) (AdvisoryRecord, error) {
 	return advisory, err
 }
 
+func scanVulnerability(row rowScanner) (VulnerabilityRecord, error) {
+	var record VulnerabilityRecord
+	var referencesJSON string
+	err := row.Scan(
+		&record.ID, &record.VulnerabilityID, &record.Source, &record.Status, &record.PackageName,
+		&record.VersionRange, &record.Severity, &record.Action, &record.FixedVersion,
+		&record.Summary, &referencesJSON, &record.CreatedBy, &record.CreatedAt, &record.UpdatedAt,
+	)
+	if err != nil {
+		return record, err
+	}
+	_ = json.Unmarshal([]byte(defaultJSONArray(referencesJSON)), &record.References)
+	return record, nil
+}
+
 func scanPreflight(row rowScanner) (PreflightRecord, error) {
 	var record PreflightRecord
 	err := row.Scan(
@@ -1706,6 +2596,15 @@ func scanBenchmark(row rowScanner) (BenchmarkRecord, error) {
 	return record, err
 }
 
+func scanTaskLease(row rowScanner) (TaskLeaseRecord, error) {
+	var record TaskLeaseRecord
+	err := row.Scan(
+		&record.PluginID, &record.TaskID, &record.ShardKey, &record.OwnerNodeID,
+		&record.ExpiresAt, &record.AcquiredAt, &record.UpdatedAt,
+	)
+	return record, err
+}
+
 func scanRepositoryImport(row rowScanner) (RepositoryImportRecord, error) {
 	var record RepositoryImportRecord
 	err := row.Scan(
@@ -1713,6 +2612,16 @@ func scanRepositoryImport(row rowScanner) (RepositoryImportRecord, error) {
 		&record.CandidateID, &record.PluginID, &record.Version, &record.ArtifactID,
 		&record.PackageSHA256, &record.TrustPolicy, &record.AdmissionJSON,
 		&record.ImportedBy, &record.CreatedAt,
+	)
+	return record, err
+}
+
+func scanRepositoryIndexSync(row rowScanner) (RepositoryIndexSyncRecord, error) {
+	var record RepositoryIndexSyncRecord
+	err := row.Scan(
+		&record.ID, &record.RepositoryType, &record.IndexPath, &record.RepositoryName,
+		&record.Status, &record.CacheKey, &record.CandidateCount, &record.Error,
+		&record.SyncedBy, &record.CreatedAt,
 	)
 	return record, err
 }
@@ -1737,13 +2646,24 @@ func scanSupplyChainAssessment(row rowScanner) (SupplyChainAssessment, error) {
 	return assessment, nil
 }
 
+func scanTrustRoot(row rowScanner) (TrustRootRecord, error) {
+	var record TrustRootRecord
+	err := row.Scan(
+		&record.ID, &record.RootID, &record.KeyID, &record.Algorithm,
+		&record.PublicKey, &record.PublicKeySHA256, &record.Status, &record.PolicyJSON,
+		&record.CreatedBy, &record.RotatedAt, &record.RevokedAt, &record.RevocationReason,
+		&record.UpdatedAt,
+	)
+	return record, err
+}
+
 func scanInstrumentation(row rowScanner) (InstrumentationRecord, error) {
 	var record InstrumentationRecord
 	err := row.Scan(
 		&record.ID, &record.Name, &record.Version, &record.Profile, &record.GeneratedDiffHash,
-		&record.ProvenanceJSON, &record.ConformanceJSON, &record.BenchmarkJSON,
-		&record.SmokeJSON, &record.RunbookRollback, &record.Status, &record.CreatedBy,
-		&record.CreatedAt,
+		&record.GatewayBinarySHA256, &record.CIArtifactSHA256, &record.ProvenanceJSON,
+		&record.ConformanceJSON, &record.BenchmarkJSON, &record.SmokeJSON,
+		&record.RunbookRollback, &record.Status, &record.CreatedBy, &record.CreatedAt,
 	)
 	return record, err
 }
@@ -1794,8 +2714,22 @@ func normalizePluginServiceState(state PluginServiceState) PluginServiceState {
 	if state.LiveMigration == "" {
 		state.LiveMigration = PluginMigrationDrainOnly
 	}
+	state.CrashPolicy = normalizePluginHostCrashPolicy(state.CrashPolicy)
 	state.RestartRequired = state.DesiredMode != state.ActiveMode
 	return state
+}
+
+func normalizePluginHostCrashPolicy(policy PluginHostCrashPolicy) PluginHostCrashPolicy {
+	if policy.BackoffSeconds <= 0 {
+		policy.BackoffSeconds = DefaultPluginHostCrashBackoffSeconds
+	}
+	if policy.MaxCrashes <= 0 {
+		policy.MaxCrashes = DefaultPluginHostCrashMaxCrashes
+	}
+	if policy.WindowSeconds <= 0 {
+		policy.WindowSeconds = DefaultPluginHostCrashWindowSeconds
+	}
+	return policy
 }
 
 func boolInt(value bool) int {

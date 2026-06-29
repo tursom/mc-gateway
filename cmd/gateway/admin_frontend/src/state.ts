@@ -1,6 +1,6 @@
 // cmd/gateway/admin_frontend/src/state.ts 保存各视图模块共享的可变客户端状态。
 
-import type { PluginArtifact, PluginBuild, PluginInstrumentation, PluginServiceStatus, PluginView, RouteRecord, ServiceRecord, User } from "./types.js";
+import type { PluginArtifact, PluginBuild, PluginFeatureFacts, PluginInstrumentation, PluginServiceStatus, PluginView, RouteRecord, ServiceRecord, User } from "./types.js";
 
 export const tokenStorageKey = "mcGatewayAdminToken";
 export const languageStorageKey = "mcGatewayAdminLanguage";
@@ -16,6 +16,7 @@ export interface AppState {
   plugins: PluginView[];
   pluginArtifacts: PluginArtifact[];
   pluginBuilds: PluginBuild[];
+  pluginFeatures: PluginFeatureFacts | null;
   pluginService: PluginServiceStatus | null;
   pluginInstrumentation: PluginInstrumentation[];
   selectedPluginID: string;
@@ -33,6 +34,7 @@ export const state: AppState = {
   plugins: [],
   pluginArtifacts: [],
   pluginBuilds: [],
+  pluginFeatures: null,
   pluginService: null,
   pluginInstrumentation: [],
   selectedPluginID: "",

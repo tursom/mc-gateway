@@ -1,6 +1,6 @@
 module github.com/tursom/mc-gateway/examples/plugins/upstream-rewrite
 
-go 1.24.0
+go 1.25.0
 
 require github.com/tursom/mc-gateway v0.0.0
 

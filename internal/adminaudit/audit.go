@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"strings"
 	"time"
 )
 
@@ -54,7 +55,7 @@ func (r Repository) RecordWithMetadata(ctx context.Context, actor, sourceIP, act
 	}
 	metadataJSON := "{}"
 	if metadata != nil {
-		data, err := json.Marshal(metadata)
+		data, err := json.Marshal(redactAuditValue(metadata, ""))
 		if err != nil {
 			return err
 		}
@@ -63,7 +64,7 @@ func (r Repository) RecordWithMetadata(ctx context.Context, actor, sourceIP, act
 	_, err := r.db.ExecContext(ctx, `
 INSERT INTO audit_logs(actor, source_ip, action, target_type, target_id, success, message, metadata_json, created_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		actor, sourceIP, action, targetType, targetID, boolToInt(success), message, metadataJSON, r.now().Unix())
+		actor, sourceIP, action, targetType, targetID, boolToInt(success), redactAuditText(message), metadataJSON, r.now().Unix())
 	return err
 }
 
@@ -99,4 +100,71 @@ func boolToInt(value bool) int {
 		return 1
 	}
 	return 0
+}
+
+func redactAuditValue(value any, key string) any {
+	if isAuditSensitiveName(key) {
+		return "[REDACTED]"
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for childKey, child := range typed {
+			out[childKey] = redactAuditValue(child, childKey)
+		}
+		return out
+	case map[string]string:
+		out := make(map[string]string, len(typed))
+		for childKey, child := range typed {
+			if isAuditSensitiveName(childKey) {
+				out[childKey] = "[REDACTED]"
+			} else {
+				out[childKey] = redactAuditText(child)
+			}
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for i, child := range typed {
+			out[i] = redactAuditValue(child, key)
+		}
+		return out
+	case string:
+		return redactAuditText(typed)
+	case nil, bool, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, float32, float64:
+		return value
+	default:
+		data, err := json.Marshal(value)
+		if err != nil {
+			return value
+		}
+		var decoded any
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			return value
+		}
+		return redactAuditValue(decoded, key)
+	}
+}
+
+func redactAuditText(text string) string {
+	if text == "" {
+		return ""
+	}
+	lower := strings.ToLower(text)
+	for _, marker := range []string{"secret", "token", "password", "credential", "authorization", "session", "packet"} {
+		if strings.Contains(lower, marker) {
+			return "[REDACTED]"
+		}
+	}
+	return text
+}
+
+func isAuditSensitiveName(name string) bool {
+	lower := strings.ToLower(name)
+	for _, marker := range []string{"secret", "token", "password", "credential", "authorization"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }

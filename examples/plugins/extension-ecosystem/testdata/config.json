@@ -1,0 +1,18 @@
+{
+  "override_host": "blue.example",
+  "override_upstream": "127.0.0.1:25566",
+  "reject_host": "blocked.example",
+  "deny_source_cidr": "203.0.113.0/24",
+  "allow_source_cidr": "198.51.100.0/24",
+  "rewrite_host": "legacy.example",
+  "rewrite_target": "blue.example",
+  "upstream_rewrite": "127.0.0.1:25567",
+  "rate_limit": 2,
+  "rate_window": "1m",
+  "maintenance": false,
+  "maintenance_window": "02:00-03:00 UTC",
+  "favicon": "data:image/png;base64,fixture",
+  "version_text": "mc-gateway",
+  "online_players": 1,
+  "max_players": 20
+}

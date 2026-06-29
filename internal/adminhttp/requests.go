@@ -68,16 +68,30 @@ type PluginRollbackRequest struct {
 }
 
 type PluginServiceRequest struct {
-	DesiredMode string `json:"desired_mode"`
+	DesiredMode string                           `json:"desired_mode"`
+	CrashPolicy *PluginServiceCrashPolicyRequest `json:"crash_policy,omitempty"`
+}
+
+type PluginServiceCrashPolicyRequest struct {
+	BackoffSeconds *int64 `json:"backoff_seconds,omitempty"`
+	MaxCrashes     *int64 `json:"max_crashes,omitempty"`
+	WindowSeconds  *int64 `json:"window_seconds,omitempty"`
 }
 
 type PluginRepositoryImportRequest struct {
-	RepositoryType string `json:"repository_type"`
-	IndexPath      string `json:"index_path"`
-	ArtifactID     string `json:"artifact_id"`
-	PluginID       string `json:"plugin_id"`
-	Version        string `json:"version"`
-	TrustPolicy    string `json:"trust_policy"`
+	RepositoryType string         `json:"repository_type"`
+	IndexPath      string         `json:"index_path"`
+	ArtifactID     string         `json:"artifact_id"`
+	PluginID       string         `json:"plugin_id"`
+	Version        string         `json:"version"`
+	TrustPolicy    string         `json:"trust_policy"`
+	Action         string         `json:"action"`
+	ImportID       int64          `json:"import_id"`
+	DesiredState   string         `json:"desired_state"`
+	Priority       int            `json:"priority"`
+	Config         map[string]any `json:"config"`
+	ConfigJSON     string         `json:"config_json"`
+	DryRun         bool           `json:"dry_run"`
 }
 
 type PluginSupplyChainRequest struct {

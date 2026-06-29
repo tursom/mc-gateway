@@ -4,10 +4,15 @@ package pluginmanager
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/tursom/mc-gateway/plugin/api"
 )
 
 func TestGovernanceHighRiskProtocolProxyRequiresReview(t *testing.T) {
@@ -29,6 +34,79 @@ func TestGovernanceHighRiskProtocolProxyRequiresReview(t *testing.T) {
 	}
 	if _, err := manager.Enable(context.Background(), "admin", "proxy-review"); err != nil {
 		t.Fatalf("Enable(after review) error = %v", err)
+	}
+}
+
+func TestGovernanceBlocksFailedPackagedConformance(t *testing.T) {
+	manager := newManagerForTest(t, &fakeAdapter{})
+	packagePath := writeTestMCGP(t, map[string][]byte{
+		"manifest.json": testManifestBytes(t, "conformance-gate"),
+		"plugin.so":     []byte("fake plugin bytes"),
+		"conformance.json": []byte(`{
+			"fixtures":[{"name":"protocol-proxy.panic","status":"fail","expected":"panic_recovered"}]
+		}`),
+	})
+	artifact, err := manager.UploadArtifact(context.Background(), ArtifactUpload{
+		SourcePath: packagePath,
+		FileName:   "conformance-gate.mcgp",
+		Actor:      "admin",
+	})
+	if err != nil {
+		t.Fatalf("UploadArtifact() error = %v", err)
+	}
+	if _, err := manager.SetDesired(context.Background(), "admin", "conformance-gate", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	preflight, err := manager.RunPreflight(context.Background(), "admin", "conformance-gate", PreflightRequest{
+		ArtifactID: artifact.ID,
+		Profile:    PolicyProfileDev,
+		Action:     GovernanceActionEnable,
+		ConfigJSON: `{}`,
+	})
+	if err != nil {
+		t.Fatalf("RunPreflight() error = %v", err)
+	}
+	if preflight.OK || !preflightCheckCodes(preflight.Checks)["conformance_fixture_failed"] {
+		t.Fatalf("preflight = %+v, want conformance_fixture_failed block", preflight)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", "conformance-gate"); err == nil || !strings.Contains(err.Error(), "conformance_fixture_failed") {
+		t.Fatalf("Enable() error = %v, want conformance fixture gate", err)
+	}
+}
+
+func TestGovernanceStrictPolicyBlocksMissingConformance(t *testing.T) {
+	manager := New(Options{
+		DB:                        openPluginManagerTestDB(t),
+		ArtifactRoot:              t.TempDir(),
+		Adapter:                   &fakeAdapter{},
+		PolicyProfile:             PolicyProfileProd,
+		RequireConformanceFixture: true,
+	})
+	artifact := uploadTestArtifact(t, manager, "missing-conformance")
+	if _, err := manager.SetDesired(context.Background(), "admin", "missing-conformance", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	preflight, err := manager.RunPreflight(context.Background(), "admin", "missing-conformance", PreflightRequest{
+		ArtifactID: artifact.ID,
+		Profile:    PolicyProfileProd,
+		Action:     GovernanceActionEnable,
+		ConfigJSON: `{}`,
+	})
+	if err != nil {
+		t.Fatalf("RunPreflight() error = %v", err)
+	}
+	if preflight.OK || !preflightCheckCodes(preflight.Checks)["conformance_fixture_missing"] {
+		t.Fatalf("preflight = %+v, want conformance_fixture_missing block", preflight)
+	}
+	decision, err := manager.EvaluateGovernance(context.Background(), "missing-conformance", artifact.ID, GovernanceActionEnable, PolicyProfileProd, `{}`)
+	if err != nil {
+		t.Fatalf("EvaluateGovernance() error = %v", err)
+	}
+	if decision.OK || !governanceIssueCodes(decision.Issues)["conformance_fixture_missing"] {
+		t.Fatalf("decision = %+v, want conformance_fixture_missing issue", decision)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", "missing-conformance"); err == nil || !strings.Contains(err.Error(), "conformance_fixture_missing") {
+		t.Fatalf("Enable() error = %v, want missing conformance fixture gate", err)
 	}
 }
 
@@ -96,9 +174,129 @@ func TestGovernanceAdvisoryRevokeBlocksRollback(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpsertAdvisory() error = %v", err)
 	}
-	_, err := manager.RollbackArtifact(context.Background(), "admin", "revoke-plugin", oldArtifact.ID)
+	before, err := manager.Plugin(context.Background(), "revoke-plugin")
+	if err != nil {
+		t.Fatalf("Plugin(before rollback) error = %v", err)
+	}
+	_, err = manager.RollbackArtifact(context.Background(), "admin", "revoke-plugin", oldArtifact.ID)
 	if err == nil || !strings.Contains(err.Error(), "advisory_revoke") {
 		t.Fatalf("RollbackArtifact() error = %v, want advisory_revoke", err)
+	}
+	after, err := manager.Plugin(context.Background(), "revoke-plugin")
+	if err != nil {
+		t.Fatalf("Plugin(after rollback) error = %v", err)
+	}
+	if after.DesiredArtifactID != before.DesiredArtifactID || after.DesiredGeneration != before.DesiredGeneration {
+		t.Fatalf("plugin after blocked rollback = %+v, want unchanged %+v", after, before)
+	}
+}
+
+func TestGovernanceExternalCIProvenanceBlocksRollback(t *testing.T) {
+	manager := newManagerForTestWithBuildersProfile(t, &fakeAdapter{}, nil, PolicyProfileProd)
+	oldArtifact := uploadTestArtifactWithProvenance(t, manager, "external-ci-rollback", map[string]any{
+		"external_ci": map[string]any{
+			"required":        true,
+			"artifact_sha256": "wrong-artifact-sha",
+			"run_id":          "github-actions/run-rollback",
+		},
+	})
+	if _, err := manager.SetDesired(context.Background(), "admin", "external-ci-rollback", oldArtifact.ID, DesiredDisabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired(old) error = %v", err)
+	}
+	newArtifact := uploadTestArtifactWithManifestBytes(t, manager, "external-ci-rollback", []byte("new plugin bytes external-ci-rollback"), func(manifest *Manifest) {
+		manifest.Version = "0.2.0"
+	})
+	if _, err := manager.SetDesired(context.Background(), "admin", "external-ci-rollback", newArtifact.ID, DesiredDisabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired(new) error = %v", err)
+	}
+	before, err := manager.Plugin(context.Background(), "external-ci-rollback")
+	if err != nil {
+		t.Fatalf("Plugin(before rollback) error = %v", err)
+	}
+	_, err = manager.RollbackArtifact(context.Background(), "admin", "external-ci-rollback", oldArtifact.ID)
+	if err == nil || !strings.Contains(err.Error(), "external_ci_artifact_hash_mismatch") {
+		t.Fatalf("RollbackArtifact() error = %v, want external_ci_artifact_hash_mismatch", err)
+	}
+	after, err := manager.Plugin(context.Background(), "external-ci-rollback")
+	if err != nil {
+		t.Fatalf("Plugin(after rollback) error = %v", err)
+	}
+	if after.DesiredArtifactID != before.DesiredArtifactID || after.DesiredGeneration != before.DesiredGeneration {
+		t.Fatalf("plugin after blocked rollback = %+v, want unchanged %+v", after, before)
+	}
+}
+
+func TestGovernanceAdvisoryQuarantineRemovesExtensionDispatch(t *testing.T) {
+	adapter := &fakeAdapter{
+		initOnly: true,
+		initHook: func(gateway *Gateway) error {
+			if err := api.RegisterHookHandler(gateway, api.HookRouteResolve,
+				func(api.RouteResolveRequest) bool { return true },
+				func(req api.RouteResolveRequest) (api.RouteDecision, error) {
+					return api.RouteDecision{
+						Action:     api.RouteDecisionOverride,
+						Upstream:   "10.0.0.10:25565",
+						Reason:     "cached quarantine fixture",
+						CacheTTL:   time.Minute,
+						ProviderID: "quarantine-plugin",
+					}, nil
+				}); err != nil {
+				return err
+			}
+			return api.RegisterHookHandler(gateway, api.HookStatusPing,
+				func(api.StatusPingRequest) bool { return true },
+				func(req api.StatusPingRequest) (api.StatusPingResponse, error) {
+					return api.StatusPingResponse{MOTD: "quarantine " + req.Host}, nil
+				})
+		},
+	}
+	manager := newManagerForTest(t, adapter)
+	artifact := uploadTestArtifactWithManifest(t, manager, "quarantine-plugin", func(manifest *Manifest) {
+		manifest.ExtensionPoints = []ExtensionPoint{
+			{Type: "provider", Key: ExtensionRouteResolve},
+			{Type: "hook", Key: ExtensionStatusPing},
+		}
+		manifest.Capabilities = json.RawMessage(`{"extension_points":["route.resolve/v1","status.ping/v1"],"route":{"cache_ttl_ms":60000},"status":{"hosts":["play.example"]}}`)
+	})
+	if _, err := manager.SetDesired(context.Background(), "admin", "quarantine-plugin", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", "quarantine-plugin"); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	route, err := manager.ResolveRoute(context.Background(), api.RouteResolveRequest{Host: "play.example"}, nil)
+	if err != nil || route.Source != "provider" || route.Decision.Upstream != "10.0.0.10:25565" {
+		t.Fatalf("ResolveRoute(before quarantine) = %+v err=%v, want provider override", route, err)
+	}
+	status, err := manager.StatusPing(context.Background(), api.StatusPingRequest{Host: "play.example"})
+	if err != nil || !status.Handled {
+		t.Fatalf("StatusPing(before quarantine) = %+v err=%v, want handled", status, err)
+	}
+	if _, err := manager.UpsertAdvisory(context.Background(), "admin", AdvisoryRequest{
+		AdvisoryID: "MCG-2026-QUARANTINE",
+		Action:     AdvisoryActionQuarantine,
+		PluginID:   "quarantine-plugin",
+	}); err != nil {
+		t.Fatalf("UpsertAdvisory() error = %v", err)
+	}
+	plan := manager.DispatchPlan(context.Background())
+	if len(plan.Routes) != 0 || len(plan.Statuses) != 0 {
+		t.Fatalf("dispatch plan after quarantine = %+v, want extension dispatch removed", plan)
+	}
+	status, err = manager.StatusPing(context.Background(), api.StatusPingRequest{Host: "play.example"})
+	if err != nil || status.Handled {
+		t.Fatalf("StatusPing(after quarantine) = %+v err=%v, want default fallback", status, err)
+	}
+	route, err = manager.ResolveRoute(context.Background(), api.RouteResolveRequest{Host: "play.example", FallbackUpstream: "sqlite:25565", FallbackHit: true}, nil)
+	if err != nil || route.Source != "sqlite_fallback" || route.Decision.Upstream != "sqlite:25565" {
+		t.Fatalf("ResolveRoute(after quarantine) = %+v err=%v, want sqlite fallback without stale cache", route, err)
+	}
+	plugin, err := manager.Plugin(context.Background(), "quarantine-plugin")
+	if err != nil {
+		t.Fatalf("Plugin(after quarantine) error = %v", err)
+	}
+	if plugin.RuntimeState != RuntimeDraining || plugin.DesiredState != DesiredEnabled {
+		t.Fatalf("plugin after quarantine = %+v, want draining runtime with desired state preserved", plugin)
 	}
 }
 
@@ -173,4 +371,271 @@ func TestGovernanceBenchmarkBlocking(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "benchmark_regression_blocking") {
 		t.Fatalf("Enable() error = %v, want benchmark_regression_blocking", err)
 	}
+}
+
+func TestGovernanceProdBlocksLocalProcessSourceBuildProvenance(t *testing.T) {
+	builder := &fakeBuilder{result: fakeSourceBuildResult(t, "source-local", BuilderTypeLocalProcess, "", "")}
+	manager := newManagerForTestWithBuildersProfile(t, &fakeAdapter{}, map[string]SourceBuilder{
+		BuilderTypeLocalProcess: builder,
+	}, PolicyProfileDev)
+	_ = uploadTestSource(t, manager, "source-local")
+	builds, err := manager.ListBuilds(context.Background(), "source-local")
+	if err != nil {
+		t.Fatalf("ListBuilds() error = %v", err)
+	}
+	if len(builds) != 1 || builds[0].BuilderType != BuilderTypeLocalProcess {
+		t.Fatalf("builds = %+v, want one local-process build", builds)
+	}
+	build, err := manager.RunBuild(context.Background(), "admin", builds[0].ID)
+	if err != nil {
+		t.Fatalf("RunBuild() error = %v", err)
+	}
+	if build.Status != BuildStatusSucceeded || build.ArtifactID == "" {
+		t.Fatalf("build = %+v, want succeeded with artifact", build)
+	}
+	if _, err := manager.SetDesired(context.Background(), "admin", "source-local", build.ArtifactID, DesiredDisabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	if err := manager.SetPolicyProfile(PolicyProfileProd); err != nil {
+		t.Fatalf("SetPolicyProfile() error = %v", err)
+	}
+	decision, err := manager.EvaluateGovernance(context.Background(), "source-local", build.ArtifactID, GovernanceActionEnable, PolicyProfileProd, `{}`)
+	if err != nil {
+		t.Fatalf("EvaluateGovernance() error = %v", err)
+	}
+	if decision.OK || !governanceIssueCodes(decision.Issues)["source_build_local_process_prod"] {
+		t.Fatalf("decision = %+v, want source_build_local_process_prod block", decision)
+	}
+	result, err := manager.RunPreflight(context.Background(), "admin", "source-local", PreflightRequest{
+		ArtifactID: build.ArtifactID,
+		Profile:    PolicyProfileProd,
+		Action:     GovernanceActionEnable,
+		ConfigJSON: `{}`,
+	})
+	if err != nil {
+		t.Fatalf("RunPreflight() error = %v", err)
+	}
+	if result.OK || !preflightCheckCodes(result.Checks)["source_build_local_process_prod"] {
+		t.Fatalf("preflight = %+v, want source_build_local_process_prod block", result)
+	}
+}
+
+func TestGovernanceProdAllowsContainerSourceBuildWithProvenance(t *testing.T) {
+	builderImage, builderDigest := testPinnedBuilderImage()
+	t.Setenv("MC_GATEWAY_PLUGIN_BUILDER_IMAGE", builderImage)
+	builder := &fakeBuilder{result: fakeSourceBuildResult(t, "source-container", BuilderTypeContainer, builderImage, builderDigest)}
+	manager := newManagerForTestWithBuildersProfile(t, &fakeAdapter{}, map[string]SourceBuilder{
+		BuilderTypeLocalProcess: &fakeBuilder{},
+		BuilderTypeContainer:    builder,
+	}, PolicyProfileProd)
+	_ = uploadTestSource(t, manager, "source-container")
+	builds, err := manager.ListBuilds(context.Background(), "source-container")
+	if err != nil {
+		t.Fatalf("ListBuilds() error = %v", err)
+	}
+	if len(builds) != 1 || builds[0].BuilderType != BuilderTypeContainer {
+		t.Fatalf("builds = %+v, want one container build", builds)
+	}
+	build, err := manager.RunBuild(context.Background(), "admin", builds[0].ID)
+	if err != nil {
+		t.Fatalf("RunBuild() error = %v", err)
+	}
+	if build.Status != BuildStatusSucceeded || build.ArtifactID == "" {
+		t.Fatalf("build = %+v, want succeeded with artifact", build)
+	}
+	if _, err := manager.SetDesired(context.Background(), "admin", "source-container", build.ArtifactID, DesiredDisabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	decision, err := manager.EvaluateGovernance(context.Background(), "source-container", build.ArtifactID, GovernanceActionEnable, PolicyProfileProd, `{}`)
+	if err != nil {
+		t.Fatalf("EvaluateGovernance() error = %v", err)
+	}
+	issueCodes := governanceIssueCodes(decision.Issues)
+	if !decision.OK || issueCodes["source_build_builder_digest_missing"] || issueCodes["source_build_builder_image_not_pinned"] {
+		t.Fatalf("decision = %+v, want container source build admitted without builder image warnings", decision)
+	}
+	if issueCodes["source_build_builder_image_release_unbound"] {
+		t.Fatalf("decision = %+v, want release-bound builder image admitted without release warning", decision)
+	}
+	assessment, err := manager.AssessSupplyChain(context.Background(), "admin", "source-container", build.ArtifactID, map[string]any{})
+	if err != nil {
+		t.Fatalf("AssessSupplyChain() error = %v", err)
+	}
+	sourceBuild := jsonMapFromAny(assessment.Metadata["source_build"])
+	if sourceBuild == nil ||
+		sourceBuild["prod_admission"] != "allowed" ||
+		sourceBuild["builder_image_digest"] != builderDigest ||
+		sourceBuild["builder_image_pinned"] != true ||
+		sourceBuild["builder_image_gateway_release_bound"] != true ||
+		sourceBuild["builder_image_go_version_bound"] != true ||
+		sourceBuild["builder_image_api_version_bound"] != true ||
+		sourceBuild["builder_image_target_bound"] != true ||
+		sourceBuild["builder_image_release_bound"] != true ||
+		sourceBuild["builder_go_version_matches_gateway"] != true ||
+		sourceBuild["builder_target_matches_gateway"] != true {
+		t.Fatalf("source_build assessment metadata = %+v, want allowed provenance with digest", sourceBuild)
+	}
+}
+
+func TestGovernanceProdWarnsContainerSourceBuildFloatingBuilderImage(t *testing.T) {
+	digest := strings.Repeat("b", 64)
+	builderImage := "golang:" + strings.TrimPrefix(runtime.Version(), "go")
+	builderDigest := "golang@sha256:" + digest
+	t.Setenv("MC_GATEWAY_PLUGIN_BUILDER_IMAGE", builderImage)
+	builder := &fakeBuilder{result: fakeSourceBuildResult(t, "source-floating-builder", BuilderTypeContainer, builderImage, builderDigest)}
+	manager := newManagerForTestWithBuildersProfile(t, &fakeAdapter{}, map[string]SourceBuilder{
+		BuilderTypeLocalProcess: &fakeBuilder{},
+		BuilderTypeContainer:    builder,
+	}, PolicyProfileProd)
+	_ = uploadTestSource(t, manager, "source-floating-builder")
+	builds, err := manager.ListBuilds(context.Background(), "source-floating-builder")
+	if err != nil {
+		t.Fatalf("ListBuilds() error = %v", err)
+	}
+	build, err := manager.RunBuild(context.Background(), "admin", builds[0].ID)
+	if err != nil {
+		t.Fatalf("RunBuild() error = %v", err)
+	}
+	if _, err := manager.SetDesired(context.Background(), "admin", "source-floating-builder", build.ArtifactID, DesiredDisabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	decision, err := manager.EvaluateGovernance(context.Background(), "source-floating-builder", build.ArtifactID, GovernanceActionEnable, PolicyProfileProd, `{}`)
+	if err != nil {
+		t.Fatalf("EvaluateGovernance() error = %v", err)
+	}
+	issueCodes := governanceIssueCodes(decision.Issues)
+	if decision.OK || !issueCodes["source_build_builder_image_not_pinned"] || issueCodes["source_build_builder_digest_missing"] {
+		t.Fatalf("decision = %+v, want floating builder image warning without digest missing warning", decision)
+	}
+	assessment, err := manager.AssessSupplyChain(context.Background(), "admin", "source-floating-builder", build.ArtifactID, map[string]any{})
+	if err != nil {
+		t.Fatalf("AssessSupplyChain() error = %v", err)
+	}
+	sourceBuild := jsonMapFromAny(assessment.Metadata["source_build"])
+	if sourceBuild == nil || sourceBuild["prod_admission"] != "warning" || sourceBuild["builder_image_pinned"] != false || sourceBuild["builder_image_go_version_bound"] != true {
+		t.Fatalf("source_build assessment metadata = %+v, want warning provenance for floating builder image", sourceBuild)
+	}
+}
+
+func TestGovernanceProdWarnsContainerBuilderImageWithoutReleaseBinding(t *testing.T) {
+	digest := strings.Repeat("c", 64)
+	version := strings.TrimPrefix(runtime.Version(), "go")
+	builderImage := "ghcr.io/tursom/mc-gateway-plugin-builder:go" + version + "@sha256:" + digest
+	builderDigest := "ghcr.io/tursom/mc-gateway-plugin-builder@sha256:" + digest
+	t.Setenv("MC_GATEWAY_PLUGIN_BUILDER_IMAGE", builderImage)
+	builder := &fakeBuilder{result: fakeSourceBuildResult(t, "source-unbound-builder", BuilderTypeContainer, builderImage, builderDigest)}
+	manager := newManagerForTestWithBuildersProfile(t, &fakeAdapter{}, map[string]SourceBuilder{
+		BuilderTypeLocalProcess: &fakeBuilder{},
+		BuilderTypeContainer:    builder,
+	}, PolicyProfileProd)
+	_ = uploadTestSource(t, manager, "source-unbound-builder")
+	builds, err := manager.ListBuilds(context.Background(), "source-unbound-builder")
+	if err != nil {
+		t.Fatalf("ListBuilds() error = %v", err)
+	}
+	build, err := manager.RunBuild(context.Background(), "admin", builds[0].ID)
+	if err != nil {
+		t.Fatalf("RunBuild() error = %v", err)
+	}
+	if _, err := manager.SetDesired(context.Background(), "admin", "source-unbound-builder", build.ArtifactID, DesiredDisabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	decision, err := manager.EvaluateGovernance(context.Background(), "source-unbound-builder", build.ArtifactID, GovernanceActionEnable, PolicyProfileProd, `{}`)
+	if err != nil {
+		t.Fatalf("EvaluateGovernance() error = %v", err)
+	}
+	issueCodes := governanceIssueCodes(decision.Issues)
+	if decision.OK || !issueCodes["source_build_builder_image_release_unbound"] || issueCodes["source_build_builder_image_not_pinned"] || issueCodes["source_build_builder_digest_missing"] {
+		t.Fatalf("decision = %+v, want release binding warning without digest/tag warnings", decision)
+	}
+	assessment, err := manager.AssessSupplyChain(context.Background(), "admin", "source-unbound-builder", build.ArtifactID, map[string]any{})
+	if err != nil {
+		t.Fatalf("AssessSupplyChain() error = %v", err)
+	}
+	sourceBuild := jsonMapFromAny(assessment.Metadata["source_build"])
+	if sourceBuild == nil ||
+		sourceBuild["prod_admission"] != "warning" ||
+		sourceBuild["builder_image_pinned"] != true ||
+		sourceBuild["builder_image_gateway_release_bound"] != false ||
+		sourceBuild["builder_image_go_version_bound"] != true ||
+		sourceBuild["builder_image_api_version_bound"] != false ||
+		sourceBuild["builder_image_target_bound"] != false ||
+		sourceBuild["builder_image_release_bound"] != false {
+		t.Fatalf("source_build assessment metadata = %+v, want release-unbound warning metadata", sourceBuild)
+	}
+}
+
+func testPinnedBuilderImage() (string, string) {
+	digest := strings.Repeat("a", 64)
+	version := strings.TrimPrefix(runtime.Version(), "go")
+	image := "ghcr.io/tursom/mc-gateway-plugin-builder:release-" + builderImageToken(GatewayRelease) + "-plugin-api-v1-go" + builderImageToken(version) + "-" + runtime.GOOS + "-" + runtime.GOARCH + "@sha256:" + digest
+	return image, "ghcr.io/tursom/mc-gateway-plugin-builder@sha256:" + digest
+}
+
+func fakeSourceBuildResult(t *testing.T, pluginID, builderType, builderImage, builderImageDigest string) BuildResult {
+	t.Helper()
+	manifest := Manifest{
+		SchemaVersion: SchemaVersion,
+		ID:            pluginID,
+		Name:          "Source Build",
+		Version:       "0.1.0",
+		ArtifactType:  ArtifactTypeBinary,
+		Runtime: RuntimeManifest{
+			Type:  RuntimeGoPlugin,
+			Entry: RuntimeEntry,
+		},
+		APIVersion:       APIVersion,
+		SDKModule:        "github.com/tursom/mc-gateway/plugin/api",
+		SDKModuleVersion: "v0.1.0",
+		GoVersion:        runtime.Version(),
+		GOOS:             runtime.GOOS,
+		GOARCH:           runtime.GOARCH,
+		ExtensionPoints: []ExtensionPoint{{
+			Type: "hook",
+			Key:  ExtensionUpstreamConnect,
+		}},
+		Capabilities: json.RawMessage(`{"extension_points":["upstream.connect/v1"]}`),
+	}
+	artifactBytes := []byte("fake built plugin bytes " + pluginID)
+	sum := sha256.Sum256(artifactBytes)
+	artifactSHA := hex.EncodeToString(sum[:])
+	abi := abiFingerprint(manifest, runtime.Version())
+	metadata := map[string]any{
+		"artifact_sha256": artifactSHA,
+		"builder_type":    builderType,
+		"go_version":      runtime.Version(),
+		"go_os":           runtime.GOOS,
+		"go_arch":         runtime.GOARCH,
+		"abi_fingerprint": abi,
+	}
+	if builderType == BuilderTypeContainer {
+		metadata["builder_image"] = builderImage
+		metadata["builder_image_digest"] = builderImageDigest
+	}
+	return BuildResult{
+		Manifest:       manifest,
+		ArtifactBytes:  artifactBytes,
+		ArtifactSHA256: artifactSHA,
+		GoVersion:      runtime.Version(),
+		ModuleSummary:  "[]",
+		GoVersionM:     "{}",
+		ABIFingerprint: abi,
+		Metadata:       metadata,
+	}
+}
+
+func governanceIssueCodes(issues []GovernanceIssue) map[string]bool {
+	codes := make(map[string]bool, len(issues))
+	for _, issue := range issues {
+		codes[issue.Code] = true
+	}
+	return codes
+}
+
+func preflightCheckCodes(checks []PreflightCheck) map[string]bool {
+	codes := make(map[string]bool, len(checks))
+	for _, check := range checks {
+		codes[check.Code] = true
+	}
+	return codes
 }

@@ -1,0 +1,132 @@
+name: Plugin Builder Image
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      gateway-release:
+        description: Gateway release tag, for example v0.1.0
+        required: true
+        type: string
+      go-version:
+        description: Go toolchain version without the go prefix
+        required: true
+        default: "1.24.4"
+        type: string
+      plugin-api-version:
+        description: Plugin API version bound into the builder image tag
+        required: true
+        default: "plugin-api/v1"
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  BUILDER_IMAGE: ghcr.io/${{ github.repository_owner }}/mc-gateway-plugin-builder
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            goos: linux
+            goarch: amd64
+          - platform: linux/arm64
+            goos: linux
+            goarch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve release binding
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          release="${{ inputs.gateway-release }}"
+          go_version="${{ inputs.go-version }}"
+          plugin_api="${{ inputs.plugin-api-version }}"
+          if [ -z "$release" ]; then
+            release="${GITHUB_REF_NAME}"
+          fi
+          if [ -z "$go_version" ]; then
+            go_version="1.24.4"
+          fi
+          if [ -z "$plugin_api" ]; then
+            plugin_api="plugin-api/v1"
+          fi
+          token() {
+            printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'
+          }
+          release_token="$(token "$release")"
+          api_token="$(token "$plugin_api")"
+          go_token="$(token "go${go_version}")"
+          tag="release-${release_token}-${api_token}-${go_token}-${{ matrix.goos }}-${{ matrix.goarch }}"
+          {
+            echo "gateway_release=$release"
+            echo "go_version=$go_version"
+            echo "plugin_api_version=$plugin_api"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish release-pinned builder
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.plugin-builder
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ${{ env.BUILDER_IMAGE }}:${{ steps.release.outputs.tag }}
+          build-args: |
+            GATEWAY_RELEASE=${{ steps.release.outputs.gateway_release }}
+            PLUGIN_API_VERSION=${{ steps.release.outputs.plugin_api_version }}
+            GO_VERSION=${{ steps.release.outputs.go_version }}
+          labels: |
+            io.mc-gateway.builder.gateway-release=${{ steps.release.outputs.gateway_release }}
+            io.mc-gateway.builder.plugin-api-version=${{ steps.release.outputs.plugin_api_version }}
+            io.mc-gateway.builder.go-version=${{ steps.release.outputs.go_version }}
+            io.mc-gateway.builder.goos=${{ matrix.goos }}
+            io.mc-gateway.builder.goarch=${{ matrix.goarch }}
+          provenance: true
+          sbom: true
+
+      - name: Emit digest-pinned release reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="${{ env.BUILDER_IMAGE }}:${{ steps.release.outputs.tag }}@${{ steps.build.outputs.digest }}"
+          echo "$ref" | tee "plugin-builder-image-${{ matrix.goos }}-${{ matrix.goarch }}.txt"
+          {
+            echo "### Plugin builder image"
+            echo
+            echo '```text'
+            echo "$ref"
+            echo '```'
+            echo
+            echo "Production release notes must use the digest-pinned reference above."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload digest-pinned reference
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-builder-image-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: plugin-builder-image-${{ matrix.goos }}-${{ matrix.goarch }}.txt

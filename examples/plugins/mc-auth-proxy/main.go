@@ -129,6 +129,10 @@ func (p *PluginImpl) emitAuthEvent(ctx context.Context, name, result string) {
 		"result": result,
 		"mode":   "fixture",
 	})
+	_ = p.gateway.ObserveMetric(ctx, "auth.attempts", 1, map[string]string{
+		"result": result,
+		"mode":   "fixture",
+	})
 	p.gateway.Logger().Info(ctx, name, map[string]string{"result": result})
 }
 

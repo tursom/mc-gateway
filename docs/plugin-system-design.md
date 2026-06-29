@@ -41,7 +41,7 @@
 | 热卸载 | Go plugin 不能真正卸载，只能逻辑禁用，删除已加载 artifact 后提示重启彻底清理 | 第一版 | 生命周期、Runbook |
 | 进程级卸载 | 未来支持 `go-plugin-process`：主进程管理，子进程加载 Go plugin 和处理数据面，退出子进程回收已加载 `.so` | 未来 | Go Plugin Process Runtime |
 | 源码包 | 支持 source `.mcgp`，由受控 builder 生成最终 `plugin.so` artifact | 第一版 | 源码包构建、构建环境 |
-| 构建环境 | 开发可 local-process，生产推荐 container builder 或外部 CI，记录 builder/Go/module/provenance | 第一版 | 源码包构建、供应链 |
+| 构建环境 | 开发可 local-process，生产默认 container builder；prod 会阻断 local-process source-built artifact，并记录 builder/Go/module/provenance 供 governance 和 supply-chain assessment 使用；external CI 产物已有 provenance assessment gate | 第一版 | 源码包构建、供应链 |
 | 沙箱 | 第一版不提供沙箱；sandbox-process/WASM 作为未来 runtime adapter | 未来 | Sandbox Runtime、WASM 模型 |
 | Extension Point 模型 | Hook 只是类型之一，统一采用 hook/middleware/provider/event/rule 等 extension point | 第一版模型，部分预留 | Extension Point 设计 |
 | `upstream.connect/v1` | 第一版主扩展点，支持 dialer mode 和 protocol-proxy mode，返回 `net.Conn` | 第一版 | Hook、net.Conn 接管契约 |
@@ -68,7 +68,7 @@
 | 热加载尽量支持，热卸载承认 Go plugin 限制 | 兼容且未加载过 artifact 可热加载；已加载 Go plugin 只能逻辑禁用，不能真正卸载 | 生命周期、热加载和热卸载、Runbook |
 | 多进程模型实现进程级热卸载 | 预留 `go-plugin-process` runtime，主进程只做管理和 fd 编排，子进程负责数据面；通过退出子进程回收 Go plugin | Go Plugin Process Runtime、第一版默认策略 |
 | 插件包不新增源码扩展名 | 统一 `.mcgp` zip，源码/二进制由包内 `manifest.json.artifact_type` 声明 | 插件包格式 |
-| 支持源码包和构建环境设计 | source `.mcgp` 经受控 builder 生成 `plugin.so`；开发 local-process，生产推荐 container builder 或外部 CI | 源码包构建环境、供应链元数据 |
+| 支持源码包和构建环境设计 | source `.mcgp` 经受控 builder 生成 `plugin.so`；开发 local-process，生产默认 container builder，外部 CI 作为后续信任路径 | 源码包构建环境、供应链元数据 |
 | Manifest 元数据稳定并记录 Go 构建信息 | 作者只维护一个 manifest source；包内 canonical `manifest.json` 是服务端唯一可信元数据来源，记录 Go/API/SDK/ABI fingerprint、builder 和 provenance | Manifest 元数据、Go Plugin ABI Fingerprint |
 | Hook 之外的插件技术方案 | 统一 Extension Point 模型，覆盖 hook、middleware、provider、event subscriber、rule/policy；mock/mixin/monkey patch 不作为生产机制 | Extension Point 设计、Mock 和 Mixin 的定位 |
 | 沙箱功能要有未来路线 | 第一版不提供沙箱；预留 sandbox-process、WASM、capability enforcement、stream relay 和 egress 策略 | Sandbox Runtime、Runtime Adapter、第一版默认策略 |
@@ -645,9 +645,18 @@ Plugin Manager 内部应通过 runtime adapter 隔离不同运行时，避免把
 
 ```go
 type RuntimeAdapter interface {
-    Preflight(ctx context.Context, artifact Artifact) error
-    Load(ctx context.Context, artifact Artifact) (LoadedPlugin, error)
-    Supports(point ExtensionPoint) bool
+    Load(ctx context.Context, artifact Artifact, plugin PluginRecord, gateway Gateway) (Plugin, error)
+}
+
+type RuntimeAdapterLifecycle interface {
+    ValidateArtifact(ctx context.Context, artifact Artifact) error
+    Prepare(ctx context.Context, artifact Artifact, plugin PluginRecord) (PreparedRuntime, error)
+    Start(ctx context.Context, prepared PreparedRuntime, artifact Artifact, plugin PluginRecord, gateway Gateway) (RuntimeInstance, error)
+    HealthCheck(ctx context.Context, instance RuntimeInstance) RuntimeHealth
+    ReloadConfig(ctx context.Context, instance RuntimeInstance, configJSON string) error
+    Drain(ctx context.Context, instance RuntimeInstance) error
+    Stop(ctx context.Context, instance RuntimeInstance) error
+    Diagnostics(ctx context.Context, instance RuntimeInstance) RuntimeAdapterDiagnostics
 }
 ```
 
@@ -664,14 +673,16 @@ type RuntimeAdapter interface {
 runtime adapter 设计规则：
 
 - extension point 声明必须标注支持哪些 runtime。
-- `upstream.connect/v1` protocol-proxy mode 第一版只支持 `go-plugin`。
+- `upstream.connect/v1` protocol-proxy mode 支持 `go-plugin` in-process 和 `go-plugin-process` drain-only stream bridge。
 - `go-plugin-process` 需要新的服务启动模式，不能在运行中从单进程无缝切换；管理后台可以保存 desired mode，并提示重启后生效。
 - sandbox-process 如果要实现协议代理，需要改成进程间 stream relay，而不是返回 Go `net.Conn`。
 - wasm 适合 `route.resolve/v1`、rule/policy engine 和配置校验，不作为第一版连接代理方案。
 - Admin 页面必须展示 runtime type 和该 runtime 下 capabilities 是否强制执行。
 - 同一个 `.mcgp` manifest 可以声明 runtime type，但不能在一个 artifact 中混用多个 runtime。
 
-### Go Plugin Process Runtime，未来能力
+当前代码状态：`in-process + go-plugin` 已通过 `RuntimeAdapterLifecycle` 运行；`go-plugin-process` 已有 `plugin-host` 同 binary 子命令、`mc-gateway-plugin-host/v1` handshake、UDS control channel、supervisor start/stop foundation、host 内 Init/ReloadConfig/Destroy lifecycle、loaded host crash summary refresh、persisted configurable restart backoff/max/window policy、crash-loop auto-isolation、per-node crash isolation、service-level last error persistence、supervised/stale control socket cleanup、metadata-backed process orphan sweep、无 metadata 的 stale active control socket handshake orphan cleanup、Linux `/proc` process-table orphan discovery、`upstream.connect/v1` dialer mode 的跨进程 UDS relay，以及 protocol-proxy drain-only stream bridge。fd/live 迁移、sandbox enforcement、完整不可信隔离和非 Linux process-table orphan discovery 仍是未来工作。
+
+### Go Plugin Process Runtime，部分实现和未来能力
 
 `go-plugin-process` 是 `go-plugin` 的多进程运行形态。它的目标不是跨语言或运行不可信插件，而是把 Go plugin 的 `.so` 加载放到可退出的子进程中，让主进程只负责管理、listener、生命周期、fd 编排和观测聚合。这样可以通过退出子进程实现进程级卸载，绕开 Go runtime 在同一进程内不能 unload plugin 的限制。
 
@@ -681,13 +692,15 @@ runtime adapter 设计规则：
 gateway main process
   -> owns listeners / Admin / SQLite / desired state
   -> starts plugin-host process
-  -> passes accepted connection fd or stream endpoint
+  -> asks plugin-host to create upstream dialer connection
+  -> later passes accepted connection fd or stream endpoint for protocol-proxy
   -> supervises health, drain, restart and migration
 
 plugin-host process
   -> plugin.Open(plugin.so)
   -> owns plugin instance and Go globals
-  -> runs upstream/protocol-proxy data plane
+  -> runs upstream dialer data plane first
+  -> later runs protocol-proxy data plane through a stream/fd protocol
   -> exits to release loaded .so and Go heap
 ```
 
@@ -696,7 +709,7 @@ plugin-host process
 | Mode | 说明 | 默认策略 |
 | --- | --- | --- |
 | `in-process` | 主进程直接 `plugin.Open`，使用 `go-plugin` runtime | 第一版默认，性能最好，不能真正热卸载 |
-| `go-plugin-process` | 主进程不加载 `.so`，为 Go 插件启动 plugin-host 子进程 | 未来可选，需要重启服务切换 |
+| `go-plugin-process` | 主进程不加载 `.so`，为 Go 插件启动 plugin-host 子进程 | 部分可用：`upstream.connect/v1` dialer mode 和 protocol-proxy drain-only；live migration 仍是未来能力 |
 | `sandbox-process` | 独立进程或容器运行跨语言/隔离插件 | 未来能力，和 `go-plugin-process` 分开 |
 
 管理后台应提供一个 gateway 级系统配置项，用来决定服务下一次启动时采用哪种插件服务模式。该配置不是插件 manifest 的一部分，也不能由单个插件在运行时覆盖。
@@ -852,6 +865,7 @@ type MigratableConnection interface {
 - 插桩规则必须版本化，作为源代码或 release artifact 的一部分接受 review。
 - 构建结果必须记录 instrumentation manifest、builder identity、source sha256、generated diff hash、Go version 和 SDK/API version。
 - 插桩后的 gateway binary 必须重新跑单元测试、conformance、benchmark 和协议 smoke test。
+- 当前实现登记 instrumentation metadata 时，`available` 状态必须携带 `generated_diff_hash`、`conformance.ok=true`、`benchmark.ok=true` 和 `smoke.ok=true`；失败或未通过的 release evidence 只能以 `blocked` 状态保留，不能作为可发布元数据。
 - 管理页只能展示当前 binary 的 instrumentation metadata 和能力声明；不能把它当作可 enable/disable 的插件。
 - 如果插桩影响连接路径、Admin 权限、secret 或外部依赖，必须在 release notes 和 Runbook 中说明回滚方式。
 
@@ -1632,13 +1646,13 @@ trusted plugin 不能只靠口头约定。第一版即使不强制签名，也�
 - 是否 protocol-proxy、是否 source package、是否 major upgrade。
 - 是否命中 organization allowlist/denylist。
 
-第一版可以先实现策略评估和展示，不强制接入外部漏洞库或签名验证服务。即便签名不强制，artifact sha256 和来源仍必须记录并参与审计。
+第一版支持策略评估、本地/导入式漏洞库和治理展示，不强制接入外部漏洞库或签名验证服务。即便签名不强制，artifact sha256 和来源仍必须记录并参与审计。
 
 策略落库和快照：
 
 - admission policy 应有 `policy_id`、`version`、`profile`、`updated_by`、`updated_at`。
 - 每次 policy evaluation 都记录 policy snapshot hash，审批和 rollback 只能引用当时的 snapshot。
-- 策略变更后，不应立即重写历史 review；新的 enable、rollback、promotion apply 和 artifact switch 必须使用当前策略重新评估。
+- 策略变更后，不应立即重写历史 review；新的 enable、rollback、repository import admission preview、repository import apply、promotion apply 和 artifact switch 必须使用当前策略重新评估。
 - 策略从宽松切到严格时，已启用插件先标记 `policy_drift` 或 `review_required`，是否自动隔离由组织策略决定。
 - policy API 返回机器可读 reason code，例如 `missing_readme`、`license_denied`、`sbom_parse_failed`、`capability_blocked`。
 
@@ -1646,7 +1660,7 @@ warning override：
 
 - override 必须绑定 artifact sha256、config hash、scope hash、risk reason 和 policy snapshot。
 - override 必须有操作者、原因、创建时间、过期时间和审计事件。
-- override 到期后不能继续启用、回滚或 promotion apply；已启用插件进入 `review_required` 或按策略隔离。
+- override 到期后不能继续启用、回滚、repository import apply 或 promotion apply；已启用插件进入 `review_required` 或按策略隔离。
 - critical 风险默认不允许 override；如果组织开启，必须明确写入 `override_policy`。
 - override 不允许绕过 Go/API/ABI 不兼容、denylist/revoke、缺失必需 secret 或 sandbox 必需权限无法强制的问题。
 
@@ -1661,7 +1675,7 @@ warning override：
 | `high` | protocol-proxy、secret ref 变化、scope 扩大、capabilities 变化 | 二次确认，可要求审批 |
 | `critical` | artifact sha256 被 denylist 命中、Go/API 不兼容、缺失必需 secret | 阻断启用 |
 
-风险评级应写入发布门禁结果，并在 promotion import、artifact switch、enable 和 rollback 时重新计算。rollback 也不能绕过 denylist；如果旧 artifact 已被撤销，只允许管理员执行隔离恢复流程，不应重新接入真实流量。
+风险评级应写入发布门禁结果，并在 repository import admission preview、promotion import、artifact switch、enable 和 rollback 时重新计算。rollback 也不能绕过 denylist；如果旧 artifact 已被撤销，只允许管理员执行隔离恢复流程，不应重新接入真实流量。
 
 ### 审批流程
 
@@ -1828,7 +1842,7 @@ denylist 适合处理明确要阻断的 artifact，但供应链治理还需要�
 | Action | 行为 |
 | --- | --- |
 | `notify` | 只展示告警和升级建议 |
-| `review_required` | 下次 enable、rollback、promotion apply 需要审批 |
+| `review_required` | 下次 enable、rollback、repository import apply、promotion apply 需要审批 |
 | `block_new_enable` | 阻断新启用和回滚，但不影响当前已启用实例 |
 | `quarantine` | 已启用插件从 dispatch table 移除，新流量不再进入 |
 | `revoke` | 等价紧急撤销，加入 denylist 并提示重启 |
@@ -1843,7 +1857,7 @@ denylist 适合处理明确要阻断的 artifact，但供应链治理还需要�
 - advisory 要求 restart 时，已加载 native plugin 必须提示重启才能彻底清理。
 - 管理员 override 只能用于 `notify` 或允许 override 的 `review_required`，必须填写原因、有效期并写审计日志。
 
-第一版可以先支持本地 advisory JSON 导入和手工创建。官方/内部仓库同步、CVE 数据库和 SBOM 自动漏洞扫描作为后续增强。
+第一版支持本地 advisory JSON 导入/手工创建，本地/外部 advisory feed sync，以及本地/导入式/外部 vulnerability 数据库按 SBOM dependency rescan 并接入 enable/rollback gate。feed scheduler 只在部署方显式配置时运行；官方/内部仓库同步和完整外部 CVE/SBOM 自动漏洞扫描链作为后续增强。
 
 ### 策略和运行时的边界
 
@@ -2704,7 +2718,7 @@ operation 规则：
 - 长操作 API 应返回 `operation_id`，前端通过 operation 查询状态。
 - `idempotency_key` 由客户端或服务端生成，用于防止刷新页面或网络重试重复创建构建、导入或启用任务。
 - `progress` 只表示粗略百分比，不应作为业务状态真相；业务状态仍以 artifact/build/plugin state 为准。
-- cancel 采用协作取消；已进入 commit 阶段的 enable/rollback/promotion apply 不能强行中断，只能等待完成后再回滚。
+- cancel 采用协作取消；已进入 commit 阶段的 enable/rollback/repository import apply/promotion apply 不能强行中断，只能等待完成后再回滚。
 - retry 默认创建新的 operation，保留旧 operation 结果；如果复用同一 build source，应在 result 中关联原 operation。
 - operation 结果不能包含 secret、完整日志、完整 packet payload 或敏感 config。
 - operation 完成后应写审计日志，并在 result 中保存相关 artifact ID、build ID、generation 或 report ID。
@@ -2942,7 +2956,24 @@ shared desired state
 
 ### 节点状态
 
-后续可以增加节点状态表：
+当前实现已经有两层节点状态。网关节点心跳表用于 Plugin Service 状态页和 CLI/API 展示当前已知节点：
+
+```sql
+CREATE TABLE plugin_nodes (
+    node_id TEXT PRIMARY KEY,
+    hostname TEXT NOT NULL DEFAULT '',
+    pid INTEGER NOT NULL DEFAULT 0,
+    service_mode TEXT NOT NULL DEFAULT 'in-process',
+    data_plane_mode TEXT NOT NULL DEFAULT 'in-process',
+    status TEXT NOT NULL DEFAULT 'online',
+    started_at INTEGER NOT NULL,
+    heartbeat_at INTEGER NOT NULL
+);
+```
+
+`GET /admin/api/plugin-service` 返回 `nodes`，每个节点包含 `node_id`、`service_mode`、`data_plane_mode`、`heartbeat_at` 和 `stale`。这只说明 gateway 节点是否近期上报，不代表某个插件 artifact 已经在该节点成功加载。
+
+插件维度 runtime state 使用 `plugin_node_states`：
 
 ```sql
 CREATE TABLE plugin_node_states (
@@ -2960,7 +2991,7 @@ CREATE TABLE plugin_node_states (
 );
 ```
 
-节点状态只用于展示和诊断，不作为启用真相。节点启动、reload、enable、disable、health change 时上报状态。
+插件维度节点状态只用于展示和诊断，不作为启用真相。当前节点会在 load、enable、disable、delete、reconcile failure 时更新状态；插件详情返回 `rollout_status` 和 `node_runtime_states`，用于展示 partial rollout failure。二进制上传和 source build 产物会在节点本地 content-addressed 目录保留可分发 `.mcgp` 包，`rollout_status.artifact_distribution_*` 展示本地包状态；Admin-to-Admin 手动 artifact package 传输已可用，CLI promotion 跨网关 apply 可串联源网关 package download、目标网关 upload 和目标侧 promotion apply。跨节点自动分发、repository apply 编排和自动集群级 apply 仍未实现。
 
 ### 多实例发布语义
 
@@ -3016,6 +3047,10 @@ ghcr.io/tursom/mc-gateway-plugin-builder:<gateway-version>-go<go-version>
 ```text
 ghcr.io/tursom/mc-gateway-plugin-builder:v0.1.0-go1.24.4
 ```
+
+当前实现会在 prod governance/preflight 中检查 source build 的 container provenance：缺失 builder image digest、builder image 未使用 `@sha256:` digest-pinned 引用，或 builder image tag/path 未绑定当前 plugin API 版本和 Go 版本，都会产生 warning，非 preview enable 需要 warning override。`AssessSupplyChain` 会记录 `builder_image_pinned`、`builder_image_go_version_bound`、`builder_image_api_version_bound`、`builder_image_release_bound`、gateway Go version、builder Go version match 和 GOOS/GOARCH match，用于后续把官方 builder image 发布策略接入 release gate。当前只是准入侧的 release 绑定检查，不代表官方 builder image 已经发布。
+
+external CI 产出的 binary `.mcgp` 不在 gateway 内执行构建，因此必须通过 supply-chain assessment 提供可审计 metadata。当前实现支持 `metadata.external_ci.required=true` 的本地门禁：目标环境必须看到 `source_sha256`、`artifact_sha256`、`run_id`、`builder_id`，并且 `signature.verified=true` 或 `external_ci.signature_verified=true`，同时 `external_ci.trusted=true`。`artifact_sha256` 或可选 `package_sha256` 与本地 artifact 不匹配会直接产生 blocking issue；缺失 provenance、签名未验证或 trusted 标记缺失也会阻断后续 enable、rollback 和 promotion apply。完整 CI 发布链仍需把这些字段与组织签名、attestation、SBOM 和官方 release 流程绑定。
 
 构建环境必须固定以下维度：
 
@@ -3819,6 +3854,8 @@ promotion-bundle/
 - 导出的 artifact 必须以 sha256 锁定；导入环境不能用同版本号但 sha256 不同的 artifact 静默替换。
 - bundle 自身应包含 `checksums.txt`，导入前先校验完整性。
 
+当前实现先采用更保守的本地 target apply 边界：promotion bundle 不导出 config 明文，只导出 `config_hash`、artifact/runtime/API/provenance 和 secret ref 摘要。目标环境 apply 时必须由目标侧请求提供 config，系统按 canonical hash 与 bundle `config_hash` 比对，再执行 `DryRunConfig` 和当前 governance gate；校验通过后只写入本地 desired state，不自动 enable active 流量。CLI `gateway plugin apply <bundle> --target-gateway ...` 会先按 bundle `artifact_sha256` 从源网关下载 artifact package、上传到目标网关，再调用目标侧 apply；完整环境覆盖、repository apply 跨节点编排和自动集群级 apply 仍属于后续实现。
+
 ### 环境覆盖和 Secret 映射
 
 跨环境导入不能假设配置完全相同。应支持导入时提供环境覆盖：
@@ -4293,6 +4330,14 @@ registered -> scheduled -> running -> succeeded
 - lease 丢失时，任务 context 必须取消；handler 应尽快退出。
 - 任务状态页面需要区分 global desired schedule 和 node runtime state。
 
+当前实现状态：
+
+- `background_tasks[].run_policy` 支持 `per_node`、`singleton`、`sharded`；未配置时默认为 `per_node`。
+- `singleton` 使用全局 shard，`sharded` 使用 `background_tasks[].shard_key`，未配置 shard 时使用 `default`。
+- `singleton` 和 `sharded` 通过 Admin SQLite 中的 `plugin_task_leases` 获取、续租和释放 lease；续租失败会取消任务 context。
+- task summary 会展示 `node_id`、`lease_required`、`lease_acquired`、`lease_owner`、`lease_expires_at` 和 `lease_skipped`。
+- node state、local artifact package mirror 和 partial rollout failure 已有可展示状态；远端 artifact 传输和 CLI promotion 跨网关 apply 编排已落地。repository apply 跨节点编排、自动 artifact 分发和自动集群级 apply 仍是 M9 后续工作，不因 task lease 可用而视为完成。
+
 推荐指标：
 
 | 指标 | 类型 | 标签 | 说明 |
@@ -4678,6 +4723,7 @@ tracing 规则：
 | `plugin_promotion_export` | `plugin_artifact` | 导出 promotion bundle |
 | `plugin_promotion_import` | `plugin_artifact` | 导入 promotion bundle |
 | `plugin_promotion_apply` | `plugin` | 将导入结果应用到 desired state |
+| `plugin_repository_import_apply` | `plugin` | 将仓库导入结果应用到 desired state |
 | `plugin_drift_detected` | `plugin` | 发现 artifact/config/scope/runtime limits 漂移 |
 | `plugin_dr_drill` | `plugin` | 执行灾备演练 |
 | `plugin_repository_add` | `plugin_repository` | 添加仓库 |
@@ -5967,6 +6013,7 @@ manifest 可以声明包内资源和运行时文件需求：
 - `DiagnosticsDir` 只保存诊断中间产物；导出前必须脱敏并受权限控制。
 - 插件不得把 secret、token、session response、完整 packet payload 或未脱敏玩家隐私写入可导出的文件。
 - 文件配额超过时，SDK 返回明确错误；插件应降级或清理缓存，不应阻塞连接路径。
+- 覆盖写入同一 runtime 文件时，配额按 `current_usage - old_file_size + new_file_size` 计算，不能把安全重写误判为超限。
 - source package 构建输出不能把 builder cache 当作运行时资源；只有进入 `.mcgp` artifact 或 runtime 目录的文件才受该模型管理。
 
 备份和迁移：
@@ -6406,8 +6453,8 @@ type Gateway interface {
 | `gateway plugin data inspect <plugin>` | 查看 plugin_data schema、data class、大小、配额和 GC candidate |
 | `gateway plugin data export <plugin>` | 导出允许迁移的数据，受 data_class 和权限控制 |
 | `gateway plugin data gc <plugin>` | 按 retention 清理过期或可丢弃 plugin_data |
-| `gateway plugin sbom` | 生成或校验 SBOM，未来能力 |
-| `gateway plugin sign` | 签名插件包，未来能力 |
+| `gateway plugin sbom` | 生成或校验 SBOM，供供应链策略使用 |
+| `gateway plugin sign verify/key-rotation/revoke` | 验证 artifact 签名，维护本地 trust store 并吊销不可信 key |
 
 CLI 规则：
 
@@ -6701,9 +6748,10 @@ scope 扩展规则：
 | `POST` | `/admin/api/plugins/artifact-gc/run` | 执行 artifact/source/log 清理 |
 | `GET` | `/admin/api/plugins/policies/admission` | 查看插件准入策略 |
 | `PUT` | `/admin/api/plugins/policies/admission` | 更新插件准入策略 |
-| `GET` | `/admin/api/plugins/security-advisories` | 查看安全公告和命中结果 |
-| `POST` | `/admin/api/plugins/security-advisories` | 导入或创建本地安全公告 |
-| `POST` | `/admin/api/plugins/security-advisories/{id}/rescan` | 重新扫描本地 artifact 是否受影响 |
+| `GET` | `/admin/api/plugin-advisories` | 查看安全公告 |
+| `POST` | `/admin/api/plugin-advisories` | 导入或创建本地安全公告、导入本地 feed，或提交 `rescan=true` 重新扫描本地 artifact |
+| `GET` | `/admin/api/plugin-vulnerabilities` | 查看本地漏洞库，可按 package name 过滤 |
+| `POST` | `/admin/api/plugin-vulnerabilities` | 导入或创建本地漏洞记录、导入本地漏洞库，或提交 `rescan=true` 按 SBOM dependency 重新扫描本地 artifact |
 | `POST` | `/admin/api/plugins/security-advisories/{id}/matches/{artifact_id}/ack` | 确认、忽略或标记已缓解 |
 | `POST` | `/admin/api/plugins/{id}/quarantine` | 按策略隔离已启用插件并停止新流量 |
 | `POST` | `/admin/api/plugins/{id}/unquarantine` | 解除隔离，需重新通过门禁 |
@@ -6821,7 +6869,10 @@ scope 扩展规则：
 - review API 的批准结果只绑定 artifact sha256、config hash、scope hash、rollout hash、runtime limits hash、features hash 和 policy hash。
 - revoke API 必须阻止后续 enable/rollback 到被撤销 artifact；已加载 native code 需要提示重启彻底清理。
 - promotion export 不能返回 secret 明文、secret 密文、KMS key 或运行时状态。
+- repository import 只生成本地 artifact，不自动创建 desired state；导入记录必须保存当前策略下的 admission preview，包含 policy hash、risk、阻断 issue 和 auto-enable=false。
+- repository import apply 必须使用目标环境提供的 config，重新执行 config dry-run 和当前 governance；成功时只写入 disabled desired state，不自动 enable active 流量，响应不能回显 config 明文或 secret 值。
 - promotion import 必须返回 artifact/config/scope/rollout/runtime limits/features/policy diff、缺失 secret、兼容性错误和发布门禁结果。
+- promotion apply 必须使用目标环境提供的 config，与 bundle `config_hash` 匹配后重新执行 dry-run 和 governance；响应只能返回 desired metadata、hash、check 和审计摘要，不能回显 config 明文或 secret 值。
 - promotion import 必须返回 external dependency endpoint、secret ref、fail policy 和 timeout diff。
 - config snapshot diff 必须使用 canonical hash 和脱敏 diff；rollback 必须重新执行当前准入策略和发布门禁，不能因为历史快照曾经可用就绕过策略。
 - drift API 必须使用 artifact sha256、canonical hash 和 desired fingerprint，不应只比较 plugin version 字符串。
@@ -7548,8 +7599,8 @@ examples/plugins/mc-status-motd/
 - README、Runbook、support contact 和 data handling 声明可由 manifest 结构化引用，并按安全 Markdown 子集展示。
 - 准入策略可以评估 source、documentation、license、SBOM、signature、capabilities、extension points、artifact sha256 和 upgrade risk。
 - admission policy 支持 dev/staging/prod profile、policy snapshot、reason code 和 warning override TTL。
-- warning override 绑定 artifact/config/scope/risk reason/policy snapshot；过期后不能继续 enable、rollback 或 promotion apply。
-- 安全公告可以按 artifact sha256、plugin/version range、SBOM dependency 或 source metadata 匹配本地 artifact，并影响 enable、rollback、promotion apply 和 quarantine。
+- warning override 绑定 artifact/config/scope/risk reason/policy snapshot；过期后不能继续 enable、rollback、repository import apply 或 promotion apply。
+- 安全公告可以按 artifact sha256、plugin/version range、SBOM dependency 或 source metadata 匹配本地 artifact，并影响 enable、rollback、repository import apply、promotion apply 和 quarantine。
 - SBOM 解析失败、缺失 SBOM、未知 license 和 license policy 命中会进入 policy result，并在 Admin 展示。
 - 高风险 artifact/config/scope/runtime limits 组合需要 review 时，审批记录绑定对应 hash；任一输入变化后审批失效。
 - review、promotion、drift、rollback 和审计使用统一 canonical hash、desired fingerprint 和脱敏 diff；CLI 与 Admin 结果一致。
@@ -7557,10 +7608,12 @@ examples/plugins/mc-status-motd/
 - denylist 命中的 artifact 不能 load、enable、rollback 或通过 promotion import 应用到生产。
 - 已启用插件被撤销后，新连接不再进入该插件，protocol-proxy 连接进入 draining 或 force close，并提示重启彻底移除已加载 native code。
 - runtime adapter 明确 `go-plugin`、`sandbox-process`、`wasm` 和 build-time instrumentation 的能力边界。
-- 文档明确 `go-plugin-process` 是未来可选服务启动模式：主进程管理，子进程加载 Go plugin 和处理数据面，通过子进程退出实现进程级卸载。
+- 文档明确 `go-plugin-process` 是部分可用的可选服务启动模式：当前已有 plugin-host command/handshake/UDS control、supervisor start/stop foundation、host 内 lifecycle、loaded host crash summary refresh、persisted configurable restart backoff/max/window policy、crash-loop auto-isolation、per-node crash isolation、service-level last error persistence、supervised/stale control socket cleanup、metadata-backed process orphan sweep、无 metadata 的 stale active control socket handshake orphan cleanup、Linux `/proc` process-table orphan discovery、`upstream.connect/v1` dialer bridge 和 protocol-proxy drain-only stream bridge；fd/live migration、sandbox enforcement、完整不可信隔离和非 Linux process-table orphan discovery 仍是未来能力。
 - Admin 能保存 gateway 插件服务 desired mode，展示 active mode、restart required、plugin-host/supervisor 状态和迁移能力；切换 `in-process`/`go-plugin-process` 不承诺运行中生效。
 - `go-plugin-process` 连接迁移分为 `drain-only`、`fd-live` 和 `fd-live-shm`；默认 `drain-only`，live migration 必须由插件显式声明并通过 conformance。
 - 文档明确 fd 只迁移内核 socket，共享内存只迁移稳定格式的用户态 buffer/state，不能共享 Go heap 对象。
+- external CI binary artifact 的 supply-chain assessment 会校验签名验证、source/artifact sha、run/builder identity 和 trusted 标记；未满足时阻断 enable、rollback、repository import apply 和 promotion apply。
+- container source build 的 prod governance 会校验 builder image digest pinning、plugin API version 和 Go version release binding；未绑定时进入 warning/override，而官方 release-pinned builder image 发布本身仍是后续发布链工作。
 - build-time instrumentation 被明确为未来官方构建期能力；它产出 gateway binary，不进入 `.mcgp` 热加载 lifecycle，也不能通过 Admin 页面按插件启用/禁用。
 - 如果未来启用 build-time instrumentation，构建产物必须记录 instrumentation manifest、builder identity、source sha256、generated diff hash、Go/API 版本，并通过 conformance、benchmark 和 smoke test。
 - sandbox-process 设计明确 control RPC、stream relay、supervisor、secret RPC、资源限制和 crash loop 策略。
@@ -7571,6 +7624,7 @@ examples/plugins/mc-status-motd/
 - API 兼容、废弃和降级策略明确，旧 artifact 回滚不会绕过 config_version 检查。
 - required feature 缺失会阻断 enable；optional feature 缺失会进入 warning，并通过 `PluginRuntimeInfo.Features` 和 compat 输出展示。
 - manifest、extension point、错误码和 CLI 输出有机器可读契约或 golden fixture。
+- conformance 的 `invalid_config` 和 `missing_secret` fixture 必须来自 manifest `config_schema` 和 required secret 声明，不能无条件标记通过。
 - conformance suite 能在 release 前验证 manifest、extension point 语义、Admin API 错误码和 CLI 输出。
 - 示例插件是契约测试的一部分；示例插件不能构建或不能通过 compat/conformance 时视为 API 回归。
 - 发布前兼容性报告能列出新增、弃用、移除和破坏性变更；破坏性变更没有新 version 或迁移说明时阻断发布。
@@ -7640,8 +7694,8 @@ examples/plugins/mc-status-motd/
 - artifact 回滚可以切回已存在且校验通过的旧版本。
 - 配置快照回滚可以选择 config-only 或 full desired rollback；成功后生成新的 desired generation 和审计日志。
 - 备份恢复后会校验 artifact sha256、重建 runtime file resource 摘要；缺失 artifact、必需 data 目录缺失或 secret 无法解密的插件不会自动启用。
-- promotion bundle 导出包含 desired state、artifact 引用、config、scope、rollout、runtime limits 和 provenance，但不包含 secret 明文、secret 密文、KMS key 或运行时状态。
-- promotion bundle 导入会校验 artifact sha256、Go/API/runtime 兼容性、config schema、secret mapping 和环境覆盖。
+- promotion bundle 导出包含 desired state、artifact 引用、config hash、scope、rollout、runtime limits 和 provenance，但当前实现不导出 config 明文、secret 明文、secret 密文、KMS key 或运行时状态。
+- promotion bundle 导入会校验 artifact sha256、Go/API/runtime 兼容性、config hash、config schema、secret mapping 和环境覆盖；本地 apply 需要目标侧提供 config。
 - 跨环境导入能展示 artifact/config/scope/rollout/runtime limits diff，缺失 secret 会阻断启用。
 - drift 检测使用 artifact sha256、canonical config/scope/rollout/runtime limits/features/policy hash 和 desired fingerprint，不依赖 version 字符串。
 - 灾备演练能在不接入真实流量的情况下验证 artifact、manifest、config、secret rebind、load dry-run、health check 和 protocol-proxy smoke test。
@@ -7834,7 +7888,7 @@ examples/plugins/mc-status-motd/
 | sandbox egress 限制 | 优先依赖部署平台/容器/network policy 强制；gateway 只做声明、审计和 ExternalClient 受控出口 |
 | WASM runtime | 优先 wazero，先定义 host ABI 和 contract；wasmtime 作为需要原生性能或组件模型时的未来选项 |
 | 跨进程协议代理扩展点 | 使用 `stream.proxy/v1` 表达跨进程 stream relay；`upstream.connect/v2` 保留给进程内上游连接结果增强 |
-| SBOM 漏洞扫描 | 第一版只解析和展示；未来优先本地/内网漏洞库，避免生产依赖外部服务 |
+| SBOM 漏洞扫描 | 第一版支持本地/导入式/外部 feed 漏洞库按 SBOM dependency rescan 并进入治理；feed scheduler 为显式配置能力，完整自动扫描链后续实现 |
 | license policy | 第一版支持本地 allowlist/denylist 配置；组织中心同步作为未来能力 |
 
 ## 已收敛决策
@@ -7845,7 +7899,7 @@ examples/plugins/mc-status-motd/
 | --- | --- |
 | protocol-proxy dry-run | 第一版禁止接管式 dry-run；只允许非 protocol-proxy handler dry-run，或未来单独设计轻量 `Evaluate()` |
 | 后台任务 cron | 第一版只支持 interval/manual；cron 只保留 schema |
-| 多实例部署 | 第一版明确单实例主路径；多实例只保留 node state、artifact 分发和 lease 设计 |
+| 多实例部署 | 第一版明确单实例主路径；已实现 gateway node heartbeat、插件维度 node runtime state、partial rollout 展示、local artifact package mirror 和 background task lease；远端分发和 cross-node apply 仍为后续工作 |
 | 同一 plugin ID 多实例 | 第一版不允许；未来引入 instance ID、数据隔离和排序规则 |
 | 源码包构建位置 | gateway 主进程不直接执行构建；开发可 local-process builder，生产推荐 container builder 或外部 CI |
 | MC 登录业务边界 | 正版/三方登录、身份映射、forwarding 和登录后的协议处理都由 protocol-proxy 插件负责；core 只提供连接交接和治理能力 |
@@ -7853,13 +7907,13 @@ examples/plugins/mc-status-motd/
 | `status.ping/v1` | 第一版预留；需要完整控制时由 protocol-proxy 插件处理 status state |
 | packet filter | 第一版不开放 play 阶段 filter；只预留 observe/filter 设计 |
 | sandbox/WASM runtime | 第一版 runtime adapter 只实现 `go-plugin`；sandbox-process/WASM 保留 manifest/runtime schema 和未来设计 |
-| go-plugin-process runtime | future 可选服务启动模式，用于 Go plugin 进程级卸载和可选连接迁移；第一版只预留配置和文档边界 |
+| go-plugin-process runtime | 部分可用的可选服务启动模式，当前支持 Go plugin 进程级加载、host lifecycle、persisted configurable restart backoff/max/window policy、crash-loop auto-isolation、per-node crash isolation、service-level last error persistence、supervised/stale control socket cleanup、metadata-backed process orphan sweep、无 metadata 的 stale active control socket handshake orphan cleanup、Linux `/proc` process-table orphan discovery、`upstream.connect/v1` dialer bridge 和 protocol-proxy drain-only stream bridge；fd/live migration、sandbox enforcement、完整不可信隔离和非 Linux process-table orphan discovery 仍是未来能力 |
 | 插件新增 listener | 第一版不允许；未来走 `ingress.service/v1` 和统一服务管理 |
 | build-time instrumentation | 第一版不启用；未来仅官方/组织 CI profile，可观测不可热加载 |
 | 仓库 | 第一版不进入主路径；即使实现也只导入本地 artifact，不自动启用 |
 | raw `.so` | 生产不接受；仅开发模式显式开启 |
 | 签名 | 第一版记录和展示，不强制校验，除非组织策略开启 |
-| SBOM/license | 第一版记录、展示并进入 warning/review；漏洞扫描和组织级策略作为后续增强 |
+| SBOM/license | 第一版记录、展示并进入 warning/review；本地/导入式漏洞库可按 SBOM dependency rescan，组织级策略同步作为后续增强 |
 | `mc-auth-proxy` 示例范围 | 第一版至少实现正版或三方 Yggdrasil-like 之一，另一个保留配置模板；offline fallback 默认关闭且必须显式启用 |
 | Minecraft protocol version 展示 | 第一版只展示数字 protocol version；名称映射作为未来便利功能 |
 | unsupported protocol version | 由 protocol-proxy 插件按 manifest 策略处理，示例默认 kick；core 不代替返回 kick/pass/close |
@@ -7884,7 +7938,7 @@ examples/plugins/mc-status-motd/
 | 隐私脱敏策略 | 默认保守脱敏；环境策略可放宽展示方式，但短期明文诊断必须有权限、TTL 和审计 |
 | alert silence | 第一版实现 Admin 本地静默窗口；外部 Prometheus/Alertmanager 等系统静默只作为未来集成 |
 | route/upstream backend metadata | 第一版允许结构化声明 backend type、forwarding mode、直连保护和真实 IP 信任边界；只做发布门禁和诊断提示，不让 core 接管 MC 登录或 forwarding |
-| SBOM 漏洞扫描 | future 默认本地或内网漏洞库；外部服务只作为可配置集成 |
+| SBOM 漏洞扫描 | 第一版支持本地/导入式漏洞库和显式配置的本地/内网/外部 feed scheduler；完整外部服务集成和自动扫描链作为后续能力 |
 | license allowlist/denylist | 第一版支持本地策略；组织中心同步作为未来能力 |
 
 ## 待确认问题

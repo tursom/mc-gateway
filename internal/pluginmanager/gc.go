@@ -88,16 +88,35 @@ func (m *Manager) RunGC(ctx context.Context, actor string, dryRun bool) ([]GCCan
 	}
 	var removed []GCCandidate
 	for _, candidate := range candidates {
-		if candidate.Protected || candidate.Path == "" || candidate.Kind != "artifact" {
+		if candidate.Protected {
 			continue
 		}
-		if err := os.RemoveAll(candidate.Path); err != nil {
-			_ = m.repo.RecordOperation(ctx, candidate.PluginID, candidate.ID, "artifact_gc", "failed", actor, err.Error(), map[string]any{
-				"path": candidate.Path,
-			})
-			continue
+		switch candidate.Kind {
+		case "artifact":
+			if candidate.Path == "" {
+				continue
+			}
+			if err := os.RemoveAll(candidate.Path); err != nil {
+				_ = m.repo.RecordOperation(ctx, candidate.PluginID, candidate.ID, "artifact_gc", "failed", actor, err.Error(), map[string]any{
+					"path": candidate.Path,
+				})
+				continue
+			}
+			_ = m.repo.UpdateArtifactStatus(ctx, candidate.ID, ArtifactStatusDeleted, "artifact files removed by gc")
+			removed = append(removed, candidate)
+		case "build_log":
+			id, err := strconv.ParseInt(candidate.ID, 10, 64)
+			if err != nil {
+				continue
+			}
+			if err := m.repo.ClearBuildLog(ctx, id); err != nil {
+				_ = m.repo.RecordOperation(ctx, candidate.PluginID, "", "artifact_gc", "failed", actor, err.Error(), map[string]any{
+					"build_id": id,
+				})
+				continue
+			}
+			removed = append(removed, candidate)
 		}
-		removed = append(removed, candidate)
 	}
 	_ = m.repo.RecordOperation(ctx, "", "", "artifact_gc", "succeeded", actor, "artifact gc completed", map[string]any{
 		"removed": len(removed),

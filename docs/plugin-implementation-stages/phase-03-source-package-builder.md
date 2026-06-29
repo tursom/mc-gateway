@@ -44,6 +44,12 @@ source `.mcgp` 必须包含：
 
 生产默认推荐 container builder 或外部 CI。gateway 主进程不得直接执行 `go build`。
 
+官方发布的 container builder image 必须绑定 gateway release、plugin API version、Go version、GOOS 和 GOARCH，并在 release 文档中只把 digest-pinned 引用作为生产推荐，例如 `ghcr.io/tursom/mc-gateway-plugin-builder:release-v0-1-0-plugin-api-v1-go1.24.4-linux-amd64@sha256:<digest>`。缺少 digest 或缺少 release/API/Go/平台绑定的 image 只能进入 warning/override，不得直接作为无提示生产准入。
+
+官方 builder image 由 `.github/workflows/plugin-builder-image.yml` 发布。release 说明必须引用该 workflow 输出的 digest-pinned 文本 artifact；单独的 tag（即使包含 release/API/Go/平台）不能作为生产配置样例。
+
+external CI binary artifact 的 `provenance.json` 必须包含签名、attestation、SBOM、source sha、artifact sha、CI run identity、builder identity 和 release provenance；缺失或 hash 不匹配时阻断 enable、rollback、repository apply 和 promotion apply。
+
 固定构建维度：
 
 - Go version。

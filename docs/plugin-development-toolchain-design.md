@@ -74,7 +74,7 @@
 | 后台任务 | 开发和运维手动触发任务、查看执行状态 | `task list`、`task run`、`task cancel` |
 | 数据和文件 | 查看 plugin_data/runtime files 配额、导出可迁移数据、GC | `data inspect/export/gc`、`files inspect/export/gc` |
 | Promotion | 跨环境导入导出、diff、drift 和灾备演练 | `export`、`import`、`diff`、`drift`、`dr-drill` |
-| 仓库和供应链 | 导入仓库候选、验证 SBOM/license/signature/advisory | `repo`、`sbom`、`sign`、`verify`、`advisory` |
+| 仓库和供应链 | 导入仓库候选、验证 SBOM/license/signature/advisory/vulnerability | `repo`、`sbom`、`sign`、`verify`、`advisory`、`vulnerability` |
 | SDK 和契约治理 | 发布前检查 SDK/API/manifest/错误码兼容性 | `contract check`、`schema export`、`conformance` |
 | Runtime 扩展 | 让新 runtime 复用同一套 init/build/test/validate 命令 | runtime adapter、`runtime features` |
 
@@ -87,7 +87,7 @@
 | 0 | 已有能力 | `inspect`、`validate`、`compat`、`source-validate`、`source-build` | 当前 CLI 基线，后续保持兼容 |
 | 1 | 阶段 1-3 | `init`、`build`、`test`、`features`、`manifest format/explain` | 插件作者日常开发闭环 |
 | 2 | 阶段 4 | `upload`、`enable`、`disable`、`rollback`、`status`、`config validate`、`secret check` | 本地开发 gateway 和 Admin API 操作闭环 |
-| 3 | 阶段 5 | `preflight`、`self-test`、`benchmark`、`review status`、`advisory scan` | 发布治理和准入证据 |
+| 3 | 阶段 5 | `preflight`、`self-test`、`benchmark`、`review status`、`advisory scan`、`vulnerability scan` | 发布治理和准入证据 |
 | 4 | 阶段 6 | `logs`、`events`、`metrics`、`diagnose`、`task`、`data`、`files`、`gc` | 运行诊断、后台任务、数据和资源治理 |
 | 5 | 阶段 7-8 | `repo`、`sbom`、`sign`、`verify`、`contract`、`conformance`、`export/import/diff/drift/dr-drill` | 生态、供应链、跨环境发布和未来 runtime |
 
@@ -372,7 +372,8 @@ type PluginBuildAdapter interface {
 | `gateway plugin self-test` | 运行插件实现的 quick/protocol-smoke/integration profile，保存脱敏证据 |
 | `gateway plugin benchmark` | 记录或执行 benchmark profile，输出 P95/P99、error rate、capacity 和 baseline diff |
 | `gateway plugin review status` | 查看当前 artifact/config/scope/risk/policy hash 是否已有有效 review |
-| `gateway plugin advisory scan` | 按 artifact sha256、plugin/version、SBOM dependency 或 source metadata 扫描安全公告 |
+| `gateway plugin advisory scan/rescan` | 查看安全公告，或按 artifact sha256、plugin/version、SBOM dependency 重新扫描本地 artifact |
+| `gateway plugin vulnerability scan/rescan` | 查看本地漏洞库，或按 SBOM dependency 重新扫描本地 artifact |
 
 发布治理命令的 JSON 报告必须包含稳定 `code`、`severity`、`message`、`evidence_id` 和相关 hash，不能要求 CI 解析人类可读文本。
 
@@ -387,6 +388,7 @@ type PluginBuildAdapter interface {
 | `gateway plugin metrics <plugin-id>` | 查看 handler calls、duration、panic、timeout、active proxy connections 和 custom metrics |
 | `gateway plugin diagnose <plugin-id>` | 生成诊断包，包含 manifest、state、recent logs/events/metrics/build summary，不含 secret 明文 |
 | `gateway plugin task list/run/cancel <plugin-id>` | 查看、手动触发或取消 background task |
+| `gateway plugin external list/health-check <plugin-id>` | 查看外部依赖状态，或触发单个声明依赖的受控健康检查 |
 | `gateway plugin data inspect/export/gc <plugin-id>` | 查看 plugin_data schema/data class/quota，导出可迁移数据，执行 dry-run 或清理 |
 | `gateway plugin files inspect/export/gc <plugin-id>` | 查看 runtime files/resources/cache/tmp/log/diagnostic 用量和 GC candidate |
 | `gateway plugin gc --dry-run` | 汇总 artifact、build log、diagnostic、plugin_data 和 runtime files 的可清理对象 |
@@ -402,11 +404,18 @@ type PluginBuildAdapter interface {
 | `gateway plugin repo list/search/show` | 查看 official/internal/file/url repository 中的候选版本 |
 | `gateway plugin repo import` | 下载或导入候选 artifact 到本地 store，只生成 local artifact，不自动启用 |
 | `gateway plugin sbom generate/verify` | 生成或验证 SBOM，供 advisory/license 策略使用 |
-| `gateway plugin sign` | 对 artifact 或 promotion bundle 签名，未来能力 |
+| `gateway plugin sign verify/key-rotation/revoke` | 验证 artifact 签名，维护本地 trust store 并吊销不可信 key |
 | `gateway plugin verify` | 验证 signature、sha256、SBOM、license 和 provenance |
-| `gateway plugin advisory import/scan/ack` | 导入安全公告、重新扫描本地 artifact、记录 mitigation/ack |
+| `gateway plugin advisory import/sync/scan/rescan` | 导入单条安全公告、本地 JSON feed 或外部 feed URL，重新扫描本地 artifact |
+| `gateway plugin vulnerability import/sync/scan/rescan` | 导入单条漏洞记录、本地 JSON 漏洞库或外部 feed URL，按 SBOM dependency 重新扫描本地 artifact |
 
 仓库删除、远端更新或签名失败都不能自动改变本地 active artifact。repository import 之后仍要走 validate、compat、preflight、review 和 enable。
+
+`gateway plugin verify` / `gateway plugin sbom verify` 提交的 `metadata-json` 支持本地 license policy：`license_policy.allowed`、`license_policy.denied`、`license_policy.review_required`、`license_policy.allow_unknown` 和 `license_policy.apply_to_transitive`。服务端会从 artifact/manifest/metadata 的 license 字段计算 `denylist_matches`、`allowlist_missing`、`review_required_matches` 或 `unknown`，再进入 supply-chain gate。
+
+`gateway plugin advisory import --metadata-json` 可以提交单条 advisory，也可以提交 `{"source":"local-json","advisories":[...]}` 形式的本地 feed。`gateway plugin advisory sync --feed-url ...` 由 Admin 端拉取 `http`、`https` 或 `file` feed。feed 导入后会触发 rescan；`quarantine` 或 `revoke` 命中 active artifact 时会移出 dispatch 并进入 drain。
+
+`gateway plugin vulnerability import --metadata-json` 可以提交单条 vulnerability，也可以提交 `{"source":"local-json","vulnerabilities":[...]}` 形式的本地漏洞库。`gateway plugin vulnerability sync --feed-url ...` 使用同一条服务端拉取和导入路径；部署方也可以通过 `pluginmanager.Options` 配置只在显式启用时运行的 feed scheduler。导入后会触发本地 rescan；命中 manifest SBOM dependency 的 `denylist`、`quarantine` 或 `revoke` 会进入治理门禁，其中 quarantine/revoke 命中 active artifact 时会移出 dispatch 并进入 drain。完整外部 CVE 自动扫描链仍是后续能力。
 
 ## 契约和 SDK 命令
 

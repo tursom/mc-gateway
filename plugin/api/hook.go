@@ -104,6 +104,32 @@ type (
 	RouteResolveAcceptor func(RouteResolveRequest) bool
 	RouteResolveHandler  func(RouteResolveRequest) (RouteDecision, error)
 
+	// RuleEvaluateRequest 描述一次可复用的策略/规则评估请求。它不直接接管
+	// Minecraft 登录或 Admin 登录数据面，只给插件和 conformance 提供稳定评估契约。
+	RuleEvaluateRequest struct {
+		Context    context.Context   `json:"-"`
+		Subject    string            `json:"subject,omitempty"`
+		Action     string            `json:"action,omitempty"`
+		Resource   string            `json:"resource,omitempty"`
+		Host       string            `json:"host,omitempty"`
+		SourceAddr string            `json:"source_addr,omitempty"`
+		Metadata   map[string]string `json:"metadata,omitempty"`
+	}
+
+	// RuleEvaluateDecision 是规则评估结果。Allow/Deny 显式表达决策；Reject 用于
+	// 兼容过滤类插件的写法；Reason/Metadata 用于审计和 explain。
+	RuleEvaluateDecision struct {
+		Allow      bool              `json:"allow"`
+		Deny       bool              `json:"deny,omitempty"`
+		Reject     bool              `json:"reject,omitempty"`
+		Reason     string            `json:"reason,omitempty"`
+		ProviderID string            `json:"provider_id,omitempty"`
+		Metadata   map[string]string `json:"metadata,omitempty"`
+	}
+
+	RuleEvaluateAcceptor func(RuleEvaluateRequest) bool
+	RuleEvaluateHandler  func(RuleEvaluateRequest) (RuleEvaluateDecision, error)
+
 	// StatusPingRequest 描述 Minecraft 状态查询请求，插件可以直接生成响应。
 	StatusPingRequest struct {
 		Context         context.Context   `json:"-"`
@@ -250,6 +276,15 @@ var (
 		RouteResolveHandler,
 	]{
 		key: "route.resolver/v1",
+	}
+
+	// HookRuleEvaluate 提供独立策略/规则评估扩展点，用于可执行 conformance
+	// 和通用策略插件；是否接入具体数据面由宿主显式决定。
+	HookRuleEvaluate = HookType[
+		RuleEvaluateAcceptor,
+		RuleEvaluateHandler,
+	]{
+		key: "rule.evaluate/v1",
 	}
 
 	// HookStatusPing 允许插件直接回答 Minecraft 状态查询。

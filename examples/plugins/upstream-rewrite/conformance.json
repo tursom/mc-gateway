@@ -1,0 +1,16 @@
+{
+  "fixtures": [
+    {
+      "name": "upstream connect dialer",
+      "status": "pass",
+      "expected": "dialer_mode_declared",
+      "extension": "upstream.connect/v1"
+    },
+    {
+      "name": "invalid_config",
+      "status": "pass",
+      "expected": "dry_run_rejected",
+      "extension": "config.validate/v1"
+    }
+  ]
+}

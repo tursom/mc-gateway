@@ -164,13 +164,22 @@ func canUnmarshalInto(value any) bool {
 }
 
 type Manager struct {
-	repo          Repository
-	store         ArtifactStore
-	adapter       RuntimeAdapter
-	builders      map[string]SourceBuilder
-	handleConn    func(net.Conn)
-	wg            *sync.WaitGroup
-	policyProfile string
+	repo                      Repository
+	store                     ArtifactStore
+	adapter                   RuntimeAdapter
+	adapterManaged            bool
+	builders                  map[string]SourceBuilder
+	handleConn                func(net.Conn)
+	wg                        *sync.WaitGroup
+	policyProfile             string
+	requireConformanceFixture bool
+	nodeID                    string
+	startedAt                 int64
+	ingressReservedListeners  []IngressReservedListener
+	futureGates               FutureRuntimeGates
+	sandboxPolicy             SandboxPolicy
+	wasmRunner                *WASMRunner
+	ingressLifecycle          *IngressLifecycleManager
 
 	mu                sync.Mutex
 	loaded            map[string]*loadedPlugin
@@ -187,9 +196,14 @@ type Manager struct {
 	operations  *Operations
 
 	// serviceMode/hosts 预留给插件运行时从进程内迁移到独立宿主的服务模式。
-	serviceMode string
-	hostMu      sync.Mutex
-	hosts       map[string]*pluginHostProcess
+	serviceMode      string
+	hostMu           sync.Mutex
+	hosts            map[string]*pluginHostProcess
+	pendingHostStops map[string]*PluginHostSupervisorProcess
+
+	feedSchedulerMu     sync.Mutex
+	feedSchedulerCancel context.CancelFunc
+	feedSchedulerDone   chan struct{}
 }
 
 // loadedPlugin 是内存中的插件实例和它注册的扩展快照。数据库记录说明期望状态，
@@ -198,6 +212,7 @@ type loadedPlugin struct {
 	record     PluginRecord
 	artifact   ArtifactRecord
 	instance   api.Plugin
+	runtime    RuntimeInstance
 	gateway    *Gateway
 	handlers   []*upstreamHandler
 	extensions pluginExtensions
@@ -206,6 +221,7 @@ type loadedPlugin struct {
 // pluginExtensions 按扩展类型拆分注册结果，便于发布不可变快照给不同热路径使用。
 type pluginExtensions struct {
 	routes      []*routeHandler
+	rules       []*ruleHandler
 	statuses    []*statusHandler
 	middleware  []*middlewareHandler
 	subscribers []*subscriberHandler
@@ -224,33 +240,37 @@ type upstreamHandler struct {
 	accept              func(api.UpstreamConnectRequest) bool
 	handle              func(api.UpstreamConnectRequest) (net.Conn, error)
 
-	calls          atomic.Uint64
-	errors         atomic.Uint64
-	panics         atomic.Uint64
-	timeouts       atomic.Uint64
-	blocked        atomic.Uint64
-	activeProxy    atomic.Int64
-	proxyStarted   atomic.Uint64
-	proxyCompleted atomic.Uint64
-	proxyErrors    atomic.Uint64
-	proxyBytesIn   atomic.Uint64
-	proxyBytesOut  atomic.Uint64
-	proxyDuration  atomic.Uint64
-	durationCount  atomic.Uint64
-	durationSumMS  atomic.Uint64
-	durationMaxMS  atomic.Uint64
+	calls            atomic.Uint64
+	errors           atomic.Uint64
+	panics           atomic.Uint64
+	timeouts         atomic.Uint64
+	blocked          atomic.Uint64
+	activeProxy      atomic.Int64
+	drainingProxy    atomic.Int64
+	proxyStarted     atomic.Uint64
+	proxyCompleted   atomic.Uint64
+	proxyErrors      atomic.Uint64
+	proxyBytesIn     atomic.Uint64
+	proxyBytesOut    atomic.Uint64
+	proxyDuration    atomic.Uint64
+	proxyForceClosed atomic.Uint64
+	durationCount    atomic.Uint64
+	durationSumMS    atomic.Uint64
+	durationMaxMS    atomic.Uint64
+	lastProxyError   atomic.Value
 }
 
 type proxyConnection struct {
-	id         uint64
-	pluginID   string
-	artifactID string
-	handlerID  string
-	handler    *upstreamHandler
-	client     net.Conn
-	endpoint   net.Conn
-	startedAt  time.Time
-	draining   bool
+	id                  uint64
+	pluginID            string
+	artifactID          string
+	handlerID           string
+	handler             *upstreamHandler
+	client              net.Conn
+	endpoint            net.Conn
+	startedAt           time.Time
+	draining            bool
+	forceCloseRequested bool
 }
 
 type ProxyConnectionHandle struct {
@@ -266,37 +286,55 @@ type ProxyConnectionStats struct {
 }
 
 type Options struct {
-	DB            *sql.DB
-	ArtifactRoot  string
-	HandleConn    func(net.Conn)
-	WaitGroup     *sync.WaitGroup
-	Adapter       RuntimeAdapter
-	Builders      map[string]SourceBuilder
-	PolicyProfile string
+	DB                        *sql.DB
+	ArtifactRoot              string
+	HandleConn                func(net.Conn)
+	WaitGroup                 *sync.WaitGroup
+	Adapter                   RuntimeAdapter
+	Builders                  map[string]SourceBuilder
+	PolicyProfile             string
+	RequireConformanceFixture bool
+	NodeID                    string
+	IngressReservedListeners  []IngressReservedListener
+	FutureRuntimeGates        FutureRuntimeGates
+	SandboxPolicy             SandboxPolicy
+	AdvisoryFeeds             []ExternalFeedSchedule
+	VulnerabilityFeeds        []ExternalFeedSchedule
 }
 
 // New 构造插件管理器并初始化内存快照。官方内置插件和插件服务模式会在这里
 // 尽力注册/应用，失败不会阻止网关启动，后续 Admin API 仍可修复状态。
 func New(options Options) *Manager {
 	adapter := options.Adapter
+	adapterManaged := adapter == nil
 	if adapter == nil {
-		adapter = GoPluginAdapter{}
+		adapter, _ = RuntimeAdapterFactory{}.AdapterFor(PluginServiceModeInProcess, RuntimeGoPlugin)
 	}
 	manager := &Manager{
-		repo:          NewRepository(options.DB),
-		store:         NewArtifactStore(options.ArtifactRoot),
-		adapter:       adapter,
-		builders:      options.Builders,
-		handleConn:    options.HandleConn,
-		wg:            options.WaitGroup,
-		policyProfile: options.PolicyProfile,
-		loaded:        make(map[string]*loadedPlugin),
-		routeCache:    make(map[string]routeCacheEntry),
-		proxyConns:    make(map[uint64]*proxyConnection),
-		drainingIDs:   make(map[string]bool),
-		hosts:         make(map[string]*pluginHostProcess),
+		repo:                      NewRepository(options.DB),
+		store:                     NewArtifactStore(options.ArtifactRoot),
+		adapter:                   adapter,
+		adapterManaged:            adapterManaged,
+		builders:                  options.Builders,
+		handleConn:                options.HandleConn,
+		wg:                        options.WaitGroup,
+		policyProfile:             options.PolicyProfile,
+		requireConformanceFixture: options.RequireConformanceFixture,
+		loaded:                    make(map[string]*loadedPlugin),
+		ingressReservedListeners:  append([]IngressReservedListener(nil), options.IngressReservedListeners...),
+		futureGates:               normalizeFutureRuntimeGates(options.FutureRuntimeGates),
+		sandboxPolicy:             normalizeSandboxPolicy(options.SandboxPolicy),
+		routeCache:                make(map[string]routeCacheEntry),
+		proxyConns:                make(map[uint64]*proxyConnection),
+		drainingIDs:               make(map[string]bool),
+		hosts:                     make(map[string]*pluginHostProcess),
+		pendingHostStops:          make(map[string]*PluginHostSupervisorProcess),
 	}
-	manager.operations = NewOperations(manager.repo, options.ArtifactRoot)
+	manager.wasmRunner = NewWASMRunner()
+	manager.ingressLifecycle = NewIngressLifecycleManager(manager.repo, manager.ingressReservedListeners)
+	manager.startedAt = time.Now().Unix()
+	manager.operations = NewOperationsWithNodeID(manager.repo, options.ArtifactRoot, options.NodeID)
+	manager.nodeID = manager.operations.nodeID
 	if manager.builders == nil {
 		// 默认同时提供本地进程构建和容器构建能力；部署方可在 Options 中收窄。
 		manager.builders = map[string]SourceBuilder{
@@ -308,6 +346,10 @@ func New(options Options) *Manager {
 	manager.publishExtensionsLocked(nil)
 	_ = manager.EnsureOfficialPlugins(context.Background(), "system")
 	_ = manager.ApplyPluginServiceMode(context.Background())
+	if state, err := manager.PluginServiceState(context.Background()); err == nil {
+		_ = manager.recordPluginNodeState(context.Background(), state)
+	}
+	_ = manager.StartExternalFeedSchedulers(context.Background(), options.AdvisoryFeeds, options.VulnerabilityFeeds)
 	return manager
 }
 
@@ -330,13 +372,21 @@ func (m *Manager) EnsureOfficialPlugins(ctx context.Context, actor string) error
 			{Type: "middleware", Key: ExtensionConnectionFilter},
 			{Type: "middleware", Key: ExtensionHandshakeFilter},
 			{Type: "provider", Key: ExtensionRouteResolve},
+			{Type: "rule", Key: ExtensionRuleEvaluate},
 			{Type: "hook", Key: ExtensionStatusPing},
 		},
-		Capabilities:  json.RawMessage(`{"extension_points":["connection.filter/v1","handshake.filter/v1","route.resolve/v1","status.ping/v1"],"middleware":{"fail_policy":"fail_open"},"route":{"cache_ttl_ms":60000},"status":{"hosts":["*"]}}`),
+		Capabilities:  json.RawMessage(`{"extension_points":["connection.filter/v1","handshake.filter/v1","route.resolve/v1","rule.evaluate/v1","status.ping/v1"],"middleware":{"fail_policy":"fail_open"},"route":{"cache_ttl_ms":60000},"status":{"hosts":["*"]}}`),
 		RuntimeLimits: RuntimeLimits{HandlerTimeoutMS: int(DefaultHandlerTimeout / time.Millisecond)},
-		ConfigSchema:  json.RawMessage(`{"type":"object","properties":{"host_rewrite":{"type":"object"},"upstream_rewrite":{"type":"object"},"source_allow_cidr":{"type":"array"},"source_deny_cidr":{"type":"array"},"rate_limit":{"type":"object"},"maintenance":{"type":"object"}}}`),
+		ConfigSchema:  json.RawMessage(`{"type":"object","properties":{"host_rewrite":{"type":"object"},"upstream_rewrite":{"type":"object"},"source_allow_cidr":{"type":"array"},"source_deny_cidr":{"type":"array"},"rate_limit":{"type":"object"},"maintenance":{"type":"object","properties":{"enabled":{"type":"boolean"},"hosts":{"type":"array"},"motd":{"type":"string"},"favicon":{"type":"string"},"online_players":{"type":"integer"},"max_players":{"type":"integer"},"version":{"type":"string"},"window":{"type":"string"},"status_by_host":{"type":"object"}}}}}`),
 	}
-	metadata, _ := json.Marshal(manifest)
+	metadata, _ := artifactMetadataJSON(manifest, ConformanceSummary{
+		Source:  "builtin:official.rule-policy",
+		OK:      true,
+		Total:   5,
+		Passed:  5,
+		Skipped: 0,
+		Failed:  0,
+	}, true, nil)
 	extensionPoints, _ := json.Marshal(manifest.ExtensionPoints)
 	summaryJSON, _ := manifestCapabilitiesSummaryJSON(manifest)
 	artifact := ArtifactRecord{
@@ -433,10 +483,13 @@ func (m *Manager) CreateBuild(ctx context.Context, actor string, req BuildReques
 	if source.ArtifactType != ArtifactTypeSource {
 		return BuildRecord{}, fmt.Errorf("artifact %s is %q, want source", source.ID, source.ArtifactType)
 	}
-	req = defaultBuildRequest(req, source)
+	req = defaultBuildRequestForProfile(req, source, m.currentPolicyProfile())
 	// Go plugin 与宿主进程存在 ABI 约束，目前只允许构建当前网关所在平台的目标。
 	if req.GOOS != runtime.GOOS || req.GOARCH != runtime.GOARCH {
 		return BuildRecord{}, fmt.Errorf("build target %s/%s does not match gateway %s/%s", req.GOOS, req.GOARCH, runtime.GOOS, runtime.GOARCH)
+	}
+	if err := m.validateBuildPolicy(req); err != nil {
+		return BuildRecord{}, err
 	}
 	builder := m.builders[req.BuilderType]
 	if builder == nil {
@@ -509,6 +562,23 @@ func (m *Manager) RunBuild(ctx context.Context, actor string, buildID int64) (Bu
 		GONOSUMDB:      build.GONOSUMDB,
 		GOPRIVATE:      build.GOPRIVATE,
 		VendorRequired: build.VendorRequired,
+	}
+	if err := m.validateBuildPolicy(req); err != nil {
+		build.StartedAt = time.Now().Unix()
+		build.EndedAt = build.StartedAt
+		build.DurationMS = 0
+		build.Status = BuildStatusFailed
+		build.Error = err.Error()
+		build.LogSummary = sanitizeLog(err.Error())
+		build.SourceSHA256 = source.SHA256
+		_ = m.repo.FinishBuild(ctx, build)
+		_ = m.repo.RecordOperation(ctx, source.PluginID, source.ID, "source_build", "failed", actor, err.Error(), map[string]any{
+			"build_id":       build.ID,
+			"source_sha256":  source.SHA256,
+			"builder_type":   req.BuilderType,
+			"active_changed": false,
+		})
+		return m.repo.Build(ctx, build.ID)
 	}
 	builder := m.builders[build.BuilderType]
 	if builder == nil {
@@ -590,6 +660,16 @@ func (m *Manager) RunBuild(ctx context.Context, actor string, buildID int64) (Bu
 	return m.repo.Build(ctx, build.ID)
 }
 
+func (m *Manager) validateBuildPolicy(req BuildRequest) error {
+	if normalizeProfile(m.currentPolicyProfile()) == PolicyProfileProd && req.BuilderType == BuilderTypeLocalProcess {
+		return errors.New("local-process source builder is disabled in prod profile; use container builder or upload an external CI binary artifact")
+	}
+	if req.BuilderType == BuilderTypeContainer && strings.TrimSpace(req.BuilderImage) == "" {
+		return errors.New("container source builder requires builder_image")
+	}
+	return nil
+}
+
 // SetDesired 只修改插件的期望状态，不直接改变当前进程已加载的插件。
 // 调用方需要再执行 Enable/Disable/Reconcile 才会推动运行态收敛。
 func (m *Manager) SetDesired(ctx context.Context, actor, pluginID, artifactID, desiredState, configJSON string, priority int) (PluginRecord, error) {
@@ -615,6 +695,30 @@ func (m *Manager) SetDesired(ctx context.Context, actor, pluginID, artifactID, d
 		"desired_generation": pluginRecord.DesiredGeneration,
 		"priority":           pluginRecord.Priority,
 	})
+	m.recordPluginNodeRuntimeState(ctx, pluginID)
+	rollout, rolloutErr := m.PluginRolloutStatus(ctx, pluginID)
+	metadata := map[string]any{
+		"desired_state":       desiredState,
+		"desired_generation":  pluginRecord.DesiredGeneration,
+		"artifact_available":  false,
+		"artifact_dist_mode":  "",
+		"artifact_dist_state": "",
+		"nodes_total":         0,
+		"nodes_ready":         0,
+		"nodes_failed":        0,
+		"partial_failure":     false,
+		"retry_policy":        "node heartbeat reconcile retries desired generation until ready",
+	}
+	if rolloutErr == nil {
+		metadata["artifact_available"] = rollout.ArtifactDistribution
+		metadata["artifact_dist_mode"] = rollout.ArtifactDistributionMode
+		metadata["artifact_dist_state"] = rollout.ArtifactDistributionStatus
+		metadata["nodes_total"] = rollout.NodesTotal
+		metadata["nodes_ready"] = rollout.NodesReady
+		metadata["nodes_failed"] = rollout.NodesFailed
+		metadata["partial_failure"] = rollout.PartialFailure
+	}
+	_ = m.repo.RecordOperation(ctx, pluginID, artifactID, "cluster_desired_apply", "succeeded", actor, "desired generation queued for automatic cluster apply", metadata)
 	return pluginRecord, nil
 }
 
@@ -702,10 +806,7 @@ func (m *Manager) RollbackArtifact(ctx context.Context, actor, pluginID, artifac
 	if err != nil {
 		return PluginRecord{}, err
 	}
-	decision, err := m.EvaluateGovernance(ctx, pluginID, artifactID, GovernanceActionRollback, m.currentPolicyProfile(), current.ConfigJSON)
-	if err == nil && !decision.OK {
-		err = governanceBlockedError(decision)
-	}
+	decision, err := m.EvaluateReleaseGate(ctx, pluginID, artifactID, GovernanceActionRollback, m.currentPolicyProfile(), current.ConfigJSON)
 	if err != nil {
 		_ = m.repo.RecordOperation(ctx, pluginID, artifactID, "artifact_rollback_gate", "failed", actor, err.Error(), map[string]any{
 			"active_changed":      false,
@@ -751,10 +852,7 @@ func (m *Manager) RollbackConfigSnapshot(ctx context.Context, actor string, snap
 		desiredState = snapshot.DesiredState
 		priority = snapshot.Priority
 	}
-	decision, err := m.EvaluateGovernance(ctx, snapshot.PluginID, artifactID, GovernanceActionRollback, m.currentPolicyProfile(), snapshot.ConfigJSON)
-	if err == nil && !decision.OK {
-		err = governanceBlockedError(decision)
-	}
+	decision, err := m.EvaluateReleaseGate(ctx, snapshot.PluginID, artifactID, GovernanceActionRollback, m.currentPolicyProfile(), snapshot.ConfigJSON)
 	if err != nil {
 		_ = m.repo.RecordOperation(ctx, snapshot.PluginID, artifactID, "config_rollback_gate", "failed", actor, err.Error(), map[string]any{
 			"snapshot_id":         snapshot.ID,
@@ -823,12 +921,10 @@ func (m *Manager) Enable(ctx context.Context, actor, pluginID string) (PluginRec
 			return PluginRecord{}, err
 		}
 	}
-	decision, err := m.EvaluateGovernance(ctx, pluginID, pluginRecord.DesiredArtifactID, GovernanceActionEnable, m.currentPolicyProfile(), pluginRecord.ConfigJSON)
-	if err == nil && !decision.OK {
-		err = governanceBlockedError(decision)
-	}
+	decision, err := m.EvaluateReleaseGate(ctx, pluginID, pluginRecord.DesiredArtifactID, GovernanceActionEnable, m.currentPolicyProfile(), pluginRecord.ConfigJSON)
 	if err != nil {
 		_ = m.repo.MarkRuntime(ctx, pluginID, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"governance": decision}, nil)
+		m.recordPluginNodeRuntimeState(ctx, pluginID)
 		_ = m.repo.RecordOperation(ctx, pluginID, pluginRecord.DesiredArtifactID, "enable_gate", "failed", actor, err.Error(), map[string]any{
 			"decision": decision,
 		})
@@ -848,6 +944,7 @@ func (m *Manager) Enable(ctx context.Context, actor, pluginID string) (PluginRec
 	if len(loaded.handlers) == 0 && loaded.extensions.empty() {
 		err := fmt.Errorf("plugin %q did not register any supported extension point", pluginID)
 		_ = m.repo.MarkRuntime(ctx, pluginID, RuntimeFailed, "", loaded.artifact.ID, pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
+		m.recordPluginNodeRuntimeStateLocked(ctx, pluginID)
 		_ = m.repo.RecordOperation(ctx, pluginID, pluginRecord.DesiredArtifactID, "enable", "failed", actor, err.Error(), nil)
 		return PluginRecord{}, err
 	}
@@ -862,7 +959,6 @@ func (m *Manager) Enable(ctx context.Context, actor, pluginID string) (PluginRec
 	}
 	// 数据库运行态先写成功，再发布内存快照；这样 UI 看到 enabled 时，
 	// 连接热路径也已经具备对应处理器。
-	m.markHostStarted(pluginID, loaded.artifact.ID)
 	m.clearDrainingLocked(pluginID)
 	m.publish(next)
 	m.publishExtensionsLocked(extensions)
@@ -896,8 +992,15 @@ func (m *Manager) Disable(ctx context.Context, actor, pluginID string) (PluginRe
 	m.markDrainingLocked(pluginID)
 	m.markHostDraining(pluginID)
 	m.operations.StopPlugin(pluginID)
-	if loaded := m.loaded[pluginID]; loaded != nil && loaded.instance != nil {
-		if err := loaded.instance.Destroy(); err != nil {
+	if loaded := m.loaded[pluginID]; loaded != nil {
+		var errs []error
+		if m.shouldDeferProcessHostStop(pluginID, loaded) {
+			errs = m.drainRuntimeInstance(ctx, loaded)
+			m.deferProcessHostStop(pluginID, loaded.runtime.HostProcess)
+		} else {
+			errs = m.stopRuntimeInstance(ctx, loaded)
+		}
+		for _, err := range errs {
 			_ = m.repo.RecordOperation(ctx, pluginID, loaded.artifact.ID, "disable", "warning", actor, err.Error(), nil)
 		}
 	}
@@ -911,6 +1014,7 @@ func (m *Manager) Disable(ctx context.Context, actor, pluginID string) (PluginRe
 	}, nil); err != nil {
 		return PluginRecord{}, err
 	}
+	m.recordPluginNodeRuntimeStateLocked(ctx, pluginID)
 	_ = m.repo.RecordOperation(ctx, pluginID, pluginRecord.DesiredArtifactID, "disable", "succeeded", actor, "plugin disabled", nil)
 	return m.repo.Plugin(ctx, pluginID)
 }
@@ -930,17 +1034,65 @@ func (m *Manager) Delete(ctx context.Context, actor, pluginID string) error {
 	m.markDrainingLocked(pluginID)
 	m.markHostDraining(pluginID)
 	m.operations.StopPlugin(pluginID)
-	if loaded := m.loaded[pluginID]; loaded != nil && loaded.instance != nil {
-		_ = loaded.instance.Destroy()
+	if loaded := m.loaded[pluginID]; loaded != nil {
+		_ = m.stopRuntimeInstance(ctx, loaded)
 	}
 	delete(m.loaded, pluginID)
-	if _, err := m.repo.UpsertDesired(ctx, actor, pluginRecord.ID, pluginRecord.DesiredArtifactID, DesiredDeleted, pluginRecord.ConfigJSON, pluginRecord.Priority); err != nil {
+	if _, err := m.repo.UpsertDesired(ctx, actor, pluginRecord.ID, pluginRecord.DesiredArtifactID, DesiredDeleted, pluginRecord.ConfigJSON, pluginRecord.Priority); err != nil && !errors.Is(err, ErrPluginNotFound) {
 		return err
 	}
+	m.deletePluginNodeRuntimeState(ctx, pluginID)
 	_ = m.repo.RecordOperation(ctx, pluginID, pluginRecord.DesiredArtifactID, "delete", "succeeded", actor, "plugin deleted", map[string]any{
 		"cleanup": "pending_restart_for_loaded_go_plugin",
 	})
 	return nil
+}
+
+func (m *Manager) stopRuntimeInstance(ctx context.Context, loaded *loadedPlugin) []error {
+	var errs []error
+	errs = append(errs, m.drainRuntimeInstance(ctx, loaded)...)
+	if loaded.instance != nil {
+		if err := loaded.instance.Destroy(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if lifecycle, ok := m.adapter.(RuntimeAdapterLifecycle); ok {
+		if err := lifecycle.Stop(ctx, loaded.runtime); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if loaded.runtime.HostProcess != nil {
+		m.markHostStopped(loaded.record.ID, loaded.artifact.ID, loaded.runtime.HostProcess)
+	}
+	return errs
+}
+
+func (m *Manager) drainRuntimeInstance(ctx context.Context, loaded *loadedPlugin) []error {
+	if lifecycle, ok := m.adapter.(RuntimeAdapterLifecycle); ok {
+		if err := lifecycle.Drain(ctx, loaded.runtime); err != nil {
+			return []error{err}
+		}
+	}
+	return nil
+}
+
+func (m *Manager) shouldDeferProcessHostStop(pluginID string, loaded *loadedPlugin) bool {
+	return m.serviceMode == PluginServiceModeGoPluginProcess &&
+		loaded != nil &&
+		loaded.runtime.HostProcess != nil &&
+		m.activeProxyCountLocked(pluginID) > 0
+}
+
+func (m *Manager) deferProcessHostStop(pluginID string, process *PluginHostSupervisorProcess) {
+	if process == nil {
+		return
+	}
+	m.hostMu.Lock()
+	if m.pendingHostStops == nil {
+		m.pendingHostStops = make(map[string]*PluginHostSupervisorProcess)
+	}
+	m.pendingHostStops[pluginID] = process
+	m.hostMu.Unlock()
 }
 
 // Reconcile 根据数据库中的期望启用列表重建内存分发快照，主要用于进程启动
@@ -957,31 +1109,30 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 	extensionsByPlugin := make(map[string]pluginExtensions)
 	for _, pluginRecord := range desired {
 		// 单个插件失败不阻断其他插件收敛；失败会记录到 runtime_state 和操作日志。
-		decision, err := m.EvaluateGovernance(ctx, pluginRecord.ID, pluginRecord.DesiredArtifactID, GovernanceActionEnable, m.currentPolicyProfile(), pluginRecord.ConfigJSON)
-		if err == nil && !decision.OK {
-			err = governanceBlockedError(decision)
-		}
+		decision, err := m.EvaluateReleaseGate(ctx, pluginRecord.ID, pluginRecord.DesiredArtifactID, GovernanceActionEnable, m.currentPolicyProfile(), pluginRecord.ConfigJSON)
 		if err != nil {
 			_ = m.repo.MarkRuntime(ctx, pluginRecord.ID, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"governance": decision}, nil)
+			m.recordPluginNodeRuntimeStateLocked(ctx, pluginRecord.ID)
 			_ = m.repo.RecordOperation(ctx, pluginRecord.ID, pluginRecord.DesiredArtifactID, "reconcile_gate", "failed", "system", err.Error(), map[string]any{"decision": decision})
 			continue
 		}
 		loaded, err := m.loadLocked(ctx, pluginRecord)
 		if err != nil {
 			_ = m.repo.MarkRuntime(ctx, pluginRecord.ID, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
+			m.recordPluginNodeRuntimeStateLocked(ctx, pluginRecord.ID)
 			_ = m.repo.RecordOperation(ctx, pluginRecord.ID, pluginRecord.DesiredArtifactID, "reconcile", "failed", "system", err.Error(), nil)
 			continue
 		}
 		if len(loaded.handlers) == 0 && loaded.extensions.empty() {
 			err := fmt.Errorf("plugin %q did not register any supported extension point", pluginRecord.ID)
 			_ = m.repo.MarkRuntime(ctx, pluginRecord.ID, RuntimeFailed, "", loaded.artifact.ID, pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
+			m.recordPluginNodeRuntimeStateLocked(ctx, pluginRecord.ID)
 			_ = m.repo.RecordOperation(ctx, pluginRecord.ID, pluginRecord.DesiredArtifactID, "reconcile", "failed", "system", err.Error(), nil)
 			continue
 		}
 		nextByPlugin[pluginRecord.ID] = loaded.handlers
 		extensionsByPlugin[pluginRecord.ID] = loaded.extensions
 		_ = m.markEnabled(ctx, loaded)
-		m.markHostStarted(pluginRecord.ID, loaded.artifact.ID)
 		m.clearDrainingLocked(pluginRecord.ID)
 	}
 	// 所有插件都处理完后一次性发布快照，避免热路径在收敛过程中看到部分插件。
@@ -1004,6 +1155,7 @@ func (m *Manager) ConnectUpstream(ctx context.Context, req api.UpstreamConnectRe
 	if req.Context == nil {
 		req.Context = ctx
 	}
+	req.Context = context.WithValue(req.Context, pluginHostCallerContextKey{}, req.Context)
 	req.InitialData = append([]byte(nil), req.InitialData...)
 	for _, handler := range handlers {
 		// accept 阶段应尽量轻量，用于快速过滤不关心的主机或上游。
@@ -1092,7 +1244,7 @@ func (m *Manager) startProtocolProxy(ctx context.Context, handler *upstreamHandl
 		_ = endpoint.Close()
 		return UpstreamResult{Handled: true, Mode: handler.mode, PluginID: handler.pluginID, HandlerID: handler.handlerID}, fmt.Errorf("plugin %s protocol-proxy tracking failed", handler.pluginID)
 	}
-	runProtocolProxy(ctx, handle, req.Source, endpoint)
+	runProtocolProxy(ctx, handle, req.Source, endpoint, int64(len(initial)))
 
 	return UpstreamResult{
 		Handled:         true,
@@ -1202,15 +1354,59 @@ func (m *Manager) quarantineAffected(ctx context.Context, advisory AdvisoryRecor
 			manifests[artifact.ID] = manifest
 		}
 		if advisoryMatches(advisory, artifact, manifest) {
-			m.removeFromDispatchLocked(plugin.ID)
-			m.markDrainingLocked(plugin.ID)
-			m.markHostDraining(plugin.ID)
+			m.quarantinePluginLocked(plugin.ID)
 			_ = m.repo.MarkRuntime(ctx, plugin.ID, RuntimeDraining, artifact.ID, artifact.ID, plugin.AppliedGeneration, "plugin quarantined by advisory "+advisory.AdvisoryID, map[string]any{
 				"quarantine":  true,
 				"advisory_id": advisory.AdvisoryID,
 			}, nil)
 		}
 	}
+}
+
+func (m *Manager) quarantineAffectedByVulnerability(ctx context.Context, vulnerability VulnerabilityRecord) {
+	plugins, err := m.repo.ListPlugins(ctx)
+	if err != nil {
+		return
+	}
+	var manifests = make(map[string]Manifest)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, plugin := range plugins {
+		if plugin.RuntimeState != RuntimeEnabled || plugin.ActiveArtifactID == "" {
+			continue
+		}
+		artifact, err := m.repo.Artifact(ctx, plugin.ActiveArtifactID)
+		if err != nil {
+			continue
+		}
+		manifest := manifests[artifact.ID]
+		if manifest.ID == "" {
+			_ = json.Unmarshal([]byte(artifact.MetadataJSON), &manifest)
+			manifests[artifact.ID] = manifest
+		}
+		for _, dep := range sbomDependencies(manifest) {
+			if vulnerabilityMatchesDependency(vulnerability, dep) {
+				m.quarantinePluginLocked(plugin.ID)
+				_ = m.repo.MarkRuntime(ctx, plugin.ID, RuntimeDraining, artifact.ID, artifact.ID, plugin.AppliedGeneration, "plugin quarantined by vulnerability "+vulnerability.VulnerabilityID, map[string]any{
+					"quarantine":       true,
+					"vulnerability_id": vulnerability.VulnerabilityID,
+					"package_name":     vulnerability.PackageName,
+				}, nil)
+				break
+			}
+		}
+	}
+}
+
+func (m *Manager) quarantinePluginLocked(pluginID string) {
+	m.removeFromDispatchLocked(pluginID)
+	m.removeExtensionsLocked(pluginID)
+	m.routeCacheMu.Lock()
+	m.routeCache = make(map[string]routeCacheEntry)
+	m.routeCacheMu.Unlock()
+	m.markDrainingLocked(pluginID)
+	m.markHostDraining(pluginID)
+	m.operations.StopPlugin(pluginID)
 }
 
 func (m *Manager) UpsertSecret(ctx context.Context, actor, pluginID, artifactID, name, value string, reloadRequired, hotReload bool) (SecretRecord, error) {
@@ -1281,13 +1477,14 @@ func (m *Manager) ActiveProxyConnections(ctx context.Context, pluginID string) (
 			continue
 		}
 		summaries = append(summaries, ProxyConnectionSummary{
-			ID:         conn.id,
-			PluginID:   conn.pluginID,
-			ArtifactID: conn.artifactID,
-			HandlerID:  conn.handlerID,
-			StartedAt:  conn.startedAt.Unix(),
-			DurationMS: now.Sub(conn.startedAt).Milliseconds(),
-			Draining:   conn.draining,
+			ID:                  conn.id,
+			PluginID:            conn.pluginID,
+			ArtifactID:          conn.artifactID,
+			HandlerID:           conn.handlerID,
+			StartedAt:           conn.startedAt.Unix(),
+			DurationMS:          now.Sub(conn.startedAt).Milliseconds(),
+			Draining:            conn.draining,
+			ForceCloseRequested: conn.forceCloseRequested,
 		})
 	}
 	sort.Slice(summaries, func(i, j int) bool {
@@ -1341,6 +1538,20 @@ func (m *Manager) Artifact(ctx context.Context, id string) (ArtifactRecord, erro
 	return m.repo.Artifact(ctx, id)
 }
 
+func (m *Manager) ArtifactDistributionPackage(ctx context.Context, id string) (ArtifactRecord, string, error) {
+	artifact, err := m.repo.Artifact(ctx, id)
+	if err != nil {
+		return ArtifactRecord{}, "", err
+	}
+	if artifact.ArtifactType != ArtifactTypeBinary {
+		return ArtifactRecord{}, "", fmt.Errorf("artifact %s is %s; only binary distribution packages are transferable", id, artifact.ArtifactType)
+	}
+	if !m.store.HasDistributionPackage(artifact) {
+		return ArtifactRecord{}, "", fmt.Errorf("artifact %s distribution package is missing", id)
+	}
+	return artifact, m.store.DistributionPackagePath(artifact), nil
+}
+
 func (m *Manager) ListPlugins(ctx context.Context) ([]PluginRecord, error) {
 	return m.repo.ListPlugins(ctx)
 }
@@ -1357,6 +1568,7 @@ func (m *Manager) DispatchPlan(ctx context.Context) DispatchPlan {
 	}
 	state := m.extensionState()
 	plan.Routes = routeHandlerSummaries(state.routes)
+	plan.Rules = ruleHandlerSummaries(state.rules)
 	plan.Statuses = statusHandlerSummaries(state.statuses)
 	plan.Middleware = middlewareHandlerSummaries(state.middleware)
 	plan.Subscribers = subscriberHandlerSummaries(state.subscribers)
@@ -1378,7 +1590,7 @@ func (m *Manager) OperationsSnapshot(ctx context.Context, pluginID string) (Oper
 			handlers = append(handlers, handler)
 		}
 	}
-	for _, group := range [][]DispatchHandlerSummary{plan.Routes, plan.Statuses, plan.Middleware, plan.Subscribers} {
+	for _, group := range [][]DispatchHandlerSummary{plan.Routes, plan.Rules, plan.Statuses, plan.Middleware, plan.Subscribers} {
 		for _, handler := range group {
 			if pluginID == "" || handler.PluginID == pluginID {
 				handlers = append(handlers, handler)
@@ -1390,7 +1602,152 @@ func (m *Manager) OperationsSnapshot(ctx context.Context, pluginID string) (Oper
 		return OperationsSnapshot{}, err
 	}
 	gc, _ := m.operations.GCCandidates(ctx, pluginID)
-	return m.operations.Snapshot(ctx, pluginID, handlers, builds, gc), nil
+	snapshot := m.operations.Snapshot(ctx, pluginID, handlers, builds, gc)
+	snapshot.Exporters = m.operations.ExportSnapshot(ctx, snapshot)
+	return snapshot, nil
+}
+
+func (m *Manager) HealthCheckExternalDependency(ctx context.Context, actor, pluginID, dependency string) (ExternalDependencyHealthCheck, error) {
+	pluginID = strings.TrimSpace(pluginID)
+	dependency = strings.TrimSpace(dependency)
+	if pluginID == "" {
+		return ExternalDependencyHealthCheck{}, errors.New("plugin_id is required")
+	}
+	if dependency == "" {
+		return ExternalDependencyHealthCheck{}, errors.New("external dependency name is required")
+	}
+	plugin, err := m.repo.Plugin(ctx, pluginID)
+	if err != nil {
+		return ExternalDependencyHealthCheck{}, err
+	}
+	artifactID := plugin.ActiveArtifactID
+	if artifactID == "" {
+		artifactID = plugin.LoadedArtifactID
+	}
+	if artifactID == "" {
+		artifactID = plugin.DesiredArtifactID
+	}
+	if artifactID == "" {
+		return ExternalDependencyHealthCheck{}, errors.New("plugin has no artifact to health-check")
+	}
+	artifact, err := m.repo.Artifact(ctx, artifactID)
+	if err != nil {
+		return ExternalDependencyHealthCheck{}, err
+	}
+	var manifest Manifest
+	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err != nil {
+		return ExternalDependencyHealthCheck{}, err
+	}
+	declared := false
+	for _, spec := range manifest.ExternalDeps {
+		if spec.Name == dependency {
+			declared = true
+			break
+		}
+	}
+	if !declared {
+		return ExternalDependencyHealthCheck{}, fmt.Errorf("external dependency %q is not declared by manifest", dependency)
+	}
+	summary, healthErr := m.operations.ForPlugin(plugin.ID, artifact.ID, manifest).HealthCheckExternalDependency(ctx, dependency)
+	result := ExternalDependencyHealthCheck{
+		PluginID:  plugin.ID,
+		Name:      dependency,
+		OK:        healthErr == nil,
+		Summary:   summary,
+		CheckedBy: actor,
+		CheckedAt: m.repo.now().Unix(),
+	}
+	status := "succeeded"
+	message := "external dependency health check succeeded"
+	if healthErr != nil {
+		status = "failed"
+		message = "external dependency health check failed"
+		result.Error = redactSensitive(healthErr.Error())
+	}
+	_ = m.repo.RecordOperation(ctx, plugin.ID, artifact.ID, "external_dependency_health_check", status, actor, message, map[string]any{
+		"dependency":    dependency,
+		"ok":            result.OK,
+		"status":        summary.LastStatus,
+		"circuit_state": summary.CircuitState,
+	})
+	return result, nil
+}
+
+func (m *Manager) PluginRolloutStatus(ctx context.Context, pluginID string) (PluginRolloutStatus, error) {
+	plugin, err := m.repo.Plugin(ctx, pluginID)
+	if err != nil {
+		return PluginRolloutStatus{}, err
+	}
+	states, err := m.repo.ListPluginNodeRuntime(ctx, pluginID, DefaultPluginNodeStaleAfter)
+	if err != nil {
+		return PluginRolloutStatus{}, err
+	}
+	status := PluginRolloutStatus{
+		PluginID:                   plugin.ID,
+		DesiredState:               plugin.DesiredState,
+		DesiredArtifactID:          plugin.DesiredArtifactID,
+		DesiredGeneration:          plugin.DesiredGeneration,
+		OK:                         plugin.DesiredState != DesiredEnabled || len(states) > 0,
+		NodeRuntimeStates:          states,
+		ArtifactDistributionMode:   "local-content-store",
+		ArtifactDistributionStatus: "not_required",
+		CrossNodeApply:             false,
+	}
+	if plugin.DesiredArtifactID != "" {
+		artifact, err := m.repo.Artifact(ctx, plugin.DesiredArtifactID)
+		if err != nil {
+			status.ArtifactDistributionStatus = "error"
+			status.ArtifactDistributionError = err.Error()
+			status.OK = false
+		} else if artifact.RuntimeType == RuntimeBuiltin {
+			status.ArtifactDistributionStatus = "not_required"
+		} else if artifact.ArtifactType == ArtifactTypeBinary && m.store.HasDistributionPackage(artifact) {
+			status.ArtifactDistribution = true
+			status.ArtifactDistributionStatus = "available"
+			status.ArtifactPackageSHA256 = artifact.PackageSHA256
+		} else if artifact.ArtifactType == ArtifactTypeBinary {
+			status.ArtifactDistributionStatus = "missing"
+			status.ArtifactDistributionError = "local distribution package is missing"
+			status.OK = false
+		}
+	}
+	for _, state := range states {
+		status.NodesTotal++
+		ready := pluginNodeRuntimeReady(plugin, state)
+		if ready {
+			status.NodesReady++
+		}
+		if state.Stale {
+			status.NodesStale++
+		}
+		failed := state.RuntimeState == RuntimeFailed || state.Error != "" || !ready
+		if failed {
+			status.NodesFailed++
+			status.OK = false
+			status.PartialFailure = true
+		}
+	}
+	status.CrossNodeApply = status.NodesTotal > 1
+	return status, nil
+}
+
+func pluginNodeRuntimeReady(plugin PluginRecord, state PluginNodeRuntimeState) bool {
+	if state.Stale {
+		return false
+	}
+	switch plugin.DesiredState {
+	case DesiredEnabled:
+		return state.Enabled &&
+			state.RuntimeState == RuntimeEnabled &&
+			state.ArtifactID == plugin.DesiredArtifactID &&
+			state.AppliedGeneration == plugin.DesiredGeneration
+	case DesiredDisabled:
+		return state.RuntimeState == RuntimeDisabled && !state.Enabled
+	case DesiredDeleted:
+		return false
+	default:
+		return false
+	}
 }
 
 func (m *Manager) TriggerBackgroundTask(ctx context.Context, actor, pluginID, taskID, confirmToken string) (BackgroundTaskSummary, error) {
@@ -1400,6 +1757,16 @@ func (m *Manager) TriggerBackgroundTask(ctx context.Context, actor, pluginID, ta
 		return BackgroundTaskSummary{}, err
 	}
 	_ = m.repo.RecordOperation(ctx, pluginID, "", "background_task_trigger", "succeeded", actor, "background task triggered", map[string]any{"task_id": taskID})
+	return summary, nil
+}
+
+func (m *Manager) CancelBackgroundTask(ctx context.Context, actor, pluginID, taskID string) (BackgroundTaskSummary, error) {
+	summary, err := m.operations.CancelTask(pluginID, taskID)
+	if err != nil {
+		_ = m.repo.RecordOperation(ctx, pluginID, "", "background_task_cancel", "failed", actor, err.Error(), map[string]any{"task_id": taskID})
+		return BackgroundTaskSummary{}, err
+	}
+	_ = m.repo.RecordOperation(ctx, pluginID, "", "background_task_cancel", "succeeded", actor, "background task canceled", map[string]any{"task_id": taskID})
 	return summary, nil
 }
 
@@ -1462,6 +1829,9 @@ func (m *Manager) TrackProxyConnection(result UpstreamResult, client, endpoint n
 	handler.proxyStarted.Add(1)
 	m.proxyMu.Lock()
 	proxyConn.draining = m.drainingIDs[result.PluginID]
+	if proxyConn.draining {
+		handler.drainingProxy.Add(1)
+	}
 	m.proxyConns[id] = proxyConn
 	m.proxyMu.Unlock()
 	return &ProxyConnectionHandle{manager: m, id: id}
@@ -1475,11 +1845,14 @@ func (h *ProxyConnectionHandle) Finish(stats ProxyConnectionStats) {
 }
 
 func (m *Manager) ForceCloseDraining(ctx context.Context, actor, pluginID string) (int, error) {
-	_ = ctx
 	var conns []*proxyConnection
 	m.proxyMu.Lock()
 	for _, conn := range m.proxyConns {
 		if conn.pluginID == pluginID && conn.draining {
+			if conn.handler != nil && !conn.forceCloseRequested {
+				conn.handler.proxyForceClosed.Add(1)
+			}
+			conn.forceCloseRequested = true
 			conns = append(conns, conn)
 		}
 	}
@@ -1525,9 +1898,13 @@ func (m *Manager) finishProxyConnection(id uint64, stats ProxyConnectionStats) {
 		return
 	}
 	proxyConn.handler.activeProxy.Add(-1)
+	if proxyConn.draining {
+		proxyConn.handler.drainingProxy.Add(-1)
+	}
 	proxyConn.handler.proxyCompleted.Add(1)
 	if stats.Err != nil {
 		proxyConn.handler.proxyErrors.Add(1)
+		proxyConn.handler.lastProxyError.Store(stats.Err.Error())
 	}
 	if stats.BytesToPlugin > 0 {
 		proxyConn.handler.proxyBytesIn.Add(uint64(stats.BytesToPlugin))
@@ -1538,6 +1915,35 @@ func (m *Manager) finishProxyConnection(id uint64, stats ProxyConnectionStats) {
 	if stats.Duration > 0 {
 		proxyConn.handler.proxyDuration.Add(uint64(stats.Duration.Milliseconds()))
 	}
+	if process := m.takePendingHostStopIfDrained(proxyConn.pluginID); process != nil {
+		go m.stopPendingProcessHost(proxyConn.pluginID, process)
+	}
+}
+
+func (m *Manager) takePendingHostStopIfDrained(pluginID string) *PluginHostSupervisorProcess {
+	m.proxyMu.Lock()
+	active := 0
+	for _, conn := range m.proxyConns {
+		if conn.pluginID == pluginID {
+			active++
+		}
+	}
+	m.proxyMu.Unlock()
+	if active > 0 {
+		return nil
+	}
+	m.hostMu.Lock()
+	defer m.hostMu.Unlock()
+	process := m.pendingHostStops[pluginID]
+	delete(m.pendingHostStops, pluginID)
+	return process
+}
+
+func (m *Manager) stopPendingProcessHost(pluginID string, process *PluginHostSupervisorProcess) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = process.Stop(ctx)
+	m.markHostStopped(pluginID, process.ArtifactID, process)
 }
 
 // loadLocked 加载或复用插件实例。调用方必须持有 m.mu，确保 loaded 缓存和
@@ -1546,27 +1952,44 @@ func (m *Manager) loadLocked(ctx context.Context, pluginRecord PluginRecord) (*l
 	if loaded := m.loaded[pluginRecord.ID]; loaded != nil &&
 		loaded.artifact.ID == pluginRecord.DesiredArtifactID &&
 		loaded.record.DesiredGeneration == pluginRecord.DesiredGeneration {
-		// 同一制品、同一期望代数已经加载时直接复用，避免重复 Init 和重复注册任务。
-		return loaded, nil
+		if m.serviceMode == PluginServiceModeGoPluginProcess && loaded.runtime.HostProcess != nil {
+			if summary := loaded.runtime.HostProcess.Summary(); summary.CrashLoop {
+				m.markHostStarted(pluginRecord.ID, loaded.artifact.ID, loaded.runtime.HostProcess)
+				delete(m.loaded, pluginRecord.ID)
+			} else {
+				// 同一制品、同一期望代数已经加载且 host 仍健康时直接复用，
+				// 避免重复 Init 和重复注册任务。
+				return loaded, nil
+			}
+		} else {
+			// 同一制品、同一期望代数已经加载时直接复用，避免重复 Init 和重复注册任务。
+			return loaded, nil
+		}
 	}
 	artifact, err := m.repo.Artifact(ctx, pluginRecord.DesiredArtifactID)
 	if err != nil {
 		return nil, err
 	}
 	if err := m.validateArtifactGate(artifact); err != nil {
+		_ = m.repo.MarkRuntime(ctx, pluginRecord.ID, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
+		m.recordPluginNodeRuntimeStateLocked(ctx, pluginRecord.ID)
 		return nil, err
 	}
 
 	var manifest Manifest
 	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err != nil {
+		_ = m.repo.MarkRuntime(ctx, pluginRecord.ID, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
+		m.recordPluginNodeRuntimeStateLocked(ctx, pluginRecord.ID)
 		return nil, err
 	}
 	gateway := NewGateway(pluginRecord.ID, m.handleConn, m.wg, m.operations.ForPlugin(pluginRecord.ID, artifact.ID, manifest))
-	instance, err := m.adapter.Load(ctx, artifact, pluginRecord, gateway)
+	runtimeInstance, err := m.startRuntimeInstance(ctx, artifact, pluginRecord, gateway)
 	if err != nil {
 		_ = m.repo.MarkRuntime(ctx, pluginRecord.ID, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
+		m.recordPluginNodeRuntimeStateLocked(ctx, pluginRecord.ID)
 		return nil, err
 	}
+	instance := runtimeInstance.Plugin
 	handlers := buildHandlers(pluginRecord, artifact, gateway)
 	extensions := buildExtensions(pluginRecord, artifact, gateway)
 	// 钩子和扩展是从 gateway 注册记录中构建出来的；插件 Init 期间完成注册。
@@ -1574,6 +1997,7 @@ func (m *Manager) loadLocked(ctx context.Context, pluginRecord PluginRecord) (*l
 		record:     pluginRecord,
 		artifact:   artifact,
 		instance:   instance,
+		runtime:    runtimeInstance,
 		gateway:    gateway,
 		handlers:   handlers,
 		extensions: extensions,
@@ -1586,8 +2010,69 @@ func (m *Manager) loadLocked(ctx context.Context, pluginRecord PluginRecord) (*l
 	}, loaded.dispatchSummaries()); err != nil {
 		return nil, err
 	}
+	m.recordPluginNodeRuntimeStateLocked(ctx, pluginRecord.ID)
 	m.operations.StartTasks(pluginRecord.ID)
 	return loaded, nil
+}
+
+func (m *Manager) startRuntimeInstance(ctx context.Context, artifact ArtifactRecord, pluginRecord PluginRecord, gateway *Gateway) (RuntimeInstance, error) {
+	if m.serviceMode == PluginServiceModeGoPluginProcess {
+		now := time.Now().Unix()
+		m.hostMu.Lock()
+		host := m.hosts[pluginRecord.ID]
+		if host != nil && host.BackoffUntil > now && (host.ArtifactID == "" || host.ArtifactID == artifact.ID) {
+			backoffUntil := host.BackoffUntil
+			lastError := host.LastError
+			m.hostMu.Unlock()
+			return RuntimeInstance{}, fmt.Errorf("plugin-host crash loop backoff active for plugin %q until %s (%ds remaining): %s", pluginRecord.ID, time.Unix(backoffUntil, 0).UTC().Format(time.RFC3339), backoffUntil-now, lastError)
+		}
+		m.hostMu.Unlock()
+	}
+	adapter := m.adapter
+	if m.adapterManaged && m.serviceMode == PluginServiceModeSandboxProcess {
+		adapter, _ = RuntimeAdapterFactory{}.AdapterFor(m.serviceMode, artifact.RuntimeType)
+		switch typed := adapter.(type) {
+		case SandboxProcessAdapter:
+			typed.Policy = m.sandboxPolicy
+			typed.Secrets = m
+			adapter = typed
+		case WASMAdapter:
+			typed.Runner = m.wasmRunner
+			adapter = typed
+		}
+	}
+	if lifecycle, ok := adapter.(RuntimeAdapterLifecycle); ok {
+		prepared, err := lifecycle.Prepare(ctx, artifact, pluginRecord)
+		if err != nil {
+			return RuntimeInstance{}, err
+		}
+		instance, err := lifecycle.Start(ctx, prepared, artifact, pluginRecord, gateway)
+		if err != nil {
+			return RuntimeInstance{}, err
+		}
+		if instance.Plugin == nil {
+			return RuntimeInstance{}, errors.New("runtime adapter returned nil plugin instance")
+		}
+		return instance, nil
+	}
+	instance, err := adapter.Load(ctx, artifact, pluginRecord, gateway)
+	if err != nil {
+		return RuntimeInstance{}, err
+	}
+	if instance == nil {
+		return RuntimeInstance{}, errors.New("runtime adapter returned nil plugin instance")
+	}
+	return RuntimeInstance{
+		RuntimePrepared: RuntimePrepared{
+			PluginID:   pluginRecord.ID,
+			ArtifactID: artifact.ID,
+			Runtime:    artifact.RuntimeType,
+			Mode:       m.serviceMode,
+			PreparedAt: time.Now().Unix(),
+		},
+		Plugin:    instance,
+		StartedAt: time.Now().Unix(),
+	}, nil
 }
 
 // validateArtifactGate 确认制品能被当前网关进程加载。Go plugin 对 Go 版本和
@@ -1603,7 +2088,7 @@ func (m *Manager) validateArtifactGate(artifact ArtifactRecord) error {
 		return nil
 	}
 	if artifact.RuntimeType == RuntimeSandbox {
-		if m.serviceMode != PluginServiceModeSandboxProcess {
+		if m.serviceMode != PluginServiceModeSandboxProcess || !m.futureGates.SandboxEnabled() {
 			return errors.New("sandbox-process runtime is disabled by plugin service mode")
 		}
 		if caps := requiredRuntimeCapabilities(artifact); len(caps) > 0 {
@@ -1612,8 +2097,11 @@ func (m *Manager) validateArtifactGate(artifact ArtifactRecord) error {
 		return nil
 	}
 	if artifact.RuntimeType == RuntimeWASM {
-		if m.serviceMode != PluginServiceModeSandboxProcess {
+		if m.serviceMode != PluginServiceModeSandboxProcess || !m.futureGates.SandboxEnabled() || !m.futureGates.WASMEnabled() {
 			return errors.New("wasm runtime is disabled by plugin service mode")
+		}
+		if caps := requiredRuntimeCapabilities(artifact); len(caps) > 0 {
+			return fmt.Errorf("wasm runtime cannot enforce required capabilities: %s", strings.Join(caps, ","))
 		}
 		return nil
 	}
@@ -1656,12 +2144,132 @@ func (m *Manager) restartRequired(pluginID, artifactID string) bool {
 
 func (m *Manager) markEnabled(ctx context.Context, loaded *loadedPlugin) error {
 	m.operations.StartTasks(loaded.record.ID)
-	return m.repo.MarkRuntime(ctx, loaded.record.ID, RuntimeEnabled, loaded.artifact.ID, loaded.artifact.ID, loaded.record.DesiredGeneration, "", map[string]any{
+	m.markHostStarted(loaded.record.ID, loaded.artifact.ID, loaded.runtime.HostProcess)
+	if err := m.repo.MarkRuntime(ctx, loaded.record.ID, RuntimeEnabled, loaded.artifact.ID, loaded.artifact.ID, loaded.record.DesiredGeneration, "", map[string]any{
 		"handler_count":   len(loaded.handlers),
 		"extension_count": loaded.extensions.count(),
 		"service_mode":    m.serviceMode,
 		"plugin_host":     m.hostSummary(loaded.record.ID),
-	}, loaded.dispatchSummaries())
+	}, loaded.dispatchSummaries()); err != nil {
+		return err
+	}
+	m.recordPluginNodeRuntimeStateLocked(ctx, loaded.record.ID)
+	return nil
+}
+
+func (m *Manager) recordPluginNodeRuntimeState(ctx context.Context, pluginID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.recordPluginNodeRuntimeStateLocked(ctx, pluginID)
+}
+
+// recordPluginNodeRuntimeStateLocked records this manager node's runtime truth.
+// Callers must hold m.mu so a local crash-loop cannot overwrite another healthy
+// node's desired/active expression through the shared plugin row.
+func (m *Manager) recordPluginNodeRuntimeStateLocked(ctx context.Context, pluginID string) {
+	plugin, err := m.repo.Plugin(ctx, pluginID)
+	if err != nil {
+		return
+	}
+	artifactID := plugin.ActiveArtifactID
+	if artifactID == "" {
+		artifactID = plugin.LoadedArtifactID
+	}
+	nodeID := m.nodeID
+	if nodeID == "" && m.operations != nil {
+		nodeID = m.operations.nodeID
+	}
+	if nodeID == "" {
+		nodeID = defaultOperationsNodeID()
+	}
+	state := PluginNodeRuntimeState{
+		NodeID:            nodeID,
+		PluginID:          plugin.ID,
+		ArtifactID:        artifactID,
+		DesiredState:      plugin.DesiredState,
+		RuntimeState:      plugin.RuntimeState,
+		DesiredGeneration: plugin.DesiredGeneration,
+		AppliedGeneration: plugin.AppliedGeneration,
+		Loaded:            plugin.LoadedArtifactID != "",
+		Enabled:           plugin.RuntimeState == RuntimeEnabled,
+		Health:            pluginNodeHealth(plugin),
+		Error:             plugin.LastError,
+	}
+	if loaded := m.loaded[pluginID]; loaded != nil {
+		state.ArtifactID = loaded.artifact.ID
+		state.DesiredState = loaded.record.DesiredState
+		state.DesiredGeneration = loaded.record.DesiredGeneration
+		state.AppliedGeneration = loaded.record.DesiredGeneration
+		state.Loaded = true
+		state.Enabled = true
+		state.RuntimeState = RuntimeEnabled
+		state.Health = RuntimeEnabled
+		state.Error = ""
+		if loaded.runtime.HostProcess != nil {
+			summary := loaded.runtime.HostProcess.Summary()
+			if summary.State != "" {
+				state.RuntimeState = summary.State
+			}
+			if summary.State == RuntimeFailed || summary.CrashLoop || summary.LastError != "" {
+				state.Enabled = false
+				state.Health = RuntimeFailed
+				state.Error = summary.LastError
+			}
+		}
+	}
+	m.hostMu.Lock()
+	host := m.hosts[pluginID]
+	if host != nil && host.State != "" && host.State != RuntimeNotLoaded {
+		state.ArtifactID = host.ArtifactID
+		state.RuntimeState = host.State
+		state.Loaded = host.State != RuntimeDisabled
+		state.Enabled = host.State == RuntimeEnabled
+		state.Health = host.State
+		state.Error = host.LastError
+	}
+	m.hostMu.Unlock()
+	_ = m.repo.UpsertPluginNodeRuntime(ctx, PluginNodeRuntimeState{
+		NodeID:            state.NodeID,
+		PluginID:          state.PluginID,
+		ArtifactID:        state.ArtifactID,
+		DesiredState:      state.DesiredState,
+		RuntimeState:      state.RuntimeState,
+		DesiredGeneration: state.DesiredGeneration,
+		AppliedGeneration: state.AppliedGeneration,
+		Loaded:            state.Loaded,
+		Enabled:           state.Enabled,
+		Health:            state.Health,
+		Error:             state.Error,
+	})
+}
+
+func (m *Manager) deletePluginNodeRuntimeState(ctx context.Context, pluginID string) {
+	nodeID := m.nodeID
+	if nodeID == "" && m.operations != nil {
+		nodeID = m.operations.nodeID
+	}
+	if nodeID == "" {
+		return
+	}
+	_ = m.repo.DeletePluginNodeRuntime(ctx, nodeID, pluginID)
+}
+
+func pluginNodeHealth(plugin PluginRecord) string {
+	if plugin.LastError != "" || plugin.RuntimeState == RuntimeFailed {
+		return RuntimeFailed
+	}
+	switch plugin.RuntimeState {
+	case RuntimeEnabled:
+		return "healthy"
+	case RuntimeLoaded:
+		return RuntimeLoaded
+	case RuntimeDraining:
+		return RuntimeDraining
+	case RuntimeDisabled:
+		return RuntimeDisabled
+	default:
+		return plugin.RuntimeState
+	}
 }
 
 func (m *Manager) currentHandlersLocked() map[string][]*upstreamHandler {
@@ -1686,8 +2294,11 @@ func (m *Manager) markDrainingLocked(pluginID string) {
 	defer m.proxyMu.Unlock()
 	m.drainingIDs[pluginID] = true
 	for _, conn := range m.proxyConns {
-		if conn.pluginID == pluginID {
+		if conn.pluginID == pluginID && !conn.draining {
 			conn.draining = true
+			if conn.handler != nil {
+				conn.handler.drainingProxy.Add(1)
+			}
 		}
 	}
 }
@@ -1793,6 +2404,15 @@ func requiredRuntimeCapabilities(artifact ArtifactRecord) []string {
 	return uniqueSortedStrings(summary.Runtime.RequiredCapabilities)
 }
 
+func runtimeRequiredCapabilitiesUnsupported(runtimeType string) bool {
+	switch runtimeType {
+	case RuntimeSandbox, RuntimeWASM:
+		return true
+	default:
+		return false
+	}
+}
+
 func (h *upstreamHandler) invoke(req api.UpstreamConnectRequest) (conn net.Conn, err error) {
 	h.calls.Add(1)
 	start := time.Now()
@@ -1872,7 +2492,7 @@ type closeReader interface {
 	CloseRead() error
 }
 
-func runProtocolProxy(ctx context.Context, handle *ProxyConnectionHandle, client, endpoint net.Conn) {
+func runProtocolProxy(ctx context.Context, handle *ProxyConnectionHandle, client, endpoint net.Conn, initialBytesToPlugin int64) {
 	start := time.Now()
 	defer client.Close()
 	defer endpoint.Close()
@@ -1893,6 +2513,7 @@ func runProtocolProxy(ctx context.Context, handle *ProxyConnectionHandle, client
 	go copyProtocolProxy(client, endpoint, false, done)
 
 	var stats ProxyConnectionStats
+	stats.BytesToPlugin = initialBytesToPlugin
 	for i := 0; i < 2; i++ {
 		result := <-done
 		if result.toPlugin {
@@ -1981,6 +2602,12 @@ func validateConfigSchema(schema json.RawMessage, configJSON string) error {
 		return err
 	}
 	return validateSchemaValue(root, config, "$")
+}
+
+// ValidateConfigSchema 复用管理端 dry-run 的 JSON schema 子集校验，供 CLI
+// conformance 和其他离线工具保持同一语义。
+func ValidateConfigSchema(schema json.RawMessage, configJSON string) error {
+	return validateConfigSchema(schema, configJSON)
 }
 
 func validateSchemaValue(schema map[string]any, value any, path string) error {
@@ -2299,29 +2926,33 @@ func flattenHandlers(byPlugin map[string][]*upstreamHandler) []*upstreamHandler 
 func handlerSummaries(handlers []*upstreamHandler) []DispatchHandlerSummary {
 	summaries := make([]DispatchHandlerSummary, 0, len(handlers))
 	for _, handler := range handlers {
+		lastProxyError, _ := handler.lastProxyError.Load().(string)
 		summaries = append(summaries, DispatchHandlerSummary{
-			PluginID:        handler.pluginID,
-			ArtifactID:      handler.artifactID,
-			Priority:        handler.priority,
-			HandlerID:       handler.handlerID,
-			ExtensionPoint:  ExtensionUpstreamConnect,
-			Mode:            handler.mode,
-			TimeoutMS:       handler.timeout.Milliseconds(),
-			Calls:           handler.calls.Load(),
-			Errors:          handler.errors.Load(),
-			Panics:          handler.panics.Load(),
-			Timeouts:        handler.timeouts.Load(),
-			Blocked:         handler.blocked.Load(),
-			ActiveProxy:     handler.activeProxy.Load(),
-			ProxyStarted:    handler.proxyStarted.Load(),
-			ProxyCompleted:  handler.proxyCompleted.Load(),
-			ProxyErrors:     handler.proxyErrors.Load(),
-			ProxyBytesIn:    handler.proxyBytesIn.Load(),
-			ProxyBytesOut:   handler.proxyBytesOut.Load(),
-			ProxyDurationMS: handler.proxyDuration.Load(),
-			DurationCount:   handler.durationCount.Load(),
-			DurationSumMS:   handler.durationSumMS.Load(),
-			DurationMaxMS:   handler.durationMaxMS.Load(),
+			PluginID:         handler.pluginID,
+			ArtifactID:       handler.artifactID,
+			Priority:         handler.priority,
+			HandlerID:        handler.handlerID,
+			ExtensionPoint:   ExtensionUpstreamConnect,
+			Mode:             handler.mode,
+			TimeoutMS:        handler.timeout.Milliseconds(),
+			Calls:            handler.calls.Load(),
+			Errors:           handler.errors.Load(),
+			Panics:           handler.panics.Load(),
+			Timeouts:         handler.timeouts.Load(),
+			Blocked:          handler.blocked.Load(),
+			ActiveProxy:      handler.activeProxy.Load(),
+			DrainingProxy:    handler.drainingProxy.Load(),
+			ProxyStarted:     handler.proxyStarted.Load(),
+			ProxyCompleted:   handler.proxyCompleted.Load(),
+			ProxyForceClosed: handler.proxyForceClosed.Load(),
+			ProxyErrors:      handler.proxyErrors.Load(),
+			LastProxyError:   lastProxyError,
+			ProxyBytesIn:     handler.proxyBytesIn.Load(),
+			ProxyBytesOut:    handler.proxyBytesOut.Load(),
+			ProxyDurationMS:  handler.proxyDuration.Load(),
+			DurationCount:    handler.durationCount.Load(),
+			DurationSumMS:    handler.durationSumMS.Load(),
+			DurationMaxMS:    handler.durationMaxMS.Load(),
 		})
 	}
 	return summaries

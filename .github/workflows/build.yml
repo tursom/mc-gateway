@@ -11,6 +11,56 @@ on:
 
 jobs:
 
+  plugin-m0-release-gate:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.24.4'
+
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+        cache: 'npm'
+
+    - name: Install admin frontend dependencies
+      run: npm ci
+
+    - name: M0 fact source and status expression gate
+      run: |
+        git diff --check
+        npm run check:admin
+        go test ./cmd/gateway ./internal/pluginmanager
+        go run ./cmd/gateway plugin features >/tmp/plugin-features.json
+        go run ./cmd/gateway plugin schema export --section admin-api >/tmp/plugin-admin-api-schema.json
+        python3 - <<'PY'
+        import json
+        features = json.load(open('/tmp/plugin-features.json'))
+        def find(items, field, value):
+            for item in items:
+                if item.get(field) == value:
+                    return item
+            raise SystemExit(f'missing {field}={value}')
+        checks = [
+            (find(features['service_modes'], 'mode', 'go-plugin-process'), 'partial', True),
+            (find(features['runtime_types'], 'type', 'wasm'), 'reserved', False),
+            (find(features['extension_points'], 'key', 'ingress.service/v1'), 'reserved', False),
+            (find(features['extension_points'], 'key', 'admin.auth.provider/v1'), 'reserved', False),
+        ]
+        for item, maturity, data_plane in checks:
+            if item.get('maturity') != maturity or item.get('data_plane') is not data_plane or 'unsupported_reason' not in item:
+                raise SystemExit(f'feature status drift: {item}')
+        schema = json.load(open('/tmp/plugin-admin-api-schema.json'))
+        defs = schema['schemas']['admin_api']['$defs']
+        for key in ('plugin_feature_facts', 'extension_point_feature', 'plugin_service_state', 'runtime_adapter_status'):
+            if key not in defs:
+                raise SystemExit(f'missing admin api schema def: {key}')
+        PY
+
   build:
     runs-on: ubuntu-latest
     strategy:

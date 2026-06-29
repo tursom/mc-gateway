@@ -64,6 +64,85 @@ func TestArtifactStoreValidateAndStoreSource(t *testing.T) {
 	}
 }
 
+func TestArtifactStoreStoresConformanceSummary(t *testing.T) {
+	packagePath := writeTestMCGP(t, map[string][]byte{
+		"manifest.json": testManifestBytes(t, "conformance-plugin"),
+		"plugin.so":     []byte("fake plugin bytes"),
+		"conformance.json": []byte(`{
+			"fixtures":[
+				{"name":"contract","status":"pass"},
+				{"name":"optional","status":"skip"},
+				{"name":"protocol-proxy.panic","status":"fail","extension":"upstream.connect/v1","expected":"panic_recovered"}
+			]
+		}`),
+	})
+	store := NewArtifactStore(t.TempDir())
+	artifact, err := store.ValidateAndStore(ArtifactUpload{
+		SourcePath: packagePath,
+		FileName:   "conformance-plugin.mcgp",
+		Actor:      "admin",
+	})
+	if err != nil {
+		t.Fatalf("ValidateAndStore() error = %v", err)
+	}
+	var metadata struct {
+		ID          string             `json:"id"`
+		Conformance ConformanceSummary `json:"conformance"`
+	}
+	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &metadata); err != nil {
+		t.Fatalf("Unmarshal metadata error = %v\n%s", err, artifact.MetadataJSON)
+	}
+	if metadata.ID != "conformance-plugin" {
+		t.Fatalf("metadata id = %q, want conformance-plugin", metadata.ID)
+	}
+	if metadata.Conformance.OK ||
+		metadata.Conformance.Total != 3 ||
+		metadata.Conformance.Passed != 1 ||
+		metadata.Conformance.Skipped != 1 ||
+		metadata.Conformance.Failed != 1 ||
+		len(metadata.Conformance.FailedFixtures) != 1 ||
+		metadata.Conformance.FailedFixtures[0].Name != "protocol-proxy.panic" {
+		t.Fatalf("conformance summary = %+v, want one failed fixture", metadata.Conformance)
+	}
+}
+
+func TestArtifactStoreMergesProvenanceMetadata(t *testing.T) {
+	packagePath := writeTestMCGP(t, map[string][]byte{
+		"manifest.json": testManifestBytes(t, "provenance-plugin"),
+		"plugin.so":     []byte("fake plugin bytes"),
+		"provenance.json": []byte(`{
+			"signature":{"verified":true},
+			"sbom":{"required":true,"scan_ok":true},
+			"external_ci":{
+				"required":true,
+				"trusted":true,
+				"source_sha256":"src-sha",
+				"artifact_sha256":"artifact-sha",
+				"run_id":"github-actions/run-1",
+				"builder_id":"builder",
+				"attestation":"attested",
+				"sbom":"sbom.spdx.json",
+				"release_provenance":"release.json"
+			}
+		}`),
+	})
+	store := NewArtifactStore(t.TempDir())
+	artifact, err := store.ValidateAndStore(ArtifactUpload{
+		SourcePath: packagePath,
+		FileName:   "provenance-plugin.mcgp",
+		Actor:      "admin",
+	})
+	if err != nil {
+		t.Fatalf("ValidateAndStore() error = %v", err)
+	}
+	metadata := jsonMap(artifact.MetadataJSON)
+	externalCI := jsonMapFromAny(metadata["external_ci"])
+	signature := jsonMapFromAny(metadata["signature"])
+	if externalCI == nil || externalCI["run_id"] != "github-actions/run-1" || signature["verified"] != true {
+		t.Fatalf("metadata = %+v, want merged provenance.json external_ci and signature", metadata)
+	}
+}
+
 func TestArtifactStoreRejectsUnsafePackage(t *testing.T) {
 	tests := []struct {
 		name    string

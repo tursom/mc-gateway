@@ -224,6 +224,7 @@ CREATE TABLE IF NOT EXISTS plugin_reviews (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     plugin_id TEXT NOT NULL,
     artifact_id TEXT NOT NULL,
+    artifact_hash TEXT NOT NULL DEFAULT '',
     profile TEXT NOT NULL DEFAULT 'dev',
     risk_level TEXT NOT NULL DEFAULT 'low',
     config_hash TEXT NOT NULL DEFAULT '',
@@ -269,6 +270,24 @@ CREATE TABLE IF NOT EXISTS plugin_advisories (
     updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS plugin_vulnerabilities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    vulnerability_id TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
+    package_name TEXT NOT NULL,
+    version_range TEXT NOT NULL DEFAULT '',
+    severity TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL DEFAULT 'denylist',
+    fixed_version TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    references_json TEXT NOT NULL DEFAULT '[]',
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(vulnerability_id, package_name)
+);
+
 CREATE TABLE IF NOT EXISTS plugin_preflight_results (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     plugin_id TEXT NOT NULL,
@@ -305,6 +324,24 @@ CREATE TABLE IF NOT EXISTS plugin_events (
     trace_id TEXT NOT NULL DEFAULT '',
     connection_id TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS plugin_subscriber_dead_letters (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subscriber_plugin_id TEXT NOT NULL,
+    subscriber_artifact_id TEXT NOT NULL DEFAULT '',
+    event_plugin_id TEXT NOT NULL,
+    event_name TEXT NOT NULL,
+    fields_json TEXT NOT NULL DEFAULT '{}',
+    trace_id TEXT NOT NULL DEFAULT '',
+    connection_id TEXT NOT NULL DEFAULT '',
+    delivery_mode TEXT NOT NULL DEFAULT '',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    node_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    reason TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS plugin_logs (
@@ -360,6 +397,17 @@ CREATE TABLE IF NOT EXISTS plugin_files (
     PRIMARY KEY(plugin_id, namespace, path)
 );
 
+CREATE TABLE IF NOT EXISTS plugin_task_leases (
+    plugin_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    shard_key TEXT NOT NULL DEFAULT '',
+    owner_node_id TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    acquired_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(plugin_id, task_id, shard_key)
+);
+
 CREATE TABLE IF NOT EXISTS plugin_diagnostics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     plugin_id TEXT NOT NULL,
@@ -375,9 +423,39 @@ CREATE TABLE IF NOT EXISTS plugin_service_state (
     active_mode TEXT NOT NULL DEFAULT 'in-process',
     applied_at INTEGER NOT NULL DEFAULT 0,
     live_migration TEXT NOT NULL DEFAULT 'drain-only',
+    crash_backoff_seconds INTEGER NOT NULL DEFAULT 30,
+    crash_max_count INTEGER NOT NULL DEFAULT 1,
+    crash_window_seconds INTEGER NOT NULL DEFAULT 300,
     last_error TEXT NOT NULL DEFAULT '',
     updated_by TEXT NOT NULL DEFAULT '',
     updated_at INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS plugin_nodes (
+    node_id TEXT PRIMARY KEY,
+    hostname TEXT NOT NULL DEFAULT '',
+    pid INTEGER NOT NULL DEFAULT 0,
+    service_mode TEXT NOT NULL DEFAULT 'in-process',
+    data_plane_mode TEXT NOT NULL DEFAULT 'in-process',
+    status TEXT NOT NULL DEFAULT 'online',
+    started_at INTEGER NOT NULL,
+    heartbeat_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS plugin_node_states (
+    node_id TEXT NOT NULL,
+    plugin_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL DEFAULT '',
+    desired_state TEXT NOT NULL DEFAULT '',
+    runtime_state TEXT NOT NULL DEFAULT '',
+    desired_generation INTEGER NOT NULL DEFAULT 0,
+    applied_generation INTEGER NOT NULL DEFAULT 0,
+    loaded INTEGER NOT NULL DEFAULT 0,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    health TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(node_id, plugin_id)
 );
 
 CREATE TABLE IF NOT EXISTS plugin_repository_imports (
@@ -396,6 +474,19 @@ CREATE TABLE IF NOT EXISTS plugin_repository_imports (
     created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS plugin_repository_index_syncs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repository_type TEXT NOT NULL,
+    index_path TEXT NOT NULL DEFAULT '',
+    repository_name TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'succeeded',
+    cache_key TEXT NOT NULL DEFAULT '',
+    candidate_count INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT '',
+    synced_by TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS plugin_supply_chain_assessments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     plugin_id TEXT NOT NULL,
@@ -411,12 +502,31 @@ CREATE TABLE IF NOT EXISTS plugin_supply_chain_assessments (
     created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS plugin_trust_roots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    root_id TEXT NOT NULL,
+    key_id TEXT NOT NULL,
+    algorithm TEXT NOT NULL DEFAULT 'ed25519',
+    public_key TEXT NOT NULL,
+    public_key_sha256 TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'trusted',
+    policy_json TEXT NOT NULL DEFAULT '{}',
+    created_by TEXT NOT NULL DEFAULT '',
+    rotated_at INTEGER NOT NULL DEFAULT 0,
+    revoked_at INTEGER NOT NULL DEFAULT 0,
+    revocation_reason TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL,
+    UNIQUE(root_id, key_id)
+);
+
 CREATE TABLE IF NOT EXISTS plugin_instrumentation (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     version TEXT NOT NULL DEFAULT '',
     profile TEXT NOT NULL DEFAULT '',
     generated_diff_hash TEXT NOT NULL DEFAULT '',
+    gateway_binary_sha256 TEXT NOT NULL DEFAULT '',
+    ci_artifact_sha256 TEXT NOT NULL DEFAULT '',
     provenance_json TEXT NOT NULL DEFAULT '{}',
     conformance_json TEXT NOT NULL DEFAULT '{}',
     benchmark_json TEXT NOT NULL DEFAULT '{}',
@@ -440,19 +550,26 @@ CREATE INDEX IF NOT EXISTS idx_plugin_reviews_lookup ON plugin_reviews(plugin_id
 CREATE INDEX IF NOT EXISTS idx_plugin_warning_overrides_lookup ON plugin_warning_overrides(plugin_id, artifact_id, profile, action, expires_at);
 CREATE INDEX IF NOT EXISTS idx_plugin_advisories_artifact ON plugin_advisories(artifact_sha256, status);
 CREATE INDEX IF NOT EXISTS idx_plugin_advisories_plugin ON plugin_advisories(plugin_id, status);
+CREATE INDEX IF NOT EXISTS idx_plugin_vulnerabilities_package ON plugin_vulnerabilities(package_name, status);
 CREATE INDEX IF NOT EXISTS idx_plugin_preflight_lookup ON plugin_preflight_results(plugin_id, artifact_id, profile, created_at);
 CREATE INDEX IF NOT EXISTS idx_plugin_benchmarks_lookup ON plugin_benchmarks(plugin_id, artifact_id, profile, created_at);
 CREATE INDEX IF NOT EXISTS idx_plugin_events_lookup ON plugin_events(plugin_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_plugin_subscriber_dead_letters_status ON plugin_subscriber_dead_letters(status, subscriber_plugin_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_plugin_logs_lookup ON plugin_logs(plugin_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_plugin_traces_lookup ON plugin_traces(plugin_id, trace_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_plugin_data_expires ON plugin_data(expires_at);
 CREATE INDEX IF NOT EXISTS idx_plugin_files_expires ON plugin_files(expires_at);
+CREATE INDEX IF NOT EXISTS idx_plugin_task_leases_expires ON plugin_task_leases(expires_at);
 CREATE INDEX IF NOT EXISTS idx_plugin_diagnostics_lookup ON plugin_diagnostics(plugin_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_plugin_nodes_heartbeat ON plugin_nodes(heartbeat_at);
+CREATE INDEX IF NOT EXISTS idx_plugin_node_states_plugin ON plugin_node_states(plugin_id, updated_at);
 CREATE INDEX IF NOT EXISTS idx_plugin_repository_imports_artifact ON plugin_repository_imports(artifact_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_plugin_repository_index_syncs_lookup ON plugin_repository_index_syncs(repository_type, index_path, created_at);
 CREATE INDEX IF NOT EXISTS idx_plugin_supply_chain_lookup ON plugin_supply_chain_assessments(plugin_id, artifact_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_plugin_trust_roots_lookup ON plugin_trust_roots(root_id, key_id, status);
 CREATE INDEX IF NOT EXISTS idx_plugin_instrumentation_lookup ON plugin_instrumentation(name, created_at);
-INSERT OR IGNORE INTO plugin_service_state(id, desired_mode, active_mode, applied_at, live_migration, updated_by, updated_at)
-VALUES (1, 'in-process', 'in-process', strftime('%s','now'), 'drain-only', 'system', strftime('%s','now'));
+INSERT OR IGNORE INTO plugin_service_state(id, desired_mode, active_mode, applied_at, live_migration, crash_backoff_seconds, crash_max_count, crash_window_seconds, updated_by, updated_at)
+VALUES (1, 'in-process', 'in-process', strftime('%s','now'), 'drain-only', 30, 1, 300, 'system', strftime('%s','now'));
 INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, strftime('%s','now'));
 `
 	if _, err := db.Exec(schema); err != nil {
@@ -473,6 +590,30 @@ INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, strftime
 		return err
 	}
 	if err := ensureColumn(db, "plugin_service_state", "last_error", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "plugin_service_state", "crash_backoff_seconds", "INTEGER NOT NULL DEFAULT 30"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "plugin_service_state", "crash_max_count", "INTEGER NOT NULL DEFAULT 1"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "plugin_service_state", "crash_window_seconds", "INTEGER NOT NULL DEFAULT 300"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "plugin_reviews", "artifact_hash", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`
+UPDATE plugin_reviews
+SET artifact_hash = COALESCE((SELECT sha256 FROM plugin_artifacts WHERE plugin_artifacts.id = plugin_reviews.artifact_id), '')
+WHERE artifact_hash = ''`); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "plugin_instrumentation", "gateway_binary_sha256", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if err := ensureColumn(db, "plugin_instrumentation", "ci_artifact_sha256", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
 	}
 	return nil

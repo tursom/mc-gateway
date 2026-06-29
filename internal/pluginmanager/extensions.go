@@ -17,6 +17,7 @@ import (
 type dispatchState struct {
 	upstreams   []*upstreamHandler
 	routes      []*routeHandler
+	rules       []*ruleHandler
 	statuses    []*statusHandler
 	middleware  []*middlewareHandler
 	subscribers []*subscriberHandler
@@ -32,6 +33,25 @@ type routeHandler struct {
 	timeout        time.Duration
 	accept         api.RouteResolveAcceptor
 	handle         api.RouteResolveHandler
+	calls          atomic.Uint64
+	errors         atomic.Uint64
+	panics         atomic.Uint64
+	timeouts       atomic.Uint64
+	blocked        atomic.Uint64
+	durationCount  atomic.Uint64
+	durationSumMS  atomic.Uint64
+	durationMaxMS  atomic.Uint64
+}
+
+type ruleHandler struct {
+	pluginID       string
+	artifactID     string
+	priority       int
+	handlerID      string
+	extensionPoint string
+	timeout        time.Duration
+	accept         api.RuleEvaluateAcceptor
+	handle         api.RuleEvaluateHandler
 	calls          atomic.Uint64
 	errors         atomic.Uint64
 	panics         atomic.Uint64
@@ -122,6 +142,13 @@ type StatusPingResult struct {
 	Source   string                 `json:"source,omitempty"`
 }
 
+type RuleEvaluateResult struct {
+	Handled  bool                     `json:"handled"`
+	Decision api.RuleEvaluateDecision `json:"decision"`
+	PluginID string                   `json:"plugin_id,omitempty"`
+	Source   string                   `json:"source,omitempty"`
+}
+
 type ConnectionFilterResult struct {
 	Allowed  bool   `json:"allowed"`
 	PluginID string `json:"plugin_id,omitempty"`
@@ -140,16 +167,48 @@ func (e pluginExtensions) empty() bool {
 }
 
 func (e pluginExtensions) count() int {
-	return len(e.routes) + len(e.statuses) + len(e.middleware) + len(e.subscribers) + len(e.providers)
+	return len(e.routes) + len(e.rules) + len(e.statuses) + len(e.middleware) + len(e.subscribers) + len(e.providers)
 }
 
 func (loaded *loadedPlugin) dispatchSummaries() []DispatchHandlerSummary {
 	out := handlerSummaries(loaded.handlers)
 	out = append(out, routeHandlerSummaries(loaded.extensions.routes)...)
+	out = append(out, ruleHandlerSummaries(loaded.extensions.rules)...)
 	out = append(out, statusHandlerSummaries(loaded.extensions.statuses)...)
 	out = append(out, middlewareHandlerSummaries(loaded.extensions.middleware)...)
 	out = append(out, subscriberHandlerSummaries(loaded.extensions.subscribers)...)
 	return out
+}
+
+func (m *Manager) EvaluateRule(ctx context.Context, req api.RuleEvaluateRequest) (RuleEvaluateResult, error) {
+	if req.Context == nil {
+		req.Context = ctx
+	}
+	for _, handler := range m.extensionState().rules {
+		accepted, err := handler.accepts(req)
+		if err != nil {
+			return RuleEvaluateResult{}, err
+		}
+		if !accepted {
+			continue
+		}
+		decision, err := handler.invoke(req)
+		if err != nil {
+			if errors.Is(err, api.ErrPass) {
+				continue
+			}
+			return RuleEvaluateResult{}, err
+		}
+		decision = normalizeRuleDecision(decision, handler.pluginID)
+		if !decision.Allow && !decision.Deny && !decision.Reject {
+			continue
+		}
+		if decision.Deny || decision.Reject || !decision.Allow {
+			handler.blocked.Add(1)
+		}
+		return RuleEvaluateResult{Handled: true, Decision: decision, PluginID: handler.pluginID, Source: "plugin"}, nil
+	}
+	return RuleEvaluateResult{Decision: api.RuleEvaluateDecision{Allow: true, Reason: "no rule evaluator handled request"}}, nil
 }
 
 func (m *Manager) ResolveRoute(ctx context.Context, req api.RouteResolveRequest, fallback func(api.RouteResolveRequest) (string, bool)) (RouteResolveResult, error) {
@@ -228,9 +287,10 @@ func (m *Manager) RefreshRouteProviders(ctx context.Context, actor string) []Rou
 }
 
 func (m *Manager) ReplaySubscriberDeadLetters(ctx context.Context, actor string) uint64 {
-	count := m.operations.SubscriberDeadLetters()
+	count := m.operations.ReplaySubscriberDeadLetters()
 	_ = m.repo.RecordOperation(ctx, "", "", "event_subscriber_replay", "succeeded", actor, "event subscriber dead letter replay requested", map[string]any{
-		"dead_letters": count,
+		"dead_letters":           count,
+		"remaining_dead_letters": m.operations.SubscriberDeadLetters(),
 	})
 	return count
 }
@@ -241,6 +301,15 @@ func (m *Manager) DropSubscriberDeadLetters(ctx context.Context, actor string) u
 		"dead_letters": count,
 	})
 	return count
+}
+
+func (m *Manager) SubscriberDeadLetters(ctx context.Context) uint64 {
+	_ = ctx
+	return m.operations.SubscriberDeadLetters()
+}
+
+func (m *Manager) EmitPluginEventForConformance(ctx context.Context, pluginID, artifactID string, manifest Manifest, name string, fields map[string]string) error {
+	return m.operations.ForPlugin(pluginID, artifactID, manifest).EmitEvent(ctx, name, fields)
 }
 
 func (m *Manager) RouteCacheSnapshot() []RouteDecisionSummary {
@@ -370,6 +439,11 @@ func (m *Manager) currentExtensionsLocked() map[string]pluginExtensions {
 		ext.routes = append(ext.routes, handler)
 		current[handler.pluginID] = ext
 	}
+	for _, handler := range state.rules {
+		ext := current[handler.pluginID]
+		ext.rules = append(ext.rules, handler)
+		current[handler.pluginID] = ext
+	}
 	for _, handler := range state.statuses {
 		ext := current[handler.pluginID]
 		ext.statuses = append(ext.statuses, handler)
@@ -397,12 +471,14 @@ func (m *Manager) publishExtensionsLocked(byPlugin map[string]pluginExtensions) 
 	var state dispatchState
 	for _, ext := range byPlugin {
 		state.routes = append(state.routes, ext.routes...)
+		state.rules = append(state.rules, ext.rules...)
 		state.statuses = append(state.statuses, ext.statuses...)
 		state.middleware = append(state.middleware, ext.middleware...)
 		state.subscribers = append(state.subscribers, ext.subscribers...)
 		state.providers = append(state.providers, ext.providers...)
 	}
 	sortRouteHandlers(state.routes)
+	sortRuleHandlers(state.rules)
 	sortStatusHandlers(state.statuses)
 	sortMiddlewareHandlers(state.middleware)
 	sortSubscriberHandlers(state.subscribers)
@@ -448,6 +524,13 @@ func buildExtensions(pluginRecord PluginRecord, artifact ArtifactRecord, gateway
 		ext.routes = append(ext.routes, &routeHandler{
 			pluginID: pluginRecord.ID, artifactID: artifact.ID, priority: pluginRecord.Priority,
 			handlerID: ExtensionRouteResolver, extensionPoint: ExtensionRouteResolver, timeout: timeout,
+			accept: hook.Acceptor(), handle: hook.Handler(),
+		})
+	}
+	if hook, ok := gateway.RuleEvaluateHandler(); ok {
+		ext.rules = append(ext.rules, &ruleHandler{
+			pluginID: pluginRecord.ID, artifactID: artifact.ID, priority: pluginRecord.Priority,
+			handlerID: ExtensionRuleEvaluate, extensionPoint: ExtensionRuleEvaluate, timeout: timeout,
 			accept: hook.Acceptor(), handle: hook.Handler(),
 		})
 	}
@@ -557,6 +640,33 @@ func (h *routeHandler) invoke(req api.RouteResolveRequest) (decision api.RouteDe
 		req.Context = context.Background()
 	}
 	return invokeWithTimeout(req.Context, h.timeout, &h.timeouts, &h.panics, &h.errors, h.pluginID, "route resolver", func(ctx context.Context) (api.RouteDecision, error) {
+		req.Context = ctx
+		return h.handle(req)
+	})
+}
+
+func (h *ruleHandler) accepts(req api.RuleEvaluateRequest) (accepted bool, err error) {
+	if h.accept == nil {
+		return true, nil
+	}
+	defer func() {
+		if rec := recover(); rec != nil {
+			h.panics.Add(1)
+			accepted = false
+			err = fmt.Errorf("plugin %s rule acceptor panic: %v", h.pluginID, rec)
+		}
+	}()
+	return h.accept(req), nil
+}
+
+func (h *ruleHandler) invoke(req api.RuleEvaluateRequest) (decision api.RuleEvaluateDecision, err error) {
+	h.calls.Add(1)
+	start := time.Now()
+	defer recordExtensionDuration(&h.durationCount, &h.durationSumMS, &h.durationMaxMS, start)
+	if req.Context == nil {
+		req.Context = context.Background()
+	}
+	return invokeWithTimeout(req.Context, h.timeout, &h.timeouts, &h.panics, &h.errors, h.pluginID, "rule evaluator", func(ctx context.Context) (api.RuleEvaluateDecision, error) {
 		req.Context = ctx
 		return h.handle(req)
 	})
@@ -716,6 +826,12 @@ func sortRouteHandlers(handlers []*routeHandler) {
 	})
 }
 
+func sortRuleHandlers(handlers []*ruleHandler) {
+	sort.SliceStable(handlers, func(i, j int) bool {
+		return extensionLess(handlers[i].priority, handlers[i].pluginID, handlers[i].handlerID, handlers[j].priority, handlers[j].pluginID, handlers[j].handlerID)
+	})
+}
+
 func sortStatusHandlers(handlers []*statusHandler) {
 	sort.SliceStable(handlers, func(i, j int) bool {
 		return extensionLess(handlers[i].priority, handlers[i].pluginID, handlers[i].handlerID, handlers[j].priority, handlers[j].pluginID, handlers[j].handlerID)
@@ -769,6 +885,14 @@ func statusHandlerSummaries(handlers []*statusHandler) []DispatchHandlerSummary 
 	return out
 }
 
+func ruleHandlerSummaries(handlers []*ruleHandler) []DispatchHandlerSummary {
+	out := make([]DispatchHandlerSummary, 0, len(handlers))
+	for _, h := range handlers {
+		out = append(out, extensionSummary(h.pluginID, h.artifactID, h.priority, h.handlerID, h.extensionPoint, "rule", h.timeout, &h.calls, &h.errors, &h.panics, &h.timeouts, &h.blocked, &h.durationCount, &h.durationSumMS, &h.durationMaxMS))
+	}
+	return out
+}
+
 func middlewareHandlerSummaries(handlers []*middlewareHandler) []DispatchHandlerSummary {
 	out := make([]DispatchHandlerSummary, 0, len(handlers))
 	for _, h := range handlers {
@@ -804,6 +928,20 @@ func normalizeRouteDecision(decision api.RouteDecision, providerID string) api.R
 	return decision
 }
 
+func normalizeRuleDecision(decision api.RuleEvaluateDecision, providerID string) api.RuleEvaluateDecision {
+	if decision.ProviderID == "" {
+		decision.ProviderID = providerID
+	}
+	if decision.Deny || decision.Reject {
+		decision.Allow = false
+		return decision
+	}
+	if !decision.Allow && decision.Reason == "" {
+		decision.Allow = true
+	}
+	return decision
+}
+
 func routeDecisionSummary(host string, decision api.RouteDecision, source string) RouteDecisionSummary {
 	now := time.Now()
 	expiresAt := int64(0)
@@ -814,9 +952,16 @@ func routeDecisionSummary(host string, decision api.RouteDecision, source string
 	if decision.Host != "" {
 		targetHost = decision.Host
 	}
+	metadata := copyStringMap(decision.Metadata)
+	if decision.Explanation != "" {
+		if metadata == nil {
+			metadata = map[string]string{}
+		}
+		metadata["explanation"] = decision.Explanation
+	}
 	return RouteDecisionSummary{
 		Host: targetHost, Action: decision.Action, Upstream: decision.Upstream, ProviderID: decision.ProviderID,
-		Source: source, Reason: decision.Reason, Metadata: copyStringMap(decision.Metadata),
+		Source: source, Reason: decision.Reason, Metadata: metadata,
 		CreatedAt: now.Unix(), ExpiresAt: expiresAt,
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -118,7 +119,7 @@ func handleAdminPluginBuilds(w http.ResponseWriter, r *http.Request) {
 			adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"builds": builds})
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"builds": publicPluginBuilds(builds)})
 	case http.MethodPost:
 		if session.Role != adminRoleAdmin {
 			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
@@ -141,7 +142,7 @@ func handleAdminPluginBuilds(w http.ResponseWriter, r *http.Request) {
 			"builder_type":    build.BuilderType,
 			"go_version":      build.GoVersion,
 		})
-		adminhttp.WriteJSON(w, http.StatusCreated, map[string]any{"build": build})
+		adminhttp.WriteJSON(w, http.StatusCreated, map[string]any{"build": publicPluginBuild(build)})
 	default:
 		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
@@ -168,7 +169,7 @@ func handleAdminPluginBuild(w http.ResponseWriter, r *http.Request, rawSegment s
 			adminhttp.WriteAPIError(w, http.StatusNotFound, err.Error())
 			return
 		}
-		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"build": build})
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"build": publicPluginBuild(build)})
 		return
 	}
 	if session.Role != adminRoleAdmin {
@@ -202,7 +203,7 @@ func handleAdminPluginBuild(w http.ResponseWriter, r *http.Request, rawSegment s
 		return
 	}
 	recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_build_"+action, "plugin_build", strconv.FormatInt(id, 10), true, "build "+action+" succeeded")
-	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"build": build})
+	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"build": publicPluginBuild(build)})
 }
 
 func handleAdminPluginGC(w http.ResponseWriter, r *http.Request) {
@@ -238,13 +239,36 @@ func handleAdminPluginArtifact(w http.ResponseWriter, r *http.Request, rawArtifa
 		adminhttp.WriteAPIError(w, http.StatusServiceUnavailable, "plugin manager is not initialized")
 		return
 	}
-	artifactID, err := adminhttp.PathSegment(rawArtifactID)
+	parts := strings.Split(rawArtifactID, "/")
+	artifactID, err := adminhttp.PathSegment(parts[0])
 	if err != nil {
 		adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if r.Method != http.MethodGet {
 		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if len(parts) == 2 && parts[1] == "package" {
+		artifact, packagePath, err := pluginsManager.ArtifactDistributionPackage(r.Context(), artifactID)
+		if err != nil {
+			writePluginManagerError(w, err)
+			return
+		}
+		fileName := filepath.Base(artifact.FileName)
+		if fileName == "." || fileName == string(filepath.Separator) || strings.TrimSpace(fileName) == "" {
+			fileName = artifact.PluginID + "-" + artifact.ID + ".mcgp"
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", `attachment; filename="`+strings.ReplaceAll(fileName, `"`, "")+`"`)
+		w.Header().Set("X-Plugin-ID", artifact.PluginID)
+		w.Header().Set("X-Plugin-Artifact-ID", artifact.ID)
+		w.Header().Set("X-Plugin-Package-SHA256", artifact.PackageSHA256)
+		http.ServeFile(w, r, packagePath)
+		return
+	}
+	if len(parts) != 1 {
+		adminhttp.WriteAPIError(w, http.StatusNotFound, "plugin artifact route not found")
 		return
 	}
 	artifact, err := pluginsManager.Artifact(r.Context(), artifactID)
@@ -412,6 +436,9 @@ func handleAdminPluginConfig(w http.ResponseWriter, r *http.Request, rawSegment 
 		}
 		configJSON, err := pluginConfigRequestJSON(req)
 		if err != nil {
+			recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_config_dry_run", "plugin", pluginID, false, err.Error(), map[string]any{
+				"artifact_id": req.ArtifactID,
+			})
 			adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -574,7 +601,13 @@ func handleAdminPluginRollback(w http.ResponseWriter, r *http.Request, rawSegmen
 		"desired_generation": plugin.DesiredGeneration,
 		"active_changed":     false,
 	})
-	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"plugin": plugin})
+	view, err := pluginView(r, plugin, true)
+	if err != nil {
+		adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	delete(view, "config_json")
+	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"plugin": view})
 }
 
 func handleAdminPluginOperations(w http.ResponseWriter, r *http.Request, rawSegment string) {
@@ -627,6 +660,57 @@ func handleAdminPluginOperations(w http.ResponseWriter, r *http.Request, rawSegm
 		}
 		recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_background_task_trigger", "plugin", pluginID, true, "background task triggered", map[string]any{"task_id": taskID})
 		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"task": task})
+	case r.Method == http.MethodPost && strings.HasPrefix(action, "tasks/") && strings.HasSuffix(action, "/cancel"):
+		if session.Role != adminRoleAdmin {
+			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		parts := strings.Split(action, "/")
+		if len(parts) != 3 {
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, "invalid task cancel path")
+			return
+		}
+		taskID, err := adminhttp.PathSegment(parts[1])
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		task, err := pluginsManager.CancelBackgroundTask(r.Context(), session.Username, pluginID, taskID)
+		if err != nil {
+			recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_background_task_cancel", "plugin", pluginID, false, err.Error())
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_background_task_cancel", "plugin", pluginID, true, "background task canceled", map[string]any{"task_id": taskID})
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"task": task})
+	case r.Method == http.MethodPost && strings.HasPrefix(action, "external/") && strings.HasSuffix(action, "/health-check"):
+		if session.Role != adminRoleAdmin {
+			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		parts := strings.Split(action, "/")
+		if len(parts) != 3 {
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, "invalid external dependency health-check path")
+			return
+		}
+		dependency, err := adminhttp.PathSegment(parts[1])
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		result, err := pluginsManager.HealthCheckExternalDependency(r.Context(), session.Username, pluginID, dependency)
+		if err != nil {
+			recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_external_dependency_health_check", "plugin", pluginID, false, err.Error())
+			writePluginManagerError(w, err)
+			return
+		}
+		recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_external_dependency_health_check", "plugin", pluginID, result.OK, "external dependency health check completed", map[string]any{
+			"dependency":    dependency,
+			"ok":            result.OK,
+			"status":        result.Summary.LastStatus,
+			"circuit_state": result.Summary.CircuitState,
+		})
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"health_check": result})
 	case r.Method == http.MethodGet && action == "diagnostic":
 		data, summary, err := pluginsManager.DiagnosticPackage(r.Context(), session.Username, pluginID)
 		if err != nil {
@@ -984,11 +1068,72 @@ func handleAdminPluginAdvisories(w http.ResponseWriter, r *http.Request) {
 			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
 			return
 		}
-		var req pluginmanager.AdvisoryRequest
+		var req adminPluginAdvisoryPostRequest
 		if !adminhttp.DecodeJSONRequest(w, r, &req) {
 			return
 		}
-		advisory, err := pluginsManager.UpsertAdvisory(r.Context(), session.Username, req)
+		if req.Rescan {
+			report, err := pluginsManager.RescanAdvisories(r.Context(), session.Username, req.PluginID, req.ArtifactID)
+			if err != nil {
+				recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_advisory_rescan", "plugin_advisory", req.PluginID, false, err.Error())
+				writePluginManagerError(w, err)
+				return
+			}
+			recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_advisory_rescan", "plugin_advisory", req.PluginID, true, "plugin advisories rescanned", map[string]any{
+				"plugin_id":       report.PluginID,
+				"artifact_id":     report.ArtifactID,
+				"scanned":         report.Scanned,
+				"matches":         len(report.Matches),
+				"blocking":        report.Blocking,
+				"warnings":        report.Warnings,
+				"quarantine_runs": report.QuarantineRuns,
+			})
+			adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"rescan": report})
+			return
+		}
+		if req.FeedURL != "" {
+			result, err := pluginsManager.SyncExternalAdvisoryFeed(r.Context(), session.Username, pluginmanager.ExternalFeedSchedule{
+				URL:    req.FeedURL,
+				Source: req.Source,
+			})
+			if err != nil {
+				recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_advisory_feed_sync", "plugin_advisory", req.Source, false, err.Error())
+				writePluginManagerError(w, err)
+				return
+			}
+			recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_advisory_feed_sync", "plugin_advisory", result.Source, true, "plugin advisory feed synced from external source", map[string]any{
+				"source":          result.Source,
+				"imported":        result.Imported,
+				"matches":         len(result.Rescan.Matches),
+				"blocking":        result.Rescan.Blocking,
+				"warnings":        result.Rescan.Warnings,
+				"quarantine_runs": result.Rescan.QuarantineRuns,
+			})
+			adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"feed": result})
+			return
+		}
+		if len(req.Advisories) > 0 {
+			result, err := pluginsManager.SyncAdvisoryFeed(r.Context(), session.Username, pluginmanager.AdvisoryFeedRequest{
+				Source:     req.Source,
+				Advisories: req.Advisories,
+			})
+			if err != nil {
+				recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_advisory_feed", "plugin_advisory", req.Source, false, err.Error())
+				writePluginManagerError(w, err)
+				return
+			}
+			recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_advisory_feed", "plugin_advisory", result.Source, true, "plugin advisory feed synced", map[string]any{
+				"source":          result.Source,
+				"imported":        result.Imported,
+				"matches":         len(result.Rescan.Matches),
+				"blocking":        result.Rescan.Blocking,
+				"warnings":        result.Rescan.Warnings,
+				"quarantine_runs": result.Rescan.QuarantineRuns,
+			})
+			adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"feed": result})
+			return
+		}
+		advisory, err := pluginsManager.UpsertAdvisory(r.Context(), session.Username, req.AdvisoryRequest)
 		if err != nil {
 			recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_advisory", "plugin_advisory", req.AdvisoryID, false, err.Error())
 			writePluginManagerError(w, err)
@@ -1004,6 +1149,129 @@ func handleAdminPluginAdvisories(w http.ResponseWriter, r *http.Request) {
 	default:
 		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+func handleAdminPluginVulnerabilities(w http.ResponseWriter, r *http.Request) {
+	session, ok := requireRole(w, r, adminRoleMember)
+	if !ok {
+		return
+	}
+	if pluginsManager == nil {
+		adminhttp.WriteAPIError(w, http.StatusServiceUnavailable, "plugin manager is not initialized")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		vulnerabilities, err := pluginsManager.ListVulnerabilities(r.Context(), r.URL.Query().Get("package_name"))
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"vulnerabilities": vulnerabilities})
+	case http.MethodPost:
+		if session.Role != adminRoleAdmin {
+			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		var req adminPluginVulnerabilityPostRequest
+		if !adminhttp.DecodeJSONRequest(w, r, &req) {
+			return
+		}
+		if req.Rescan {
+			report, err := pluginsManager.ScanVulnerabilities(r.Context(), session.Username, req.PluginID, req.ArtifactID)
+			if err != nil {
+				recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_vulnerability_scan", "plugin_vulnerability", req.PluginID, false, err.Error())
+				writePluginManagerError(w, err)
+				return
+			}
+			recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_vulnerability_scan", "plugin_vulnerability", req.PluginID, true, "plugin vulnerability database scanned", map[string]any{
+				"plugin_id":       report.PluginID,
+				"artifact_id":     report.ArtifactID,
+				"scanned":         report.Scanned,
+				"matches":         len(report.Matches),
+				"blocking":        report.Blocking,
+				"warnings":        report.Warnings,
+				"quarantine_runs": report.QuarantineRuns,
+			})
+			adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"scan": report})
+			return
+		}
+		if req.FeedURL != "" {
+			result, err := pluginsManager.SyncExternalVulnerabilityFeed(r.Context(), session.Username, pluginmanager.ExternalFeedSchedule{
+				URL:    req.FeedURL,
+				Source: req.Source,
+			})
+			if err != nil {
+				recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_vulnerability_feed_sync", "plugin_vulnerability", req.Source, false, err.Error())
+				writePluginManagerError(w, err)
+				return
+			}
+			recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_vulnerability_feed_sync", "plugin_vulnerability", result.Source, true, "plugin vulnerability feed synced from external source", map[string]any{
+				"source":          result.Source,
+				"imported":        result.Imported,
+				"matches":         len(result.Scan.Matches),
+				"blocking":        result.Scan.Blocking,
+				"warnings":        result.Scan.Warnings,
+				"quarantine_runs": result.Scan.QuarantineRuns,
+			})
+			adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"database": result})
+			return
+		}
+		if len(req.Vulnerabilities) > 0 {
+			result, err := pluginsManager.ImportVulnerabilityDB(r.Context(), session.Username, pluginmanager.VulnerabilityDBRequest{
+				Source:          req.Source,
+				Vulnerabilities: req.Vulnerabilities,
+			})
+			if err != nil {
+				recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_vulnerability_db", "plugin_vulnerability", req.Source, false, err.Error())
+				writePluginManagerError(w, err)
+				return
+			}
+			recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_vulnerability_db", "plugin_vulnerability", result.Source, true, "plugin vulnerability database imported", map[string]any{
+				"source":          result.Source,
+				"imported":        result.Imported,
+				"matches":         len(result.Scan.Matches),
+				"blocking":        result.Scan.Blocking,
+				"warnings":        result.Scan.Warnings,
+				"quarantine_runs": result.Scan.QuarantineRuns,
+			})
+			adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"database": result})
+			return
+		}
+		vulnerability, err := pluginsManager.UpsertVulnerability(r.Context(), session.Username, req.VulnerabilityRequest)
+		if err != nil {
+			recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_vulnerability", "plugin_vulnerability", req.VulnerabilityID, false, err.Error())
+			writePluginManagerError(w, err)
+			return
+		}
+		recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_governance_vulnerability", "plugin_vulnerability", vulnerability.VulnerabilityID, true, "plugin vulnerability upserted", map[string]any{
+			"action":       vulnerability.Action,
+			"status":       vulnerability.Status,
+			"package_name": vulnerability.PackageName,
+			"severity":     vulnerability.Severity,
+		})
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"vulnerability": vulnerability})
+	default:
+		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+type adminPluginAdvisoryPostRequest struct {
+	pluginmanager.AdvisoryRequest
+	Source     string                          `json:"source"`
+	Advisories []pluginmanager.AdvisoryRequest `json:"advisories"`
+	Rescan     bool                            `json:"rescan"`
+	ArtifactID string                          `json:"artifact_id"`
+	FeedURL    string                          `json:"feed_url"`
+}
+
+type adminPluginVulnerabilityPostRequest struct {
+	pluginmanager.VulnerabilityRequest
+	Vulnerabilities []pluginmanager.VulnerabilityRequest `json:"vulnerabilities"`
+	Rescan          bool                                 `json:"rescan"`
+	PluginID        string                               `json:"plugin_id"`
+	ArtifactID      string                               `json:"artifact_id"`
+	FeedURL         string                               `json:"feed_url"`
 }
 
 func receivePluginArtifact(r *http.Request, actor string) (pluginmanager.ArtifactRecord, error) {
@@ -1144,6 +1412,28 @@ func pluginViews(r *http.Request, plugins []pluginmanager.PluginRecord) ([]map[s
 	return views, nil
 }
 
+func publicPluginBuilds(builds []pluginmanager.BuildRecord) []pluginmanager.BuildRecord {
+	public := make([]pluginmanager.BuildRecord, 0, len(builds))
+	for _, build := range builds {
+		public = append(public, publicPluginBuild(build))
+	}
+	return public
+}
+
+func publicPluginBuild(build pluginmanager.BuildRecord) pluginmanager.BuildRecord {
+	build.GOPROXY = buildPolicySummary(build.GOPROXY)
+	build.GONOSUMDB = buildPolicySummary(build.GONOSUMDB)
+	build.GOPRIVATE = buildPolicySummary(build.GOPRIVATE)
+	return build
+}
+
+func buildPolicySummary(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return ""
+	}
+	return "configured"
+}
+
 func pluginView(r *http.Request, plugin pluginmanager.PluginRecord, detail bool) (map[string]any, error) {
 	artifacts, err := pluginsManager.ListArtifacts(r.Context(), plugin.ID)
 	if err != nil {
@@ -1199,7 +1489,7 @@ func pluginView(r *http.Request, plugin pluginmanager.PluginRecord, detail bool)
 		"config_schema":        jsonObjectString(manifestConfigSchemaString(manifest)),
 		"secrets":              secrets,
 		"snapshots":            snapshots,
-		"builds":               builds,
+		"builds":               publicPluginBuilds(builds),
 		"artifacts":            artifacts,
 		"updated_at":           plugin.UpdatedAt,
 	}
@@ -1211,6 +1501,13 @@ func pluginView(r *http.Request, plugin pluginmanager.PluginRecord, detail bool)
 			view["governance_error"] = err.Error()
 		} else {
 			view["governance"] = governance
+		}
+		rollout, err := pluginsManager.PluginRolloutStatus(r.Context(), plugin.ID)
+		if err != nil {
+			view["rollout_error"] = err.Error()
+		} else {
+			view["rollout_status"] = rollout
+			view["node_runtime_states"] = rollout.NodeRuntimeStates
 		}
 		view["active_proxy_connections"] = activeProxyConnections(plugin)
 		connections, err := pluginsManager.ActiveProxyConnections(r.Context(), plugin.ID)
@@ -1241,6 +1538,7 @@ func pluginExtensionStatus(ctx context.Context, pluginID string) map[string]any 
 	}
 	return map[string]any{
 		"routes":      filter(plan.Routes),
+		"rules":       filter(plan.Rules),
 		"statuses":    filter(plan.Statuses),
 		"middleware":  filter(plan.Middleware),
 		"subscribers": filter(plan.Subscribers),
@@ -1349,6 +1647,17 @@ func writePluginManagerError(w http.ResponseWriter, err error) {
 	}
 }
 
+func handleAdminPluginFeatures(w http.ResponseWriter, r *http.Request) {
+	if _, ok := requireRole(w, r, adminRoleMember); !ok {
+		return
+	}
+	if r.Method != http.MethodGet {
+		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"plugin_features": pluginFeatureFacts()})
+}
+
 func handleAdminPluginService(w http.ResponseWriter, r *http.Request) {
 	session, ok := requireRole(w, r, adminRoleMember)
 	if !ok {
@@ -1375,18 +1684,55 @@ func handleAdminPluginService(w http.ResponseWriter, r *http.Request) {
 		if !adminhttp.DecodeJSONRequest(w, r, &req) {
 			return
 		}
-		state, err := pluginsManager.SetPluginServiceDesired(r.Context(), session.Username, req.DesiredMode)
-		if err != nil {
-			recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_service_mode_update", "plugin_service", "", false, err.Error())
-			adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
-			return
+		var state pluginmanager.PluginServiceState
+		var err error
+		if req.DesiredMode != "" {
+			state, err = pluginsManager.SetPluginServiceDesired(r.Context(), session.Username, req.DesiredMode)
+			if err != nil {
+				recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_service_mode_update", "plugin_service", "", false, err.Error())
+				adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		} else {
+			state, err = pluginsManager.PluginServiceState(r.Context())
+			if err != nil {
+				adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
+		if req.CrashPolicy != nil {
+			policy := state.CrashPolicy
+			if req.CrashPolicy.BackoffSeconds != nil {
+				policy.BackoffSeconds = *req.CrashPolicy.BackoffSeconds
+			}
+			if req.CrashPolicy.MaxCrashes != nil {
+				policy.MaxCrashes = *req.CrashPolicy.MaxCrashes
+			}
+			if req.CrashPolicy.WindowSeconds != nil {
+				policy.WindowSeconds = *req.CrashPolicy.WindowSeconds
+			}
+			state, err = pluginsManager.SetPluginServiceCrashPolicy(r.Context(), session.Username, policy)
+			if err != nil {
+				recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_service_mode_update", "plugin_service", "", false, err.Error())
+				adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+				return
+			}
 		}
 		recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_service_mode_update", "plugin_service", "", true, "plugin service mode desired state updated", map[string]any{
 			"desired_mode":     state.DesiredMode,
 			"active_mode":      state.ActiveMode,
+			"data_plane_mode":  state.DataPlaneMode,
 			"restart_required": state.RestartRequired,
+			"maturity":         state.DesiredMaturity,
+			"unsupported":      state.UnsupportedReason,
+			"crash_policy":     state.CrashPolicy,
 		})
-		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"plugin_service": state})
+		status, err := pluginsManager.PluginServiceStatus(r.Context())
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"plugin_service": status})
 	case http.MethodPost:
 		if session.Role != adminRoleAdmin {
 			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
@@ -1425,12 +1771,58 @@ func handleAdminPluginRepositories(w http.ResponseWriter, r *http.Request) {
 		}
 		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"imports": imports})
 	case http.MethodPost:
-		if session.Role != adminRoleAdmin {
-			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
-			return
-		}
 		var req adminhttp.PluginRepositoryImportRequest
 		if !adminhttp.DecodeJSONRequest(w, r, &req) {
+			return
+		}
+		switch strings.TrimSpace(req.Action) {
+		case "", "import":
+		case "updates":
+			report, err := pluginsManager.RepositoryUpdateAvailability(r.Context(), pluginmanager.RepositoryImportRequest{
+				RepositoryType: req.RepositoryType,
+				IndexPath:      req.IndexPath,
+				ArtifactID:     req.ArtifactID,
+				PluginID:       req.PluginID,
+				Version:        req.Version,
+				TrustPolicy:    req.TrustPolicy,
+			})
+			if err != nil {
+				adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"updates": report})
+			return
+		case "apply":
+			if session.Role != adminRoleAdmin {
+				adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
+				return
+			}
+			configJSON, err := adminRepositoryImportConfigJSON(req)
+			if err != nil {
+				adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			result, err := pluginsManager.ApplyRepositoryImport(r.Context(), session.Username, req.ImportID, configJSON, req.DesiredState, req.Priority, req.DryRun)
+			if err != nil {
+				recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_repository_import_apply", "plugin_repository_import", strconv.FormatInt(req.ImportID, 10), false, err.Error())
+				adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_repository_import_apply", "plugin_repository_import", strconv.FormatInt(req.ImportID, 10), result.OK, "repository import apply evaluated", map[string]any{
+				"import_id": result.Import.ID,
+				"plugin_id": result.Import.PluginID,
+				"artifact":  result.Import.ArtifactID,
+				"dry_run":   result.DryRun,
+				"ok":        result.OK,
+			})
+			adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"result": result, "dry_run": req.DryRun})
+			return
+		default:
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, "unknown repository action")
+			return
+		}
+		if session.Role != adminRoleAdmin {
+			adminhttp.WriteAPIError(w, http.StatusForbidden, "forbidden")
 			return
 		}
 		record, artifact, err := pluginsManager.ImportRepositoryArtifact(r.Context(), session.Username, pluginmanager.RepositoryImportRequest{
@@ -1456,6 +1848,26 @@ func handleAdminPluginRepositories(w http.ResponseWriter, r *http.Request) {
 	default:
 		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+func adminRepositoryImportConfigJSON(req adminhttp.PluginRepositoryImportRequest) (string, error) {
+	if req.ConfigJSON != "" && req.Config != nil {
+		return "", errors.New("config and config_json are mutually exclusive")
+	}
+	if req.ConfigJSON != "" {
+		if !json.Valid([]byte(req.ConfigJSON)) {
+			return "", errors.New("config_json must be valid JSON")
+		}
+		return req.ConfigJSON, nil
+	}
+	if req.Config != nil {
+		data, err := json.Marshal(req.Config)
+		if err != nil {
+			return "", err
+		}
+		return string(data), nil
+	}
+	return "", nil
 }
 
 func handleAdminPluginSupplyChain(w http.ResponseWriter, r *http.Request) {
@@ -1493,6 +1905,173 @@ func handleAdminPluginSupplyChain(w http.ResponseWriter, r *http.Request) {
 	default:
 		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+type adminPluginPromotionRequest struct {
+	Action             string                        `json:"action"`
+	PluginID           string                        `json:"plugin_id"`
+	ArtifactID         string                        `json:"artifact_id"`
+	Profile            string                        `json:"profile"`
+	Config             map[string]any                `json:"config"`
+	ConfigJSON         string                        `json:"config_json"`
+	ConfigByPlugin     map[string]map[string]any     `json:"config_by_plugin"`
+	ConfigJSONByPlugin map[string]string             `json:"config_json_by_plugin"`
+	DryRun             bool                          `json:"dry_run"`
+	Bundle             pluginmanager.PromotionBundle `json:"bundle"`
+	Baseline           pluginmanager.PromotionBundle `json:"baseline"`
+	Target             pluginmanager.PromotionBundle `json:"target"`
+	Current            pluginmanager.PromotionBundle `json:"current"`
+}
+
+func handleAdminPluginPromotions(w http.ResponseWriter, r *http.Request) {
+	session, ok := requireRole(w, r, adminRoleAdmin)
+	if !ok {
+		return
+	}
+	if pluginsManager == nil {
+		adminhttp.WriteAPIError(w, http.StatusServiceUnavailable, "plugin manager is not initialized")
+		return
+	}
+	if r.Method != http.MethodPost {
+		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req adminPluginPromotionRequest
+	if !adminhttp.DecodeJSONRequest(w, r, &req) {
+		return
+	}
+	switch strings.TrimSpace(req.Action) {
+	case "export":
+		configJSON, err := adminPromotionConfigJSON(req)
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		bundle, err := pluginsManager.ExportPromotionBundle(r.Context(), "admin-api", req.Profile, req.PluginID, req.ArtifactID, configJSON)
+		if err != nil {
+			recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_promotion_export", "plugin", req.PluginID, false, err.Error())
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		report := pluginmanager.EvaluatePromotionBundle(bundle)
+		recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_promotion_export", "plugin", req.PluginID, true, "promotion bundle exported", map[string]any{
+			"artifact_id": req.ArtifactID,
+			"bundle_id":   bundle.BundleID,
+			"dry_run":     true,
+		})
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"bundle": bundle, "report": report, "dry_run": true})
+	case "import":
+		report := pluginmanager.EvaluatePromotionBundle(req.Bundle)
+		recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_promotion_import", "promotion", req.Bundle.BundleID, report.OK, "promotion bundle import dry-run evaluated", map[string]any{
+			"bundle_id": req.Bundle.BundleID,
+			"dry_run":   true,
+			"status":    report.Status,
+		})
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"report": report, "dry_run": true})
+	case "apply":
+		configByPlugin, err := adminPromotionConfigByPlugin(req)
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		result, err := pluginsManager.ApplyPromotionBundle(r.Context(), session.Username, req.Bundle, configByPlugin, req.DryRun)
+		if err != nil {
+			recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_promotion_apply", "promotion", req.Bundle.BundleID, false, err.Error())
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_promotion_apply", "promotion", req.Bundle.BundleID, result.OK, "promotion bundle apply evaluated", map[string]any{
+			"bundle_id": req.Bundle.BundleID,
+			"dry_run":   req.DryRun,
+			"status":    result.Status,
+			"applied":   len(result.Applied),
+		})
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"result": result, "dry_run": req.DryRun})
+	case "diff":
+		diff := pluginmanager.DiffPromotionBundles(req.Baseline, req.Target)
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"diff": diff, "ok": len(diff) == 0})
+	case "drift":
+		report := pluginmanager.PromotionDrift(req.Current, req.Baseline)
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"report": report})
+	case "dr-drill":
+		configByPlugin, err := adminPromotionConfigByPlugin(req)
+		if err != nil {
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		report, err := pluginsManager.RunPromotionDRDrill(r.Context(), req.Bundle, configByPlugin)
+		if err != nil {
+			recordAudit(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_promotion_dr_drill", "promotion", req.Bundle.BundleID, false, err.Error())
+			adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_promotion_dr_drill", "promotion", req.Bundle.BundleID, report.OK, "promotion DR drill evaluated", map[string]any{
+			"bundle_id": req.Bundle.BundleID,
+			"dry_run":   true,
+			"status":    report.Status,
+		})
+		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"report": report, "dry_run": true})
+	default:
+		adminhttp.WriteAPIError(w, http.StatusBadRequest, "unknown promotion action")
+	}
+}
+
+func adminPromotionConfigJSON(req adminPluginPromotionRequest) (string, error) {
+	if req.ConfigJSON != "" && req.Config != nil {
+		return "", errors.New("config and config_json are mutually exclusive")
+	}
+	if req.ConfigJSON != "" {
+		if !json.Valid([]byte(req.ConfigJSON)) {
+			return "", errors.New("config_json must be valid JSON")
+		}
+		return req.ConfigJSON, nil
+	}
+	if req.Config != nil {
+		data, err := json.Marshal(req.Config)
+		if err != nil {
+			return "", err
+		}
+		return string(data), nil
+	}
+	return "", nil
+}
+
+func adminPromotionConfigByPlugin(req adminPluginPromotionRequest) (map[string]string, error) {
+	out := map[string]string{}
+	for pluginID, configJSON := range req.ConfigJSONByPlugin {
+		if !json.Valid([]byte(configJSON)) {
+			return nil, fmt.Errorf("config_json_by_plugin[%s] must be valid JSON", pluginID)
+		}
+		out[pluginID] = configJSON
+	}
+	for pluginID, config := range req.ConfigByPlugin {
+		if _, exists := out[pluginID]; exists {
+			return nil, fmt.Errorf("config_by_plugin[%s] conflicts with config_json_by_plugin", pluginID)
+		}
+		data, err := json.Marshal(config)
+		if err != nil {
+			return nil, err
+		}
+		out[pluginID] = string(data)
+	}
+	if req.ConfigJSON != "" || req.Config != nil {
+		configJSON, err := adminPromotionConfigJSON(req)
+		if err != nil {
+			return nil, err
+		}
+		pluginID := req.PluginID
+		if pluginID == "" && len(req.Bundle.Plugins) == 1 {
+			pluginID = req.Bundle.Plugins[0].PluginID
+		}
+		if pluginID == "" {
+			return nil, errors.New("plugin_id is required when applying a shared promotion config to a multi-plugin bundle")
+		}
+		if _, exists := out[pluginID]; exists {
+			return nil, fmt.Errorf("config for plugin %s is specified more than once", pluginID)
+		}
+		out[pluginID] = configJSON
+	}
+	return out, nil
 }
 
 func handleAdminPluginInstrumentation(w http.ResponseWriter, r *http.Request) {

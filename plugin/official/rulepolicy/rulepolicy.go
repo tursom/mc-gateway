@@ -34,12 +34,15 @@ type RateLimitConfig struct {
 }
 
 type MaintenanceConfig struct {
-	Enabled      bool              `json:"enabled,omitempty"`
-	Hosts        []string          `json:"hosts,omitempty"`
-	MOTD         string            `json:"motd,omitempty"`
-	Version      string            `json:"version,omitempty"`
-	Window       string            `json:"window,omitempty"`
-	StatusByHost map[string]string `json:"status_by_host,omitempty"`
+	Enabled       bool              `json:"enabled,omitempty"`
+	Hosts         []string          `json:"hosts,omitempty"`
+	MOTD          string            `json:"motd,omitempty"`
+	Favicon       string            `json:"favicon,omitempty"`
+	OnlinePlayers int               `json:"online_players,omitempty"`
+	MaxPlayers    int               `json:"max_players,omitempty"`
+	Version       string            `json:"version,omitempty"`
+	Window        string            `json:"window,omitempty"`
+	StatusByHost  map[string]string `json:"status_by_host,omitempty"`
 }
 
 type rateBucket struct {
@@ -77,6 +80,9 @@ func (p *Plugin) Init(gateway api.Gateway) error {
 		return err
 	}
 	if err := api.RegisterHookHandler(gateway, api.HookRouteResolve, p.acceptRoute, p.resolveRoute); err != nil {
+		return err
+	}
+	if err := api.RegisterHookHandler(gateway, api.HookRuleEvaluate, p.acceptRule, p.evaluateRule); err != nil {
 		return err
 	}
 	return api.RegisterHookHandler(gateway, api.HookStatusPing, p.acceptStatus, p.statusPing)
@@ -130,6 +136,25 @@ func (p *Plugin) resolveRoute(req api.RouteResolveRequest) (api.RouteDecision, e
 	return api.RouteDecision{Action: api.RouteDecisionPass}, nil
 }
 
+func (p *Plugin) acceptRule(api.RuleEvaluateRequest) bool { return true }
+
+func (p *Plugin) evaluateRule(req api.RuleEvaluateRequest) (api.RuleEvaluateDecision, error) {
+	cfg := p.snapshot()
+	ip := sourceIP(req.SourceAddr)
+	if ip != nil {
+		if cidrMatches(cfg.SourceDenyCIDR, ip) {
+			return api.RuleEvaluateDecision{Deny: true, Reason: "source denied by CIDR policy", ProviderID: "official.rule-policy"}, nil
+		}
+		if len(cfg.SourceAllowCIDR) > 0 && !cidrMatches(cfg.SourceAllowCIDR, ip) {
+			return api.RuleEvaluateDecision{Deny: true, Reason: "source not allowed by CIDR policy", ProviderID: "official.rule-policy"}, nil
+		}
+	}
+	if cfg.RateLimit.Requests > 0 && p.rateLimited(req.SourceAddr, cfg.RateLimit) {
+		return api.RuleEvaluateDecision{Deny: true, Reason: "source rate limited", ProviderID: "official.rule-policy"}, nil
+	}
+	return api.RuleEvaluateDecision{Allow: true, Reason: "rule policy allowed", ProviderID: "official.rule-policy"}, nil
+}
+
 func (p *Plugin) acceptStatus(req api.StatusPingRequest) bool {
 	cfg := p.snapshot()
 	if !cfg.Maintenance.Enabled && len(cfg.Maintenance.StatusByHost) == 0 {
@@ -162,6 +187,9 @@ func (p *Plugin) statusPing(req api.StatusPingRequest) (api.StatusPingResponse, 
 	}
 	return api.StatusPingResponse{
 		MOTD:              motd,
+		Favicon:           cfg.Maintenance.Favicon,
+		OnlinePlayers:     cfg.Maintenance.OnlinePlayers,
+		MaxPlayers:        cfg.Maintenance.MaxPlayers,
 		VersionText:       version,
 		ProtocolVersion:   req.ProtocolVersion,
 		Maintenance:       cfg.Maintenance.Enabled,

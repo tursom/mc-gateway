@@ -5,7 +5,7 @@ schema_version: mc-gateway.plugin/v1
 id: extension-ecosystem-example
 name: Extension Ecosystem Example
 version: 0.1.0
-description: Example fixture for route, status, subscriber and provider extension points.
+description: Example fixture for route, status, rule, middleware, subscriber and provider extension points.
 artifact_type: binary
 runtime:
   type: go-plugin
@@ -18,8 +18,14 @@ go_version: go1.24.0
 go_os: linux
 go_arch: amd64
 extension_points:
+  - type: middleware
+    key: connection.filter/v1
+  - type: middleware
+    key: handshake.filter/v1
   - type: provider
     key: route.resolve/v1
+  - type: rule
+    key: rule.evaluate/v1
   - type: hook
     key: status.ping/v1
   - type: event
@@ -28,23 +34,46 @@ extension_points:
     key: admin.auth.provider/v1
 capabilities:
   extension_points:
+    - connection.filter/v1
+    - handshake.filter/v1
     - route.resolve/v1
+    - rule.evaluate/v1
     - status.ping/v1
     - event.subscriber/v1
     - admin.auth.provider/v1
+  middleware:
+    fail_policy: fail_open
   route:
     cache_ttl_ms: 60000
+    external_refresh: true
+    sqlite_fallback: true
+    decision_explain: true
+  rule:
+    source_cidr: true
+    simple_rate_limit: true
+    upstream_rewrite: true
   status:
     hosts:
       - blue.example
       - red.example
+    maintenance_message: true
   event_subscriber:
     mode: at_least_once
     max_retry: 3
+  scope:
+    type: host
+    values:
+      - blue.example
+      - red.example
   providers:
     - type: admin.auth.provider/v1
       name: external-identity
+      priority: 100
       fallback: true
+      dependencies:
+        - local-admin-break-glass
+  provider_singletons:
+    - admin.auth.provider/v1:external-identity
 runtime_limits:
   handler_timeout_ms: 1000
 config_schema:

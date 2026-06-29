@@ -23,16 +23,17 @@ func TestParseDefaultsAndEnv(t *testing.T) {
 	}
 
 	env := map[string]string{
-		EnvDB:           "/tmp/mc.db",
-		EnvTCPAdminPort: "25575",
-		EnvPath:         "/ops",
-		EnvAPIPrefix:    "/ops/api/",
+		EnvDB:                              "/tmp/mc.db",
+		EnvTCPAdminPort:                    "25575",
+		EnvPath:                            "/ops",
+		EnvAPIPrefix:                       "/ops/api/",
+		EnvPluginRequireConformanceFixture: "true",
 	}
 	cfg, err = Parse(func(key string) string { return env[key] })
 	if err != nil {
 		t.Fatalf("Parse(env) error = %v", err)
 	}
-	if cfg.DBPath != "/tmp/mc.db" || cfg.TCPAdminPort != 25575 || cfg.AdminPath != "/ops/" || cfg.AdminAPIPrefix != "/ops/api" {
+	if cfg.DBPath != "/tmp/mc.db" || cfg.TCPAdminPort != 25575 || cfg.AdminPath != "/ops/" || cfg.AdminAPIPrefix != "/ops/api" || !cfg.PluginRequireConformanceFixture {
 		t.Fatalf("config = %+v", cfg)
 	}
 }
@@ -68,6 +69,10 @@ func TestParseReturnsErrors(t *testing.T) {
 		{
 			name: "api prefix under config asset path",
 			env:  map[string]string{EnvAPIPrefix: "/admin/config.js/api"},
+		},
+		{
+			name: "invalid plugin conformance gate",
+			env:  map[string]string{EnvPluginRequireConformanceFixture: "maybe"},
 		},
 	}
 

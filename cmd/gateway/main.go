@@ -19,8 +19,11 @@ import (
 )
 
 func main() {
-	// 插件子命令复用网关二进制。这里先于运行态配置加载处理它们，
-	// 这样本地构建和清单命令不需要一份可用的网关部署配置。
+	// 插件和 plugin-host 子命令复用网关二进制。这里先于运行态配置加载
+	// 处理它们，这样本地构建、清单和 host 握手命令不需要一份可用的网关部署配置。
+	if handled, code := runPluginHostCLI(os.Args[1:]); handled {
+		os.Exit(code)
+	}
 	if handled, code := runPluginCLI(os.Args[1:]); handled {
 		os.Exit(code)
 	}

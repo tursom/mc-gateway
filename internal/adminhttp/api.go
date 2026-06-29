@@ -49,11 +49,14 @@ type APIHandlers struct {
 	PluginDispatch        http.HandlerFunc
 	PluginGovernance      SegmentHandlerFunc
 	PluginAdvisories      http.HandlerFunc
+	PluginVulnerabilities http.HandlerFunc
 	PluginDiagnostics     SegmentHandlerFunc
+	PluginFeatures        http.HandlerFunc
 	PluginService         http.HandlerFunc
 	PluginRepositories    http.HandlerFunc
 	PluginSupplyChain     http.HandlerFunc
 	PluginInstrumentation http.HandlerFunc
+	PluginPromotions      http.HandlerFunc
 }
 
 func NewAPIHandler(prefix string, handlers APIHandlers) http.HandlerFunc {
@@ -115,6 +118,10 @@ func NewAPIHandler(prefix string, handlers APIHandlers) http.HandlerFunc {
 			callHandler(w, r, handlers.PluginDispatch)
 		case path == "/plugin-advisories" && (r.Method == http.MethodGet || r.Method == http.MethodPost):
 			callHandler(w, r, handlers.PluginAdvisories)
+		case path == "/plugin-vulnerabilities" && (r.Method == http.MethodGet || r.Method == http.MethodPost):
+			callHandler(w, r, handlers.PluginVulnerabilities)
+		case path == "/plugin-features" && r.Method == http.MethodGet:
+			callHandler(w, r, handlers.PluginFeatures)
 		case path == "/plugin-service" && (r.Method == http.MethodGet || r.Method == http.MethodPut || r.Method == http.MethodPost):
 			callHandler(w, r, handlers.PluginService)
 		case path == "/plugin-repositories/imports" && (r.Method == http.MethodGet || r.Method == http.MethodPost):
@@ -123,6 +130,8 @@ func NewAPIHandler(prefix string, handlers APIHandlers) http.HandlerFunc {
 			callHandler(w, r, handlers.PluginSupplyChain)
 		case path == "/plugin-instrumentation" && (r.Method == http.MethodGet || r.Method == http.MethodPost):
 			callHandler(w, r, handlers.PluginInstrumentation)
+		case path == "/plugin-promotions" && r.Method == http.MethodPost:
+			callHandler(w, r, handlers.PluginPromotions)
 		case strings.HasPrefix(path, "/plugins/"):
 			pluginPath := strings.TrimPrefix(path, "/plugins/")
 			if strings.Contains(pluginPath, "/governance/") || strings.HasSuffix(pluginPath, "/governance") {

@@ -74,13 +74,31 @@ export interface PluginBuild {
   artifact_id: string;
   status: string;
   builder_type: string;
+  builder_image?: string;
+  builder_version?: string;
   go_version?: string;
   go_os?: string;
   go_arch?: string;
+  go_amd64?: string;
+  go_arm64?: string;
+  cgo_enabled?: string;
+  build_tags?: string;
+  sdk_module?: string;
+  sdk_version?: string;
+  go_proxy?: string;
+  go_no_sumdb?: string;
+  go_private?: string;
+  vendor_required?: boolean;
   source_sha256?: string;
   artifact_sha256?: string;
+  module_summary_json?: string;
+  go_version_m_json?: string;
+  abi_fingerprint?: string;
   log_summary?: string;
+  metadata_json?: string;
   error?: string;
+  started_at?: number;
+  ended_at?: number;
   duration_ms?: number;
   created_at?: number;
   updated_at?: number;
@@ -109,6 +127,29 @@ export interface PluginSnapshot {
   created_at?: number;
 }
 
+export interface RepositoryUpdateReport {
+  repository_type: string;
+  index_path: string;
+  repository_name: string;
+  checked_at: number;
+  candidates: RepositoryUpdateCandidate[];
+  updates: RepositoryUpdateCandidate[];
+}
+
+export interface RepositoryUpdateCandidate {
+  candidate_id: string;
+  plugin_id: string;
+  available_version: string;
+  candidate_sha256?: string;
+  current_version?: string;
+  current_artifact_id?: string;
+  current_package_sha256?: string;
+  update_available: boolean;
+  reason: string;
+  version_comparison?: number;
+  version_comparison_stable: boolean;
+}
+
 export interface PluginProxyConnection {
   id: number;
   plugin_id: string;
@@ -122,27 +163,153 @@ export interface PluginProxyConnection {
 export interface PluginServiceState {
   desired_mode: string;
   active_mode: string;
+  data_plane_mode?: string;
+  implemented_adapter?: boolean;
+  desired_maturity?: string;
+  active_maturity?: string;
   applied_at?: number;
   restart_required: boolean;
   live_migration?: string;
+  crash_policy?: PluginHostCrashPolicy;
+  unsupported_reason?: string;
   last_error?: string;
   updated_by?: string;
   updated_at?: number;
 }
 
+export interface PluginHostCrashPolicy {
+  backoff_seconds: number;
+  max_crashes?: number;
+  window_seconds?: number;
+}
+
+export interface PluginServiceModeFeature {
+  mode: string;
+  implemented: boolean;
+  maturity: string;
+  data_plane: boolean;
+  requires_restart: boolean;
+  host_protocol?: string;
+  control_channel?: string;
+  unsupported_reason?: string;
+}
+
+export interface PluginRuntimeFeature {
+  type: string;
+  implemented: boolean;
+  maturity: string;
+  data_plane: boolean;
+  requires_restart: boolean;
+  unsupported_reason?: string;
+  entry?: string;
+}
+
+export interface PluginRuntimeAdapterStatus {
+  service_mode: string;
+  runtime_type: string;
+  adapter: string;
+  implemented: boolean;
+  maturity: string;
+  data_plane: boolean;
+  lifecycle: boolean;
+  requires_restart: boolean;
+  host_protocol?: string;
+  control_channel?: string;
+  unsupported_reason?: string;
+}
+
+export interface PluginExtensionPointFeature {
+  key: string;
+  type: string;
+  implemented: boolean;
+  maturity: string;
+  data_plane: boolean;
+  requires_restart: boolean;
+  unsupported_reason?: string;
+}
+
+export interface PluginFeatureFacts {
+  schema_version: string;
+  api_version: string;
+  runtime_types?: PluginRuntimeFeature[];
+  service_modes?: PluginServiceModeFeature[];
+  runtime_adapters?: PluginRuntimeAdapterStatus[];
+  extension_points?: PluginExtensionPointFeature[];
+}
+
 export interface PluginHostRuntimeSummary {
   plugin_id: string;
   artifact_id: string;
+  pid?: number;
   state: string;
   drain_mode: string;
   crash_loop: boolean;
   crash_count: number;
   last_error?: string;
+  started_at?: number;
+  draining_at?: number;
+  exited_at?: number;
+  last_crash_at?: number;
+  backoff_until?: number;
+  isolated?: boolean;
+}
+
+export interface PluginNodeState {
+  node_id: string;
+  hostname?: string;
+  pid?: number;
+  service_mode?: string;
+  data_plane_mode?: string;
+  status?: string;
+  started_at?: number;
+  heartbeat_at?: number;
+  stale?: boolean;
+}
+
+export interface PluginNodeRuntimeState {
+  node_id: string;
+  plugin_id: string;
+  artifact_id?: string;
+  desired_state?: string;
+  runtime_state?: string;
+  desired_generation?: number;
+  applied_generation?: number;
+  loaded?: boolean;
+  enabled?: boolean;
+  health?: string;
+  error?: string;
+  updated_at?: number;
+  node_heartbeat_at?: number;
+  stale?: boolean;
+}
+
+export interface PluginRolloutStatus {
+  plugin_id: string;
+  desired_state: string;
+  desired_artifact_id?: string;
+  desired_generation?: number;
+  ok: boolean;
+  partial_failure: boolean;
+  nodes_total: number;
+  nodes_ready: number;
+  nodes_failed: number;
+  nodes_stale: number;
+  node_runtime_states?: PluginNodeRuntimeState[];
+  artifact_distribution?: boolean;
+  artifact_distribution_mode?: string;
+  artifact_distribution_status?: string;
+  artifact_distribution_error?: string;
+  artifact_package_sha256?: string;
+  cross_node_apply?: boolean;
 }
 
 export interface PluginServiceStatus {
   service: PluginServiceState;
+  service_modes?: PluginServiceModeFeature[];
+  runtime_types?: PluginRuntimeFeature[];
+  runtime_adapters?: PluginRuntimeAdapterStatus[];
   hosts?: PluginHostRuntimeSummary[];
+  nodes?: PluginNodeState[];
 }
 
 export interface PluginInstrumentation {
@@ -151,6 +318,12 @@ export interface PluginInstrumentation {
   version: string;
   profile: string;
   generated_diff_hash: string;
+  gateway_binary_sha256?: string;
+  ci_artifact_sha256?: string;
+  provenance_json?: string;
+  conformance_json?: string;
+  benchmark_json?: string;
+  smoke_json?: string;
   runbook_rollback: string;
   status: string;
   created_by?: string;
@@ -178,9 +351,19 @@ export interface GovernanceDecision {
   checks?: GovernanceIssue[];
 }
 
+export interface PolicySnapshot {
+  profile: string;
+  warning_override_ttl_seconds?: number;
+  review_required_risk?: string;
+  warn_benchmark_regression?: number;
+  block_benchmark_regression?: number;
+  require_conformance_fixture?: boolean;
+  created_at?: number;
+}
+
 export interface GovernanceStatus {
   decision?: GovernanceDecision;
-  policy?: Record<string, unknown>;
+  policy?: PolicySnapshot;
   reviews?: Record<string, unknown>[];
   warning_overrides?: Record<string, unknown>[];
   preflights?: Record<string, unknown>[];
@@ -230,6 +413,9 @@ export interface PluginView {
   proxy_connections?: PluginProxyConnection[];
   governance?: GovernanceStatus;
   governance_error?: string;
+  rollout_status?: PluginRolloutStatus;
+  rollout_error?: string;
+  node_runtime_states?: PluginNodeRuntimeState[];
   updated_at?: number;
 }
 

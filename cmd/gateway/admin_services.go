@@ -7,6 +7,7 @@ import (
 	"database/sql"
 
 	"github.com/tursom/mc-gateway/internal/adminservice"
+	"github.com/tursom/mc-gateway/internal/pluginmanager"
 )
 
 func ensureDefaultServices(ctx context.Context, db *sql.DB, tcpAdminPort int) error {
@@ -65,6 +66,36 @@ func listServiceConfigs(ctx context.Context, db *sql.DB) ([]adminservice.Record,
 		services[i].Running = serviceIsRunning(services[i])
 	}
 	return services, nil
+}
+
+func pluginIngressReservedListeners(ctx context.Context, db *sql.DB) ([]pluginmanager.IngressReservedListener, error) {
+	services, err := listServiceConfigs(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	listeners := make([]pluginmanager.IngressReservedListener, 0, len(services))
+	for _, service := range services {
+		if !service.Running {
+			continue
+		}
+		network := "tcp"
+		switch service.Name {
+		case serviceNameKCP, serviceNameQUIC:
+			network = "udp"
+		case serviceNameTCPAdmin, serviceNameWebSocket:
+			network = "tcp"
+		default:
+			continue
+		}
+		listeners = append(listeners, pluginmanager.IngressReservedListener{
+			Name:    service.Name,
+			Network: network,
+			Bind:    "0.0.0.0",
+			Port:    service.Port,
+			Enabled: true,
+		})
+	}
+	return listeners, nil
 }
 
 func serviceIsRunning(service adminservice.Record) bool {

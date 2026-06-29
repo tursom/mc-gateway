@@ -69,6 +69,16 @@ func TestMigrateCreatesSchema(t *testing.T) {
 	if version != 1 {
 		t.Fatalf("schema migration version = %d, want 1", version)
 	}
+	for _, column := range []string{"gateway_binary_sha256", "ci_artifact_sha256"} {
+		if !sqliteColumnExists(t, db, "plugin_instrumentation", column) {
+			t.Fatalf("plugin_instrumentation missing column %q", column)
+		}
+	}
+	for _, column := range []string{"crash_backoff_seconds", "crash_max_count", "crash_window_seconds"} {
+		if !sqliteColumnExists(t, db, "plugin_service_state", column) {
+			t.Fatalf("plugin_service_state missing column %q", column)
+		}
+	}
 }
 
 func sqliteObjectExists(t *testing.T, db *sql.DB, objectType, name string) bool {
@@ -79,4 +89,31 @@ func sqliteObjectExists(t *testing.T, db *sql.DB, objectType, name string) bool 
 		t.Fatalf("sqlite_master query error = %v", err)
 	}
 	return count == 1
+}
+
+func sqliteColumnExists(t *testing.T, db *sql.DB, table, column string) bool {
+	t.Helper()
+
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		t.Fatalf("table_info(%s) error = %v", table, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			t.Fatalf("table_info(%s) scan error = %v", table, err)
+		}
+		if name == column {
+			return true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("table_info(%s) rows error = %v", table, err)
+	}
+	return false
 }

@@ -18,19 +18,21 @@ const (
 	DefaultAdminAPIPrefix = "/admin/api"
 	DefaultSessionTTL     = 8 * time.Hour
 
-	EnvDB              = "MC_GATEWAY_DB"
-	EnvTCPAdminPort    = "MC_GATEWAY_TCP_ADMIN_PORT"
-	EnvPath            = "MC_GATEWAY_ADMIN_PATH"
-	EnvAPIPrefix       = "MC_GATEWAY_ADMIN_API_PREFIX"
-	EnvInitialPassword = "MC_GATEWAY_ADMIN_PASSWORD"
+	EnvDB                              = "MC_GATEWAY_DB"
+	EnvTCPAdminPort                    = "MC_GATEWAY_TCP_ADMIN_PORT"
+	EnvPath                            = "MC_GATEWAY_ADMIN_PATH"
+	EnvAPIPrefix                       = "MC_GATEWAY_ADMIN_API_PREFIX"
+	EnvInitialPassword                 = "MC_GATEWAY_ADMIN_PASSWORD"
+	EnvPluginRequireConformanceFixture = "MC_GATEWAY_PLUGIN_REQUIRE_CONFORMANCE_FIXTURE"
 )
 
 type Config struct {
-	DBPath         string
-	TCPAdminPort   int
-	AdminPath      string
-	AdminAPIPrefix string
-	SessionTTL     time.Duration
+	DBPath                          string
+	TCPAdminPort                    int
+	AdminPath                       string
+	AdminAPIPrefix                  string
+	SessionTTL                      time.Duration
+	PluginRequireConformanceFixture bool
 }
 
 func Default() Config {
@@ -72,6 +74,12 @@ func Parse(getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 
+	requireConformance, err := parseOptionalBool(getenv(EnvPluginRequireConformanceFixture), false, EnvPluginRequireConformanceFixture)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.PluginRequireConformanceFixture = requireConformance
+
 	return cfg, nil
 }
 
@@ -85,6 +93,21 @@ func parseOptionalPort(value string, fallback int, name string) (int, error) {
 		return 0, fmt.Errorf("%s must be an integer from 1 to 65535", name)
 	}
 	return port, nil
+}
+
+func parseOptionalBool(value string, fallback bool, name string) (bool, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return fallback, nil
+	}
+	switch value {
+	case "1", "t", "true", "yes", "y", "on":
+		return true, nil
+	case "0", "f", "false", "no", "n", "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s must be a boolean", name)
+	}
 }
 
 func normalizeAdminPath(value string) (string, error) {

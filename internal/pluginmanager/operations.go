@@ -13,11 +13,13 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,8 +51,9 @@ type traceContext struct {
 }
 
 type Operations struct {
-	repo Repository
-	root string
+	repo   Repository
+	root   string
+	nodeID string
 
 	// plugins 保存每个插件的运行时运维上下文，按 manifest 重新配置但保留统计摘要。
 	mu      sync.RWMutex
@@ -65,11 +68,28 @@ type Operations struct {
 	subscriberQueue      chan queuedEvent
 	subscriberQueued     atomic.Uint64
 	subscriberDropped    atomic.Uint64
-	subscriberDeadLetter atomic.Uint64
+	subscriberDeadMu     sync.Mutex
+	subscriberDeadEvents []subscriberDeadLetterEntry
 
 	// subscribers 是当前启用插件注册的事件订阅者快照，由 Manager 发布。
 	subscriberMu sync.RWMutex
 	subscribers  []*subscriberHandler
+
+	exporterMu sync.RWMutex
+	exporters  map[string]*operationsExporterRuntime
+}
+
+type operationsExporterRuntime struct {
+	cfg  OperationsExporterConfig
+	sink OperationsExporterSink
+
+	mu             sync.Mutex
+	lastError      string
+	failureCount   uint64
+	lastFailureAt  int64
+	lastSuccessAt  int64
+	rollbackCount  uint64
+	lastRollbackAt int64
 }
 
 type queuedEvent struct {
@@ -80,6 +100,16 @@ type queuedEvent struct {
 	reason       string
 	traceID      string
 	connectionID string
+}
+
+type subscriberDeadLetterEntry struct {
+	id                   int64
+	subscriberPluginID   string
+	subscriberArtifactID string
+	deliveryMode         string
+	attempts             int
+	nodeID               string
+	event                queuedEvent
 }
 
 type PluginOperations struct {
@@ -125,6 +155,7 @@ type externalRuntime struct {
 
 type taskRuntime struct {
 	pluginID     string
+	nodeID       string
 	spec         TaskSpec
 	task         api.BackgroundTask
 	confirmToken string
@@ -138,22 +169,46 @@ type taskRuntime struct {
 	nextRunAt           int64
 	lastDurationMS      int64
 	lastError           string
+	lastAttempts        int
 	skipped             uint64
+	leaseOwner          string
+	leaseExpiresAt      int64
+	leaseAcquired       bool
+	leaseSkipped        uint64
 	consecutiveFailures uint64
 }
 
 // NewOperations 创建插件运维协调器，并启动事件落库和订阅投递两个后台消费者。
 func NewOperations(repo Repository, root string) *Operations {
+	return NewOperationsWithNodeID(repo, root, "")
+}
+
+func NewOperationsWithNodeID(repo Repository, root, nodeID string) *Operations {
+	if strings.TrimSpace(nodeID) == "" {
+		nodeID = defaultOperationsNodeID()
+	}
 	ops := &Operations{
 		repo:            repo,
 		root:            root,
+		nodeID:          nodeID,
 		plugins:         make(map[string]*PluginOperations),
 		eventQueue:      make(chan queuedEvent, DefaultEventQueueLimit),
 		subscriberQueue: make(chan queuedEvent, DefaultEventQueueLimit),
+		exporters:       make(map[string]*operationsExporterRuntime),
 	}
 	go ops.consumeEvents()
 	go ops.consumeSubscriberEvents()
 	return ops
+}
+
+func defaultOperationsNodeID() string {
+	if value := strings.TrimSpace(os.Getenv("MC_GATEWAY_NODE_ID")); value != "" {
+		return value
+	}
+	if host, err := os.Hostname(); err == nil && strings.TrimSpace(host) != "" {
+		return fmt.Sprintf("%s-%d", host, os.Getpid())
+	}
+	return fmt.Sprintf("local-%d", os.Getpid())
 }
 
 // SetSubscribers 用新的订阅者快照替换旧快照。Manager 在插件启停后调用它，
@@ -165,11 +220,132 @@ func (o *Operations) SetSubscribers(subscribers []*subscriberHandler) {
 }
 
 func (o *Operations) SubscriberDeadLetters() uint64 {
-	return o.subscriberDeadLetter.Load()
+	count, err := o.repo.CountPendingSubscriberDeadLetters(context.Background())
+	if err == nil {
+		return count
+	}
+	o.subscriberDeadMu.Lock()
+	defer o.subscriberDeadMu.Unlock()
+	return uint64(len(o.subscriberDeadEvents))
+}
+
+func (o *Operations) ReplaySubscriberDeadLetters() uint64 {
+	entries := o.pendingSubscriberDeadLetters()
+	if len(entries) == 0 {
+		return 0
+	}
+
+	o.subscriberMu.RLock()
+	subscribers := append([]*subscriberHandler(nil), o.subscribers...)
+	o.subscriberMu.RUnlock()
+	for _, entry := range entries {
+		replayed := false
+		for _, subscriber := range subscribers {
+			if subscriber.pluginID != entry.subscriberPluginID {
+				continue
+			}
+			replayed = true
+			o.deliverSubscriberEvent(subscriber, entry.event)
+		}
+		if !replayed {
+			o.restoreSubscriberDeadLetter(entry)
+			continue
+		}
+		if entry.id > 0 {
+			_ = o.repo.MarkSubscriberDeadLetter(context.Background(), entry.id, "replayed", "replay requested")
+		}
+	}
+	return uint64(len(entries))
 }
 
 func (o *Operations) DropSubscriberDeadLetters() uint64 {
-	return o.subscriberDeadLetter.Swap(0)
+	persisted, err := o.repo.PendingSubscriberDeadLetters(context.Background(), DefaultSubscriberDeadLetterLimit)
+	if err == nil && len(persisted) > 0 {
+		for _, record := range persisted {
+			_ = o.repo.MarkSubscriberDeadLetter(context.Background(), record.ID, "dropped", "drop requested")
+		}
+		o.subscriberDeadMu.Lock()
+		o.subscriberDeadEvents = nil
+		o.subscriberDeadMu.Unlock()
+		return uint64(len(persisted))
+	}
+	o.subscriberDeadMu.Lock()
+	defer o.subscriberDeadMu.Unlock()
+	count := uint64(len(o.subscriberDeadEvents))
+	o.subscriberDeadEvents = nil
+	return count
+}
+
+func (o *Operations) ConfigureExporter(cfg OperationsExporterConfig, sink OperationsExporterSink) OperationsExporterStatus {
+	typ := normalizeOperationsExporterType(cfg.Type)
+	cfg.Type = typ
+	o.exporterMu.Lock()
+	runtime := o.exporters[typ]
+	if runtime == nil {
+		runtime = &operationsExporterRuntime{cfg: cfg}
+		o.exporters[typ] = runtime
+	}
+	runtime.mu.Lock()
+	runtime.cfg = cfg
+	runtime.sink = sink
+	runtime.mu.Unlock()
+	o.exporterMu.Unlock()
+	return runtime.status()
+}
+
+func (o *Operations) RollbackExporter(exporterType string) OperationsExporterStatus {
+	typ := normalizeOperationsExporterType(exporterType)
+	o.exporterMu.Lock()
+	runtime := o.exporters[typ]
+	if runtime == nil {
+		runtime = &operationsExporterRuntime{cfg: OperationsExporterConfig{Type: typ}}
+		o.exporters[typ] = runtime
+	}
+	runtime.mu.Lock()
+	runtime.cfg.Enabled = false
+	runtime.cfg.Endpoint = ""
+	runtime.sink = nil
+	runtime.rollbackCount++
+	runtime.lastRollbackAt = time.Now().Unix()
+	runtime.mu.Unlock()
+	o.exporterMu.Unlock()
+	return runtime.status()
+}
+
+func (o *Operations) ExporterStatuses() []OperationsExporterStatus {
+	o.exporterMu.RLock()
+	runtimes := make([]*operationsExporterRuntime, 0, len(o.exporters)+2)
+	seen := make(map[string]bool, len(o.exporters)+2)
+	for typ, runtime := range o.exporters {
+		runtimes = append(runtimes, runtime)
+		seen[typ] = true
+	}
+	for _, typ := range []string{OperationsExporterPrometheus, OperationsExporterOTel} {
+		if !seen[typ] {
+			runtimes = append(runtimes, &operationsExporterRuntime{cfg: OperationsExporterConfig{Type: typ}})
+		}
+	}
+	o.exporterMu.RUnlock()
+
+	statuses := make([]OperationsExporterStatus, 0, len(runtimes))
+	for _, runtime := range runtimes {
+		statuses = append(statuses, runtime.status())
+	}
+	sort.Slice(statuses, func(i, j int) bool { return statuses[i].Type < statuses[j].Type })
+	return statuses
+}
+
+func (o *Operations) ExportSnapshot(ctx context.Context, snapshot OperationsSnapshot) []OperationsExporterStatus {
+	o.exporterMu.RLock()
+	runtimes := make([]*operationsExporterRuntime, 0, len(o.exporters))
+	for _, runtime := range o.exporters {
+		runtimes = append(runtimes, runtime)
+	}
+	o.exporterMu.RUnlock()
+	for _, runtime := range runtimes {
+		runtime.export(ctx, snapshot)
+	}
+	return o.ExporterStatuses()
 }
 
 func (o *Operations) ForPlugin(pluginID, artifactID string, manifest Manifest) *PluginOperations {
@@ -303,12 +479,259 @@ func (o *Operations) deliverSubscriberEvent(subscriber *subscriberHandler, event
 			time.Sleep(DefaultSubscriberRetryDelay)
 		}
 	}
-	o.subscriberDeadLetter.Add(1)
+	o.storeSubscriberDeadLetter(subscriber, event, maxRetry)
 	_ = o.repo.RecordOperation(context.Background(), subscriber.pluginID, subscriber.artifactID, "event_subscriber_delivery", "dead_letter", "system", "event subscriber delivery failed", map[string]any{
 		"event_plugin_id": event.pluginID,
 		"event_name":      event.name,
 		"subscriber_mode": subscriber.mode,
 	})
+}
+
+func (o *Operations) storeSubscriberDeadLetter(subscriber *subscriberHandler, event queuedEvent, attempts int) {
+	entry := subscriberDeadLetterEntry{
+		subscriberPluginID:   subscriber.pluginID,
+		subscriberArtifactID: subscriber.artifactID,
+		deliveryMode:         subscriber.mode,
+		attempts:             attempts,
+		nodeID:               o.nodeID,
+		event:                copyQueuedEvent(event),
+	}
+	if id, err := o.repo.SaveSubscriberDeadLetter(context.Background(), subscriberDeadLetterRecordFromEntry(entry, "pending", "subscriber delivery failed")); err == nil {
+		entry.id = id
+	}
+	o.restoreSubscriberDeadLetter(entry)
+}
+
+func (o *Operations) restoreSubscriberDeadLetter(entry subscriberDeadLetterEntry) {
+	o.subscriberDeadMu.Lock()
+	defer o.subscriberDeadMu.Unlock()
+	if len(o.subscriberDeadEvents) >= DefaultSubscriberDeadLetterLimit {
+		o.subscriberDeadEvents = append([]subscriberDeadLetterEntry(nil), o.subscriberDeadEvents[1:]...)
+		o.subscriberDropped.Add(1)
+	}
+	o.subscriberDeadEvents = append(o.subscriberDeadEvents, entry)
+}
+
+func (o *Operations) pendingSubscriberDeadLetters() []subscriberDeadLetterEntry {
+	records, err := o.repo.PendingSubscriberDeadLetters(context.Background(), DefaultSubscriberDeadLetterLimit)
+	if err == nil && len(records) > 0 {
+		entries := make([]subscriberDeadLetterEntry, 0, len(records))
+		for _, record := range records {
+			entries = append(entries, subscriberDeadLetterEntry{
+				id:                   record.ID,
+				subscriberPluginID:   record.SubscriberPluginID,
+				subscriberArtifactID: record.SubscriberArtifactID,
+				deliveryMode:         record.DeliveryMode,
+				attempts:             record.Attempts,
+				nodeID:               record.NodeID,
+				event: queuedEvent{
+					pluginID:     record.EventPluginID,
+					name:         record.EventName,
+					fields:       copyStringMap(record.Fields),
+					traceID:      record.TraceID,
+					connectionID: record.ConnectionID,
+				},
+			})
+		}
+		return entries
+	}
+	o.subscriberDeadMu.Lock()
+	entries := append([]subscriberDeadLetterEntry(nil), o.subscriberDeadEvents...)
+	o.subscriberDeadEvents = nil
+	o.subscriberDeadMu.Unlock()
+	return entries
+}
+
+func subscriberDeadLetterRecordFromEntry(entry subscriberDeadLetterEntry, status, reason string) SubscriberDeadLetterRecord {
+	return SubscriberDeadLetterRecord{
+		ID:                   entry.id,
+		SubscriberPluginID:   entry.subscriberPluginID,
+		SubscriberArtifactID: entry.subscriberArtifactID,
+		EventPluginID:        entry.event.pluginID,
+		EventName:            entry.event.name,
+		Fields:               copyStringMap(entry.event.fields),
+		TraceID:              entry.event.traceID,
+		ConnectionID:         entry.event.connectionID,
+		DeliveryMode:         entry.deliveryMode,
+		Attempts:             entry.attempts,
+		NodeID:               entry.nodeID,
+		Status:               status,
+		Reason:               reason,
+	}
+}
+
+func copyQueuedEvent(event queuedEvent) queuedEvent {
+	event.fields = copyStringMap(event.fields)
+	return event
+}
+
+func normalizeOperationsExporterType(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", OperationsExporterPrometheus:
+		return OperationsExporterPrometheus
+	case "opentelemetry", "open-telemetry", OperationsExporterOTel:
+		return OperationsExporterOTel
+	default:
+		return strings.ToLower(strings.TrimSpace(value))
+	}
+}
+
+func (rt *operationsExporterRuntime) status() OperationsExporterStatus {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	status := "disabled"
+	degraded := false
+	unsupported := "external exporter integration is disabled by default; in-process summaries remain authoritative"
+	if rt.cfg.Enabled {
+		if rt.sink == nil {
+			status = "degraded"
+			degraded = true
+			unsupported = "no external exporter sink is configured"
+		} else if rt.lastError != "" {
+			status = "degraded"
+			degraded = true
+			unsupported = "last export failed; connection path remains fail-open"
+		} else {
+			status = "enabled"
+			unsupported = ""
+		}
+	}
+	return OperationsExporterStatus{
+		Type:               normalizeOperationsExporterType(rt.cfg.Type),
+		Status:             status,
+		Enabled:            rt.cfg.Enabled,
+		Endpoint:           redactEndpoint(rt.cfg.Endpoint),
+		Degraded:           degraded,
+		FailOpen:           true,
+		LowCardinalityGate: true,
+		SensitiveFieldGate: true,
+		LastError:          rt.lastError,
+		FailureCount:       rt.failureCount,
+		LastFailureAt:      rt.lastFailureAt,
+		LastSuccessAt:      rt.lastSuccessAt,
+		RollbackCount:      rt.rollbackCount,
+		LastRollbackAt:     rt.lastRollbackAt,
+		Boundary:           "exporter failures are recorded as degraded and never fail plugin connection handling",
+		UnsupportedReason:  unsupported,
+	}
+}
+
+func (rt *operationsExporterRuntime) export(ctx context.Context, snapshot OperationsSnapshot) {
+	rt.mu.Lock()
+	cfg := rt.cfg
+	sink := rt.sink
+	rt.mu.Unlock()
+	if !cfg.Enabled {
+		return
+	}
+	if sink == nil {
+		rt.recordExporterFailure(errors.New("no external exporter sink is configured"))
+		return
+	}
+	batch, err := operationsExportBatch(cfg.Type, snapshot)
+	if err != nil {
+		rt.recordExporterFailure(err)
+		return
+	}
+	if err := sink.ExportOperations(ctx, batch); err != nil {
+		rt.recordExporterFailure(err)
+		return
+	}
+	rt.mu.Lock()
+	rt.lastError = ""
+	rt.lastSuccessAt = time.Now().Unix()
+	rt.mu.Unlock()
+}
+
+func (rt *operationsExporterRuntime) recordExporterFailure(err error) {
+	if err == nil {
+		return
+	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.failureCount++
+	rt.lastFailureAt = time.Now().Unix()
+	rt.lastError = redactSensitive(err.Error())
+}
+
+func operationsExportBatch(exporterType string, snapshot OperationsSnapshot) (OperationsExportBatch, error) {
+	batch := OperationsExportBatch{ExporterType: normalizeOperationsExporterType(exporterType)}
+	for _, event := range snapshot.Events {
+		labels, err := validateExporterLabels(event.Fields)
+		if err != nil {
+			return batch, fmt.Errorf("event %s labels rejected by exporter boundary: %w", event.Name, err)
+		}
+		labels["plugin_id"] = event.PluginID
+		if err := validateExporterLabelSet(labels); err != nil {
+			return batch, fmt.Errorf("event %s labels rejected by exporter boundary: %w", event.Name, err)
+		}
+		batch.Samples = append(batch.Samples, OperationsExportSample{
+			PluginID:  event.PluginID,
+			Kind:      "event",
+			Name:      event.Name,
+			Labels:    labels,
+			Value:     float64(event.Count),
+			CreatedAt: event.LastSeenAt,
+		})
+	}
+	for _, metric := range snapshot.CustomMetrics {
+		labels, err := validateExporterLabels(metric.Labels)
+		if err != nil {
+			return batch, fmt.Errorf("metric %s labels rejected by exporter boundary: %w", metric.Name, err)
+		}
+		labels["plugin_id"] = metric.PluginID
+		if err := validateExporterLabelSet(labels); err != nil {
+			return batch, fmt.Errorf("metric %s labels rejected by exporter boundary: %w", metric.Name, err)
+		}
+		batch.Samples = append(batch.Samples, OperationsExportSample{
+			PluginID:  metric.PluginID,
+			Kind:      "metric",
+			Name:      metric.Name,
+			Labels:    labels,
+			Value:     metric.LastValue,
+			CreatedAt: metric.LastSeenAt,
+		})
+	}
+	return batch, nil
+}
+
+func validateExporterLabels(labels map[string]string) (map[string]string, error) {
+	return validateExporterLabelsWithLimit(labels, 12)
+}
+
+func validateExporterLabelsWithLimit(labels map[string]string, maxLabels int) (map[string]string, error) {
+	if maxLabels <= 0 {
+		maxLabels = 12
+	}
+	if len(labels) > maxLabels {
+		return nil, errors.New("too many exporter labels")
+	}
+	clean := make(map[string]string, len(labels))
+	for key, value := range labels {
+		if !metricNamePattern.MatchString(key) {
+			return clean, fmt.Errorf("invalid exporter label %q", key)
+		}
+		if isSensitiveName(key) {
+			return clean, fmt.Errorf("exporter label %q is sensitive", key)
+		}
+		if len(value) > DefaultLabelValueMaxBytes {
+			return clean, fmt.Errorf("exporter label %q value exceeds low-cardinality size limit", key)
+		}
+		value = redactSensitive(value)
+		if value == "[REDACTED]" {
+			return clean, fmt.Errorf("exporter label %q contains sensitive value", key)
+		}
+		if value == "" {
+			continue
+		}
+		clean[key] = value
+	}
+	return clean, nil
+}
+
+func validateExporterLabelSet(labels map[string]string) error {
+	_, err := validateExporterLabelsWithLimit(labels, 13)
+	return err
 }
 
 // configure 根据 manifest 重新构建插件运维能力边界。统计对象尽量复用，
@@ -454,6 +877,45 @@ func (po *PluginOperations) ExternalClient(name string) api.ExternalClient {
 	return pluginExternalClient{ops: po, name: name, runtime: runtime}
 }
 
+func (po *PluginOperations) ExternalDependencySummary(name string) (ExternalDependencySummary, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ExternalDependencySummary{}, errors.New("external dependency name is required")
+	}
+	po.mu.Lock()
+	runtime := po.externals[name]
+	if runtime == nil {
+		spec := po.externalSpecs[name]
+		if spec.Name == "" {
+			po.mu.Unlock()
+			return ExternalDependencySummary{}, fmt.Errorf("external dependency %q is not declared by manifest", name)
+		}
+		runtime = &externalRuntime{spec: spec}
+		po.externals[name] = runtime
+	}
+	po.mu.Unlock()
+	return runtime.summary(po.pluginID, name), nil
+}
+
+func (po *PluginOperations) HealthCheckExternalDependency(ctx context.Context, name string) (ExternalDependencySummary, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ExternalDependencySummary{}, errors.New("external dependency name is required")
+	}
+	po.mu.Lock()
+	spec := po.externalSpecs[name]
+	po.mu.Unlock()
+	if spec.Name == "" {
+		return ExternalDependencySummary{}, fmt.Errorf("external dependency %q is not declared by manifest", name)
+	}
+	err := po.ExternalClient(name).HealthCheck(ctx)
+	summary, summaryErr := po.ExternalDependencySummary(name)
+	if summaryErr != nil {
+		return ExternalDependencySummary{}, summaryErr
+	}
+	return summary, err
+}
+
 func (po *PluginOperations) RegisterBackgroundTask(task api.BackgroundTask) error {
 	if task.ID == "" {
 		return errors.New("background task id is required")
@@ -501,11 +963,13 @@ func (po *PluginOperations) RegisterBackgroundTask(task api.BackgroundTask) erro
 		// confirmToken 用于高风险手动任务的二次确认，避免误点直接执行。
 		rt = &taskRuntime{
 			pluginID:     po.pluginID,
+			nodeID:       po.parent.nodeID,
 			spec:         spec,
 			confirmToken: randomToken(),
 		}
 		po.tasks[task.ID] = rt
 	}
+	rt.nodeID = po.parent.nodeID
 	rt.task = task
 	rt.spec = spec
 	return nil
@@ -602,27 +1066,221 @@ func (po *PluginOperations) runTask(task *taskRuntime) {
 	if timeout <= 0 {
 		timeout = DefaultHandlerTimeout
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	policy := normalizeTaskRunPolicy(task.spec.RunPolicy)
+	shardKey := taskLeaseShardKey(policy, task.spec)
+	leaseRequired := taskLeaseRequired(policy)
+	if !leaseRequired {
+		task.leaseOwner = ""
+		task.leaseExpiresAt = 0
+		task.leaseAcquired = false
+	}
+	task.mu.Unlock()
+
+	maxAttempts := taskMaxAttempts(task.spec)
+	leaseTTL := taskLeaseTTL(task.spec, timeout*time.Duration(maxAttempts))
+	leaseOwned := false
+	if leaseRequired {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		record, acquired, err := po.parent.repo.AcquireTaskLease(ctx, po.pluginID, task.task.ID, shardKey, po.parent.nodeID, leaseTTL)
+		cancel()
+		task.mu.Lock()
+		task.leaseOwner = record.OwnerNodeID
+		task.leaseExpiresAt = record.ExpiresAt
+		task.leaseAcquired = acquired
+		if err != nil {
+			task.running = false
+			task.consecutiveFailures++
+			task.lastError = redactSensitive(err.Error())
+			task.mu.Unlock()
+			return
+		}
+		if !acquired {
+			task.running = false
+			task.skipped++
+			task.leaseSkipped++
+			task.lastError = fmt.Sprintf("task lease held by node %s until %d", record.OwnerNodeID, record.ExpiresAt)
+			task.mu.Unlock()
+			return
+		}
+		task.mu.Unlock()
+		leaseOwned = true
+	}
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	task.mu.Lock()
 	task.cancel = cancel
 	task.mu.Unlock()
 
+	var stopRenew chan struct{}
+	var renewDone chan struct{}
+	leaseLost := make(chan string, 1)
+	if leaseOwned {
+		stopRenew = make(chan struct{})
+		renewDone = make(chan struct{})
+		go po.renewTaskLease(runCtx, task, shardKey, leaseTTL, cancel, stopRenew, renewDone, leaseLost)
+	}
+
 	start := time.Now()
-	err := task.task.Run(ctx)
+	attempts := 0
+	var err error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		attempts = attempt
+		attemptCtx, attemptCancel := context.WithTimeout(runCtx, timeout)
+		err = task.task.Run(attemptCtx)
+		attemptCancel()
+		if err == nil || runCtx.Err() != nil {
+			break
+		}
+	}
 	cancel()
+	if stopRenew != nil {
+		close(stopRenew)
+		<-renewDone
+	}
+	if leaseOwned {
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), time.Second)
+		_ = po.parent.repo.ReleaseTaskLease(releaseCtx, po.pluginID, task.task.ID, shardKey, po.parent.nodeID)
+		releaseCancel()
+	}
 
 	task.mu.Lock()
 	task.running = false
 	task.cancel = nil
+	if leaseOwned {
+		task.leaseAcquired = false
+		task.leaseOwner = ""
+		task.leaseExpiresAt = 0
+	}
 	task.lastRunAt = start.Unix()
 	task.lastDurationMS = time.Since(start).Milliseconds()
+	task.lastAttempts = attempts
 	if err != nil {
 		task.consecutiveFailures++
-		task.lastError = redactSensitive(err.Error())
+		select {
+		case leaseErr := <-leaseLost:
+			task.lastError = redactSensitive(leaseErr)
+		default:
+			task.lastError = redactSensitive(err.Error())
+		}
 	} else {
 		task.consecutiveFailures = 0
 		task.lastError = ""
 	}
 	task.mu.Unlock()
+}
+
+func (po *PluginOperations) renewTaskLease(ctx context.Context, task *taskRuntime, shardKey string, ttl time.Duration, cancel context.CancelFunc, stop <-chan struct{}, done chan<- struct{}, leaseLost chan<- string) {
+	defer close(done)
+	interval := ttl / 2
+	if interval <= 0 {
+		interval = time.Second
+	}
+	if interval < 100*time.Millisecond {
+		interval = 100 * time.Millisecond
+	}
+	if interval >= ttl && ttl > 0 {
+		interval = ttl / 2
+		if interval <= 0 {
+			interval = ttl
+		}
+	}
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-stop:
+			return
+		case <-timer.C:
+			renewCtx, renewCancel := context.WithTimeout(context.Background(), time.Second)
+			record, renewed, err := po.parent.repo.RenewTaskLease(renewCtx, po.pluginID, task.task.ID, shardKey, po.parent.nodeID, ttl)
+			renewCancel()
+			task.mu.Lock()
+			task.leaseOwner = record.OwnerNodeID
+			task.leaseExpiresAt = record.ExpiresAt
+			task.leaseAcquired = renewed && record.OwnerNodeID == po.parent.nodeID
+			task.mu.Unlock()
+			if err != nil {
+				select {
+				case leaseLost <- "task lease renew failed: " + err.Error():
+				default:
+				}
+				cancel()
+				return
+			}
+			if !renewed {
+				message := "task lease lost"
+				if record.OwnerNodeID != "" {
+					message = fmt.Sprintf("task lease held by node %s until %d", record.OwnerNodeID, record.ExpiresAt)
+				}
+				select {
+				case leaseLost <- message:
+				default:
+				}
+				cancel()
+				return
+			}
+			timer.Reset(interval)
+		}
+	}
+}
+
+func normalizeTaskRunPolicy(policy string) string {
+	switch strings.ReplaceAll(strings.ToLower(strings.TrimSpace(policy)), "-", "_") {
+	case "", TaskRunPolicyPerNode:
+		return TaskRunPolicyPerNode
+	case TaskRunPolicySingleton:
+		return TaskRunPolicySingleton
+	case TaskRunPolicySharded:
+		return TaskRunPolicySharded
+	default:
+		return policy
+	}
+}
+
+func taskLeaseRequired(policy string) bool {
+	return policy == TaskRunPolicySingleton || policy == TaskRunPolicySharded
+}
+
+func taskLeaseShardKey(policy string, spec TaskSpec) string {
+	if policy == TaskRunPolicySingleton {
+		return "global"
+	}
+	if policy == TaskRunPolicySharded {
+		if key := strings.TrimSpace(spec.ShardKey); key != "" {
+			return key
+		}
+		return "default"
+	}
+	return ""
+}
+
+func taskLeaseTTL(spec TaskSpec, timeout time.Duration) time.Duration {
+	ttl := DefaultTaskLeaseTTL
+	if timeout > 0 && timeout*2 > ttl {
+		ttl = timeout * 2
+	}
+	if spec.LeaseTTL != "" {
+		if parsed, err := time.ParseDuration(spec.LeaseTTL); err == nil && parsed > 0 {
+			ttl = parsed
+		}
+	}
+	return ttl
+}
+
+func taskMaxAttempts(spec TaskSpec) int {
+	return taskRetryLimit(spec) + 1
+}
+
+func taskRetryLimit(spec TaskSpec) int {
+	if spec.Retry <= 0 {
+		return 0
+	}
+	if spec.Retry > 10 {
+		return 10
+	}
+	return spec.Retry
 }
 
 // TriggerTask 手动触发后台任务。confirmToken 来自任务摘要，调用方必须显式回传，
@@ -641,6 +1299,27 @@ func (po *PluginOperations) TriggerTask(taskID, confirmToken string) (Background
 		return BackgroundTaskSummary{}, errors.New("confirm_token is required")
 	}
 	go po.runTask(task)
+	return task.summary(), nil
+}
+
+func (po *PluginOperations) CancelTask(taskID string) (BackgroundTaskSummary, error) {
+	po.mu.Lock()
+	task := po.tasks[taskID]
+	po.mu.Unlock()
+	if task == nil {
+		return BackgroundTaskSummary{}, fmt.Errorf("background task %q not found", taskID)
+	}
+	task.mu.Lock()
+	cancel := task.cancel
+	running := task.running
+	if cancel != nil {
+		cancel()
+		task.lastError = "cancellation requested"
+	}
+	task.mu.Unlock()
+	if !running || cancel == nil {
+		return task.summary(), errors.New("background task is not running")
+	}
 	return task.summary(), nil
 }
 
@@ -696,6 +1375,7 @@ func (po *PluginOperations) Snapshot(ctx context.Context, pluginID string, handl
 	return OperationsSnapshot{
 		PluginID:             pluginID,
 		UpdatedAt:            time.Now().Unix(),
+		Exporters:            po.parent.ExporterStatuses(),
 		Handlers:             handlers,
 		Builds:               buildMetrics,
 		Events:               events,
@@ -714,7 +1394,7 @@ func (po *PluginOperations) Snapshot(ctx context.Context, pluginID string, handl
 			DeadLetters:           po.parent.deadLetter.Load(),
 			SubscriberQueued:      po.parent.subscriberQueued.Load(),
 			SubscriberDropped:     po.parent.subscriberDropped.Load(),
-			SubscriberDeadLetters: po.parent.subscriberDeadLetter.Load(),
+			SubscriberDeadLetters: po.parent.SubscriberDeadLetters(),
 		},
 		Diagnostics: diagnostics,
 	}
@@ -740,6 +1420,16 @@ func (o *Operations) TriggerTask(pluginID, taskID, confirmToken string) (Backgro
 	return po.TriggerTask(taskID, confirmToken)
 }
 
+func (o *Operations) CancelTask(pluginID, taskID string) (BackgroundTaskSummary, error) {
+	o.mu.RLock()
+	po := o.plugins[pluginID]
+	o.mu.RUnlock()
+	if po == nil {
+		return BackgroundTaskSummary{}, ErrPluginNotFound
+	}
+	return po.CancelTask(taskID)
+}
+
 // DiagnosticPackage 生成可下载的插件诊断包。输出前会统一脱敏，避免把密钥、
 // token 或完整协议载荷写入可共享文件。
 func (o *Operations) DiagnosticPackage(ctx context.Context, plugin PluginRecord, manifest Manifest, handlers []DispatchHandlerSummary, builds []BuildRecord, gc []GCCandidate) ([]byte, DiagnosticPackageSummary, error) {
@@ -747,10 +1437,17 @@ func (o *Operations) DiagnosticPackage(ctx context.Context, plugin PluginRecord,
 	operations, _ := o.repo.ListOperations(ctx, plugin.ID, 50)
 	body := map[string]any{
 		"created_at":        time.Now().Unix(),
-		"plugin":            plugin,
-		"manifest":          manifest,
-		"operations":        snapshot,
-		"recent_operations": operations,
+		"plugin":            diagnosticPluginRecord(plugin, manifest),
+		"plugin_state":      diagnosticPluginState(plugin),
+		"manifest":          diagnosticSafeValue(manifest),
+		"dispatch_summary":  diagnosticSafeValue(snapshot.Handlers),
+		"recent_errors":     diagnosticRecentErrors(plugin, snapshot, operations),
+		"trace_summary":     diagnosticSafeValue(snapshot.Traces),
+		"event_summary":     diagnosticSafeValue(snapshot.Events),
+		"metric_summary":    diagnosticSafeValue(snapshot.CustomMetrics),
+		"operations":        diagnosticSafeValue(snapshot),
+		"recent_operations": diagnosticOperationRecords(operations),
+		"runbook":           diagnosticRunbook(plugin, snapshot, gc),
 		"redaction_policy": []string{
 			"secret", "token", "password", "session response", "full packet payload",
 		},
@@ -759,7 +1456,6 @@ func (o *Operations) DiagnosticPackage(ctx context.Context, plugin PluginRecord,
 	if err != nil {
 		return nil, DiagnosticPackageSummary{}, err
 	}
-	data = []byte(redactSensitive(string(data)))
 	dir := filepath.Join(o.runtimeRoot(), "diagnostics", plugin.ID)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, DiagnosticPackageSummary{}, err
@@ -768,11 +1464,257 @@ func (o *Operations) DiagnosticPackage(ctx context.Context, plugin PluginRecord,
 	if err := os.WriteFile(file, data, 0600); err != nil {
 		return nil, DiagnosticPackageSummary{}, err
 	}
-	summary, err := o.repo.SaveDiagnostic(ctx, plugin.ID, file, int64(len(data)), []string{"plugin", "manifest", "operations", "recent_operations"})
+	summary, err := o.repo.SaveDiagnostic(ctx, plugin.ID, file, int64(len(data)), []string{
+		"plugin", "plugin_state", "manifest", "dispatch_summary", "recent_errors",
+		"trace_summary", "event_summary", "metric_summary", "operations", "recent_operations", "runbook",
+	})
 	if err != nil {
 		return nil, DiagnosticPackageSummary{}, err
 	}
 	return data, summary, nil
+}
+
+func diagnosticPluginState(plugin PluginRecord) map[string]any {
+	return map[string]any{
+		"plugin_id":             plugin.ID,
+		"desired_state":         plugin.DesiredState,
+		"runtime_state":         plugin.RuntimeState,
+		"desired_artifact_id":   plugin.DesiredArtifactID,
+		"active_artifact_id":    plugin.ActiveArtifactID,
+		"loaded_artifact_id":    plugin.LoadedArtifactID,
+		"desired_generation":    plugin.DesiredGeneration,
+		"applied_generation":    plugin.AppliedGeneration,
+		"last_error":            redactSensitive(plugin.LastError),
+		"runtime_summary_json":  diagnosticRedactJSONString(plugin.RuntimeSummaryJSON),
+		"dispatch_summary_json": diagnosticRedactJSONString(plugin.DispatchSummaryJSON),
+	}
+}
+
+func diagnosticRecentErrors(plugin PluginRecord, snapshot OperationsSnapshot, operations []OperationRecord) []map[string]any {
+	var out []map[string]any
+	appendError := func(source, message string, fields map[string]any) {
+		message = redactSensitive(strings.TrimSpace(message))
+		if message == "" {
+			return
+		}
+		item := map[string]any{
+			"source":  source,
+			"message": message,
+		}
+		for key, value := range fields {
+			item[key] = diagnosticSafeValue(value)
+		}
+		out = append(out, item)
+	}
+	appendError("plugin", plugin.LastError, map[string]any{"plugin_id": plugin.ID})
+	for _, operation := range operations {
+		if operation.Status != "failed" && operation.Status != "warning" {
+			continue
+		}
+		appendError("operation", operation.Message, map[string]any{
+			"operation":  operation.Operation,
+			"status":     operation.Status,
+			"created_at": operation.CreatedAt,
+		})
+		if len(out) >= 20 {
+			return out
+		}
+	}
+	for _, logItem := range snapshot.Logs {
+		if logItem.Level != "error" && logItem.Level != "warn" {
+			continue
+		}
+		appendError("log", logItem.Message, map[string]any{
+			"level":      logItem.Level,
+			"trace_id":   logItem.TraceID,
+			"created_at": logItem.CreatedAt,
+		})
+		if len(out) >= 20 {
+			return out
+		}
+	}
+	for _, dep := range snapshot.ExternalDependencies {
+		appendError("external_dependency", dep.RecentError, map[string]any{
+			"name":          dep.Name,
+			"last_status":   dep.LastStatus,
+			"circuit_state": dep.CircuitState,
+		})
+		if len(out) >= 20 {
+			return out
+		}
+	}
+	for _, task := range snapshot.BackgroundTasks {
+		appendError("background_task", task.LastError, map[string]any{
+			"task_id":    task.TaskID,
+			"run_policy": task.RunPolicy,
+			"node_id":    task.NodeID,
+		})
+		if len(out) >= 20 {
+			return out
+		}
+	}
+	return out
+}
+
+func diagnosticRunbook(plugin PluginRecord, snapshot OperationsSnapshot, gc []GCCandidate) map[string]any {
+	actions := []map[string]string{
+		{
+			"id":      "review_release_gates",
+			"command": fmt.Sprintf("gateway plugin preflight %s --profile prod", plugin.ID),
+			"reason":  "Re-run config, secret, governance, conformance, advisory, and conflict gates before changing production state.",
+		},
+		{
+			"id":      "collect_diagnostics",
+			"command": fmt.Sprintf("gateway plugin diagnose %s", plugin.ID),
+			"reason":  "Capture a fresh redacted package after reproducing the incident.",
+		},
+	}
+	if plugin.RuntimeState == RuntimeEnabled || plugin.DesiredState == DesiredEnabled {
+		actions = append(actions, map[string]string{
+			"id":      "stop_new_dispatch",
+			"command": fmt.Sprintf("gateway plugin disable %s", plugin.ID),
+			"reason":  "Stop new plugin dispatch before rollback or deep investigation.",
+		})
+	}
+	if plugin.ActiveArtifactID != "" {
+		actions = append(actions, map[string]string{
+			"id":      "rollback_artifact",
+			"command": fmt.Sprintf("gateway plugin rollback %s --artifact <approved-artifact-id>", plugin.ID),
+			"reason":  "Rollback only to an artifact that still passes current governance and advisory gates.",
+		})
+	}
+	for _, dep := range snapshot.ExternalDependencies {
+		if dep.Name == "" {
+			continue
+		}
+		actions = append(actions, map[string]string{
+			"id":      "check_external_dependency",
+			"command": fmt.Sprintf("gateway plugin external health-check %s %s", plugin.ID, dep.Name),
+			"reason":  fmt.Sprintf("Verify external dependency %s before blaming plugin code.", dep.Name),
+		})
+	}
+	if len(gc) > 0 {
+		actions = append(actions, map[string]string{
+			"id":      "review_gc",
+			"command": fmt.Sprintf("gateway plugin gc --gateway <admin-url> --token <token>"),
+			"reason":  "Review protected and expired plugin data/files before applying cleanup.",
+		})
+	}
+	return map[string]any{
+		"summary": map[string]any{
+			"plugin_id":           plugin.ID,
+			"desired_state":       plugin.DesiredState,
+			"runtime_state":       plugin.RuntimeState,
+			"desired_artifact_id": plugin.DesiredArtifactID,
+			"active_artifact_id":  plugin.ActiveArtifactID,
+			"handler_count":       len(snapshot.Handlers),
+			"external_count":      len(snapshot.ExternalDependencies),
+			"gc_candidate_count":  len(gc),
+		},
+		"actions": actions,
+		"notes": []string{
+			"Diagnostic packages are redacted but should still be treated as internal operational data.",
+			"Do not bypass governance, conformance, advisory, or secret checks during rollback.",
+		},
+	}
+}
+
+func diagnosticPluginRecord(plugin PluginRecord, manifest Manifest) PluginRecord {
+	plugin.ConfigJSON = diagnosticRedactedConfig(plugin.ConfigJSON, manifest)
+	plugin.LastError = redactSensitive(plugin.LastError)
+	plugin.RuntimeSummaryJSON = diagnosticRedactJSONString(plugin.RuntimeSummaryJSON)
+	plugin.DispatchSummaryJSON = diagnosticRedactJSONString(plugin.DispatchSummaryJSON)
+	return plugin
+}
+
+func diagnosticRedactedConfig(configJSON string, manifest Manifest) string {
+	configJSON = defaultJSONObject(configJSON)
+	paths := sensitiveConfigPaths(manifest.ConfigSchema, configJSON)
+	redacted, err := redactJSON(configJSON, paths)
+	if err != nil {
+		return `"[REDACTED]"`
+	}
+	return redacted
+}
+
+func diagnosticOperationRecords(records []OperationRecord) []OperationRecord {
+	out := make([]OperationRecord, 0, len(records))
+	for _, record := range records {
+		record.Actor = redactSensitive(record.Actor)
+		record.Message = redactSensitive(record.Message)
+		record.MetadataJSON = diagnosticRedactJSONString(record.MetadataJSON)
+		out = append(out, record)
+	}
+	return out
+}
+
+func diagnosticRedactJSONString(raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return ""
+	}
+	var value any
+	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		return redactSensitive(limitString(raw, 512))
+	}
+	data, err := json.Marshal(diagnosticRedactValue(value, ""))
+	if err != nil {
+		return "[REDACTED]"
+	}
+	return string(data)
+}
+
+func diagnosticSafeValue(value any) any {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return "[REDACTED]"
+	}
+	var decoded any
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return "[REDACTED]"
+	}
+	return diagnosticRedactValue(decoded, "")
+}
+
+func diagnosticRedactValue(value any, key string) any {
+	if isDiagnosticSensitiveName(key) {
+		return "[REDACTED]"
+	}
+	switch typed := value.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for childKey, child := range typed {
+			out[childKey] = diagnosticRedactValue(child, childKey)
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for i, child := range typed {
+			out[i] = diagnosticRedactValue(child, key)
+		}
+		return out
+	case string:
+		if isEndpointName(key) {
+			return redactSensitive(redactEndpoint(typed))
+		}
+		return redactSensitive(limitString(typed, 512))
+	default:
+		return value
+	}
+}
+
+func isEndpointName(name string) bool {
+	lower := strings.ToLower(name)
+	return lower == "endpoint" || lower == "url" || strings.Contains(lower, "uri")
+}
+
+func isDiagnosticSensitiveName(name string) bool {
+	lower := strings.ToLower(name)
+	for _, marker := range []string{"secret", "password", "token", "credential", "authorization"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (o *Operations) runtimeRoot() string {
@@ -784,7 +1726,7 @@ func (o *Operations) runtimeRoot() string {
 
 func (o *Operations) GCCandidates(ctx context.Context, pluginID string) ([]GCCandidate, error) {
 	now := time.Now().Unix()
-	var candidates []GCCandidate
+	candidates := o.retentionRuleCandidates(pluginID)
 	// 插件数据和文件只有在过期后才允许删除；未过期记录作为受保护候选项返回，
 	// 方便 dry-run 解释为什么没有删除它们。
 	data, err := o.repo.ListPluginData(ctx, pluginID)
@@ -798,39 +1740,108 @@ func (o *Operations) GCCandidates(ctx context.Context, pluginID string) ([]GCCan
 			reason = "plugin_data retention expired"
 		}
 		candidates = append(candidates, GCCandidate{
-			Kind:       "plugin_data",
-			ID:         record.Key,
-			PluginID:   record.PluginID,
-			Protected:  !expired,
-			Reason:     reason,
-			SizeBytes:  record.SizeBytes,
-			CreatedAt:  record.UpdatedAt,
-			Referenced: !expired,
+			Kind:          "plugin_data",
+			Category:      "data",
+			ID:            record.Key,
+			PluginID:      record.PluginID,
+			Protected:     !expired,
+			Reason:        reason,
+			RetentionRule: dataRetentionRule(record.ExpiresAt),
+			SizeBytes:     record.SizeBytes,
+			CreatedAt:     record.UpdatedAt,
+			ExpiresAt:     record.ExpiresAt,
+			Referenced:    !expired,
 		})
 	}
 	files, err := o.repo.ListPluginFiles(ctx, pluginID)
 	if err != nil {
 		return nil, err
 	}
-	seenFiles := make(map[string]bool)
+	seenRuntimeFiles := make(map[string]bool)
 	for _, record := range files {
 		expired := record.ExpiresAt > 0 && record.ExpiresAt <= now
 		filePath := filepath.Join(o.runtimeRoot(), record.PluginID, record.Namespace, filepath.FromSlash(record.Path))
-		seenFiles[filePath] = true
+		seenRuntimeFiles[filePath] = true
 		reason := "plugin file retained"
 		if expired {
 			reason = "plugin file retention expired"
 		}
 		candidates = append(candidates, GCCandidate{
-			Kind:       "plugin_file",
-			ID:         record.Namespace + "/" + record.Path,
-			PluginID:   record.PluginID,
-			Path:       filePath,
-			Protected:  !expired,
-			Reason:     reason,
-			SizeBytes:  record.SizeBytes,
-			CreatedAt:  record.UpdatedAt,
-			Referenced: !expired,
+			Kind:          "plugin_file",
+			Category:      "file",
+			ID:            record.Namespace + "/" + record.Path,
+			PluginID:      record.PluginID,
+			Path:          filePath,
+			Protected:     !expired,
+			Reason:        reason,
+			RetentionRule: dataRetentionRule(record.ExpiresAt),
+			SizeBytes:     record.SizeBytes,
+			CreatedAt:     record.UpdatedAt,
+			ExpiresAt:     record.ExpiresAt,
+			Referenced:    !expired,
+		})
+	}
+	diagnostics, err := o.repo.ListDiagnosticRecords(ctx, pluginID)
+	if err != nil {
+		return nil, err
+	}
+	retentionSeconds := int64(DefaultDiagnosticRetention.Seconds())
+	for _, record := range diagnostics {
+		if record.Path != "" {
+			seenRuntimeFiles[record.Path] = true
+		}
+		expired := record.CreatedAt > 0 && record.CreatedAt+retentionSeconds <= now
+		missing := false
+		if record.Path != "" {
+			if _, err := os.Stat(record.Path); errors.Is(err, os.ErrNotExist) {
+				missing = true
+			}
+		}
+		reason := "diagnostic package retained"
+		if expired {
+			reason = "diagnostic package retention expired"
+		}
+		if missing {
+			reason = "diagnostic package file missing"
+		}
+		candidates = append(candidates, GCCandidate{
+			Kind:             "diagnostic_package",
+			Category:         "diagnostic",
+			ID:               fmt.Sprintf("%d", record.ID),
+			PluginID:         record.PluginID,
+			Path:             record.Path,
+			Protected:        !expired && !missing,
+			Reason:           reason,
+			RetentionRule:    "diagnostic packages retained for 7d by default",
+			RetentionSeconds: retentionSeconds,
+			SizeBytes:        record.SizeBytes,
+			CreatedAt:        record.CreatedAt,
+			ExpiresAt:        record.CreatedAt + retentionSeconds,
+			Referenced:       !expired && !missing,
+		})
+	}
+	leases, err := o.repo.ListTaskLeases(ctx, pluginID)
+	if err != nil {
+		return nil, err
+	}
+	for _, lease := range leases {
+		expired := lease.ExpiresAt > 0 && lease.ExpiresAt <= now
+		reason := "background task lease retained"
+		if expired {
+			reason = "background task lease expired"
+		}
+		candidates = append(candidates, GCCandidate{
+			Kind:          "background_task_lease",
+			Category:      "background_task",
+			ID:            strings.Join([]string{lease.TaskID, lease.ShardKey}, "/"),
+			PluginID:      lease.PluginID,
+			Protected:     !expired,
+			Reason:        reason,
+			RetentionRule: "singleton/sharded task leases are retained until expires_at to protect cross-node ownership",
+			SizeBytes:     int64(len(lease.PluginID) + len(lease.TaskID) + len(lease.ShardKey) + len(lease.OwnerNodeID)),
+			CreatedAt:     lease.AcquiredAt,
+			ExpiresAt:     lease.ExpiresAt,
+			Referenced:    !expired,
 		})
 	}
 	runtimeRoot := o.runtimeRoot()
@@ -838,7 +1849,7 @@ func (o *Operations) GCCandidates(ctx context.Context, pluginID string) ([]GCCan
 		if err != nil || d.IsDir() || !strings.Contains(filePath, string(filepath.Separator)+"_runtime"+string(filepath.Separator)) {
 			return nil
 		}
-		if seenFiles[filePath] {
+		if seenRuntimeFiles[filePath] {
 			return nil
 		}
 		// 文件系统里存在但仓库没有记录的文件视为孤儿文件，可以由 GC 清理。
@@ -857,32 +1868,78 @@ func (o *Operations) GCCandidates(ctx context.Context, pluginID string) ([]GCCan
 			return nil
 		}
 		candidates = append(candidates, GCCandidate{
-			Kind:      "plugin_file_orphan",
-			ID:        id,
-			PluginID:  pid,
-			Path:      filePath,
-			Protected: false,
-			Reason:    "orphaned runtime file",
-			SizeBytes: info.Size(),
-			CreatedAt: info.ModTime().Unix(),
+			Kind:          "plugin_file_orphan",
+			Category:      "file",
+			ID:            id,
+			PluginID:      pid,
+			Path:          filePath,
+			Protected:     false,
+			Reason:        "orphaned runtime file",
+			RetentionRule: "runtime files without PluginFileStore or diagnostic records are removable",
+			SizeBytes:     info.Size(),
+			CreatedAt:     info.ModTime().Unix(),
 		})
 		return nil
 	})
-	logs, err := o.repo.RecentLogs(ctx, pluginID, DefaultLogRecentLimit+1)
-	if err == nil && len(logs) > DefaultLogRecentLimit {
-		for _, item := range logs[DefaultLogRecentLimit:] {
-			candidates = append(candidates, GCCandidate{
-				Kind:      "plugin_log",
-				ID:        fmt.Sprintf("%s/%d", item.PluginID, item.CreatedAt),
-				PluginID:  item.PluginID,
-				Protected: false,
-				Reason:    "log summary exceeds recent retention",
-				SizeBytes: int64(len(item.Message)),
-				CreatedAt: item.CreatedAt,
-			})
+	if pluginID != "" {
+		if candidate, ok, err := o.repo.EventRetentionOverflow(ctx, pluginID, DefaultEventRecentLimit); err != nil {
+			return nil, err
+		} else if ok {
+			candidates = append(candidates, candidate)
+		}
+		if candidate, ok, err := o.repo.LogRetentionOverflow(ctx, pluginID, DefaultLogRecentLimit); err != nil {
+			return nil, err
+		} else if ok {
+			candidates = append(candidates, candidate)
+		}
+		if candidate, ok, err := o.repo.TraceRetentionOverflow(ctx, pluginID, DefaultEventRecentLimit); err != nil {
+			return nil, err
+		} else if ok {
+			candidates = append(candidates, candidate)
 		}
 	}
 	return candidates, nil
+}
+
+func (o *Operations) retentionRuleCandidates(pluginID string) []GCCandidate {
+	pluginLabel := pluginID
+	if pluginLabel == "" {
+		pluginLabel = "*"
+	}
+	rules := []struct {
+		category string
+		rule     string
+		reason   string
+	}{
+		{"diagnostic", "diagnostic packages retained for 7d by default", "diagnostic package retention rule"},
+		{"event", fmt.Sprintf("keep latest %d event records per plugin", DefaultEventRecentLimit), "event retention rule"},
+		{"metric", "custom metrics keep in-memory current summary only; no long-term gateway metric series are retained", "metric retention rule"},
+		{"trace", fmt.Sprintf("keep latest %d trace summary records per plugin", DefaultEventRecentLimit), "trace retention rule"},
+		{"background_task", "task run summaries stay in memory; singleton/sharded leases are retained until expires_at", "background task retention rule"},
+		{"data", "PluginDataStore records without expires_at are protected; records with expired expires_at are removable", "plugin data retention rule"},
+		{"file", "PluginFileStore records without expires_at are protected; expired records and orphan runtime files are removable", "plugin file retention rule"},
+	}
+	out := make([]GCCandidate, 0, len(rules))
+	for _, rule := range rules {
+		out = append(out, GCCandidate{
+			Kind:          "retention_rule",
+			Category:      rule.category,
+			ID:            pluginLabel + "/" + rule.category,
+			PluginID:      pluginID,
+			Protected:     true,
+			Reason:        rule.reason,
+			RetentionRule: rule.rule,
+			Referenced:    true,
+		})
+	}
+	return out
+}
+
+func dataRetentionRule(expiresAt int64) string {
+	if expiresAt <= 0 {
+		return "no expires_at set; protected until plugin or admin deletes it"
+	}
+	return "expires_at controls retention; removable after deadline"
 }
 
 // RunGC 执行插件运维数据清理。dryRun 只返回候选项并写操作日志，
@@ -913,10 +1970,47 @@ func (o *Operations) RunGC(ctx context.Context, actor, pluginID string, dryRun b
 		case "plugin_file_orphan":
 			_ = os.Remove(candidate.Path)
 			removed = append(removed, candidate)
+		case "diagnostic_package":
+			id, err := strconv.ParseInt(candidate.ID, 10, 64)
+			if err != nil {
+				continue
+			}
+			if candidate.Path != "" {
+				_ = os.Remove(candidate.Path)
+			}
+			_ = o.repo.DeleteDiagnostic(ctx, id)
+			removed = append(removed, candidate)
+		case "background_task_lease":
+			taskID, shardKey, _ := strings.Cut(candidate.ID, "/")
+			_ = o.repo.DeleteTaskLease(ctx, candidate.PluginID, taskID, shardKey)
+			removed = append(removed, candidate)
+		case "event":
+			if count, err := o.repo.DeleteEventRetentionOverflow(ctx, candidate.PluginID, DefaultEventRecentLimit); err == nil && count > 0 {
+				removed = append(removed, candidate)
+			}
+		case "plugin_log":
+			if count, err := o.repo.DeleteLogRetentionOverflow(ctx, candidate.PluginID, DefaultLogRecentLimit); err == nil && count > 0 {
+				removed = append(removed, candidate)
+			}
+		case "trace":
+			if count, err := o.repo.DeleteTraceRetentionOverflow(ctx, candidate.PluginID, DefaultEventRecentLimit); err == nil && count > 0 {
+				removed = append(removed, candidate)
+			}
 		}
 	}
-	_ = o.repo.RecordOperation(ctx, pluginID, "", "plugin_operations_gc", "succeeded", actor, "plugin operations gc completed", map[string]any{"removed": len(removed)})
+	_ = o.repo.RecordOperation(ctx, pluginID, "", "plugin_operations_gc", "succeeded", actor, "plugin operations gc completed", map[string]any{
+		"removed":       len(removed),
+		"removed_kinds": gcCandidateKindCounts(removed),
+	})
 	return removed, nil
+}
+
+func gcCandidateKindCounts(candidates []GCCandidate) map[string]int {
+	counts := make(map[string]int)
+	for _, candidate := range candidates {
+		counts[candidate.Kind]++
+	}
+	return counts
 }
 
 // validateEvent 校验事件声明和字段集合，并限制字段值基数，避免插件事件把
@@ -1135,8 +2229,18 @@ func (s pluginFileStore) Write(ctx context.Context, namespace, name string, data
 		quota = s.ops.fileQuota
 	}
 	usage, _ := s.ops.parent.repo.PluginFileUsage(ctx, s.ops.pluginID)
-	if usage+int64(len(data)) > quota {
-		return fmt.Errorf("plugin file quota exceeded: %d > %d", usage+int64(len(data)), quota)
+	var oldSize int64
+	if files, err := s.ops.parent.repo.ListPluginFiles(ctx, s.ops.pluginID); err == nil {
+		for _, existing := range files {
+			if existing.Namespace == namespace && existing.Path == clean {
+				oldSize = existing.SizeBytes
+				break
+			}
+		}
+	}
+	nextUsage := usage - oldSize + int64(len(data))
+	if nextUsage > quota {
+		return fmt.Errorf("plugin file quota exceeded: %d > %d", nextUsage, quota)
 	}
 	root := s.runtimeRoot(namespace)
 	target := filepath.Join(root, filepath.FromSlash(clean))
@@ -1354,9 +2458,11 @@ func (c pluginExternalClient) DialTCP(ctx context.Context, address string, timeo
 	}
 	start := time.Now()
 	defer c.runtime.inflight.Add(-1)
+	dialCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	// 外部 TCP 连接返回给插件后由插件负责关闭；这里仅记录拨号阶段的观测信息。
 	var dialer net.Dialer
-	conn, err := dialer.DialContext(ctx, "tcp", address)
+	conn, err := dialer.DialContext(dialCtx, "tcp", address)
 	if err != nil {
 		c.finish(start, "dial_error", err)
 		return nil, err
@@ -1471,7 +2577,7 @@ func (rt *externalRuntime) summary(pluginID, name string) ExternalDependencySumm
 		Endpoint:            redactEndpoint(rt.spec.Endpoint),
 		Purpose:             redactSensitive(rt.spec.Purpose),
 		Required:            rt.spec.Required,
-		FailPolicy:          rt.spec.FailPolicy,
+		FailPolicy:          normalizeExternalFailPolicy(rt.spec),
 		DataClasses:         append([]string(nil), rt.spec.DataClasses...),
 		Requests:            rt.requests.Load(),
 		Errors:              rt.errors.Load(),
@@ -1483,6 +2589,8 @@ func (rt *externalRuntime) summary(pluginID, name string) ExternalDependencySumm
 		RecentError:         rt.recentError,
 		LastStatus:          rt.lastStatus,
 		LastSeenAt:          rt.lastSeenAt,
+		NetworkBoundary:     "native go plugins can bypass ExternalClient; gateway observes declared clients but does not provide strong network isolation",
+		NetworkEnforced:     false,
 	}
 }
 
@@ -1498,11 +2606,16 @@ func (rt *taskRuntime) summary() BackgroundTaskSummary {
 			mode = "interval"
 		}
 	}
+	policy := normalizeTaskRunPolicy(rt.spec.RunPolicy)
+	shardKey := taskLeaseShardKey(policy, rt.spec)
 	return BackgroundTaskSummary{
 		PluginID:            rt.pluginID,
 		TaskID:              rt.task.ID,
 		Name:                rt.task.Name,
 		Mode:                mode,
+		RunPolicy:           policy,
+		NodeID:              rt.nodeID,
+		ShardKey:            shardKey,
 		IntervalMS:          rt.task.Interval.Milliseconds(),
 		RunOnStart:          rt.task.RunOnStart,
 		TimeoutMS:           rt.task.Timeout.Milliseconds(),
@@ -1513,6 +2626,13 @@ func (rt *taskRuntime) summary() BackgroundTaskSummary {
 		LastDurationMS:      rt.lastDurationMS,
 		LastError:           rt.lastError,
 		Skipped:             rt.skipped,
+		Retry:               taskRetryLimit(rt.spec),
+		LastAttempts:        rt.lastAttempts,
+		LeaseRequired:       taskLeaseRequired(policy),
+		LeaseAcquired:       rt.leaseAcquired,
+		LeaseOwner:          rt.leaseOwner,
+		LeaseExpiresAt:      rt.leaseExpiresAt,
+		LeaseSkipped:        rt.leaseSkipped,
 		ConsecutiveFailures: rt.consecutiveFailures,
 	}
 }
@@ -1659,8 +2779,23 @@ func redactEndpoint(endpoint string) string {
 	if endpoint == "" {
 		return ""
 	}
-	if strings.Contains(endpoint, "@") {
-		return "[REDACTED]"
+	parsed, err := url.Parse(endpoint)
+	if err == nil && parsed.User != nil {
+		parsed.User = url.User("[REDACTED]")
+	}
+	if err == nil {
+		query := parsed.Query()
+		for key := range query {
+			lower := strings.ToLower(key)
+			for _, marker := range []string{"secret", "token", "password", "session", "credential", "authorization"} {
+				if strings.Contains(lower, marker) {
+					query.Set(key, "[REDACTED]")
+					break
+				}
+			}
+		}
+		parsed.RawQuery = query.Encode()
+		endpoint = parsed.String()
 	}
 	return limitString(endpoint, 256)
 }

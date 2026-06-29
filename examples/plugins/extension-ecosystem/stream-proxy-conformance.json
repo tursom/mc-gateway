@@ -1,0 +1,66 @@
+{
+  "stream_proxy_scenarios": [
+    {
+      "name": "stream.proxy/v1.half_close",
+      "protocol": "stream.proxy/v1",
+      "status": "pass",
+      "expected": "half_close_propagated",
+      "bytes_to_plugin": 12,
+      "bytes_to_gateway": 2,
+      "frames": [
+        {"type": "data", "direction": "gateway_to_plugin", "bytes": 12},
+        {"type": "half_close", "direction": "gateway_to_plugin"},
+        {"type": "data", "direction": "plugin_to_gateway", "bytes": 2},
+        {"type": "half_close", "direction": "plugin_to_gateway"},
+        {"type": "accounting"}
+      ]
+    },
+    {
+      "name": "stream.proxy/v1.deadline",
+      "protocol": "stream.proxy/v1",
+      "status": "pass",
+      "expected": "deadline_enforced",
+      "deadline_unix_ms": 1893456000000,
+      "frames": [
+        {"type": "deadline", "deadline_unix_ms": 1893456000000},
+        {"type": "cancel", "reason": "deadline_exceeded"}
+      ]
+    },
+    {
+      "name": "stream.proxy/v1.backpressure",
+      "protocol": "stream.proxy/v1",
+      "status": "pass",
+      "expected": "backpressure_window_respected",
+      "backpressure_bytes": 32768,
+      "bytes_to_plugin": 32768,
+      "frames": [
+        {"type": "window", "window_bytes": 32768},
+        {"type": "data", "direction": "gateway_to_plugin", "bytes": 32768},
+        {"type": "accounting"}
+      ]
+    },
+    {
+      "name": "stream.proxy/v1.cancel",
+      "protocol": "stream.proxy/v1",
+      "status": "pass",
+      "expected": "cancel_closes_stream",
+      "frames": [
+        {"type": "cancel", "reason": "client_closed"},
+        {"type": "accounting"}
+      ]
+    },
+    {
+      "name": "stream.proxy/v1.accounting",
+      "protocol": "stream.proxy/v1",
+      "status": "pass",
+      "expected": "byte_accounting_exact",
+      "bytes_to_plugin": 7,
+      "bytes_to_gateway": 11,
+      "frames": [
+        {"type": "data", "direction": "gateway_to_plugin", "bytes": 7},
+        {"type": "data", "direction": "plugin_to_gateway", "bytes": 11},
+        {"type": "accounting"}
+      ]
+    }
+  ]
+}

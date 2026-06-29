@@ -5,6 +5,7 @@ package adminaudit
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -62,5 +63,43 @@ func TestRepositoryRecordIgnoresNilDB(t *testing.T) {
 	repo := NewRepository(nil)
 	if err := repo.Record(context.Background(), "admin", "127.0.0.1", "login", "user", "admin", true, "ok"); err != nil {
 		t.Fatalf("Record(nil DB) error = %v", err)
+	}
+}
+
+func TestRepositoryRecordRedactsSensitiveMessageAndMetadata(t *testing.T) {
+	db, err := admindb.Open(filepath.Join(t.TempDir(), "gateway.sqlite3"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer db.Close()
+	if err := admindb.Migrate(db); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+
+	repo := NewRepository(db)
+	if err := repo.RecordWithMetadata(context.Background(), "admin", "127.0.0.1", "plugin_secret_update", "plugin_secret", "plugin://plugin-a/api_token", false, "token=plain-secret", map[string]any{
+		"token": "plain-secret",
+		"nested": map[string]any{
+			"password": "plain-password",
+			"host":     "play.example",
+		},
+	}); err != nil {
+		t.Fatalf("RecordWithMetadata() error = %v", err)
+	}
+	logs, err := repo.List(context.Background(), DefaultListLimit)
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("logs = %+v, want one", logs)
+	}
+	payload := logs[0].Message + " " + logs[0].MetadataJSON
+	for _, forbidden := range []string{"plain-secret", "plain-password"} {
+		if strings.Contains(payload, forbidden) {
+			t.Fatalf("audit record leaked %q: %+v", forbidden, logs[0])
+		}
+	}
+	if !strings.Contains(logs[0].MetadataJSON, "play.example") {
+		t.Fatalf("metadata_json = %s, want non-sensitive context retained", logs[0].MetadataJSON)
 	}
 }
