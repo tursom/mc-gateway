@@ -60,10 +60,13 @@ globalThis.document = {
 
 const stateModule = await import(pathToFileURL(path.join(tmpJS, "state.js")));
 const pluginsModule = await import(pathToFileURL(path.join(tmpJS, "views/plugins.js")));
+const i18nModule = await import(pathToFileURL(path.join(tmpJS, "i18n.js")));
 const { state } = stateModule;
 const { renderPlugins, renderPluginDetail } = pluginsModule;
+const { t, ui } = i18nModule;
 
 state.user = { username: "admin", role: "admin", disabled: false };
+state.language = "zh";
 state.pluginFeatures = {
   schema_version: "mc-gateway.plugin/v1",
   api_version: "plugin-api/v1",
@@ -196,37 +199,50 @@ const serviceHTML = element("pluginServicePanel").innerHTML;
 const detailHTML = element("pluginDetail").innerHTML;
 
 for (const expected of [
-  "Plugin Service",
-  "Desired maturity",
-  "future desired only",
-  "Current data plane remains in-process",
-  "Build-Time Instrumentation",
+  "插件服务",
+  "期望成熟度",
+  "在服务模式应用前仅作为未来期望",
+  "当前数据面保持为 in-process",
+  "构建期埋点",
+  "预留认证提供方",
   "admin.auth.provider/v1",
 ]) {
   assert.match(serviceHTML, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `service panel should include ${expected}`);
 }
 
 for (const expected of [
-  "Runtime maturity",
-  "Artifact",
-  "implemented",
-  "Governance",
-  "Fixture gate",
-  "Rollout",
-  "Artifact package",
-  "Secrets",
-  "current/previous summaries only",
-  "Value visibility",
-  "reload required",
-  "Snapshots",
-  "dry-run and governance rechecked",
-  "config-only and full desired rollback",
-  "sensitive values redacted",
+  "运行时成熟度",
+  "制品",
+  "已实现",
+  "治理",
+  "夹具门禁",
+  "发布",
+  "制品包",
+  "密钥",
+  "仅展示当前/上一版本摘要",
+  "值可见性",
+  "需要重载",
+  "快照",
+  "重新执行试运行和治理检查",
+  "支持仅配置和完整期望回滚",
+  "敏感值已脱敏",
   "container",
 ]) {
   assert.match(detailHTML, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `detail panel should include ${expected}`);
 }
 
+for (const untranslated of [
+  "Plugin Service",
+  "Desired maturity",
+  "Current data plane remains",
+  "Runtime maturity",
+  "Value visibility",
+]) {
+  assert.doesNotMatch(`${serviceHTML}\n${detailHTML}`, new RegExp(untranslated.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `Chinese UI should not include ${untranslated}`);
+}
+
+assert.equal(ui("No builds"), "暂无构建");
+assert.equal(t("action"), "动作");
 assert.doesNotMatch(serviceHTML, /sandbox-process[^<]*(active|current data plane)/i, "future runtime must not read as the active data plane");
 
 console.log("plugin UI acceptance passed");

@@ -5,3 +5,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
+        NODE_IMAGE: ${NODE_IMAGE:-node:24.11.1-alpine}
+        GO_IMAGE: ${GO_IMAGE:-golang:1.25.0-alpine}
+        RUNTIME_IMAGE: ${RUNTIME_IMAGE:-alpine:3.22}

@@ -10,3 +10,4 @@ config.toml
 /data/
 
 .omc
+.tmp

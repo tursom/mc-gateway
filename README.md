@@ -39,6 +39,21 @@ docker compose up -d
 docker compose build
 ```
 
+如果构建环境不能直接访问默认 Go 模块代理或 Docker Hub，可以通过宿主机环境变量透传构建镜像和 Go 模块代理：
+
+```sh
+GOPROXY=https://goproxy.cn,direct docker compose up -d --build
+```
+
+可选构建变量：
+
+```env
+GOPROXY=https://proxy.golang.org,direct
+NODE_IMAGE=node:24.11.1-alpine
+GO_IMAGE=golang:1.25.0-alpine
+RUNTIME_IMAGE=alpine:3.22
+```
+
 默认使用 host network，在宿主机 `25565/tcp` 提供 Minecraft TCP 转发入口和后台管理入口，后台地址为：
 
 ```text

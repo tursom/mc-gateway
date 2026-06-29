@@ -2,7 +2,11 @@
 
 # syntax=docker/dockerfile:1
 
-FROM --platform=$BUILDPLATFORM node:24.11.1-alpine AS admin-frontend
+ARG NODE_IMAGE=node:24.11.1-alpine
+ARG GO_IMAGE=golang:1.25.0-alpine
+ARG RUNTIME_IMAGE=alpine:3.22
+
+FROM --platform=$BUILDPLATFORM ${NODE_IMAGE} AS admin-frontend
 
 WORKDIR /src
 
@@ -14,10 +18,13 @@ COPY cmd/gateway/admin_frontend ./cmd/gateway/admin_frontend
 COPY cmd/gateway/admin_static/index.html cmd/gateway/admin_static/app.css ./cmd/gateway/admin_static/
 RUN npm run build:admin
 
-FROM --platform=$BUILDPLATFORM golang:1.24.4-alpine AS build
+FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS build
 
 ARG TARGETOS
 ARG TARGETARCH
+ARG GOPROXY=https://proxy.golang.org,direct
+
+ENV GOPROXY=${GOPROXY}
 
 WORKDIR /src
 
@@ -32,7 +39,7 @@ RUN --mount=type=cache,id=mc-gateway-go-mod,target=/go/pkg/mod,sharing=locked \
     mkdir -p /out \
     && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags="-s -w" -o /out/mc-gateway ./cmd/gateway
 
-FROM alpine:3.22
+FROM ${RUNTIME_IMAGE}
 
 WORKDIR /data
 
