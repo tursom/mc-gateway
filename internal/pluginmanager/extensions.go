@@ -499,6 +499,9 @@ func (m *Manager) removeExtensionsLocked(pluginID string) {
 	current := m.currentExtensionsLocked()
 	delete(current, pluginID)
 	m.publishExtensionsLocked(current)
+	m.routeCacheMu.Lock()
+	m.routeCache = make(map[string]routeCacheEntry)
+	m.routeCacheMu.Unlock()
 }
 
 func buildExtensions(pluginRecord PluginRecord, artifact ArtifactRecord, gateway *Gateway) pluginExtensions {

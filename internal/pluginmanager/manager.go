@@ -802,11 +802,7 @@ func (m *Manager) DryRunConfig(ctx context.Context, pluginID, artifactID, config
 	}
 	dryRunAdapter := m.adapter
 	if m.adapterManaged {
-		dryRunAdapter, _ = RuntimeAdapterFactory{}.AdapterFor(m.serviceMode, artifact.RuntimeType)
-		if typed, ok := dryRunAdapter.(WASMAdapter); ok {
-			typed.Runner = m.wasmRunner
-			dryRunAdapter = typed
-		}
+		dryRunAdapter = m.runtimeAdapterForArtifact(artifact)
 	}
 	if dryRunner, ok := dryRunAdapter.(ConfigDryRunAdapter); ok {
 		// 运行时 dry-run 会实例化插件但不调用 Init，避免注册钩子或启动后台任务。
@@ -2302,6 +2298,16 @@ func (m *Manager) runtimeAdapterForArtifact(artifact ArtifactRecord) RuntimeAdap
 			}
 			adapter = typed
 		case SandboxProcessAdapter:
+			switch configured := m.adapter.(type) {
+			case SandboxProcessAdapter:
+				typed.Supervisor = configured.Supervisor
+				typed.startProcess = configured.startProcess
+			case *SandboxProcessAdapter:
+				if configured != nil {
+					typed.Supervisor = configured.Supervisor
+					typed.startProcess = configured.startProcess
+				}
+			}
 			typed.Policy = m.sandboxPolicy
 			typed.Secrets = m
 			adapter = typed

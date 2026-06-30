@@ -182,7 +182,7 @@ func sandboxRuntimeFeature(options RuntimeFeatureFactsOptions) sandboxProduction
 			serviceModeReason: reason,
 		}
 	}
-	reason := "sandbox-process data-plane is partial; first production slice only supports sandbox-process artifacts in sandbox-process service mode"
+	reason := "sandbox-process data-plane is partial; selected request/response extension points are supported under sandbox-process service mode, while protocol-proxy requires S4 stream relay and is not enabled"
 	return sandboxProductionFeature{
 		implemented:       true,
 		maturity:          FeatureMaturityPartial,

@@ -52,6 +52,8 @@ const (
 	sandboxControlErrorRegisterFailed    = "register_failed"
 	sandboxControlErrorNotImplemented    = "not_implemented"
 	sandboxControlErrorSecretUnavailable = "secret_unavailable"
+	sandboxControlErrorBadResponse       = "bad_response"
+	sandboxControlErrorProcessExited     = "process_exited"
 )
 
 type SandboxProcessAdapter struct {
@@ -102,6 +104,9 @@ type SandboxProcess struct {
 	crashCount  int
 	exitedAt    int64
 	lastCrashAt int64
+
+	controlInvoker sandboxControlInvoker
+	operations     *PluginOperations
 }
 
 type SandboxSecretResolver interface {
@@ -143,6 +148,7 @@ type SandboxControlResponse struct {
 	Health            *RuntimeHealth            `json:"health,omitempty"`
 	Diagnostics       *SandboxDiagnosticSummary `json:"diagnostics,omitempty"`
 	Secret            *SandboxSecretResponse    `json:"secret,omitempty"`
+	Invoke            *SandboxInvokeResponse    `json:"invoke,omitempty"`
 }
 
 type sandboxHostedPlugin struct {
@@ -223,6 +229,41 @@ type SandboxMetricsResponse struct {
 	RuntimeInstanceID  string `json:"runtime_instance_id"`
 	RegisteredHandlers int    `json:"registered_handlers"`
 }
+
+type SandboxInvokeRequest struct {
+	ExtensionPoint string `json:"extension_point"`
+	HandlerID      string `json:"handler_id"`
+	FailPolicy     string `json:"fail_policy,omitempty"`
+
+	ConfigJSON    json.RawMessage              `json:"config_json,omitempty"`
+	RouteResolve  *api.RouteResolveRequest     `json:"route_resolve,omitempty"`
+	RuleEvaluate  *api.RuleEvaluateRequest     `json:"rule_evaluate,omitempty"`
+	StatusPing    *api.StatusPingRequest       `json:"status_ping,omitempty"`
+	Provider      *SandboxProviderQueryRequest `json:"provider,omitempty"`
+	EventDelivery *api.EventDeliveryRequest    `json:"event_delivery,omitempty"`
+}
+
+type SandboxInvokeResponse struct {
+	ExtensionPoint string `json:"extension_point"`
+	HandlerID      string `json:"handler_id"`
+
+	OK             bool                      `json:"ok"`
+	Valid          *bool                     `json:"valid,omitempty"`
+	RouteDecision  *api.RouteDecision        `json:"route_decision,omitempty"`
+	RuleDecision   *api.RuleEvaluateDecision `json:"rule_decision,omitempty"`
+	StatusResponse *api.StatusPingResponse   `json:"status_response,omitempty"`
+	Provider       *api.ProviderRegistration `json:"provider,omitempty"`
+	EventResult    *api.EventDeliveryResult  `json:"event_result,omitempty"`
+	Reason         string                    `json:"reason,omitempty"`
+	ErrorCode      string                    `json:"error_code,omitempty"`
+	Error          string                    `json:"error,omitempty"`
+}
+
+type SandboxProviderQueryRequest struct {
+	ExtensionPoint string `json:"extension_point"`
+}
+
+type sandboxControlInvoker func(context.Context, string, SandboxControlRequest) (SandboxControlResponse, error)
 
 func normalizeSandboxPolicy(policy SandboxPolicy) SandboxPolicy {
 	if policy.CPUSeconds <= 0 {
@@ -366,7 +407,7 @@ func (a SandboxProcessAdapter) Prepare(ctx context.Context, artifact ArtifactRec
 	}, nil
 }
 
-func (a SandboxProcessAdapter) Start(ctx context.Context, prepared RuntimePrepared, artifact ArtifactRecord, pluginRecord PluginRecord, _ *Gateway) (RuntimeInstance, error) {
+func (a SandboxProcessAdapter) Start(ctx context.Context, prepared RuntimePrepared, artifact ArtifactRecord, pluginRecord PluginRecord, gateway *Gateway) (RuntimeInstance, error) {
 	supervisor := a.Supervisor
 	if sandboxPolicyEmpty(supervisor.Policy) {
 		supervisor.Policy = a.Policy
@@ -385,16 +426,21 @@ func (a SandboxProcessAdapter) Start(ctx context.Context, prepared RuntimePrepar
 	if err != nil {
 		return RuntimeInstance{}, err
 	}
+	plugin := sandboxHostedPlugin{process: process}
+	if err := plugin.Init(gateway); err != nil {
+		_ = process.Stop(ctx)
+		return RuntimeInstance{}, err
+	}
 	return RuntimeInstance{
 		RuntimePrepared: prepared,
-		Plugin:          sandboxHostedPlugin{process: process},
+		Plugin:          plugin,
 		StartedAt:       process.StartedAt,
 	}, nil
 }
 
 func (a SandboxProcessAdapter) HealthCheck(_ context.Context, instance RuntimeInstance) RuntimeHealth {
 	now := time.Now().Unix()
-	process, _ := instance.Plugin.(sandboxHostedPlugin)
+	process := sandboxHostedPluginFromInstance(instance.Plugin)
 	summary := SandboxDiagnosticSummary{PluginID: instance.PluginID, ArtifactID: instance.ArtifactID, State: RuntimeEnabled}
 	if process.process != nil {
 		summary = process.process.Diagnostics()
@@ -408,7 +454,41 @@ func (a SandboxProcessAdapter) HealthCheck(_ context.Context, instance RuntimeIn
 	}
 }
 
-func (a SandboxProcessAdapter) ReloadConfig(context.Context, RuntimeInstance, string) error {
+func (a SandboxProcessAdapter) DryRunConfig(ctx context.Context, artifact ArtifactRecord, pluginRecord PluginRecord) error {
+	prepared, err := a.Prepare(ctx, artifact, pluginRecord)
+	if err != nil {
+		return err
+	}
+	instance, err := a.Start(ctx, prepared, artifact, pluginRecord, NewGateway(pluginRecord.ID, nil, nil, nil))
+	if err != nil {
+		return err
+	}
+	stopCtx, cancel := context.WithTimeout(context.Background(), sandboxControlStartupTimeout(a.Supervisor.StartupTimeout))
+	defer cancel()
+	defer func() { _ = a.Stop(stopCtx, instance) }()
+	return instance.Plugin.ReloadConfig(json.RawMessage(defaultJSONObject(pluginRecord.ConfigJSON)))
+}
+
+func (a SandboxProcessAdapter) ReloadConfig(ctx context.Context, instance RuntimeInstance, configJSON string) error {
+	hosted := sandboxHostedPluginFromInstance(instance.Plugin)
+	if hosted.process == nil {
+		return errors.New("sandbox process is nil")
+	}
+	if err := hosted.validateConfig(ctx, json.RawMessage(defaultJSONObject(configJSON))); err != nil {
+		return err
+	}
+	payload, err := json.Marshal(SandboxReloadConfigRequest{ConfigJSON: defaultJSONObject(configJSON)})
+	if err != nil {
+		return err
+	}
+	resp, err := hosted.process.sendControlRequest(ctx, sandboxControlCommandReloadConfig, "", payload)
+	if err != nil {
+		return err
+	}
+	if !resp.OK {
+		return sandboxResponseError(resp, sandboxFailPolicyForExtension(ExtensionConfigValidate))
+	}
+	hosted.process.ConfigJSON = defaultJSONObject(configJSON)
 	return nil
 }
 
@@ -417,7 +497,7 @@ func (a SandboxProcessAdapter) Drain(context.Context, RuntimeInstance) error {
 }
 
 func (a SandboxProcessAdapter) Stop(ctx context.Context, instance RuntimeInstance) error {
-	process, _ := instance.Plugin.(sandboxHostedPlugin)
+	process := sandboxHostedPluginFromInstance(instance.Plugin)
 	if process.process == nil {
 		return nil
 	}
@@ -425,7 +505,7 @@ func (a SandboxProcessAdapter) Stop(ctx context.Context, instance RuntimeInstanc
 }
 
 func (a SandboxProcessAdapter) Diagnostics(_ context.Context, instance RuntimeInstance) RuntimeAdapterDiagnostics {
-	process, _ := instance.Plugin.(sandboxHostedPlugin)
+	process := sandboxHostedPluginFromInstance(instance.Plugin)
 	summary := SandboxDiagnosticSummary{PluginID: instance.PluginID, ArtifactID: instance.ArtifactID, State: RuntimeNotLoaded}
 	if process.process != nil {
 		summary = process.process.Diagnostics()
@@ -1048,8 +1128,8 @@ func normalizeSandboxRegistrations(req SandboxRegisterRequest) ([]SandboxHandler
 		if reg.ExtensionPoint == "" {
 			return nil, nil, errors.New("extension_point is required")
 		}
-		if !supportedExtensionPoint(reg.ExtensionPoint) {
-			return nil, nil, fmt.Errorf("unsupported extension_point %q", reg.ExtensionPoint)
+		if !supportedSandboxRequestResponseExtensionPoint(reg.ExtensionPoint) {
+			return nil, nil, fmt.Errorf("unsupported sandbox request/response extension_point %q", reg.ExtensionPoint)
 		}
 		if reg.HandlerID == "" {
 			return nil, nil, errors.New("handler_id is required")
@@ -1080,6 +1160,21 @@ func normalizeSandboxRegistrations(req SandboxRegisterRequest) ([]SandboxHandler
 	}
 	capabilities = normalizeSandboxControlStringList(capabilities)
 	return registrations, capabilities, nil
+}
+
+func supportedSandboxRequestResponseExtensionPoint(point string) bool {
+	switch point {
+	case ExtensionRouteResolve,
+		ExtensionRouteResolver,
+		ExtensionRuleEvaluate,
+		ExtensionConfigValidate,
+		ExtensionStatusPing,
+		ExtensionProvider,
+		ExtensionEventSubscriber:
+		return true
+	default:
+		return false
+	}
 }
 
 func validSandboxControlFailPolicy(policy string) bool {
@@ -1399,13 +1494,592 @@ func sandboxDiagnosticsDetails(summary SandboxDiagnosticSummary) map[string]any 
 	}
 }
 
-func (p sandboxHostedPlugin) Init(api.Gateway) error { return nil }
+func (p sandboxHostedPlugin) Init(gateway api.Gateway) error {
+	if p.process == nil {
+		return errors.New("sandbox process is nil")
+	}
+	if concrete, ok := gateway.(*Gateway); ok {
+		p.process.operations = concrete.ops
+	}
+	for _, registration := range p.process.Registrations {
+		reg := registration
+		switch reg.ExtensionPoint {
+		case ExtensionRouteResolve:
+			if err := api.RegisterHookHandler(
+				gateway,
+				api.HookRouteResolve,
+				func(api.RouteResolveRequest) bool { return true },
+				func(req api.RouteResolveRequest) (api.RouteDecision, error) {
+					return p.resolveRoute(req, reg)
+				},
+			); err != nil {
+				return err
+			}
+		case ExtensionRouteResolver:
+			if err := api.RegisterHookHandler(
+				gateway,
+				api.HookRouteResolver,
+				func(api.RouteResolveRequest) bool { return true },
+				func(req api.RouteResolveRequest) (api.RouteDecision, error) {
+					return p.resolveRoute(req, reg)
+				},
+			); err != nil {
+				return err
+			}
+		case ExtensionRuleEvaluate:
+			if err := api.RegisterHookHandler(
+				gateway,
+				api.HookRuleEvaluate,
+				func(api.RuleEvaluateRequest) bool { return true },
+				func(req api.RuleEvaluateRequest) (api.RuleEvaluateDecision, error) {
+					return p.evaluateRule(req, reg)
+				},
+			); err != nil {
+				return err
+			}
+		case ExtensionStatusPing:
+			if err := api.RegisterHookHandler(
+				gateway,
+				api.HookStatusPing,
+				func(api.StatusPingRequest) bool { return true },
+				func(req api.StatusPingRequest) (api.StatusPingResponse, error) {
+					return p.statusPing(req, reg)
+				},
+			); err != nil {
+				return err
+			}
+		case ExtensionProvider:
+			if err := api.RegisterHookHandler(
+				gateway,
+				api.HookProvider,
+				func(api.ProviderRegistration) bool { return true },
+				func() (api.ProviderRegistration, error) {
+					return p.queryProvider(reg)
+				},
+			); err != nil {
+				return err
+			}
+		case ExtensionEventSubscriber:
+			if err := api.RegisterHookHandler(
+				gateway,
+				api.HookEventSubscriber,
+				func(api.EventDeliveryRequest) bool { return true },
+				func(req api.EventDeliveryRequest) (api.EventDeliveryResult, error) {
+					return p.deliverEvent(req, reg)
+				},
+			); err != nil {
+				return err
+			}
+		case ExtensionConfigValidate:
+			// Config validation is called through ReloadConfig/DryRunConfig, not
+			// through Gateway dispatch snapshots.
+		default:
+			return fmt.Errorf("sandbox extension point %q is not supported by the S3 request/response data-plane", reg.ExtensionPoint)
+		}
+	}
+	return nil
+}
 
 func (p sandboxHostedPlugin) Destroy() error { return nil }
 
-func (p sandboxHostedPlugin) NewConfigObj() any { return struct{}{} }
+func (p sandboxHostedPlugin) NewConfigObj() any { return json.RawMessage(`{}`) }
 
-func (p sandboxHostedPlugin) ReloadConfig(any) error { return nil }
+func (p sandboxHostedPlugin) ReloadConfig(config any) error {
+	configJSON, err := sandboxConfigJSON(config)
+	if err != nil {
+		return err
+	}
+	return p.validateConfig(context.Background(), configJSON)
+}
+
+func (p sandboxHostedPlugin) validateConfig(ctx context.Context, configJSON json.RawMessage) error {
+	reg, ok := p.registrationFor(ExtensionConfigValidate)
+	if !ok {
+		return nil
+	}
+	resp, err := p.invoke(ctx, reg, SandboxInvokeRequest{ConfigJSON: append(json.RawMessage(nil), configJSON...)})
+	if err != nil {
+		if sandboxFailOpen(reg.FailPolicy) {
+			return nil
+		}
+		return err
+	}
+	if resp.Valid == nil {
+		err := newSandboxInvocationError(sandboxControlErrorBadResponse, reg.FailPolicy, "sandbox config.validate/v1 response missing valid")
+		if sandboxFailOpen(reg.FailPolicy) {
+			return nil
+		}
+		return err
+	}
+	if !*resp.Valid {
+		reason := resp.Reason
+		if reason == "" {
+			reason = "sandbox config validation failed"
+		}
+		return fmt.Errorf("sandbox config validation failed: %s", reason)
+	}
+	return nil
+}
+
+func (p sandboxHostedPlugin) resolveRoute(req api.RouteResolveRequest, reg SandboxHandlerRegistration) (api.RouteDecision, error) {
+	resp, err := p.invoke(req.Context, reg, SandboxInvokeRequest{RouteResolve: &req})
+	if err != nil {
+		if sandboxFailClosed(reg.FailPolicy) {
+			return api.RouteDecision{
+				Action:     api.RouteDecisionReject,
+				Host:       req.Host,
+				ProviderID: p.pluginID(),
+				Reason:     sandboxStableErrorReason(err),
+			}, nil
+		}
+		return api.RouteDecision{}, api.ErrPass
+	}
+	if resp.RouteDecision == nil {
+		err := newSandboxInvocationError(sandboxControlErrorBadResponse, reg.FailPolicy, "sandbox route.resolve/v1 response missing route_decision")
+		if sandboxFailClosed(reg.FailPolicy) {
+			return api.RouteDecision{
+				Action:     api.RouteDecisionReject,
+				Host:       req.Host,
+				ProviderID: p.pluginID(),
+				Reason:     err.Error(),
+			}, nil
+		}
+		return api.RouteDecision{}, api.ErrPass
+	}
+	decision := *resp.RouteDecision
+	if decision.ProviderID == "" {
+		decision.ProviderID = p.pluginID()
+	}
+	if decision.Host == "" {
+		decision.Host = req.Host
+	}
+	return decision, nil
+}
+
+func (p sandboxHostedPlugin) evaluateRule(req api.RuleEvaluateRequest, reg SandboxHandlerRegistration) (api.RuleEvaluateDecision, error) {
+	resp, err := p.invoke(req.Context, reg, SandboxInvokeRequest{RuleEvaluate: &req})
+	if err != nil {
+		if sandboxFailClosed(reg.FailPolicy) {
+			return api.RuleEvaluateDecision{
+				Deny:       true,
+				Reject:     true,
+				ProviderID: p.pluginID(),
+				Reason:     sandboxStableErrorReason(err),
+			}, nil
+		}
+		return api.RuleEvaluateDecision{}, api.ErrPass
+	}
+	if resp.RuleDecision == nil {
+		err := newSandboxInvocationError(sandboxControlErrorBadResponse, reg.FailPolicy, "sandbox rule.evaluate/v1 response missing rule_decision")
+		if sandboxFailClosed(reg.FailPolicy) {
+			return api.RuleEvaluateDecision{
+				Deny:       true,
+				Reject:     true,
+				ProviderID: p.pluginID(),
+				Reason:     err.Error(),
+			}, nil
+		}
+		return api.RuleEvaluateDecision{}, api.ErrPass
+	}
+	decision := *resp.RuleDecision
+	if decision.ProviderID == "" {
+		decision.ProviderID = p.pluginID()
+	}
+	return decision, nil
+}
+
+func (p sandboxHostedPlugin) statusPing(req api.StatusPingRequest, reg SandboxHandlerRegistration) (api.StatusPingResponse, error) {
+	resp, err := p.invoke(req.Context, reg, SandboxInvokeRequest{StatusPing: &req})
+	if err != nil {
+		if sandboxFailOpen(reg.FailPolicy) {
+			return api.StatusPingResponse{}, api.ErrPass
+		}
+		return api.StatusPingResponse{}, err
+	}
+	if resp.StatusResponse == nil {
+		err := newSandboxInvocationError(sandboxControlErrorBadResponse, reg.FailPolicy, "sandbox status.ping/v1 response missing status_response")
+		if sandboxFailOpen(reg.FailPolicy) {
+			return api.StatusPingResponse{}, api.ErrPass
+		}
+		return api.StatusPingResponse{}, err
+	}
+	return *resp.StatusResponse, nil
+}
+
+func (p sandboxHostedPlugin) queryProvider(reg SandboxHandlerRegistration) (api.ProviderRegistration, error) {
+	resp, err := p.invoke(context.Background(), reg, SandboxInvokeRequest{
+		Provider: &SandboxProviderQueryRequest{ExtensionPoint: reg.ExtensionPoint},
+	})
+	if err != nil {
+		return api.ProviderRegistration{}, err
+	}
+	if resp.Provider == nil {
+		return api.ProviderRegistration{}, newSandboxInvocationError(sandboxControlErrorBadResponse, reg.FailPolicy, "sandbox provider/v1 response missing provider")
+	}
+	provider := *resp.Provider
+	if provider.Type == "" {
+		provider.Type = ExtensionProvider
+	}
+	if provider.Name == "" {
+		provider.Name = p.pluginID()
+	}
+	return provider, nil
+}
+
+func (p sandboxHostedPlugin) deliverEvent(req api.EventDeliveryRequest, reg SandboxHandlerRegistration) (api.EventDeliveryResult, error) {
+	resp, err := p.invoke(req.Context, reg, SandboxInvokeRequest{EventDelivery: &req})
+	if err != nil {
+		if sandboxFailOpen(reg.FailPolicy) {
+			return api.EventDeliveryResult{OK: true, Reason: sandboxStableErrorReason(err)}, nil
+		}
+		return api.EventDeliveryResult{}, err
+	}
+	if resp.EventResult == nil {
+		err := newSandboxInvocationError(sandboxControlErrorBadResponse, reg.FailPolicy, "sandbox event.subscriber/v1 response missing event_result")
+		if sandboxFailOpen(reg.FailPolicy) {
+			return api.EventDeliveryResult{OK: true, Reason: err.Error()}, nil
+		}
+		return api.EventDeliveryResult{}, err
+	}
+	return *resp.EventResult, nil
+}
+
+func (p sandboxHostedPlugin) invoke(ctx context.Context, reg SandboxHandlerRegistration, req SandboxInvokeRequest) (SandboxInvokeResponse, error) {
+	if p.process == nil {
+		return SandboxInvokeResponse{}, newSandboxInvocationError(sandboxControlErrorProcessExited, reg.FailPolicy, "sandbox process is nil")
+	}
+	req.ExtensionPoint = reg.ExtensionPoint
+	req.HandlerID = reg.HandlerID
+	if req.FailPolicy == "" {
+		req.FailPolicy = reg.FailPolicy
+	}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return SandboxInvokeResponse{}, err
+	}
+	start := time.Now()
+	resp, err := p.process.sendControlRequest(ctx, sandboxControlCommandInvoke, reg.ExtensionPoint, payload)
+	duration := time.Since(start)
+	if err != nil {
+		p.process.recordSandboxTrace(ctx, reg, sandboxErrorCode(err), duration)
+		return SandboxInvokeResponse{}, err
+	}
+	if !resp.OK {
+		err := sandboxResponseError(resp, reg.FailPolicy)
+		p.process.recordSandboxTrace(ctx, reg, sandboxErrorCode(err), duration)
+		return SandboxInvokeResponse{}, err
+	}
+	if resp.Invoke == nil {
+		err := newSandboxInvocationError(sandboxControlErrorBadResponse, reg.FailPolicy, "sandbox invoke response missing invoke payload")
+		p.process.recordSandboxTrace(ctx, reg, sandboxControlErrorBadResponse, duration)
+		return SandboxInvokeResponse{}, err
+	}
+	invoke := *resp.Invoke
+	if invoke.ExtensionPoint == "" {
+		invoke.ExtensionPoint = reg.ExtensionPoint
+	}
+	if invoke.HandlerID == "" {
+		invoke.HandlerID = reg.HandlerID
+	}
+	if invoke.ExtensionPoint != reg.ExtensionPoint || invoke.HandlerID != reg.HandlerID {
+		err := newSandboxInvocationError(sandboxControlErrorBadResponse, reg.FailPolicy, "sandbox invoke response identity mismatch")
+		p.process.recordSandboxTrace(ctx, reg, sandboxControlErrorBadResponse, duration)
+		return SandboxInvokeResponse{}, err
+	}
+	if !invoke.OK && invoke.ErrorCode != "" {
+		err := newSandboxInvocationError(invoke.ErrorCode, reg.FailPolicy, invoke.Error)
+		p.process.recordSandboxTrace(ctx, reg, sandboxErrorCode(err), duration)
+		return SandboxInvokeResponse{}, err
+	}
+	p.process.recordSandboxTrace(ctx, reg, "ok", duration)
+	return invoke, nil
+}
+
+func (p sandboxHostedPlugin) registrationFor(point string) (SandboxHandlerRegistration, bool) {
+	if p.process == nil {
+		return SandboxHandlerRegistration{}, false
+	}
+	for _, reg := range p.process.Registrations {
+		if reg.ExtensionPoint == point {
+			return reg, true
+		}
+	}
+	return SandboxHandlerRegistration{}, false
+}
+
+func (p sandboxHostedPlugin) pluginID() string {
+	if p.process == nil {
+		return ""
+	}
+	return p.process.PluginID
+}
+
+func sandboxHostedPluginFromInstance(instance api.Plugin) sandboxHostedPlugin {
+	switch typed := instance.(type) {
+	case sandboxHostedPlugin:
+		return typed
+	case *sandboxHostedPlugin:
+		if typed != nil {
+			return *typed
+		}
+	}
+	return sandboxHostedPlugin{}
+}
+
+func (p *SandboxProcess) sendControlRequest(ctx context.Context, command, extensionPoint string, payload json.RawMessage) (SandboxControlResponse, error) {
+	if p == nil {
+		return SandboxControlResponse{}, newSandboxInvocationError(sandboxControlErrorProcessExited, sandboxFailPolicyForExtension(extensionPoint), "sandbox process is nil")
+	}
+	select {
+	case <-p.done:
+		return SandboxControlResponse{}, newSandboxInvocationError(sandboxControlErrorProcessExited, sandboxFailPolicyForExtension(extensionPoint), "sandbox process exited")
+	default:
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if timeout := sandboxHandlerTimeoutForExtension(p.Registrations, extensionPoint); timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	req := SandboxControlRequest{
+		RequestID:         newSandboxRuntimeInstanceID(),
+		Command:           command,
+		Protocol:          sandboxProcessProtocol,
+		PluginID:          p.PluginID,
+		ArtifactID:        p.ArtifactID,
+		RuntimeInstanceID: p.RuntimeInstanceID,
+		Generation:        p.Generation,
+		TraceID:           sandboxTraceID(ctx),
+		Payload:           payload,
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		req.DeadlineUnixMS = deadline.UnixMilli()
+	}
+	invoker := p.controlInvoker
+	if invoker == nil {
+		invoker = SendSandboxControlRequest
+	}
+	resp, err := invoker(ctx, p.SocketPath, req)
+	if err != nil {
+		return SandboxControlResponse{}, mapSandboxControlInvokeError(ctx, p, sandboxFailPolicyForExtension(extensionPoint), err)
+	}
+	if err := validateSandboxControlInvokeEnvelope(p, req, resp); err != nil {
+		return SandboxControlResponse{}, err
+	}
+	return resp, nil
+}
+
+func sandboxHandlerTimeoutForExtension(registrations []SandboxHandlerRegistration, extensionPoint string) time.Duration {
+	for _, reg := range registrations {
+		if reg.ExtensionPoint == extensionPoint && reg.TimeoutMS > 0 {
+			return time.Duration(reg.TimeoutMS) * time.Millisecond
+		}
+	}
+	return DefaultHandlerTimeout
+}
+
+func validateSandboxControlInvokeEnvelope(p *SandboxProcess, req SandboxControlRequest, resp SandboxControlResponse) error {
+	if resp.Protocol != sandboxProcessProtocol {
+		return newSandboxInvocationError(sandboxControlErrorBadResponse, sandboxFailPolicyForExtension(""), "sandbox response protocol mismatch")
+	}
+	if p == nil {
+		return nil
+	}
+	failPolicy := sandboxFailPolicyForExtension("")
+	if resp.Invoke != nil {
+		failPolicy = sandboxFailPolicyForExtension(resp.Invoke.ExtensionPoint)
+	}
+	switch {
+	case resp.PluginID != "" && resp.PluginID != p.PluginID:
+		return newSandboxInvocationError(sandboxControlErrorBadResponse, failPolicy, "sandbox response plugin_id mismatch")
+	case resp.ArtifactID != "" && resp.ArtifactID != p.ArtifactID:
+		return newSandboxInvocationError(sandboxControlErrorBadResponse, failPolicy, "sandbox response artifact_id mismatch")
+	case resp.RuntimeInstanceID != "" && p.RuntimeInstanceID != "" && resp.RuntimeInstanceID != p.RuntimeInstanceID:
+		return newSandboxInvocationError(sandboxControlErrorBadResponse, failPolicy, "sandbox response runtime_instance_id mismatch")
+	case resp.Generation != 0 && resp.Generation != p.Generation:
+		return newSandboxInvocationError(sandboxControlErrorBadResponse, failPolicy, "sandbox response generation mismatch")
+	case resp.RequestID != "" && req.RequestID != "" && resp.RequestID != req.RequestID:
+		return newSandboxInvocationError(sandboxControlErrorBadResponse, failPolicy, "sandbox response request_id mismatch")
+	}
+	return nil
+}
+
+func (p *SandboxProcess) recordSandboxTrace(ctx context.Context, reg SandboxHandlerRegistration, status string, duration time.Duration) {
+	if p == nil || p.operations == nil || p.operations.parent == nil {
+		return
+	}
+	trace := traceFromContext(ctx)
+	durationMS := duration.Milliseconds()
+	if durationMS < 0 {
+		durationMS = 0
+	}
+	if status == "" {
+		status = "error"
+	}
+	_ = p.operations.parent.repo.SaveTrace(context.Background(), TraceSummary{
+		PluginID:     p.PluginID,
+		TraceID:      trace.TraceID,
+		ConnectionID: trace.ConnectionID,
+		HandlerID:    reg.HandlerID,
+		Operation:    "sandbox.invoke." + reg.ExtensionPoint,
+		Status:       status,
+		DurationMS:   durationMS,
+	}, map[string]string{
+		"extension_point": reg.ExtensionPoint,
+		"fail_policy":     reg.FailPolicy,
+	})
+}
+
+type sandboxInvocationError struct {
+	code       string
+	failPolicy string
+	message    string
+}
+
+func (e sandboxInvocationError) Error() string {
+	if e.message == "" {
+		return "sandbox invoke " + e.code
+	}
+	return "sandbox invoke " + e.code + ": " + e.message
+}
+
+func newSandboxInvocationError(code, failPolicy, message string) sandboxInvocationError {
+	if code == "" {
+		code = sandboxControlErrorBadResponse
+	}
+	if failPolicy == "" {
+		failPolicy = api.FailPolicyClose
+	}
+	return sandboxInvocationError{code: code, failPolicy: failPolicy, message: redactSandboxControlMessage(message)}
+}
+
+func sandboxResponseError(resp SandboxControlResponse, failPolicy string) error {
+	code := resp.ErrorCode
+	if code == "" {
+		code = resp.Code
+	}
+	if code == "" {
+		code = sandboxControlErrorBadResponse
+	}
+	message := resp.Error
+	if message == "" {
+		message = "sandbox control request failed"
+	}
+	return newSandboxInvocationError(code, failPolicy, message)
+}
+
+func mapSandboxControlInvokeError(ctx context.Context, p *SandboxProcess, failPolicy string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var invokeErr sandboxInvocationError
+	if errors.As(err, &invokeErr) {
+		return invokeErr
+	}
+	var controlErr sandboxControlError
+	if errors.As(err, &controlErr) {
+		return newSandboxInvocationError(controlErr.code, failPolicy, controlErr.message)
+	}
+	if ctx != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return newSandboxInvocationError(sandboxControlErrorTimeout, failPolicy, ctx.Err().Error())
+	}
+	if p != nil {
+		select {
+		case <-p.done:
+			return newSandboxInvocationError(sandboxControlErrorProcessExited, failPolicy, "sandbox process exited")
+		default:
+		}
+	}
+	return newSandboxInvocationError(sandboxControlErrorBadResponse, failPolicy, err.Error())
+}
+
+func sandboxErrorCode(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	var invokeErr sandboxInvocationError
+	if errors.As(err, &invokeErr) {
+		return invokeErr.code
+	}
+	var controlErr sandboxControlError
+	if errors.As(err, &controlErr) {
+		return controlErr.code
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return sandboxControlErrorTimeout
+	}
+	return sandboxControlErrorBadResponse
+}
+
+func sandboxStableErrorReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func sandboxFailOpen(policy string) bool {
+	switch policy {
+	case api.FailPolicyOpen, ExternalFailPolicyDegraded, ExternalFailPolicyFallback:
+		return true
+	default:
+		return false
+	}
+}
+
+func sandboxFailClosed(policy string) bool {
+	return !sandboxFailOpen(policy)
+}
+
+func sandboxFailPolicyForExtension(extensionPoint string) string {
+	switch extensionPoint {
+	case ExtensionRouteResolve, ExtensionRouteResolver, ExtensionStatusPing, ExtensionEventSubscriber, ExtensionProvider:
+		return api.FailPolicyOpen
+	default:
+		return api.FailPolicyClose
+	}
+}
+
+func sandboxConfigJSON(config any) (json.RawMessage, error) {
+	switch typed := config.(type) {
+	case nil:
+		return json.RawMessage(`{}`), nil
+	case json.RawMessage:
+		if len(typed) == 0 {
+			return json.RawMessage(`{}`), nil
+		}
+		return append(json.RawMessage(nil), typed...), nil
+	case []byte:
+		if len(typed) == 0 {
+			return json.RawMessage(`{}`), nil
+		}
+		return append(json.RawMessage(nil), typed...), nil
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return json.RawMessage(`{}`), nil
+		}
+		return json.RawMessage(typed), nil
+	default:
+		data, err := json.Marshal(config)
+		if err != nil {
+			return nil, err
+		}
+		if len(data) == 0 || string(data) == "null" {
+			return json.RawMessage(`{}`), nil
+		}
+		return data, nil
+	}
+}
+
+func sandboxTraceID(ctx context.Context) string {
+	trace := traceFromContext(ctx)
+	if trace.TraceID != "" {
+		return trace.TraceID
+	}
+	return newSandboxRuntimeInstanceID()
+}
 
 func (m *Manager) ResolveSandboxSecret(ctx context.Context, req SandboxSecretRequest) (SandboxSecretResponse, error) {
 	if strings.TrimSpace(req.PluginID) == "" || strings.TrimSpace(req.Handle) == "" {
