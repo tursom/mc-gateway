@@ -51,7 +51,7 @@ jobs:
             (find(features['service_modes'], 'mode', 'go-plugin-process'), 'partial', True),
             (find(features['service_modes'], 'mode', 'sandbox-process'), 'reserved', False),
             (find(features['runtime_types'], 'type', 'sandbox-process'), 'reserved', False),
-            (find(features['runtime_types'], 'type', 'wasm'), 'reserved', False),
+            (find(features['runtime_types'], 'type', 'wasm'), 'partial', True),
             (find(features['extension_points'], 'key', 'ingress.service/v1'), 'reserved', False),
             (find(features['extension_points'], 'key', 'admin.auth.provider/v1'), 'reserved', False),
         ]
