@@ -20,6 +20,23 @@ import (
 	"github.com/tursom/mc-gateway/internal/pluginmanager"
 )
 
+func TestPluginRuntimeCLIAdapterWASMErrorIsNotReserved(t *testing.T) {
+	if _, err := pluginCLIAdapterForRuntime(pluginmanager.RuntimeWASM); err == nil {
+		t.Fatal("pluginCLIAdapterForRuntime(wasm) error = nil, want not implemented error")
+	} else if strings.Contains(err.Error(), "reserved") ||
+		!strings.Contains(err.Error(), "wasm CLI build/test adapter is not implemented yet") {
+		t.Fatalf("pluginCLIAdapterForRuntime(wasm) error = %q, want non-reserved wasm not implemented message", err)
+	}
+
+	for _, runtimeType := range []string{pluginmanager.RuntimeBuiltin, pluginmanager.RuntimeSandbox} {
+		if _, err := pluginCLIAdapterForRuntime(runtimeType); err == nil {
+			t.Fatalf("pluginCLIAdapterForRuntime(%s) error = nil, want reserved error", runtimeType)
+		} else if !strings.Contains(err.Error(), "reserved; no CLI build/test adapter is implemented yet") {
+			t.Fatalf("pluginCLIAdapterForRuntime(%s) error = %q, want reserved adapter message", runtimeType, err)
+		}
+	}
+}
+
 func TestPluginInitCreatesBuildableTemplate(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "sample-plugin")
 	handled, code := runPluginCLI([]string{
@@ -484,9 +501,13 @@ func TestPluginFeaturesAndManifestCommands(t *testing.T) {
 		wasm.Entry != expectedWASM.Entry {
 		t.Fatalf("wasm feature = %+v, want shared runtime fact source %+v", wasm, expectedWASM)
 	}
-	if wasm.Implemented || wasm.Maturity != pluginmanager.FeatureMaturityReserved || wasm.DataPlane ||
-		!strings.Contains(wasm.UnsupportedReason, "WASM data-plane") {
-		t.Fatalf("wasm feature = %+v, want reserved non-data-plane runtime", wasm)
+	if !wasm.Implemented || wasm.Maturity != pluginmanager.FeatureMaturityPartial || !wasm.DataPlane ||
+		!strings.Contains(wasm.UnsupportedReason, "low-risk extension points") ||
+		!strings.Contains(wasm.UnsupportedReason, "protocol-proxy") ||
+		!strings.Contains(wasm.UnsupportedReason, "network") ||
+		!strings.Contains(wasm.UnsupportedReason, "file") ||
+		!strings.Contains(wasm.UnsupportedReason, "high-risk extension points") {
+		t.Fatalf("wasm feature = %+v, want partial low-risk data-plane runtime", wasm)
 	}
 	sandboxRuntime := findRuntimeFeature(features.RuntimeTypes, pluginmanager.RuntimeSandbox)
 	if sandboxRuntime.Implemented || sandboxRuntime.Maturity != pluginmanager.FeatureMaturityReserved || sandboxRuntime.DataPlane ||
@@ -528,6 +549,16 @@ func TestPluginFeaturesAndManifestCommands(t *testing.T) {
 		wasmSandboxAdapter.ControlChannel != expectedWASMAdapter.ControlChannel ||
 		wasmSandboxAdapter.UnsupportedReason != expectedWASMAdapter.UnsupportedReason {
 		t.Fatalf("wasm sandbox runtime adapter = %+v, want shared adapter fact source %+v", wasmSandboxAdapter, expectedWASMAdapter)
+	}
+	if wasmSandboxAdapter.Implemented || wasmSandboxAdapter.Maturity != pluginmanager.FeatureMaturityReserved || wasmSandboxAdapter.DataPlane ||
+		!strings.Contains(wasmSandboxAdapter.UnsupportedReason, "reserved") {
+		t.Fatalf("wasm sandbox runtime adapter = %+v, want reserved non-data-plane adapter", wasmSandboxAdapter)
+	}
+	wasmInProcessAdapter := findRuntimeAdapterStatus(features.RuntimeAdapters, pluginmanager.PluginServiceModeInProcess, pluginmanager.RuntimeWASM)
+	if !wasmInProcessAdapter.Implemented || wasmInProcessAdapter.Maturity != pluginmanager.FeatureMaturityPartial || !wasmInProcessAdapter.DataPlane ||
+		!wasmInProcessAdapter.Lifecycle || wasmInProcessAdapter.Adapter != "wasm" ||
+		!strings.Contains(wasmInProcessAdapter.UnsupportedReason, "low-risk extension points") {
+		t.Fatalf("wasm in-process runtime adapter = %+v, want partial wasm data-plane adapter", wasmInProcessAdapter)
 	}
 	ingressPoint := findExtensionPointFeature(features.ExtensionPoints, pluginmanager.ExtensionIngressService)
 	expectedIngress := findExtensionPointFeature(pluginmanager.ExtensionPointFeatures(), pluginmanager.ExtensionIngressService)
@@ -740,17 +771,17 @@ func TestPluginFeaturesAndManifestCommands(t *testing.T) {
 		features.Sandbox.DataPlane {
 		t.Fatalf("sandbox feature = %+v, want reserved sandbox controls without current data plane", features.Sandbox)
 	}
-	if !features.WASM.RuntimeTypeReserved ||
+	if features.WASM.RuntimeTypeReserved ||
 		!features.WASM.ContainedValidation ||
 		!features.WASM.HighRiskExtensionRejected ||
-		!features.WASM.FutureRuntimeGate ||
+		features.WASM.FutureRuntimeGate ||
 		!features.WASM.RuntimeAdapter ||
 		!features.WASM.HostABI ||
 		!features.WASM.ModuleCache ||
 		!features.WASM.FuelTimeMemoryLimits ||
 		!features.WASM.DefaultNoFileNetwork ||
-		features.WASM.DataPlane {
-		t.Fatalf("wasm feature = %+v, want reserved WASM controls without current data plane", features.WASM)
+		!features.WASM.DataPlane {
+		t.Fatalf("wasm feature = %+v, want partial low-risk WASM data plane", features.WASM)
 	}
 	if !features.Conformance.StableJSON ||
 		!features.Conformance.GoldenFixtureFile ||

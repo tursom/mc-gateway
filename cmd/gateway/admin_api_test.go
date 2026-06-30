@@ -253,8 +253,17 @@ func TestAdminPluginServiceStatusReportsReservedModes(t *testing.T) {
 	if wasmSandboxAdapter["implemented"] != false ||
 		wasmSandboxAdapter["data_plane"] != false ||
 		wasmSandboxAdapter["maturity"] != pluginmanager.FeatureMaturityReserved ||
-		!strings.Contains(wasmSandboxAdapter["unsupported_reason"].(string), "WASM data-plane") {
+		!strings.Contains(wasmSandboxAdapter["unsupported_reason"].(string), "reserved") {
 		t.Fatalf("wasm sandbox adapter = %#v, want reserved non-data-plane adapter", wasmSandboxAdapter)
+	}
+	wasmInProcessAdapter := findAdminRuntimeAdapterStatus(t, status["runtime_adapters"].([]any), pluginmanager.PluginServiceModeInProcess, pluginmanager.RuntimeWASM)
+	if wasmInProcessAdapter["implemented"] != true ||
+		wasmInProcessAdapter["data_plane"] != true ||
+		wasmInProcessAdapter["maturity"] != pluginmanager.FeatureMaturityPartial ||
+		wasmInProcessAdapter["lifecycle"] != true ||
+		wasmInProcessAdapter["adapter"] != "wasm" ||
+		!strings.Contains(wasmInProcessAdapter["unsupported_reason"].(string), "low-risk extension points") {
+		t.Fatalf("wasm in-process adapter = %#v, want partial wasm data-plane adapter", wasmInProcessAdapter)
 	}
 	nodes := status["nodes"].([]any)
 	if len(nodes) != 1 {
@@ -332,11 +341,15 @@ func TestAdminPluginFeaturesExposeSharedFactSource(t *testing.T) {
 		wasm["entry"] != expectedWASM.Entry {
 		t.Fatalf("wasm feature = %#v, want shared runtime fact source %+v", wasm, expectedWASM)
 	}
-	if wasm["implemented"] != false ||
-		wasm["maturity"] != pluginmanager.FeatureMaturityReserved ||
-		wasm["data_plane"] != false ||
-		!strings.Contains(wasm["unsupported_reason"].(string), "WASM data-plane") {
-		t.Fatalf("wasm feature = %#v, want reserved non-data-plane runtime", wasm)
+	if wasm["implemented"] != true ||
+		wasm["maturity"] != pluginmanager.FeatureMaturityPartial ||
+		wasm["data_plane"] != true ||
+		!strings.Contains(wasm["unsupported_reason"].(string), "low-risk extension points") ||
+		!strings.Contains(wasm["unsupported_reason"].(string), "protocol-proxy") ||
+		!strings.Contains(wasm["unsupported_reason"].(string), "network") ||
+		!strings.Contains(wasm["unsupported_reason"].(string), "file") ||
+		!strings.Contains(wasm["unsupported_reason"].(string), "high-risk extension points") {
+		t.Fatalf("wasm feature = %#v, want partial low-risk data-plane runtime", wasm)
 	}
 	sandboxRuntime := findAdminRuntimeFeature(t, runtimeTypes, pluginmanager.RuntimeSandbox)
 	if sandboxRuntime["implemented"] != false ||

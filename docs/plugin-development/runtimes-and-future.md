@@ -122,6 +122,8 @@ capabilities:
 
 WASM runtime 当前是 partial/future-gated，适合低风险 validation 类扩展。
 
+把 WASM 宣告为生产可启用前，需要先补齐真实 extension dispatch、ABI、lifecycle、governance、conformance 和 Admin/CLI fact source 闭环；实施拆解见 [WASM 运行时生产可用化实施计划](../plugin-wasm-runtime-production-plan.md)。
+
 已建模能力：
 
 - wazero host ABI。

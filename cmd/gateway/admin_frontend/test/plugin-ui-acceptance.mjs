@@ -72,7 +72,7 @@ state.pluginFeatures = {
   api_version: "plugin-api/v1",
 	  runtime_types: [
 	    { type: "go-plugin", implemented: true, maturity: "implemented", data_plane: true, requires_restart: false },
-	    { type: "wasm", implemented: false, maturity: "reserved", data_plane: false, requires_restart: true, unsupported_reason: "wasm runtime is reserved; schema and validation checks do not provide a WASM data-plane" },
+	    { type: "wasm", implemented: true, maturity: "partial", data_plane: true, requires_restart: false, unsupported_reason: "wasm runtime only supports low-risk extension points; protocol-proxy, network, file, and high-risk extension points are not supported" },
 	  ],
 	  service_modes: [
 	    { mode: "in-process", implemented: true, maturity: "implemented", data_plane: true, requires_restart: false },

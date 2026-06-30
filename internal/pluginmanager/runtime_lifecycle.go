@@ -79,6 +79,7 @@ func RuntimeAdapterFactoryStatuses() []RuntimeAdapterFactoryStatus {
 	}{
 		{PluginServiceModeInProcess, RuntimeGoPlugin},
 		{PluginServiceModeInProcess, RuntimeBuiltin},
+		{PluginServiceModeInProcess, RuntimeWASM},
 		{PluginServiceModeGoPluginProcess, RuntimeGoPlugin},
 		{PluginServiceModeSandboxProcess, RuntimeSandbox},
 		{PluginServiceModeSandboxProcess, RuntimeWASM},
@@ -135,8 +136,12 @@ func (RuntimeAdapterFactory) AdapterFor(serviceMode, runtimeType string) (Runtim
 			status.UnsupportedReason = "sandbox-process runtime requires sandbox-process service mode"
 		case RuntimeWASM:
 			status.Adapter = "wasm"
-			status.RequiresRestart = true
-			status.UnsupportedReason = "wasm runtime requires sandbox-process service mode"
+			status.Implemented = true
+			status.DataPlane = true
+			status.Lifecycle = true
+			status.ControlChannel = "wazero-host-abi"
+			status.UnsupportedReason = "wasm runtime only supports low-risk extension points; protocol-proxy, network, file, and high-risk extension points are not supported"
+			return WASMAdapter{Mode: PluginServiceModeInProcess}, completeStatus()
 		default:
 			status.Adapter = "unknown"
 			status.RequiresRestart = true
@@ -163,8 +168,8 @@ func (RuntimeAdapterFactory) AdapterFor(serviceMode, runtimeType string) (Runtim
 		case RuntimeWASM:
 			status.Adapter = "wazero"
 			status.ControlChannel = "wazero-host-abi"
-			status.UnsupportedReason = "wasm runtime adapter is reserved; current gateway releases do not expose a WASM data-plane"
-			return WASMAdapter{}, completeStatus()
+			status.UnsupportedReason = "sandbox-process wasm adapter is reserved; use in-process wasm for the current low-risk WASM data-plane"
+			return WASMAdapter{Mode: PluginServiceModeSandboxProcess}, completeStatus()
 		default:
 			status.Adapter = "sandbox-process"
 			status.UnsupportedReason = "sandbox-process service mode supports sandbox-process and wasm runtimes"

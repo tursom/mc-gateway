@@ -221,8 +221,10 @@ func pluginCLIAdapterForRuntime(runtimeType string) (pluginRuntimeCLIAdapter, er
 	switch runtimeType {
 	case pluginmanager.RuntimeGoPlugin:
 		return goPluginCLIAdapter{}, nil
-	case pluginmanager.RuntimeBuiltin, pluginmanager.RuntimeSandbox, pluginmanager.RuntimeWASM:
+	case pluginmanager.RuntimeBuiltin, pluginmanager.RuntimeSandbox:
 		return nil, fmt.Errorf("runtime %q is reserved; no CLI build/test adapter is implemented yet", runtimeType)
+	case pluginmanager.RuntimeWASM:
+		return nil, errors.New("wasm CLI build/test adapter is not implemented yet")
 	default:
 		return nil, fmt.Errorf("unsupported runtime %q", runtimeType)
 	}
@@ -425,16 +427,16 @@ func pluginFeatureFacts() map[string]any {
 			"data_plane":                   false,
 		},
 		"wasm": map[string]any{
-			"runtime_type_reserved":        true,
+			"runtime_type_reserved":        false,
 			"contained_validation":         true,
 			"high_risk_extension_rejected": true,
-			"future_runtime_gate":          true,
+			"future_runtime_gate":          false,
 			"runtime_adapter":              true,
 			"host_abi":                     true,
 			"module_cache":                 true,
 			"fuel_time_memory_limits":      true,
 			"default_no_file_network":      true,
-			"data_plane":                   false,
+			"data_plane":                   true,
 		},
 		"conformance": map[string]any{
 			"stable_json":                              true,

@@ -34,6 +34,7 @@ type WASMInvocation struct {
 
 type WASMAdapter struct {
 	Runner *WASMRunner
+	Mode   string
 }
 
 type wasmHostedPlugin struct {
@@ -132,7 +133,7 @@ func (r *WASMRunner) compile(ctx context.Context, runtime wazero.Runtime, invoca
 func validateWASMExtensionPoints(manifest Manifest) error {
 	for _, point := range manifest.ExtensionPoints {
 		switch point.Key {
-		case ExtensionRuleEvaluate, ExtensionRouteResolve, ExtensionRouteResolver, ExtensionConfigValidate:
+		case ExtensionRuleEvaluate, ExtensionRouteResolve, ExtensionConfigValidate:
 		default:
 			return fmt.Errorf("wasm extension point %q is not supported by contained validation", point.Key)
 		}
@@ -217,11 +218,15 @@ func (a WASMAdapter) Prepare(ctx context.Context, artifact ArtifactRecord, plugi
 	if err := a.ValidateArtifact(ctx, artifact); err != nil {
 		return RuntimePrepared{}, err
 	}
+	mode := a.Mode
+	if mode == "" {
+		mode = PluginServiceModeInProcess
+	}
 	return RuntimePrepared{
 		PluginID:   pluginRecord.ID,
 		ArtifactID: artifact.ID,
 		Runtime:    artifact.RuntimeType,
-		Mode:       PluginServiceModeSandboxProcess,
+		Mode:       mode,
 		PreparedAt: time.Now().Unix(),
 	}, nil
 }

@@ -107,7 +107,7 @@ func TestPluginServiceStatusIncludesModeMaturity(t *testing.T) {
 		t.Fatalf("go-plugin-process adapter = %+v, want partial process adapter", processAdapter)
 	}
 	wasmSandboxAdapter := findRuntimeAdapterStatus(status.RuntimeAdapters, PluginServiceModeSandboxProcess, RuntimeWASM)
-	if wasmSandboxAdapter.Implemented || wasmSandboxAdapter.Maturity != FeatureMaturityReserved || wasmSandboxAdapter.DataPlane || !wasmSandboxAdapter.RequiresRestart || !strings.Contains(wasmSandboxAdapter.UnsupportedReason, "WASM data-plane") {
+	if wasmSandboxAdapter.Implemented || wasmSandboxAdapter.Maturity != FeatureMaturityReserved || wasmSandboxAdapter.DataPlane || !wasmSandboxAdapter.RequiresRestart || !strings.Contains(wasmSandboxAdapter.UnsupportedReason, "reserved") {
 		t.Fatalf("wasm sandbox adapter = %+v, want reserved non-data-plane adapter", wasmSandboxAdapter)
 	}
 }
@@ -181,11 +181,38 @@ func TestRuntimeAdapterFactoryProcessModeSupportsProcessDataPlane(t *testing.T) 
 	}
 
 	adapter, status = factory.AdapterFor(PluginServiceModeSandboxProcess, RuntimeWASM)
-	if status.Implemented || status.Maturity != FeatureMaturityReserved || status.DataPlane || status.Adapter != "wazero" || !strings.Contains(status.UnsupportedReason, "WASM data-plane") {
+	if status.Implemented || status.Maturity != FeatureMaturityReserved || status.DataPlane || status.Adapter != "wazero" || !strings.Contains(status.UnsupportedReason, "reserved") {
 		t.Fatalf("wasm sandbox adapter status = %+v, want reserved wazero adapter status", status)
 	}
 	if _, ok := adapter.(RuntimeAdapterLifecycle); !ok {
 		t.Fatalf("adapter %T does not implement lifecycle", adapter)
+	}
+
+	adapter, status = factory.AdapterFor(PluginServiceModeInProcess, RuntimeWASM)
+	if !status.Implemented || status.Maturity != FeatureMaturityPartial || !status.DataPlane || !status.Lifecycle || status.Adapter != "wasm" || !strings.Contains(status.UnsupportedReason, "low-risk extension points") {
+		t.Fatalf("wasm in-process adapter status = %+v, want partial in-process wasm data-plane adapter", status)
+	}
+	lifecycle, ok = adapter.(RuntimeAdapterLifecycle)
+	if !ok {
+		t.Fatalf("adapter %T does not implement lifecycle", adapter)
+	}
+	artifact := ArtifactRecord{
+		ID:           "wasm-low-risk-0.1.0",
+		PluginID:     "wasm-low-risk",
+		ArtifactType: ArtifactTypeBinary,
+		RuntimeType:  RuntimeWASM,
+		MetadataJSON: `{"schema_version":"mc-gateway.plugin/v1","id":"wasm-low-risk","name":"WASM Low Risk","version":"0.1.0","artifact_type":"binary","runtime":{"type":"wasm","entry":"plugin.wasm"},"api_version":"plugin-api/v1","extension_points":[{"type":"provider","key":"route.resolve/v1"}],"capabilities":{}}`,
+	}
+	prepared, err := lifecycle.Prepare(context.Background(), artifact, PluginRecord{ID: artifact.PluginID})
+	if err != nil {
+		t.Fatalf("Prepare(wasm in-process) error = %v", err)
+	}
+	if prepared.Mode != PluginServiceModeInProcess || prepared.Runtime != RuntimeWASM {
+		t.Fatalf("Prepare(wasm in-process) = %+v, want in-process wasm runtime", prepared)
+	}
+	diag := lifecycle.Diagnostics(context.Background(), RuntimeInstance{RuntimePrepared: prepared})
+	if diag.Mode != PluginServiceModeInProcess || diag.Runtime != RuntimeWASM {
+		t.Fatalf("Diagnostics(wasm in-process) = %+v, want in-process wasm diagnostics", diag)
 	}
 }
 
@@ -673,8 +700,6 @@ func TestSandboxPolicyBlocksUnenforceableControls(t *testing.T) {
 
 func TestWASMRequiredCapabilityBlocksEnable(t *testing.T) {
 	manager := newManagerForTest(t, &fakeAdapter{initOnly: true})
-	manager.serviceMode = PluginServiceModeSandboxProcess
-	manager.futureGates = FutureRuntimeGates{SandboxProcess: true, WASM: true}
 	artifact := uploadTestArtifactWithManifest(t, manager, "wasm-capability-plugin", func(manifest *Manifest) {
 		manifest.Runtime.Type = RuntimeWASM
 		manifest.Runtime.Entry = RuntimeWASMEntry
@@ -738,6 +763,11 @@ func TestWASMValidationRejectsUnsupportedExtensionPoint(t *testing.T) {
 	err := manager.RunWASMValidation(context.Background(), "wasm-upstream", artifact.ID, "ok")
 	if err == nil || !strings.Contains(err.Error(), "wasm extension point") {
 		t.Fatalf("RunWASMValidation(unsupported extension) error = %v, want extension point block", err)
+	}
+	preflight := manager.preflightChecks(context.Background(), PluginRecord{ID: "wasm-upstream", ConfigJSON: `{}`}, artifact, mustManifestFromArtifact(t, artifact), PolicyProfileProd, GovernanceActionEnable, `{}`)
+	codes := preflightCheckCodes(preflight.Checks)
+	if preflight.OK || !codes["wasm_extension_point_unsupported"] || codes["wasm_runtime_disabled"] {
+		t.Fatalf("preflight = %+v, want unsupported extension block without service-mode block", preflight)
 	}
 }
 

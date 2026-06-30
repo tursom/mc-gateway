@@ -2042,7 +2042,7 @@ func (m *Manager) startRuntimeInstance(ctx context.Context, artifact ArtifactRec
 		m.hostMu.Unlock()
 	}
 	adapter := m.adapter
-	if m.adapterManaged && m.serviceMode == PluginServiceModeSandboxProcess {
+	if m.adapterManaged {
 		adapter, _ = RuntimeAdapterFactory{}.AdapterFor(m.serviceMode, artifact.RuntimeType)
 		switch typed := adapter.(type) {
 		case SandboxProcessAdapter:
@@ -2089,7 +2089,7 @@ func (m *Manager) startRuntimeInstance(ctx context.Context, artifact ArtifactRec
 }
 
 // validateArtifactGate 确认制品能被当前网关进程加载。Go plugin 对 Go 版本和
-// 目标平台敏感，沙箱/wasm 运行时则受插件服务模式控制。
+// 目标平台敏感；沙箱保留在未来服务模式下，WASM 只允许低风险扩展点。
 func (m *Manager) validateArtifactGate(artifact ArtifactRecord) error {
 	if artifact.Status == ArtifactStatusDeleted || artifact.Status == ArtifactStatusRejected {
 		return fmt.Errorf("artifact status %q is not loadable", artifact.Status)
@@ -2110,11 +2110,15 @@ func (m *Manager) validateArtifactGate(artifact ArtifactRecord) error {
 		return nil
 	}
 	if artifact.RuntimeType == RuntimeWASM {
-		if m.serviceMode != PluginServiceModeSandboxProcess || !m.futureGates.SandboxEnabled() || !m.futureGates.WASMEnabled() {
-			return errors.New("wasm runtime is disabled by plugin service mode")
-		}
 		if caps := requiredRuntimeCapabilities(artifact); len(caps) > 0 {
 			return fmt.Errorf("wasm runtime cannot enforce required capabilities: %s", strings.Join(caps, ","))
+		}
+		var manifest Manifest
+		if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err != nil {
+			return fmt.Errorf("decode wasm manifest: %w", err)
+		}
+		if err := validateWASMExtensionPoints(manifest); err != nil {
+			return err
 		}
 		return nil
 	}

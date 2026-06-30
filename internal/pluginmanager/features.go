@@ -28,11 +28,11 @@ func RuntimeTypeFeatures() []RuntimeFeature {
 		},
 		{
 			Type:              RuntimeWASM,
-			Implemented:       false,
-			Maturity:          FeatureMaturityReserved,
-			DataPlane:         false,
-			RequiresRestart:   true,
-			UnsupportedReason: "wasm runtime is reserved; schema and validation checks do not provide a WASM data-plane",
+			Implemented:       true,
+			Maturity:          FeatureMaturityPartial,
+			DataPlane:         true,
+			RequiresRestart:   false,
+			UnsupportedReason: "wasm runtime only supports low-risk extension points; protocol-proxy, network, file, and high-risk extension points are not supported",
 			Entry:             RuntimeWASMEntry,
 		},
 	}

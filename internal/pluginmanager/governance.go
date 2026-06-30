@@ -865,8 +865,14 @@ func (m *Manager) preflightChecks(ctx context.Context, plugin PluginRecord, arti
 	if artifact.RuntimeType == RuntimeSandbox && (m.serviceMode != PluginServiceModeSandboxProcess || !m.futureGates.SandboxEnabled()) {
 		result.Checks = append(result.Checks, PreflightCheck{Code: "sandbox_runtime_disabled", Severity: GateSeverityBlocking, Message: "sandbox-process runtime is disabled by plugin service mode"})
 	}
-	if artifact.RuntimeType == RuntimeWASM && (m.serviceMode != PluginServiceModeSandboxProcess || !m.futureGates.SandboxEnabled() || !m.futureGates.WASMEnabled()) {
-		result.Checks = append(result.Checks, PreflightCheck{Code: "wasm_runtime_disabled", Severity: GateSeverityBlocking, Message: "wasm runtime is disabled by plugin service mode"})
+	if artifact.RuntimeType == RuntimeWASM {
+		if err := validateWASMExtensionPoints(manifest); err != nil {
+			result.Checks = append(result.Checks, PreflightCheck{
+				Code:     "wasm_extension_point_unsupported",
+				Severity: GateSeverityBlocking,
+				Message:  err.Error(),
+			})
+		}
 	}
 	if caps := requiredRuntimeCapabilities(artifact); runtimeRequiredCapabilitiesUnsupported(artifact.RuntimeType) && len(caps) > 0 {
 		result.Checks = append(result.Checks, PreflightCheck{
