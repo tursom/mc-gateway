@@ -1663,7 +1663,11 @@ func handleAdminPluginFeatures(w http.ResponseWriter, r *http.Request) {
 		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"plugin_features": pluginFeatureFacts()})
+	facts := pluginFeatureFacts()
+	if pluginsManager != nil {
+		facts = pluginFeatureFactsFor(pluginsManager.RuntimeFeatureFactsOptions())
+	}
+	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"plugin_features": facts})
 }
 
 func handleAdminPluginService(w http.ResponseWriter, r *http.Request) {

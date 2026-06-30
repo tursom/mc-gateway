@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -56,6 +57,144 @@ func TestPluginServiceModeReservedApplyKeepsDataPlaneInProcess(t *testing.T) {
 		!state.RestartRequired ||
 		!strings.Contains(state.LastError, "managed runtime adapter") {
 		t.Fatalf("service state after apply = %+v, want custom adapter fallback to in-process data plane", state)
+	}
+}
+
+func TestSandboxFeatureFactsGateStates(t *testing.T) {
+	runtimeFeature := RuntimeTypeFeature(RuntimeSandbox)
+	modeFeature := PluginServiceModeFeatureFor(PluginServiceModeSandboxProcess)
+	if runtimeFeature.Implemented || runtimeFeature.Maturity != FeatureMaturityReserved || runtimeFeature.DataPlane ||
+		modeFeature.Implemented || modeFeature.Maturity != FeatureMaturityReserved || modeFeature.DataPlane {
+		t.Fatalf("closed gate runtime=%+v mode=%+v, want reserved non-data-plane", runtimeFeature, modeFeature)
+	}
+
+	failingOptions := RuntimeFeatureFactsOptions{
+		FutureRuntimeGates: FutureRuntimeGates{SandboxProcess: true},
+		SandboxSelfCheck: func(SandboxPolicy) error {
+			return errors.New("missing cgroup v2")
+		},
+	}
+	runtimeFeature = RuntimeTypeFeatureFor(RuntimeSandbox, failingOptions)
+	modeFeature = PluginServiceModeFeatureForOptions(PluginServiceModeSandboxProcess, failingOptions)
+	if !runtimeFeature.Implemented || runtimeFeature.Maturity != FeatureMaturityPartial || runtimeFeature.DataPlane ||
+		!modeFeature.Implemented || modeFeature.Maturity != FeatureMaturityPartial || modeFeature.DataPlane ||
+		!strings.Contains(runtimeFeature.UnsupportedReason, "missing cgroup v2") {
+		t.Fatalf("failed self-check runtime=%+v mode=%+v, want partial non-data-plane with concrete reason", runtimeFeature, modeFeature)
+	}
+	adapterStatus := findRuntimeAdapterStatus(RuntimeAdapterFactoryStatusesFor(failingOptions), PluginServiceModeSandboxProcess, RuntimeSandbox)
+	if !adapterStatus.Implemented || adapterStatus.Maturity != FeatureMaturityPartial || adapterStatus.DataPlane || adapterStatus.Lifecycle ||
+		!strings.Contains(adapterStatus.UnsupportedReason, "missing cgroup v2") {
+		t.Fatalf("failed self-check adapter = %+v, want partial non-data-plane adapter reason", adapterStatus)
+	}
+
+	passingOptions := RuntimeFeatureFactsOptions{
+		FutureRuntimeGates: FutureRuntimeGates{SandboxProcess: true},
+		SandboxSelfCheck:   func(SandboxPolicy) error { return nil },
+	}
+	runtimeFeature = RuntimeTypeFeatureFor(RuntimeSandbox, passingOptions)
+	modeFeature = PluginServiceModeFeatureForOptions(PluginServiceModeSandboxProcess, passingOptions)
+	adapterStatus = findRuntimeAdapterStatus(RuntimeAdapterFactoryStatusesFor(passingOptions), PluginServiceModeSandboxProcess, RuntimeSandbox)
+	if !runtimeFeature.Implemented || runtimeFeature.Maturity != FeatureMaturityPartial || !runtimeFeature.DataPlane ||
+		!modeFeature.Implemented || modeFeature.Maturity != FeatureMaturityPartial || !modeFeature.DataPlane ||
+		!adapterStatus.Implemented || adapterStatus.Maturity != FeatureMaturityPartial || !adapterStatus.DataPlane || !adapterStatus.Lifecycle {
+		t.Fatalf("passed self-check runtime=%+v mode=%+v adapter=%+v, want partial data-plane", runtimeFeature, modeFeature, adapterStatus)
+	}
+}
+
+func TestSandboxApplyFailurePreservesActiveDataPlane(t *testing.T) {
+	manager := New(Options{
+		DB:           openPluginManagerTestDB(t),
+		ArtifactRoot: t.TempDir(),
+		FutureRuntimeGates: FutureRuntimeGates{
+			SandboxProcess: true,
+		},
+		SandboxSelfCheck: func(SandboxPolicy) error {
+			return errors.New("missing cgroup v2")
+		},
+	})
+	if _, err := manager.SetPluginServiceDesired(context.Background(), "admin", PluginServiceModeGoPluginProcess); err != nil {
+		t.Fatalf("SetPluginServiceDesired(process) error = %v", err)
+	}
+	if err := manager.ApplyPluginServiceMode(context.Background()); err != nil {
+		t.Fatalf("ApplyPluginServiceMode(process) error = %v", err)
+	}
+	state, err := manager.PluginServiceState(context.Background())
+	if err != nil {
+		t.Fatalf("PluginServiceState(process) error = %v", err)
+	}
+	if state.ActiveMode != PluginServiceModeGoPluginProcess || state.DataPlaneMode != PluginServiceModeGoPluginProcess || state.RestartRequired {
+		t.Fatalf("process state = %+v, want active process data-plane", state)
+	}
+
+	if _, err := manager.SetPluginServiceDesired(context.Background(), "admin", PluginServiceModeSandboxProcess); err != nil {
+		t.Fatalf("SetPluginServiceDesired(sandbox) error = %v", err)
+	}
+	if err := manager.ApplyPluginServiceMode(context.Background()); err != nil {
+		t.Fatalf("ApplyPluginServiceMode(sandbox) error = %v", err)
+	}
+	state, err = manager.PluginServiceState(context.Background())
+	if err != nil {
+		t.Fatalf("PluginServiceState(sandbox failed) error = %v", err)
+	}
+	if state.DesiredMode != PluginServiceModeSandboxProcess ||
+		state.ActiveMode != PluginServiceModeGoPluginProcess ||
+		state.DataPlaneMode != PluginServiceModeGoPluginProcess ||
+		!state.RestartRequired ||
+		!strings.Contains(state.LastError, "missing cgroup v2") {
+		t.Fatalf("sandbox failed state = %+v, want desired sandbox while active process data-plane is preserved", state)
+	}
+	ops, err := manager.repo.ListOperations(context.Background(), "", 20)
+	if err != nil {
+		t.Fatalf("ListOperations() error = %v", err)
+	}
+	found := false
+	for _, op := range ops {
+		if op.Operation == "plugin_service_mode_apply" && op.Status == "failed" && strings.Contains(op.MetadataJSON, "sandbox_environment_self_check_failed") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("operations = %+v, want sandbox apply failure with reason_code", ops)
+	}
+}
+
+func TestSandboxApplySuccessActivatesDataPlaneWhenSelfCheckPasses(t *testing.T) {
+	manager := New(Options{
+		DB:           openPluginManagerTestDB(t),
+		ArtifactRoot: t.TempDir(),
+		FutureRuntimeGates: FutureRuntimeGates{
+			SandboxProcess: true,
+		},
+		SandboxSelfCheck: func(SandboxPolicy) error { return nil },
+	})
+	if _, err := manager.SetPluginServiceDesired(context.Background(), "admin", PluginServiceModeSandboxProcess); err != nil {
+		t.Fatalf("SetPluginServiceDesired(sandbox) error = %v", err)
+	}
+	if err := manager.ApplyPluginServiceMode(context.Background()); err != nil {
+		t.Fatalf("ApplyPluginServiceMode(sandbox) error = %v", err)
+	}
+	state, err := manager.PluginServiceState(context.Background())
+	if err != nil {
+		t.Fatalf("PluginServiceState() error = %v", err)
+	}
+	if state.DesiredMode != PluginServiceModeSandboxProcess ||
+		state.ActiveMode != PluginServiceModeSandboxProcess ||
+		state.DataPlaneMode != PluginServiceModeSandboxProcess ||
+		!state.ImplementedAdapter ||
+		state.RestartRequired ||
+		state.LastError != "" {
+		t.Fatalf("sandbox state = %+v, want active sandbox data-plane without restart", state)
+	}
+	status, err := manager.PluginServiceStatus(context.Background())
+	if err != nil {
+		t.Fatalf("PluginServiceStatus() error = %v", err)
+	}
+	mode := findServiceModeFeature(status.Modes, PluginServiceModeSandboxProcess)
+	adapter := findRuntimeAdapterStatus(status.RuntimeAdapters, PluginServiceModeSandboxProcess, RuntimeSandbox)
+	if !mode.Implemented || !mode.DataPlane || mode.Maturity != FeatureMaturityPartial ||
+		!adapter.Implemented || !adapter.DataPlane || !adapter.Lifecycle || adapter.Maturity != FeatureMaturityPartial {
+		t.Fatalf("sandbox mode=%+v adapter=%+v, want partial active data-plane facts", mode, adapter)
 	}
 }
 
@@ -567,8 +706,8 @@ func TestSandboxRequiredCapabilityBlocksEnable(t *testing.T) {
 	}
 	if status.Service.DataPlaneMode != PluginServiceModeInProcess ||
 		status.Service.DesiredMaturity != FeatureMaturityReserved ||
-		!strings.Contains(status.Service.LastError, "reserved") {
-		t.Fatalf("service status after sandbox apply = %+v, want reserved sandbox fallback status", status.Service)
+		!strings.Contains(status.Service.LastError, "future runtime gate") {
+		t.Fatalf("service status after sandbox apply = %+v, want gate-closed sandbox fallback status", status.Service)
 	}
 	if _, err := manager.SetDesired(context.Background(), "admin", "sandbox-plugin", artifact.ID, DesiredEnabled, `{}`, 10); err == nil || !strings.Contains(err.Error(), "sandbox-process runtime is disabled") {
 		t.Fatalf("SetDesired(sandbox desired mode) error = %v, want service mode block", err)

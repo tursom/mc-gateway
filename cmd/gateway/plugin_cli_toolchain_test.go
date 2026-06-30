@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -913,6 +914,51 @@ func TestPluginFeaturesAndManifestCommands(t *testing.T) {
 	}
 	if code != 0 {
 		t.Fatalf("runPluginCLI(manifest explain) code = %d, want 0", code)
+	}
+}
+
+func TestPluginFeatureFactsSandboxGateStates(t *testing.T) {
+	facts := pluginFeatureFactsFor(pluginmanager.RuntimeFeatureFactsOptions{})
+	assertSandboxFeatureState(t, facts, pluginmanager.FeatureMaturityReserved, false, "sandbox data-plane")
+
+	facts = pluginFeatureFactsFor(pluginmanager.RuntimeFeatureFactsOptions{
+		FutureRuntimeGates: pluginmanager.FutureRuntimeGates{SandboxProcess: true},
+		SandboxSelfCheck: func(pluginmanager.SandboxPolicy) error {
+			return errors.New("missing cgroup v2")
+		},
+	})
+	assertSandboxFeatureState(t, facts, pluginmanager.FeatureMaturityPartial, false, "missing cgroup v2")
+
+	facts = pluginFeatureFactsFor(pluginmanager.RuntimeFeatureFactsOptions{
+		FutureRuntimeGates: pluginmanager.FutureRuntimeGates{SandboxProcess: true},
+		SandboxSelfCheck:   func(pluginmanager.SandboxPolicy) error { return nil },
+	})
+	assertSandboxFeatureState(t, facts, pluginmanager.FeatureMaturityPartial, true, "partial")
+}
+
+func assertSandboxFeatureState(t *testing.T, facts map[string]any, wantMaturity string, wantDataPlane bool, wantReason string) {
+	t.Helper()
+	runtimeFeatures, ok := facts["runtime_types"].([]pluginmanager.RuntimeFeature)
+	if !ok {
+		t.Fatalf("runtime_types = %T", facts["runtime_types"])
+	}
+	serviceModes, ok := facts["service_modes"].([]pluginmanager.PluginServiceModeFeature)
+	if !ok {
+		t.Fatalf("service_modes = %T", facts["service_modes"])
+	}
+	sandboxRuntime := findRuntimeFeature(runtimeFeatures, pluginmanager.RuntimeSandbox)
+	sandboxMode := findCLIServiceModeFeature(serviceModes, pluginmanager.PluginServiceModeSandboxProcess)
+	if sandboxRuntime.Maturity != wantMaturity || sandboxRuntime.DataPlane != wantDataPlane ||
+		sandboxMode.Maturity != wantMaturity || sandboxMode.DataPlane != wantDataPlane ||
+		!strings.Contains(sandboxRuntime.UnsupportedReason, wantReason) {
+		t.Fatalf("sandbox runtime=%+v mode=%+v, want maturity=%s data_plane=%v reason containing %q", sandboxRuntime, sandboxMode, wantMaturity, wantDataPlane, wantReason)
+	}
+	sandboxFacts, ok := facts["sandbox"].(map[string]any)
+	if !ok {
+		t.Fatalf("sandbox facts = %T", facts["sandbox"])
+	}
+	if sandboxFacts["data_plane"] != wantDataPlane {
+		t.Fatalf("sandbox facts = %+v, want data_plane=%v", sandboxFacts, wantDataPlane)
 	}
 }
 

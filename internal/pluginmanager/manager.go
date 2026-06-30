@@ -178,6 +178,7 @@ type Manager struct {
 	ingressReservedListeners  []IngressReservedListener
 	futureGates               FutureRuntimeGates
 	sandboxPolicy             SandboxPolicy
+	sandboxSelfCheck          SandboxEnvironmentSelfCheck
 	wasmRunner                *WASMRunner
 	ingressLifecycle          *IngressLifecycleManager
 
@@ -299,6 +300,7 @@ type Options struct {
 	IngressReservedListeners  []IngressReservedListener
 	FutureRuntimeGates        FutureRuntimeGates
 	SandboxPolicy             SandboxPolicy
+	SandboxSelfCheck          SandboxEnvironmentSelfCheck
 	AdvisoryFeeds             []ExternalFeedSchedule
 	VulnerabilityFeeds        []ExternalFeedSchedule
 }
@@ -331,11 +333,15 @@ func New(options Options) *Manager {
 		ingressReservedListeners:  append([]IngressReservedListener(nil), options.IngressReservedListeners...),
 		futureGates:               normalizeFutureRuntimeGates(options.FutureRuntimeGates),
 		sandboxPolicy:             normalizeSandboxPolicy(options.SandboxPolicy),
+		sandboxSelfCheck:          options.SandboxSelfCheck,
 		routeCache:                make(map[string]routeCacheEntry),
 		proxyConns:                make(map[uint64]*proxyConnection),
 		drainingIDs:               make(map[string]bool),
 		hosts:                     make(map[string]*pluginHostProcess),
 		pendingHostStops:          make(map[string]*PluginHostSupervisorProcess),
+	}
+	if manager.sandboxSelfCheck == nil {
+		manager.sandboxSelfCheck = defaultSandboxEnvironmentSelfCheck
 	}
 	manager.wasmRunner = NewWASMRunner()
 	manager.ingressLifecycle = NewIngressLifecycleManager(manager.repo, manager.ingressReservedListeners)
@@ -2283,7 +2289,7 @@ func (m *Manager) startRuntimeInstance(ctx context.Context, artifact ArtifactRec
 func (m *Manager) runtimeAdapterForArtifact(artifact ArtifactRecord) RuntimeAdapter {
 	adapter := m.adapter
 	if m.adapterManaged {
-		adapter, _ = RuntimeAdapterFactory{}.AdapterFor(m.serviceMode, artifact.RuntimeType)
+		adapter, _ = RuntimeAdapterFactory{Facts: m.RuntimeFeatureFactsOptions()}.AdapterFor(m.serviceMode, artifact.RuntimeType)
 		switch typed := adapter.(type) {
 		case GoPluginProcessAdapter:
 			switch configured := m.adapter.(type) {
@@ -2320,8 +2326,11 @@ func (m *Manager) validateArtifactGate(artifact ArtifactRecord) error {
 		return nil
 	}
 	if artifact.RuntimeType == RuntimeSandbox {
-		if m.serviceMode != PluginServiceModeSandboxProcess || !m.futureGates.SandboxEnabled() {
+		if m.serviceMode != PluginServiceModeSandboxProcess {
 			return errors.New("sandbox-process runtime is disabled by plugin service mode")
+		}
+		if _, message := m.validateSandboxServiceModeApply(); message != "" {
+			return errors.New(message)
 		}
 		if caps := requiredRuntimeCapabilities(artifact); len(caps) > 0 {
 			return fmt.Errorf("sandbox-process cannot enforce required capabilities: %s", strings.Join(caps, ","))

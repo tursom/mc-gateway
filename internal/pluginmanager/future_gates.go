@@ -22,3 +22,14 @@ func (m *Manager) FutureRuntimeGates() FutureRuntimeGates {
 	}
 	return m.futureGates
 }
+
+func (m *Manager) RuntimeFeatureFactsOptions() RuntimeFeatureFactsOptions {
+	if m == nil {
+		return RuntimeFeatureFactsOptions{}
+	}
+	return RuntimeFeatureFactsOptions{
+		FutureRuntimeGates: m.futureGates,
+		SandboxPolicy:      m.sandboxPolicy,
+		SandboxSelfCheck:   m.sandboxSelfCheck,
+	}
+}

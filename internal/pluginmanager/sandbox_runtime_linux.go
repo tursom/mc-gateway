@@ -5,6 +5,7 @@ package pluginmanager
 import (
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"syscall"
 
@@ -39,5 +40,27 @@ func applySandboxRLimits(pid int, policy SandboxPolicy) error {
 }
 
 func validateSandboxEnforcementSupported() error {
+	for _, nsPath := range []string{
+		"/proc/self/ns/mnt",
+		"/proc/self/ns/net",
+		"/proc/self/ns/ipc",
+		"/proc/self/ns/uts",
+	} {
+		if _, err := os.Stat(nsPath); err != nil {
+			return fmt.Errorf("sandbox-process linux namespace support missing %s: %w", nsPath, err)
+		}
+	}
+	var limit unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_AS, &limit); err != nil {
+		return fmt.Errorf("sandbox-process memory rlimit unavailable: %w", err)
+	}
+	if err := unix.Getrlimit(unix.RLIMIT_CPU, &limit); err != nil {
+		return fmt.Errorf("sandbox-process cpu rlimit unavailable: %w", err)
+	}
+	if stat, err := os.Stat("/sys/fs/cgroup"); err != nil {
+		return fmt.Errorf("sandbox-process cgroup filesystem unavailable: %w", err)
+	} else if !stat.IsDir() {
+		return errors.New("sandbox-process cgroup filesystem is not a directory")
+	}
 	return nil
 }

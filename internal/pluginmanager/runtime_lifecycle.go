@@ -69,10 +69,16 @@ type RuntimeAdapterFactoryStatus struct {
 	UnsupportedReason string `json:"unsupported_reason,omitempty"`
 }
 
-type RuntimeAdapterFactory struct{}
+type RuntimeAdapterFactory struct {
+	Facts RuntimeFeatureFactsOptions
+}
 
 func RuntimeAdapterFactoryStatuses() []RuntimeAdapterFactoryStatus {
-	factory := RuntimeAdapterFactory{}
+	return RuntimeAdapterFactoryStatusesFor(RuntimeFeatureFactsOptions{})
+}
+
+func RuntimeAdapterFactoryStatusesFor(options RuntimeFeatureFactsOptions) []RuntimeAdapterFactoryStatus {
+	factory := RuntimeAdapterFactory{Facts: options}
 	pairs := []struct {
 		mode        string
 		runtimeType string
@@ -92,10 +98,11 @@ func RuntimeAdapterFactoryStatuses() []RuntimeAdapterFactoryStatus {
 	return statuses
 }
 
-func (RuntimeAdapterFactory) AdapterFor(serviceMode, runtimeType string) (RuntimeAdapter, RuntimeAdapterFactoryStatus) {
+func (factory RuntimeAdapterFactory) AdapterFor(serviceMode, runtimeType string) (RuntimeAdapter, RuntimeAdapterFactoryStatus) {
 	if serviceMode == "" {
 		serviceMode = PluginServiceModeInProcess
 	}
+	facts := normalizeRuntimeFeatureFactsOptions(factory.Facts)
 	status := RuntimeAdapterFactoryStatus{
 		ServiceMode: serviceMode,
 		RuntimeType: runtimeType,
@@ -104,8 +111,11 @@ func (RuntimeAdapterFactory) AdapterFor(serviceMode, runtimeType string) (Runtim
 		if status.RuntimeType == "" {
 			status.RuntimeType = RuntimeGoPlugin
 		}
-		modeMaturity := PluginServiceModeFeatureFor(status.ServiceMode).Maturity
-		runtimeMaturity := RuntimeTypeFeature(status.RuntimeType).Maturity
+		if status.Maturity != "" {
+			return status
+		}
+		modeMaturity := PluginServiceModeFeatureForOptions(status.ServiceMode, facts).Maturity
+		runtimeMaturity := RuntimeTypeFeatureFor(status.RuntimeType, facts).Maturity
 		status.Maturity = FeatureMaturityImplemented
 		switch {
 		case modeMaturity == FeatureMaturityStub || runtimeMaturity == FeatureMaturityStub:
@@ -161,13 +171,19 @@ func (RuntimeAdapterFactory) AdapterFor(serviceMode, runtimeType string) (Runtim
 		status.RequiresRestart = true
 		switch runtimeType {
 		case RuntimeSandbox:
+			modeFeature := PluginServiceModeFeatureForOptions(PluginServiceModeSandboxProcess, facts)
+			runtimeFeature := RuntimeTypeFeatureFor(RuntimeSandbox, facts)
 			status.Adapter = "sandbox-process"
 			status.ControlChannel = "sandbox-control-rpc"
-			status.UnsupportedReason = "sandbox-process runtime adapter is reserved; current gateway releases do not expose a sandbox data-plane"
+			status.Implemented = modeFeature.Implemented && runtimeFeature.Implemented
+			status.DataPlane = modeFeature.DataPlane && runtimeFeature.DataPlane
+			status.Lifecycle = status.DataPlane
+			status.UnsupportedReason = firstRuntimeUnsupportedReason(modeFeature.UnsupportedReason, runtimeFeature.UnsupportedReason)
 			return SandboxProcessAdapter{}, completeStatus()
 		case RuntimeWASM:
 			status.Adapter = "wazero"
 			status.ControlChannel = "wazero-host-abi"
+			status.Maturity = FeatureMaturityReserved
 			status.UnsupportedReason = "sandbox-process wasm adapter is reserved; use in-process wasm for the current low-risk WASM data-plane"
 			return WASMAdapter{Mode: PluginServiceModeSandboxProcess}, completeStatus()
 		default:
@@ -181,6 +197,15 @@ func (RuntimeAdapterFactory) AdapterFor(serviceMode, runtimeType string) (Runtim
 	}
 	status = completeStatus()
 	return UnsupportedRuntimeAdapter{Status: status}, status
+}
+
+func firstRuntimeUnsupportedReason(reasons ...string) string {
+	for _, reason := range reasons {
+		if reason != "" {
+			return reason
+		}
+	}
+	return ""
 }
 
 type UnsupportedRuntimeAdapter struct {

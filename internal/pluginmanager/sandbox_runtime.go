@@ -125,6 +125,14 @@ func validateSandboxPolicyEnforceable(policy SandboxPolicy) error {
 	return nil
 }
 
+func defaultSandboxEnvironmentSelfCheck(policy SandboxPolicy) error {
+	policy = normalizeSandboxPolicy(policy)
+	if err := validateSandboxPolicyEnforceable(policy); err != nil {
+		return err
+	}
+	return validateSandboxEnforcementSupported()
+}
+
 func (a SandboxProcessAdapter) Load(ctx context.Context, artifact ArtifactRecord, pluginRecord PluginRecord, gateway *Gateway) (api.Plugin, error) {
 	prepared, err := a.Prepare(ctx, artifact, pluginRecord)
 	if err != nil {

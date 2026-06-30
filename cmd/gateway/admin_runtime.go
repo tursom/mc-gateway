@@ -96,6 +96,10 @@ func initializeGatewayRuntime() error {
 	if err := refreshRouteSnapshot(ctx); err != nil {
 		return err
 	}
+	runtimeFacts, err := pluginRuntimeFeatureFactsOptionsFromEnv(os.Getenv)
+	if err != nil {
+		return err
+	}
 
 	// 插件制品放在数据库同级目录下，便于容器挂载一个 data volume 即可保留全部运行态。
 	pluginsManager = pluginmanager.New(pluginmanager.Options{
@@ -105,6 +109,8 @@ func initializeGatewayRuntime() error {
 		WaitGroup:                 &exitWaitGroup,
 		IngressReservedListeners:  reservedIngressListeners,
 		RequireConformanceFixture: startup.PluginRequireConformanceFixture,
+		FutureRuntimeGates:        runtimeFacts.FutureRuntimeGates,
+		SandboxPolicy:             runtimeFacts.SandboxPolicy,
 	})
 	return pluginsManager.Reconcile(ctx)
 }

@@ -280,10 +280,35 @@ func runPluginFeaturesCLI(args []string) error {
 	if len(args) > 0 {
 		return fmt.Errorf("features does not accept positional arguments")
 	}
-	return encodePluginCLIJSON(pluginFeatureFacts())
+	facts, err := pluginFeatureFactsFromEnv(os.Getenv)
+	if err != nil {
+		return err
+	}
+	return encodePluginCLIJSON(facts)
 }
 
 func pluginFeatureFacts() map[string]any {
+	facts, err := pluginFeatureFactsFromEnv(os.Getenv)
+	if err != nil {
+		return pluginFeatureFactsFor(pluginmanager.RuntimeFeatureFactsOptions{})
+	}
+	return facts
+}
+
+func pluginFeatureFactsFromEnv(getenv func(string) string) (map[string]any, error) {
+	options, err := pluginRuntimeFeatureFactsOptionsFromEnv(getenv)
+	if err != nil {
+		return nil, err
+	}
+	return pluginFeatureFactsFor(options), nil
+}
+
+func pluginFeatureFactsFor(options pluginmanager.RuntimeFeatureFactsOptions) map[string]any {
+	runtimeTypes := pluginmanager.RuntimeTypeFeaturesFor(options)
+	serviceModes := pluginmanager.PluginServiceModeFeaturesFor(options)
+	runtimeAdapters := pluginmanager.RuntimeAdapterFactoryStatusesFor(options)
+	sandboxRuntime := pluginmanager.RuntimeTypeFeatureFor(pluginmanager.RuntimeSandbox, options)
+	sandboxMode := pluginmanager.PluginServiceModeFeatureForOptions(pluginmanager.PluginServiceModeSandboxProcess, options)
 	return map[string]any{
 		"schema_version": pluginmanager.SchemaVersion,
 		"api_version":    pluginmanager.APIVersion,
@@ -291,9 +316,9 @@ func pluginFeatureFacts() map[string]any {
 			pluginmanager.ArtifactTypeBinary,
 			pluginmanager.ArtifactTypeSource,
 		},
-		"runtime_types":    pluginmanager.RuntimeTypeFeatures(),
-		"service_modes":    pluginmanager.PluginServiceModeFeatures(),
-		"runtime_adapters": pluginmanager.RuntimeAdapterFactoryStatuses(),
+		"runtime_types":    runtimeTypes,
+		"service_modes":    serviceModes,
+		"runtime_adapters": runtimeAdapters,
 		"plugin_host":      pluginmanager.PluginHostProtocolFeature(),
 		"extension_points": pluginmanager.ExtensionPointFeatures(),
 		"build": map[string]any{
@@ -457,10 +482,12 @@ func pluginFeatureFacts() map[string]any {
 			"data_plane":                            false,
 		},
 		"sandbox": map[string]any{
-			"runtime_type_reserved":        true,
-			"service_mode_reserved":        true,
+			"runtime_type_reserved":        sandboxRuntime.Maturity == pluginmanager.FeatureMaturityReserved,
+			"service_mode_reserved":        sandboxMode.Maturity == pluginmanager.FeatureMaturityReserved,
 			"required_capability_gate":     true,
 			"future_runtime_gate":          true,
+			"environment_self_check":       options.FutureRuntimeGates.SandboxEnabled(),
+			"unsupported_reason":           sandboxRuntime.UnsupportedReason,
 			"supervisor":                   true,
 			"control_rpc":                  true,
 			"filesystem_enforcement":       true,
@@ -470,7 +497,7 @@ func pluginFeatureFacts() map[string]any {
 			"secret_rpc":                   true,
 			"crash_loop_policy_data_plane": false,
 			"diagnostic_summary":           true,
-			"data_plane":                   false,
+			"data_plane":                   sandboxRuntime.DataPlane && sandboxMode.DataPlane,
 		},
 		"wasm": map[string]any{
 			"runtime_type_reserved":        false,

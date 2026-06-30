@@ -65,9 +65,9 @@ func (m *Manager) PluginServiceStatus(ctx context.Context) (PluginServiceStatus,
 	}
 	return PluginServiceStatus{
 		Service:         state,
-		Modes:           PluginServiceModeFeatures(),
-		RuntimeTypes:    RuntimeTypeFeatures(),
-		RuntimeAdapters: RuntimeAdapterFactoryStatuses(),
+		Modes:           PluginServiceModeFeaturesFor(m.RuntimeFeatureFactsOptions()),
+		RuntimeTypes:    RuntimeTypeFeaturesFor(m.RuntimeFeatureFactsOptions()),
+		RuntimeAdapters: RuntimeAdapterFactoryStatusesFor(m.RuntimeFeatureFactsOptions()),
 		Hosts:           m.pluginHostSummaries(ctx),
 		Nodes:           nodes,
 	}, nil
@@ -151,7 +151,12 @@ func (m *Manager) ApplyPluginServiceMode(ctx context.Context) error {
 		_ = m.repo.SetPluginServiceError(ctx, err.Error())
 		state.DesiredMode = PluginServiceModeInProcess
 	}
-	desiredFeature := PluginServiceModeFeatureFor(state.DesiredMode)
+	desiredFeature := PluginServiceModeFeatureForOptions(state.DesiredMode, m.RuntimeFeatureFactsOptions())
+	if state.DesiredMode == PluginServiceModeSandboxProcess {
+		if code, message := m.validateSandboxServiceModeApply(); code != "" {
+			return m.recordPluginServiceModeApplyFailure(ctx, state, desiredFeature, code, message)
+		}
+	}
 	if state.DesiredMode != PluginServiceModeInProcess && !m.adapterManaged {
 		applied, applyErr := m.repo.ApplyPluginServiceActive(ctx, PluginServiceModeInProcess)
 		if applyErr != nil {
@@ -212,8 +217,73 @@ func (m *Manager) ApplyPluginServiceMode(ctx context.Context) error {
 	}
 	m.serviceMode = applied.ActiveMode
 	if m.adapterManaged {
-		m.adapter, _ = RuntimeAdapterFactory{}.AdapterFor(m.serviceMode, RuntimeGoPlugin)
+		runtimeType := RuntimeGoPlugin
+		if m.serviceMode == PluginServiceModeSandboxProcess {
+			runtimeType = RuntimeSandbox
+		}
+		m.adapter, _ = RuntimeAdapterFactory{Facts: m.RuntimeFeatureFactsOptions()}.AdapterFor(m.serviceMode, runtimeType)
 	}
+	return nil
+}
+
+func (m *Manager) validateSandboxServiceModeApply() (string, string) {
+	if !m.futureGates.SandboxEnabled() {
+		return "sandbox_future_gate_closed", "sandbox-process service mode is disabled by future runtime gate"
+	}
+	if !m.adapterManaged {
+		return "sandbox_adapter_factory_unavailable", "sandbox-process service mode requires the managed runtime adapter factory"
+	}
+	switch m.currentPolicyProfile() {
+	case PolicyProfileDev, PolicyProfileStaging, PolicyProfileProd:
+	default:
+		return "sandbox_policy_profile_invalid", fmt.Sprintf("sandbox-process service mode requires a supported policy profile, got %q", m.currentPolicyProfile())
+	}
+	selfCheck := m.sandboxSelfCheck
+	if selfCheck == nil {
+		selfCheck = defaultSandboxEnvironmentSelfCheck
+	}
+	if err := selfCheck(m.sandboxPolicy); err != nil {
+		return "sandbox_environment_self_check_failed", "sandbox-process environment self-check failed: " + err.Error()
+	}
+	_, status := RuntimeAdapterFactory{Facts: m.RuntimeFeatureFactsOptions()}.AdapterFor(PluginServiceModeSandboxProcess, RuntimeSandbox)
+	if !status.Implemented || !status.DataPlane || !status.Lifecycle {
+		message := status.UnsupportedReason
+		if message == "" {
+			message = "sandbox-process runtime adapter is not available for the data plane"
+		}
+		return "sandbox_adapter_factory_unavailable", message
+	}
+	return "", ""
+}
+
+func (m *Manager) recordPluginServiceModeApplyFailure(ctx context.Context, state PluginServiceState, desiredFeature PluginServiceModeFeature, reasonCode, message string) error {
+	if message == "" {
+		message = "plugin service mode is not implemented for the data plane"
+	}
+	if err := m.repo.SetPluginServiceError(ctx, message); err != nil {
+		return err
+	}
+	preservedMode := state.ActiveMode
+	if preservedMode == "" {
+		preservedMode = PluginServiceModeInProcess
+	}
+	m.serviceMode = preservedMode
+	if m.adapterManaged {
+		runtimeType := RuntimeGoPlugin
+		if preservedMode == PluginServiceModeSandboxProcess {
+			runtimeType = RuntimeSandbox
+		}
+		m.adapter, _ = RuntimeAdapterFactory{Facts: m.RuntimeFeatureFactsOptions()}.AdapterFor(preservedMode, runtimeType)
+	}
+	enriched := m.enrichPluginServiceState(state)
+	_ = m.repo.RecordOperation(ctx, "", "", "plugin_service_mode_apply", "failed", "system", message, map[string]any{
+		"reason_code":      reasonCode,
+		"desired_mode":     state.DesiredMode,
+		"active_mode":      enriched.ActiveMode,
+		"data_plane_mode":  enriched.DataPlaneMode,
+		"restart_required": enriched.RestartRequired,
+		"maturity":         desiredFeature.Maturity,
+	})
 	return nil
 }
 
@@ -223,13 +293,13 @@ func (m *Manager) enrichPluginServiceState(state PluginServiceState) PluginServi
 	if dataPlaneMode == "" {
 		dataPlaneMode = state.ActiveMode
 	}
-	dataPlaneFeature := PluginServiceModeFeatureFor(dataPlaneMode)
+	dataPlaneFeature := PluginServiceModeFeatureForOptions(dataPlaneMode, m.RuntimeFeatureFactsOptions())
 	if !dataPlaneFeature.Implemented || !dataPlaneFeature.DataPlane {
 		dataPlaneMode = PluginServiceModeInProcess
-		dataPlaneFeature = PluginServiceModeFeatureFor(dataPlaneMode)
+		dataPlaneFeature = PluginServiceModeFeatureForOptions(dataPlaneMode, m.RuntimeFeatureFactsOptions())
 	}
-	desiredFeature := PluginServiceModeFeatureFor(state.DesiredMode)
-	activeFeature := PluginServiceModeFeatureFor(state.ActiveMode)
+	desiredFeature := PluginServiceModeFeatureForOptions(state.DesiredMode, m.RuntimeFeatureFactsOptions())
+	activeFeature := PluginServiceModeFeatureForOptions(state.ActiveMode, m.RuntimeFeatureFactsOptions())
 	state.DataPlaneMode = dataPlaneMode
 	state.ImplementedAdapter = activeFeature.Implemented && activeFeature.DataPlane && state.ActiveMode == dataPlaneMode
 	state.DesiredMaturity = desiredFeature.Maturity
