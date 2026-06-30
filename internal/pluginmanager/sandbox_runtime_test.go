@@ -1,9 +1,12 @@
 package pluginmanager
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -364,6 +367,481 @@ func TestSandboxManagerConfigValidateBlocksDryRun(t *testing.T) {
 	if _, err := manager.SetDesired(context.Background(), "admin", artifact.PluginID, artifact.ID, DesiredDisabled, `{"reject":true}`, 10); err == nil || !strings.Contains(err.Error(), "sandbox config validation failed") {
 		t.Fatalf("SetDesired(invalid config) error = %v, want sandbox config validation failure", err)
 	}
+}
+
+func TestSandboxProtocolProxyStreamRelayConformanceFocused(t *testing.T) {
+	peer := newFakeSandboxStreamPeer(t)
+	manager, artifact, _ := enableSandboxStreamProxyForTest(t, "sandbox-stream", peer, api.FailPolicyClose, 1000)
+
+	clientGateway, clientSide := newTestTCPConnPair(t)
+	defer clientSide.Close()
+	initial := []byte("initial")
+	next := []byte("next")
+	reply := []byte("sandbox-reply")
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{
+			Host:         "play.example",
+			Upstream:     "backend",
+			Source:       clientGateway,
+			InitialData:  initial,
+			ConnectionID: "conn-1",
+			TraceID:      "trace-1",
+			Metadata: map[string]string{
+				"safe":          "value",
+				"api_token":     "plain-secret-value",
+				"authorization": "Bearer secret",
+			},
+		})
+		errCh <- err
+	}()
+	pluginConn := peer.nextPluginConn(t)
+	pluginDone := make(chan error, 1)
+	go func() {
+		defer pluginConn.Close()
+		got := make([]byte, len(initial)+len(next))
+		if _, err := io.ReadFull(pluginConn, got); err != nil {
+			pluginDone <- err
+			return
+		}
+		if !bytes.Equal(got, append(append([]byte(nil), initial...), next...)) {
+			pluginDone <- fmt.Errorf("plugin stream bytes = %q, want initial replay plus client bytes", got)
+			return
+		}
+		if _, err := pluginConn.Write(reply); err != nil {
+			pluginDone <- err
+			return
+		}
+		closeWrite(pluginConn)
+		_, err := io.Copy(io.Discard, pluginConn)
+		pluginDone <- err
+	}()
+	if _, err := clientSide.Write(next); err != nil {
+		t.Fatalf("client write error = %v", err)
+	}
+	gotReply := make([]byte, len(reply))
+	if _, err := io.ReadFull(clientSide, gotReply); err != nil {
+		t.Fatalf("client read reply error = %v", err)
+	}
+	if !bytes.Equal(gotReply, reply) {
+		t.Fatalf("client reply = %q, want %q", gotReply, reply)
+	}
+	if err := clientSide.CloseWrite(); err != nil {
+		t.Fatalf("client CloseWrite() error = %v", err)
+	}
+	if err := <-pluginDone; err != nil {
+		t.Fatalf("plugin stream error = %v", err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("ConnectUpstream() error = %v", err)
+	}
+	open := peer.lastOpen(t)
+	if open.Protocol != StreamProxyProtocolV1 || open.ExtensionPoint != ExtensionUpstreamConnect || open.HandlerID != "upstream.connect/v1" {
+		t.Fatalf("stream_open request = %+v, want stream.proxy/v1 upstream.connect/v1", open)
+	}
+	if open.Metadata["safe"] != "value" || open.Metadata["api_token"] != "[redacted]" || open.Metadata["authorization"] != "[redacted]" {
+		t.Fatalf("stream_open metadata = %+v, want redacted secret metadata", open.Metadata)
+	}
+	if raw := peer.rawOpenPayload(t); bytes.Contains(raw, initial) || bytes.Contains(raw, []byte("plain-secret-value")) {
+		t.Fatalf("stream_open payload leaked initial bytes or secret metadata: %s", raw)
+	}
+	waitForPluginManagerTest(t, func() bool { return peer.closeCount() >= 1 })
+	plan := manager.DispatchPlan(context.Background())
+	if len(plan.Handlers) != 1 || plan.Handlers[0].PluginID != artifact.PluginID {
+		t.Fatalf("DispatchPlan handlers = %+v, want sandbox stream handler", plan.Handlers)
+	}
+	handler := plan.Handlers[0]
+	if handler.ProxyStarted != 1 || handler.ProxyCompleted != 1 || handler.ActiveProxy != 0 || handler.ProxyErrors != 0 {
+		t.Fatalf("proxy summary = %+v, want one clean completed sandbox stream", handler)
+	}
+	if got, want := handler.ProxyBytesIn, uint64(len(initial)+len(next)); got != want {
+		t.Fatalf("proxy bytes in = %d, want %d", got, want)
+	}
+	if got, want := handler.ProxyBytesOut, uint64(len(reply)); got != want {
+		t.Fatalf("proxy bytes out = %d, want %d", got, want)
+	}
+}
+
+func TestSandboxProtocolProxyClientAndEndpointClose(t *testing.T) {
+	t.Run("client close", func(t *testing.T) {
+		peer := newFakeSandboxStreamPeer(t)
+		manager, _, _ := enableSandboxStreamProxyForTest(t, "sandbox-client-close", peer, api.FailPolicyClose, 1000)
+		clientGateway, clientSide := newTestTCPConnPair(t)
+		errCh := make(chan error, 1)
+		go func() {
+			_, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{
+				Host:   "play.example",
+				Source: clientGateway,
+			})
+			errCh <- err
+		}()
+		pluginConn := peer.nextPluginConn(t)
+		pluginDone := make(chan error, 1)
+		go func() {
+			defer pluginConn.Close()
+			_, err := io.Copy(io.Discard, pluginConn)
+			pluginDone <- err
+		}()
+		if err := clientSide.Close(); err != nil {
+			t.Fatalf("client Close() error = %v", err)
+		}
+		if err := <-pluginDone; err != nil {
+			t.Fatalf("plugin read after client close error = %v", err)
+		}
+		if err := <-errCh; err != nil {
+			t.Fatalf("ConnectUpstream() error = %v", err)
+		}
+	})
+
+	t.Run("endpoint close", func(t *testing.T) {
+		peer := newFakeSandboxStreamPeer(t)
+		peer.mode = "endpoint_close"
+		manager, _, _ := enableSandboxStreamProxyForTest(t, "sandbox-endpoint-close", peer, api.FailPolicyClose, 1000)
+		clientGateway, clientSide := newTestTCPConnPair(t)
+		defer clientSide.Close()
+		errCh := make(chan error, 1)
+		go func() {
+			_, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{
+				Host:   "play.example",
+				Source: clientGateway,
+			})
+			errCh <- err
+		}()
+		_ = peer.nextPluginConn(t)
+		_ = clientSide.Close()
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Fatalf("ConnectUpstream() error = %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("ConnectUpstream() did not return after sandbox endpoint close")
+		}
+	})
+}
+
+func TestSandboxProtocolProxyTimeoutBackpressureAndForceClose(t *testing.T) {
+	t.Run("timeout", func(t *testing.T) {
+		peer := newFakeSandboxStreamPeer(t)
+		peer.mode = "timeout"
+		manager, _, _ := enableSandboxStreamProxyForTest(t, "sandbox-timeout-stream", peer, api.FailPolicyClose, 20)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
+		result, err := manager.ConnectUpstream(ctx, api.UpstreamConnectRequest{Host: "play.example"})
+		if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("ConnectUpstream(timeout) = %+v err=%v, want deadline exceeded", result, err)
+		}
+	})
+
+	t.Run("backpressure and force close", func(t *testing.T) {
+		peer := newFakeSandboxStreamPeer(t)
+		manager, _, _ := enableSandboxStreamProxyForTest(t, "sandbox-force-close", peer, api.FailPolicyClose, 1000)
+		clientGateway, clientSide := newTestTCPConnPair(t)
+		defer clientSide.Close()
+		errCh := make(chan error, 1)
+		go func() {
+			_, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{
+				Host:   "play.example",
+				Source: clientGateway,
+			})
+			errCh <- err
+		}()
+		pluginConn := peer.nextPluginConn(t)
+		defer pluginConn.Close()
+		payload := bytes.Repeat([]byte("x"), 512*1024)
+		readDone := make(chan int, 1)
+		go func() {
+			buf := make([]byte, 4096)
+			total := 0
+			for total < len(payload) {
+				n, err := pluginConn.Read(buf)
+				if n > 0 {
+					total += n
+					time.Sleep(time.Millisecond)
+				}
+				if err != nil {
+					break
+				}
+			}
+			readDone <- total
+		}()
+		writeDone := make(chan error, 1)
+		go func() {
+			_, err := clientSide.Write(payload)
+			writeDone <- err
+		}()
+		select {
+		case err := <-writeDone:
+			if err != nil {
+				t.Fatalf("client large write error = %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("client large write timed out under sandbox stream relay backpressure")
+		}
+		if got := <-readDone; got != len(payload) {
+			t.Fatalf("plugin read bytes = %d, want %d", got, len(payload))
+		}
+		waitForPluginManagerTest(t, func() bool {
+			return manager.activeProxyCountLocked("sandbox-force-close") == 1
+		})
+		if _, err := manager.Disable(context.Background(), "admin", "sandbox-force-close"); err != nil {
+			t.Fatalf("Disable() error = %v", err)
+		}
+		active, err := manager.ActiveProxyConnections(context.Background(), "sandbox-force-close")
+		if err != nil {
+			t.Fatalf("ActiveProxyConnections() error = %v", err)
+		}
+		if len(active) != 1 || !active[0].Draining || active[0].ForceCloseRequested {
+			t.Fatalf("active sandbox proxy after disable = %+v, want draining stream", active)
+		}
+		closed, err := manager.ForceCloseDraining(context.Background(), "admin", "sandbox-force-close")
+		if err != nil {
+			t.Fatalf("ForceCloseDraining() error = %v", err)
+		}
+		if closed != 1 {
+			t.Fatalf("ForceCloseDraining() = %d, want 1", closed)
+		}
+		if err := <-errCh; err != nil {
+			t.Fatalf("ConnectUpstream() error = %v", err)
+		}
+		waitForPluginManagerTest(t, func() bool {
+			return manager.activeProxyCountLocked("sandbox-force-close") == 0
+		})
+	})
+}
+
+func TestSandboxProtocolProxyProcessCrashClosesActiveStreams(t *testing.T) {
+	peer := newFakeSandboxStreamPeer(t)
+	manager, _, process := enableSandboxStreamProxyForTest(t, "sandbox-crash-stream", peer, api.FailPolicyClose, 1000)
+	clientGateway, clientSide := newTestTCPConnPair(t)
+	defer clientSide.Close()
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{
+			Host:   "play.example",
+			Source: clientGateway,
+		})
+		errCh <- err
+	}()
+	pluginConn := peer.nextPluginConn(t)
+	defer pluginConn.Close()
+	waitForPluginManagerTest(t, func() bool {
+		return manager.activeProxyCountLocked("sandbox-crash-stream") == 1
+	})
+	closeSandboxProcessForTest(process)
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("ConnectUpstream() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("active sandbox stream did not close after process crash")
+	}
+	waitForPluginManagerTest(t, func() bool {
+		return manager.activeProxyCountLocked("sandbox-crash-stream") == 0
+	})
+	if os.Getpid() <= 0 {
+		t.Fatal("gateway process exited during sandbox process crash")
+	}
+}
+
+type fakeSandboxStreamPeer struct {
+	mu          sync.Mutex
+	mode        string
+	opens       []SandboxStreamOpenRequest
+	rawOpens    [][]byte
+	closes      []SandboxStreamCloseRequest
+	pluginConns chan net.Conn
+	makePair    func() (net.Conn, net.Conn)
+	process     *SandboxProcess
+}
+
+func newFakeSandboxStreamPeer(t *testing.T) *fakeSandboxStreamPeer {
+	t.Helper()
+	peer := &fakeSandboxStreamPeer{
+		pluginConns: make(chan net.Conn, 8),
+	}
+	peer.makePair = func() (net.Conn, net.Conn) {
+		gatewayEnd, pluginEnd := newTestTCPConnPair(t)
+		return gatewayEnd, pluginEnd
+	}
+	return peer
+}
+
+func (p *fakeSandboxStreamPeer) invoke(ctx context.Context, _ string, req SandboxControlRequest) (SandboxControlResponse, error) {
+	resp := SandboxControlResponse{
+		RequestID:         req.RequestID,
+		Command:           req.Command,
+		Protocol:          sandboxProcessProtocol,
+		PluginID:          req.PluginID,
+		ArtifactID:        req.ArtifactID,
+		RuntimeInstanceID: req.RuntimeInstanceID,
+		Generation:        req.Generation,
+		TraceID:           req.TraceID,
+		DeadlineUnixMS:    req.DeadlineUnixMS,
+		OK:                true,
+	}
+	switch req.Command {
+	case sandboxControlCommandStreamOpen:
+		if p.mode == "timeout" {
+			<-ctx.Done()
+			return SandboxControlResponse{}, ctx.Err()
+		}
+		var payload SandboxStreamOpenRequest
+		if err := json.Unmarshal(req.Payload, &payload); err != nil {
+			return SandboxControlResponse{}, err
+		}
+		p.mu.Lock()
+		p.opens = append(p.opens, payload)
+		p.rawOpens = append(p.rawOpens, append([]byte(nil), req.Payload...))
+		p.mu.Unlock()
+		resp.Stream = &SandboxStreamOpenResponse{
+			Connected:    true,
+			Protocol:     StreamProxyProtocolV1,
+			StreamID:     payload.StreamID,
+			Endpoint:     "/run/streams/" + payload.StreamID + ".sock",
+			EndpointType: "unix",
+		}
+		return resp, nil
+	case sandboxControlCommandStreamClose:
+		var payload SandboxStreamCloseRequest
+		if err := json.Unmarshal(req.Payload, &payload); err != nil {
+			return SandboxControlResponse{}, err
+		}
+		p.mu.Lock()
+		p.closes = append(p.closes, payload)
+		p.mu.Unlock()
+		return resp, nil
+	case sandboxControlCommandDrain, sandboxControlCommandReloadConfig:
+		return resp, nil
+	default:
+		return setSandboxControlError(resp, sandboxControlErrorUnknownCommand, "unexpected fake stream peer command"), nil
+	}
+}
+
+func (p *fakeSandboxStreamPeer) dial(ctx context.Context, _ *SandboxProcess, _ SandboxStreamOpenResponse) (net.Conn, error) {
+	_ = ctx
+	gatewayEnd, pluginEnd := p.makePair()
+	p.pluginConns <- pluginEnd
+	if p.mode == "endpoint_close" {
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			_ = pluginEnd.Close()
+		}()
+	}
+	return gatewayEnd, nil
+}
+
+func (p *fakeSandboxStreamPeer) nextPluginConn(t *testing.T) net.Conn {
+	t.Helper()
+	select {
+	case conn := <-p.pluginConns:
+		return conn
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for sandbox stream endpoint")
+		return nil
+	}
+}
+
+func (p *fakeSandboxStreamPeer) lastOpen(t *testing.T) SandboxStreamOpenRequest {
+	t.Helper()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.opens) == 0 {
+		t.Fatal("no sandbox stream_open request recorded")
+	}
+	return p.opens[len(p.opens)-1]
+}
+
+func (p *fakeSandboxStreamPeer) rawOpenPayload(t *testing.T) []byte {
+	t.Helper()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.rawOpens) == 0 {
+		t.Fatal("no sandbox raw stream_open payload recorded")
+	}
+	return append([]byte(nil), p.rawOpens[len(p.rawOpens)-1]...)
+}
+
+func (p *fakeSandboxStreamPeer) closeCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.closes)
+}
+
+func enableSandboxStreamProxyForTest(t *testing.T, pluginID string, peer *fakeSandboxStreamPeer, failPolicy string, timeoutMS int64) (*Manager, ArtifactRecord, *SandboxProcess) {
+	t.Helper()
+	if failPolicy == "" {
+		failPolicy = api.FailPolicyClose
+	}
+	if timeoutMS == 0 {
+		timeoutMS = 1000
+	}
+	policy := SandboxPolicy{CPUSeconds: 1, MemoryBytes: 8 * 1024 * 1024}
+	manager := New(Options{
+		DB:                 openPluginManagerTestDB(t),
+		ArtifactRoot:       t.TempDir(),
+		FutureRuntimeGates: FutureRuntimeGates{SandboxProcess: true},
+		SandboxSelfCheck:   func(SandboxPolicy) error { return nil },
+		SandboxPolicy:      policy,
+	})
+	registration := SandboxHandlerRegistration{
+		ExtensionPoint: ExtensionUpstreamConnect,
+		HandlerID:      "upstream.connect/v1",
+		FailPolicy:     failPolicy,
+		TimeoutMS:      timeoutMS,
+		SchemaVersion:  1,
+		DeclaredCapabilities: []string{
+			StreamProxyProtocolV1,
+		},
+	}
+	manager.adapter = SandboxProcessAdapter{
+		Policy: policy,
+		startProcess: func(_ context.Context, _ SandboxSupervisor, pluginID, artifactID, _ string, generation int64, configJSON string, _ SandboxSecretResolver) (*SandboxProcess, error) {
+			process := newSandboxControlProcessForTest(pluginID, artifactID, generation, configJSON)
+			process.SocketPath = "fake-sandbox-stream-control.sock"
+			process.Registrations = []SandboxHandlerRegistration{registration}
+			process.registerOK = true
+			process.UpstreamMode = UpstreamModeProtocolProxy
+			process.controlInvoker = peer.invoke
+			process.streamDialer = peer.dial
+			peer.process = process
+			return process, nil
+		},
+	}
+	manager.serviceMode = PluginServiceModeSandboxProcess
+	artifact := uploadSandboxStreamArtifactForTest(t, manager, pluginID, timeoutMS)
+	if _, err := manager.SetDesired(context.Background(), "admin", pluginID, artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	approveGovernanceForTest(t, manager, pluginID, artifact.ID)
+	if _, err := manager.Enable(context.Background(), "admin", pluginID); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	if peer.process == nil {
+		t.Fatal("sandbox stream fake process was not started")
+	}
+	return manager, artifact, peer.process
+}
+
+func uploadSandboxStreamArtifactForTest(t *testing.T, manager *Manager, pluginID string, timeoutMS int64) ArtifactRecord {
+	t.Helper()
+	return uploadTestArtifactWithManifest(t, manager, pluginID, func(manifest *Manifest) {
+		manifest.Runtime.Type = RuntimeSandbox
+		manifest.ExtensionPoints = []ExtensionPoint{{Type: "hook", Key: ExtensionUpstreamConnect}}
+		manifest.Capabilities = json.RawMessage(`{
+			"extension_points":["upstream.connect/v1"],
+			"upstream_connect":{"mode":"protocol-proxy"},
+			"scope":{"type":"host","values":["play.example"]},
+			"rollout":{"mode":"canary"},
+			"minecraft":{
+				"protocol_versions":{"tested":[767]},
+				"forwarding":{"supported":["none"],"default":"none"}
+			}
+		}`)
+		manifest.RuntimeLimits.HandlerTimeoutMS = int(timeoutMS)
+		manifest.RuntimeLimits.InitialWriteTimeoutMS = 1000
+	})
 }
 
 type fakeSandboxControlPeer struct {

@@ -197,10 +197,11 @@ type Manager struct {
 	operations  *Operations
 
 	// serviceMode/hosts 预留给插件运行时从进程内迁移到独立宿主的服务模式。
-	serviceMode      string
-	hostMu           sync.Mutex
-	hosts            map[string]*pluginHostProcess
-	pendingHostStops map[string]*PluginHostSupervisorProcess
+	serviceMode         string
+	hostMu              sync.Mutex
+	hosts               map[string]*pluginHostProcess
+	pendingHostStops    map[string]*PluginHostSupervisorProcess
+	pendingSandboxStops map[string]*SandboxProcess
 
 	feedSchedulerMu     sync.Mutex
 	feedSchedulerCancel context.CancelFunc
@@ -339,6 +340,7 @@ func New(options Options) *Manager {
 		drainingIDs:               make(map[string]bool),
 		hosts:                     make(map[string]*pluginHostProcess),
 		pendingHostStops:          make(map[string]*PluginHostSupervisorProcess),
+		pendingSandboxStops:       make(map[string]*SandboxProcess),
 	}
 	if manager.sandboxSelfCheck == nil {
 		manager.sandboxSelfCheck = defaultSandboxEnvironmentSelfCheck
@@ -1047,6 +1049,9 @@ func (m *Manager) Disable(ctx context.Context, actor, pluginID string) (PluginRe
 		if m.shouldDeferProcessHostStop(pluginID, loaded) {
 			errs = m.drainRuntimeInstance(ctx, loaded)
 			m.deferProcessHostStop(pluginID, loaded.runtime.HostProcess)
+		} else if m.shouldDeferSandboxProcessStop(pluginID, loaded) {
+			errs = m.drainRuntimeInstance(ctx, loaded)
+			m.deferSandboxProcessStop(pluginID, sandboxHostedPluginFromInstance(loaded.instance).process)
 		} else {
 			errs = m.stopRuntimeInstance(ctx, loaded)
 		}
@@ -1136,6 +1141,13 @@ func (m *Manager) shouldDeferProcessHostStop(pluginID string, loaded *loadedPlug
 		m.activeProxyCountLocked(pluginID) > 0
 }
 
+func (m *Manager) shouldDeferSandboxProcessStop(pluginID string, loaded *loadedPlugin) bool {
+	if m.serviceMode != PluginServiceModeSandboxProcess || loaded == nil || m.activeProxyCountLocked(pluginID) == 0 {
+		return false
+	}
+	return sandboxHostedPluginFromInstance(loaded.instance).process != nil
+}
+
 func (m *Manager) deferProcessHostStop(pluginID string, process *PluginHostSupervisorProcess) {
 	if process == nil {
 		return
@@ -1145,6 +1157,18 @@ func (m *Manager) deferProcessHostStop(pluginID string, process *PluginHostSuper
 		m.pendingHostStops = make(map[string]*PluginHostSupervisorProcess)
 	}
 	m.pendingHostStops[pluginID] = process
+	m.hostMu.Unlock()
+}
+
+func (m *Manager) deferSandboxProcessStop(pluginID string, process *SandboxProcess) {
+	if process == nil {
+		return
+	}
+	m.hostMu.Lock()
+	if m.pendingSandboxStops == nil {
+		m.pendingSandboxStops = make(map[string]*SandboxProcess)
+	}
+	m.pendingSandboxStops[pluginID] = process
 	m.hostMu.Unlock()
 }
 
@@ -2138,6 +2162,9 @@ func (m *Manager) finishProxyConnection(id uint64, stats ProxyConnectionStats) {
 	if process := m.takePendingHostStopIfDrained(proxyConn.pluginID); process != nil {
 		go m.stopPendingProcessHost(proxyConn.pluginID, process)
 	}
+	if process := m.takePendingSandboxStopIfDrained(proxyConn.pluginID); process != nil {
+		go m.stopPendingSandboxProcess(proxyConn.pluginID, process)
+	}
 }
 
 func (m *Manager) takePendingHostStopIfDrained(pluginID string) *PluginHostSupervisorProcess {
@@ -2159,11 +2186,36 @@ func (m *Manager) takePendingHostStopIfDrained(pluginID string) *PluginHostSuper
 	return process
 }
 
+func (m *Manager) takePendingSandboxStopIfDrained(pluginID string) *SandboxProcess {
+	m.proxyMu.Lock()
+	active := 0
+	for _, conn := range m.proxyConns {
+		if conn.pluginID == pluginID {
+			active++
+		}
+	}
+	m.proxyMu.Unlock()
+	if active > 0 {
+		return nil
+	}
+	m.hostMu.Lock()
+	defer m.hostMu.Unlock()
+	process := m.pendingSandboxStops[pluginID]
+	delete(m.pendingSandboxStops, pluginID)
+	return process
+}
+
 func (m *Manager) stopPendingProcessHost(pluginID string, process *PluginHostSupervisorProcess) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = process.Stop(ctx)
 	m.markHostStopped(pluginID, process.ArtifactID, process)
+}
+
+func (m *Manager) stopPendingSandboxProcess(_ string, process *SandboxProcess) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = process.Stop(ctx)
 }
 
 // loadLocked 加载或复用插件实例。调用方必须持有 m.mu，确保 loaded 缓存和
@@ -2929,6 +2981,16 @@ func runProtocolProxy(ctx context.Context, handle *ProxyConnectionHandle, client
 		go func() {
 			select {
 			case <-ctx.Done():
+				_ = client.Close()
+				_ = endpoint.Close()
+			case <-stopContext:
+			}
+		}()
+	}
+	if signaler, ok := endpoint.(interface{ ProxyCloseSignal() <-chan struct{} }); ok {
+		go func() {
+			select {
+			case <-signaler.ProxyCloseSignal():
 				_ = client.Close()
 				_ = endpoint.Close()
 			case <-stopContext:

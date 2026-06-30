@@ -77,6 +77,7 @@ type SandboxProcess struct {
 	RuntimeInstanceID string
 	Generation        int64
 	Protocol          string
+	UpstreamMode      string
 	PID               int
 	StartedAt         int64
 	Policy            SandboxPolicy
@@ -106,6 +107,7 @@ type SandboxProcess struct {
 	lastCrashAt int64
 
 	controlInvoker sandboxControlInvoker
+	streamDialer   sandboxStreamDialer
 	operations     *PluginOperations
 }
 
@@ -128,27 +130,28 @@ type SandboxControlRequest struct {
 }
 
 type SandboxControlResponse struct {
-	RequestID         string                    `json:"request_id,omitempty"`
-	Command           string                    `json:"command,omitempty"`
-	Protocol          string                    `json:"protocol"`
-	PluginID          string                    `json:"plugin_id,omitempty"`
-	ArtifactID        string                    `json:"artifact_id,omitempty"`
-	RuntimeInstanceID string                    `json:"runtime_instance_id,omitempty"`
-	Generation        int64                     `json:"generation"`
-	TraceID           string                    `json:"trace_id,omitempty"`
-	DeadlineUnixMS    int64                     `json:"deadline,omitempty"`
-	OK                bool                      `json:"ok"`
-	Code              string                    `json:"code,omitempty"`
-	ErrorCode         string                    `json:"error_code,omitempty"`
-	Error             string                    `json:"error,omitempty"`
-	Handshake         *SandboxHandshakeResponse `json:"handshake,omitempty"`
-	Init              *SandboxInitResponse      `json:"init,omitempty"`
-	Register          *SandboxRegisterResponse  `json:"register,omitempty"`
-	Metrics           *SandboxMetricsResponse   `json:"metrics,omitempty"`
-	Health            *RuntimeHealth            `json:"health,omitempty"`
-	Diagnostics       *SandboxDiagnosticSummary `json:"diagnostics,omitempty"`
-	Secret            *SandboxSecretResponse    `json:"secret,omitempty"`
-	Invoke            *SandboxInvokeResponse    `json:"invoke,omitempty"`
+	RequestID         string                     `json:"request_id,omitempty"`
+	Command           string                     `json:"command,omitempty"`
+	Protocol          string                     `json:"protocol"`
+	PluginID          string                     `json:"plugin_id,omitempty"`
+	ArtifactID        string                     `json:"artifact_id,omitempty"`
+	RuntimeInstanceID string                     `json:"runtime_instance_id,omitempty"`
+	Generation        int64                      `json:"generation"`
+	TraceID           string                     `json:"trace_id,omitempty"`
+	DeadlineUnixMS    int64                      `json:"deadline,omitempty"`
+	OK                bool                       `json:"ok"`
+	Code              string                     `json:"code,omitempty"`
+	ErrorCode         string                     `json:"error_code,omitempty"`
+	Error             string                     `json:"error,omitempty"`
+	Handshake         *SandboxHandshakeResponse  `json:"handshake,omitempty"`
+	Init              *SandboxInitResponse       `json:"init,omitempty"`
+	Register          *SandboxRegisterResponse   `json:"register,omitempty"`
+	Metrics           *SandboxMetricsResponse    `json:"metrics,omitempty"`
+	Health            *RuntimeHealth             `json:"health,omitempty"`
+	Diagnostics       *SandboxDiagnosticSummary  `json:"diagnostics,omitempty"`
+	Secret            *SandboxSecretResponse     `json:"secret,omitempty"`
+	Invoke            *SandboxInvokeResponse     `json:"invoke,omitempty"`
+	Stream            *SandboxStreamOpenResponse `json:"stream,omitempty"`
 }
 
 type sandboxHostedPlugin struct {
@@ -265,6 +268,49 @@ type SandboxProviderQueryRequest struct {
 
 type sandboxControlInvoker func(context.Context, string, SandboxControlRequest) (SandboxControlResponse, error)
 
+type sandboxStreamDialer func(context.Context, *SandboxProcess, SandboxStreamOpenResponse) (net.Conn, error)
+
+type SandboxStreamOpenRequest struct {
+	ExtensionPoint   string            `json:"extension_point"`
+	HandlerID        string            `json:"handler_id"`
+	FailPolicy       string            `json:"fail_policy,omitempty"`
+	Protocol         string            `json:"protocol"`
+	StreamID         string            `json:"stream_id"`
+	ConnectionID     string            `json:"connection_id,omitempty"`
+	TraceID          string            `json:"trace_id,omitempty"`
+	Host             string            `json:"host,omitempty"`
+	Upstream         string            `json:"upstream,omitempty"`
+	Metadata         map[string]string `json:"metadata,omitempty"`
+	SourceAddr       string            `json:"source_addr,omitempty"`
+	ServerHost       string            `json:"server_host,omitempty"`
+	RawServerHost    string            `json:"raw_server_host,omitempty"`
+	ProtocolVersion  int               `json:"protocol_version,omitempty"`
+	NextState        int               `json:"next_state,omitempty"`
+	RouteID          string            `json:"route_id,omitempty"`
+	RouteTags        []string          `json:"route_tags,omitempty"`
+	UpstreamRaw      string            `json:"upstream_raw,omitempty"`
+	UpstreamProtocol string            `json:"upstream_protocol,omitempty"`
+	UpstreamAddress  string            `json:"upstream_address,omitempty"`
+	Transport        string            `json:"transport,omitempty"`
+	ServiceName      string            `json:"service_name,omitempty"`
+	ListenerPort     int               `json:"listener_port,omitempty"`
+	DeadlineUnixMS   int64             `json:"deadline_unix_ms,omitempty"`
+}
+
+type SandboxStreamOpenResponse struct {
+	Connected    bool   `json:"connected"`
+	Protocol     string `json:"protocol"`
+	StreamID     string `json:"stream_id"`
+	Endpoint     string `json:"endpoint"`
+	EndpointType string `json:"endpoint_type,omitempty"`
+}
+
+type SandboxStreamCloseRequest struct {
+	Protocol string `json:"protocol"`
+	StreamID string `json:"stream_id"`
+	Reason   string `json:"reason,omitempty"`
+}
+
 func normalizeSandboxPolicy(policy SandboxPolicy) SandboxPolicy {
 	if policy.CPUSeconds <= 0 {
 		policy.CPUSeconds = 2
@@ -345,7 +391,7 @@ func sandboxControlCommands() []string {
 }
 
 func sandboxControlCapabilities() []string {
-	return []string{
+	capabilities := []string{
 		"control.handshake",
 		"control.init",
 		"control.register",
@@ -354,7 +400,17 @@ func sandboxControlCapabilities() []string {
 		"control.drain",
 		"control.stop",
 		"secret.handle",
+		StreamProxyProtocolV1,
+		"stream.open",
+		"stream.close",
+		"stream.half_close",
+		"stream.deadline",
+		"stream.backpressure",
+		"stream.cancel",
+		"stream.byte_accounting",
 	}
+	capabilities = append(capabilities, StreamProxyCapabilities()...)
+	return capabilities
 }
 
 func sandboxControlStartupTimeout(timeout time.Duration) time.Duration {
@@ -426,6 +482,7 @@ func (a SandboxProcessAdapter) Start(ctx context.Context, prepared RuntimePrepar
 	if err != nil {
 		return RuntimeInstance{}, err
 	}
+	process.UpstreamMode = upstreamModeFromArtifact(artifact)
 	plugin := sandboxHostedPlugin{process: process}
 	if err := plugin.Init(gateway); err != nil {
 		_ = process.Stop(ctx)
@@ -492,7 +549,18 @@ func (a SandboxProcessAdapter) ReloadConfig(ctx context.Context, instance Runtim
 	return nil
 }
 
-func (a SandboxProcessAdapter) Drain(context.Context, RuntimeInstance) error {
+func (a SandboxProcessAdapter) Drain(ctx context.Context, instance RuntimeInstance) error {
+	hosted := sandboxHostedPluginFromInstance(instance.Plugin)
+	if hosted.process == nil {
+		return nil
+	}
+	resp, err := hosted.process.sendControlRequest(ctx, sandboxControlCommandDrain, "", nil)
+	if err != nil {
+		return err
+	}
+	if !resp.OK {
+		return sandboxResponseError(resp, api.FailPolicyClose)
+	}
 	return nil
 }
 
@@ -1128,8 +1196,8 @@ func normalizeSandboxRegistrations(req SandboxRegisterRequest) ([]SandboxHandler
 		if reg.ExtensionPoint == "" {
 			return nil, nil, errors.New("extension_point is required")
 		}
-		if !supportedSandboxRequestResponseExtensionPoint(reg.ExtensionPoint) {
-			return nil, nil, fmt.Errorf("unsupported sandbox request/response extension_point %q", reg.ExtensionPoint)
+		if !supportedSandboxRegistrationExtensionPoint(reg.ExtensionPoint) {
+			return nil, nil, fmt.Errorf("unsupported sandbox extension_point %q", reg.ExtensionPoint)
 		}
 		if reg.HandlerID == "" {
 			return nil, nil, errors.New("handler_id is required")
@@ -1175,6 +1243,10 @@ func supportedSandboxRequestResponseExtensionPoint(point string) bool {
 	default:
 		return false
 	}
+}
+
+func supportedSandboxRegistrationExtensionPoint(point string) bool {
+	return supportedSandboxRequestResponseExtensionPoint(point) || point == ExtensionUpstreamConnect
 }
 
 func validSandboxControlFailPolicy(policy string) bool {
@@ -1448,6 +1520,7 @@ func (p *SandboxProcess) Diagnostics() SandboxDiagnosticSummary {
 		EnforcementAttributes: map[string]string{
 			"control_channel": sandboxControlChannelUnix,
 			"protocol":        protocol,
+			"stream_protocol": StreamProxyProtocolV1,
 			"filesystem":      "chroot-staged-root-with-explicit-roots",
 			"network":         "newnet-without-host-network-by-default",
 			"environment":     "explicit-allowlist-no-secret-env",
@@ -1476,6 +1549,7 @@ func sandboxDiagnosticsDetails(summary SandboxDiagnosticSummary) map[string]any 
 	return map[string]any{
 		"protocol":               sandboxProcessProtocol,
 		"control_channel":        sandboxControlChannelUnix,
+		"stream_protocol":        StreamProxyProtocolV1,
 		"pid":                    summary.PID,
 		"control_rpc":            summary.ControlRPC,
 		"filesystem_enforced":    summary.FilesystemEnforced,
@@ -1504,6 +1578,20 @@ func (p sandboxHostedPlugin) Init(gateway api.Gateway) error {
 	for _, registration := range p.process.Registrations {
 		reg := registration
 		switch reg.ExtensionPoint {
+		case ExtensionUpstreamConnect:
+			if p.process.UpstreamMode != UpstreamModeProtocolProxy {
+				return errors.New("sandbox-process upstream.connect/v1 requires stream.proxy/v1 protocol-proxy mode; dialer semantics are unsupported")
+			}
+			if err := api.RegisterHookHandler(
+				gateway,
+				api.HookUpstreamConnect,
+				func(api.UpstreamConnectRequest) bool { return true },
+				func(req api.UpstreamConnectRequest) (net.Conn, error) {
+					return p.openStream(req.Context, req, reg)
+				},
+			); err != nil {
+				return err
+			}
 		case ExtensionRouteResolve:
 			if err := api.RegisterHookHandler(
 				gateway,
@@ -1574,7 +1662,7 @@ func (p sandboxHostedPlugin) Init(gateway api.Gateway) error {
 			// Config validation is called through ReloadConfig/DryRunConfig, not
 			// through Gateway dispatch snapshots.
 		default:
-			return fmt.Errorf("sandbox extension point %q is not supported by the S3 request/response data-plane", reg.ExtensionPoint)
+			return fmt.Errorf("sandbox extension point %q is not supported by the sandbox data-plane", reg.ExtensionPoint)
 		}
 	}
 	return nil
@@ -1742,6 +1830,326 @@ func (p sandboxHostedPlugin) deliverEvent(req api.EventDeliveryRequest, reg Sand
 		return api.EventDeliveryResult{}, err
 	}
 	return *resp.EventResult, nil
+}
+
+func (p sandboxHostedPlugin) openStream(ctx context.Context, req api.UpstreamConnectRequest, reg SandboxHandlerRegistration) (net.Conn, error) {
+	if p.process == nil {
+		return nil, newSandboxInvocationError(sandboxControlErrorProcessExited, reg.FailPolicy, "sandbox process is nil")
+	}
+	if p.process.UpstreamMode != UpstreamModeProtocolProxy {
+		return nil, newSandboxInvocationError(sandboxControlErrorNotImplemented, reg.FailPolicy, "sandbox-process only supports upstream.connect/v1 through stream.proxy/v1 protocol-proxy")
+	}
+	callerCtx := pluginHostCallerContext(ctx)
+	if callerCtx == nil {
+		callerCtx = context.Background()
+	}
+	controlCtx := callerCtx
+	if timeout := sandboxHandlerTimeoutForExtension(p.process.Registrations, reg.ExtensionPoint); timeout > 0 {
+		var cancel context.CancelFunc
+		controlCtx, cancel = context.WithTimeout(callerCtx, timeout)
+		defer cancel()
+	}
+	streamReq := sandboxStreamOpenRequest(req, reg)
+	payload, err := json.Marshal(streamReq)
+	if err != nil {
+		return nil, err
+	}
+	start := time.Now()
+	resp, err := p.process.sendControlRequest(controlCtx, sandboxControlCommandStreamOpen, reg.ExtensionPoint, payload)
+	duration := time.Since(start)
+	if err != nil {
+		p.process.recordSandboxTrace(callerCtx, reg, sandboxErrorCode(err), duration)
+		return nil, err
+	}
+	if !resp.OK {
+		err := sandboxResponseError(resp, reg.FailPolicy)
+		p.process.recordSandboxTrace(callerCtx, reg, sandboxErrorCode(err), duration)
+		return nil, err
+	}
+	if resp.Stream == nil {
+		err := newSandboxInvocationError(sandboxControlErrorBadResponse, reg.FailPolicy, "sandbox stream_open response missing stream payload")
+		p.process.recordSandboxTrace(callerCtx, reg, sandboxControlErrorBadResponse, duration)
+		return nil, err
+	}
+	stream := *resp.Stream
+	if stream.Protocol == "" {
+		stream.Protocol = StreamProxyProtocolV1
+	}
+	if stream.StreamID == "" {
+		stream.StreamID = streamReq.StreamID
+	}
+	if err := validateSandboxStreamOpenResponse(streamReq, stream); err != nil {
+		status := sandboxControlErrorBadResponse
+		if errors.Is(err, api.ErrPass) {
+			status = "pass"
+		}
+		p.process.recordSandboxTrace(callerCtx, reg, status, duration)
+		return nil, err
+	}
+	dialer := p.process.streamDialer
+	if dialer == nil {
+		dialer = dialSandboxStreamEndpoint
+	}
+	endpoint, err := dialer(controlCtx, p.process, stream)
+	if err != nil {
+		p.process.recordSandboxTrace(callerCtx, reg, sandboxErrorCode(err), duration)
+		return nil, err
+	}
+	if deadline, ok := callerCtx.Deadline(); ok {
+		_ = endpoint.SetDeadline(deadline)
+	}
+	endpoint = bindSandboxStreamEndpoint(callerCtx, p.process, stream.StreamID, endpoint)
+	p.process.recordSandboxTrace(callerCtx, reg, "ok", duration)
+	return endpoint, nil
+}
+
+func sandboxStreamOpenRequest(req api.UpstreamConnectRequest, reg SandboxHandlerRegistration) SandboxStreamOpenRequest {
+	sourceAddr := req.SourceAddr
+	if sourceAddr == "" && req.Source != nil && req.Source.RemoteAddr() != nil {
+		sourceAddr = req.Source.RemoteAddr().String()
+	}
+	out := SandboxStreamOpenRequest{
+		ExtensionPoint:   reg.ExtensionPoint,
+		HandlerID:        reg.HandlerID,
+		FailPolicy:       reg.FailPolicy,
+		Protocol:         StreamProxyProtocolV1,
+		StreamID:         newSandboxStreamID(),
+		ConnectionID:     req.ConnectionID,
+		TraceID:          req.TraceID,
+		Host:             req.Host,
+		Upstream:         req.Upstream,
+		Metadata:         redactSandboxStreamMetadata(req.Metadata),
+		SourceAddr:       sourceAddr,
+		ServerHost:       req.ServerHost,
+		RawServerHost:    req.RawServerHost,
+		ProtocolVersion:  req.ProtocolVersion,
+		NextState:        req.NextState,
+		RouteID:          req.RouteID,
+		RouteTags:        append([]string(nil), req.RouteTags...),
+		UpstreamRaw:      req.UpstreamRaw,
+		UpstreamProtocol: req.UpstreamProtocol,
+		UpstreamAddress:  req.UpstreamAddress,
+		Transport:        req.Transport,
+		ServiceName:      req.ServiceName,
+		ListenerPort:     req.ListenerPort,
+	}
+	if ctx := pluginHostCallerContext(req.Context); ctx != nil {
+		if deadline, ok := ctx.Deadline(); ok {
+			out.DeadlineUnixMS = deadline.UnixMilli()
+		}
+	}
+	return out
+}
+
+func validateSandboxStreamOpenResponse(req SandboxStreamOpenRequest, resp SandboxStreamOpenResponse) error {
+	if !resp.Connected {
+		return api.ErrPass
+	}
+	if strings.TrimSpace(resp.Protocol) != StreamProxyProtocolV1 {
+		return newSandboxInvocationError(sandboxControlErrorBadResponse, req.FailPolicy, "sandbox stream_open response protocol mismatch")
+	}
+	if strings.TrimSpace(resp.StreamID) != req.StreamID {
+		return newSandboxInvocationError(sandboxControlErrorBadResponse, req.FailPolicy, "sandbox stream_open response stream_id mismatch")
+	}
+	if strings.TrimSpace(resp.Endpoint) == "" {
+		return newSandboxInvocationError(sandboxControlErrorBadResponse, req.FailPolicy, "sandbox stream_open response endpoint is required")
+	}
+	if endpointType := strings.TrimSpace(resp.EndpointType); endpointType != "" && endpointType != "unix" {
+		return newSandboxInvocationError(sandboxControlErrorBadResponse, req.FailPolicy, "sandbox stream_open endpoint_type must be unix")
+	}
+	return nil
+}
+
+func dialSandboxStreamEndpoint(ctx context.Context, process *SandboxProcess, stream SandboxStreamOpenResponse) (net.Conn, error) {
+	address, err := sandboxStreamUnixAddress(process, stream)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", address)
+	if err != nil {
+		return nil, err
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	return conn, nil
+}
+
+func sandboxStreamUnixAddress(process *SandboxProcess, stream SandboxStreamOpenResponse) (string, error) {
+	endpoint := strings.TrimSpace(stream.Endpoint)
+	if strings.HasPrefix(endpoint, "unix://") {
+		endpoint = strings.TrimPrefix(endpoint, "unix://")
+	}
+	if endpoint == "" {
+		return "", errors.New("sandbox stream endpoint is required")
+	}
+	if strings.Contains(endpoint, "\x00") {
+		return "", errors.New("sandbox stream endpoint contains NUL")
+	}
+	if strings.HasPrefix(endpoint, "/run/") && process != nil && strings.TrimSpace(process.RootDir) != "" {
+		endpoint = filepath.Join(process.RootDir, strings.TrimPrefix(endpoint, "/"))
+	} else if !filepath.IsAbs(endpoint) {
+		if process == nil || strings.TrimSpace(process.RootDir) == "" {
+			return "", errors.New("sandbox stream endpoint must be absolute")
+		}
+		endpoint = filepath.Join(process.RootDir, endpoint)
+	}
+	if process != nil && strings.TrimSpace(process.RootDir) != "" {
+		root, err := filepath.Abs(process.RootDir)
+		if err != nil {
+			return "", err
+		}
+		address, err := filepath.Abs(endpoint)
+		if err != nil {
+			return "", err
+		}
+		if address != root && !strings.HasPrefix(address, root+string(filepath.Separator)) {
+			return "", errors.New("sandbox stream endpoint escapes sandbox root")
+		}
+		endpoint = address
+	}
+	return endpoint, nil
+}
+
+func bindSandboxStreamEndpoint(ctx context.Context, process *SandboxProcess, streamID string, conn net.Conn) net.Conn {
+	if conn == nil {
+		return nil
+	}
+	done := make(chan struct{})
+	closeSignal := make(chan struct{})
+	var once sync.Once
+	var signalOnce sync.Once
+	stop := func() {
+		once.Do(func() { close(done) })
+	}
+	signalClose := func() {
+		signalOnce.Do(func() { close(closeSignal) })
+	}
+	go func() {
+		var processDone <-chan struct{}
+		if process != nil {
+			processDone = process.done
+		}
+		var ctxDone <-chan struct{}
+		if ctx != nil {
+			ctxDone = ctx.Done()
+		}
+		select {
+		case <-ctxDone:
+			signalClose()
+			_ = conn.Close()
+		case <-processDone:
+			signalClose()
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
+	return &sandboxStreamConn{
+		Conn:        &contextBoundConn{Conn: conn, stop: stop},
+		process:     process,
+		streamID:    streamID,
+		closeSignal: closeSignal,
+	}
+}
+
+type sandboxStreamConn struct {
+	net.Conn
+	process     *SandboxProcess
+	streamID    string
+	closeSignal <-chan struct{}
+	once        sync.Once
+}
+
+func (c *sandboxStreamConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(func() {
+		c.notifyClosed()
+	})
+	return err
+}
+
+func (c *sandboxStreamConn) CloseWrite() error {
+	if closer, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return closer.CloseWrite()
+	}
+	return nil
+}
+
+func (c *sandboxStreamConn) CloseRead() error {
+	if closer, ok := c.Conn.(interface{ CloseRead() error }); ok {
+		return closer.CloseRead()
+	}
+	return nil
+}
+
+func (c *sandboxStreamConn) ProxyCloseSignal() <-chan struct{} {
+	return c.closeSignal
+}
+
+func (c *sandboxStreamConn) notifyClosed() {
+	if c.process == nil || strings.TrimSpace(c.streamID) == "" {
+		return
+	}
+	select {
+	case <-c.process.done:
+		return
+	default:
+	}
+	payload, err := json.Marshal(SandboxStreamCloseRequest{
+		Protocol: StreamProxyProtocolV1,
+		StreamID: c.streamID,
+		Reason:   "gateway_stream_closed",
+	})
+	if err != nil {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		_, _ = c.process.sendControlRequest(ctx, sandboxControlCommandStreamClose, ExtensionUpstreamConnect, payload)
+	}()
+}
+
+func newSandboxStreamID() string {
+	return "stream-" + strings.TrimPrefix(newSandboxRuntimeInstanceID(), "sandbox-")
+}
+
+func redactSandboxStreamMetadata(metadata map[string]string) map[string]string {
+	if len(metadata) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(metadata))
+	for key := range metadata {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make(map[string]string, len(keys))
+	for _, key := range keys {
+		cleanKey := strings.TrimSpace(key)
+		if cleanKey == "" {
+			continue
+		}
+		value := metadata[key]
+		if sandboxStreamSensitiveText(cleanKey) || sandboxStreamSensitiveText(value) {
+			out[cleanKey] = "[redacted]"
+			continue
+		}
+		out[cleanKey] = value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func sandboxStreamSensitiveText(value string) bool {
+	lower := strings.ToLower(value)
+	for _, marker := range []string{"secret", "token", "password", "authorization"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (p sandboxHostedPlugin) invoke(ctx context.Context, reg SandboxHandlerRegistration, req SandboxInvokeRequest) (SandboxInvokeResponse, error) {
