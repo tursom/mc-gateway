@@ -894,7 +894,7 @@ func (po *PluginOperations) ExternalDependencySummary(name string) (ExternalDepe
 		po.externals[name] = runtime
 	}
 	po.mu.Unlock()
-	return runtime.summary(po.pluginID, name), nil
+	return runtime.summary(po.pluginID, name, po.manifest.Runtime.Type), nil
 }
 
 func (po *PluginOperations) HealthCheckExternalDependency(ctx context.Context, name string) (ExternalDependencySummary, error) {
@@ -1338,7 +1338,7 @@ func (po *PluginOperations) Snapshot(ctx context.Context, pluginID string, handl
 	}
 	externals := make([]ExternalDependencySummary, 0, len(po.externals))
 	for name, ext := range po.externals {
-		externals = append(externals, ext.summary(po.pluginID, name))
+		externals = append(externals, ext.summary(po.pluginID, name, po.manifest.Runtime.Type))
 	}
 	tasks := make([]BackgroundTaskSummary, 0, len(po.tasks))
 	for _, task := range po.tasks {
@@ -2450,17 +2450,22 @@ func (c pluginExternalClient) DoHTTP(ctx context.Context, req api.ExternalReques
 	if err != nil {
 		return api.ExternalResponse{}, err
 	}
-	if req.URL == "" {
-		req.URL = spec.Endpoint
+	start := time.Now()
+	req.URL, err = externalHTTPURLForSpec(spec, req.URL)
+	if err != nil {
+		c.finish(start, "policy_denied", err)
+		c.recordTrace(ctx, start, "http", "policy_denied")
+		return api.ExternalResponse{}, err
 	}
 	if req.Method == "" {
 		req.Method = http.MethodGet
 	}
 	if err := c.beforeRequest(); err != nil {
+		c.finish(start, "circuit_open", err)
+		c.recordTrace(ctx, start, "http", "circuit_open")
 		return api.ExternalResponse{}, err
 	}
 	// beforeRequest 会增加 inflight，后续必须在 defer 中成对减少。
-	start := time.Now()
 	defer c.runtime.inflight.Add(-1)
 
 	timeout := req.Timeout
@@ -2476,6 +2481,7 @@ func (c pluginExternalClient) DoHTTP(ctx context.Context, req api.ExternalReques
 	httpReq, err := http.NewRequestWithContext(ctx, req.Method, req.URL, req.Body)
 	if err != nil {
 		c.finish(start, "request_error", err)
+		c.recordTrace(ctx, start, "http", "request_error")
 		return api.ExternalResponse{}, err
 	}
 	httpReq.Header = req.Header.Clone()
@@ -2505,17 +2511,20 @@ func (c pluginExternalClient) DoHTTP(ctx context.Context, req api.ExternalReques
 	}
 	if lastErr != nil {
 		c.finish(start, "error", lastErr)
+		c.recordTrace(ctx, start, "http", "error")
 		return api.ExternalResponse{}, lastErr
 	}
 	defer resp.Body.Close()
 	body, err := readLimited(resp.Body, 1024*1024)
 	if err != nil {
 		c.finish(start, "read_error", err)
+		c.recordTrace(ctx, start, "http", "read_error")
 		return api.ExternalResponse{}, err
 	}
 	if resp.StatusCode >= 500 {
 		err := fmt.Errorf("external dependency %s returned status %d", c.name, resp.StatusCode)
 		c.finish(start, fmt.Sprintf("http_%d", resp.StatusCode), err)
+		c.recordTrace(ctx, start, "http", fmt.Sprintf("http_%d", resp.StatusCode))
 		return api.ExternalResponse{}, err
 	}
 	c.finish(start, fmt.Sprintf("http_%d", resp.StatusCode), nil)
@@ -2531,16 +2540,21 @@ func (c pluginExternalClient) DialTCP(ctx context.Context, address string, timeo
 	if err != nil {
 		return nil, err
 	}
-	if address == "" {
-		address = strings.TrimPrefix(spec.Endpoint, "tcp://")
+	start := time.Now()
+	address, err = externalTCPAddressForSpec(spec, address)
+	if err != nil {
+		c.finish(start, "policy_denied", err)
+		c.recordTrace(ctx, start, "tcp", "policy_denied")
+		return nil, err
 	}
 	if timeout <= 0 {
 		timeout = parseDurationDefault(spec.Timeout, DefaultExternalTimeout)
 	}
 	if err := c.beforeRequest(); err != nil {
+		c.finish(start, "circuit_open", err)
+		c.recordTrace(ctx, start, "tcp", "circuit_open")
 		return nil, err
 	}
-	start := time.Now()
 	defer c.runtime.inflight.Add(-1)
 	dialCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -2549,6 +2563,7 @@ func (c pluginExternalClient) DialTCP(ctx context.Context, address string, timeo
 	conn, err := dialer.DialContext(dialCtx, "tcp", address)
 	if err != nil {
 		c.finish(start, "dial_error", err)
+		c.recordTrace(ctx, start, "tcp", "dial_error")
 		return nil, err
 	}
 	c.finish(start, "ok", nil)
@@ -2591,6 +2606,73 @@ func (c pluginExternalClient) declaredSpec() (ExternalSpec, error) {
 		return ExternalSpec{}, fmt.Errorf("external dependency %q is not declared by manifest", c.name)
 	}
 	return spec, nil
+}
+
+func externalHTTPURLForSpec(spec ExternalSpec, raw string) (string, error) {
+	endpoint, err := url.Parse(strings.TrimSpace(spec.Endpoint))
+	if err != nil || endpoint.Scheme == "" || endpoint.Host == "" {
+		return "", fmt.Errorf("external dependency %q endpoint is invalid", spec.Name)
+	}
+	if endpoint.Scheme != "http" && endpoint.Scheme != "https" {
+		return "", fmt.Errorf("external dependency %q does not allow HTTP access", spec.Name)
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return endpoint.String(), nil
+	}
+	target, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("external dependency %q request URL is invalid", spec.Name)
+	}
+	if !target.IsAbs() {
+		target = endpoint.ResolveReference(target)
+	}
+	if target.Scheme != endpoint.Scheme || !strings.EqualFold(target.Host, endpoint.Host) {
+		return "", fmt.Errorf("external dependency %q request URL is outside declared endpoint", spec.Name)
+	}
+	if !externalHTTPPathInScope(endpoint.Path, target.Path) {
+		return "", fmt.Errorf("external dependency %q request URL is outside declared endpoint path", spec.Name)
+	}
+	return target.String(), nil
+}
+
+func externalHTTPPathInScope(scopePath, targetPath string) bool {
+	scopePath = cleanExternalHTTPPath(scopePath)
+	targetPath = cleanExternalHTTPPath(targetPath)
+	if scopePath == "/" {
+		return true
+	}
+	return targetPath == scopePath || strings.HasPrefix(targetPath, scopePath+"/")
+}
+
+func cleanExternalHTTPPath(value string) string {
+	if value == "" {
+		return "/"
+	}
+	clean := path.Clean(value)
+	if clean == "." {
+		return "/"
+	}
+	if !strings.HasPrefix(clean, "/") {
+		clean = "/" + clean
+	}
+	return clean
+}
+
+func externalTCPAddressForSpec(spec ExternalSpec, address string) (string, error) {
+	endpoint := strings.TrimSpace(spec.Endpoint)
+	if !strings.HasPrefix(endpoint, "tcp://") {
+		return "", fmt.Errorf("external dependency %q does not allow TCP access", spec.Name)
+	}
+	declared := strings.TrimPrefix(endpoint, "tcp://")
+	address = strings.TrimSpace(address)
+	if address == "" {
+		return declared, nil
+	}
+	if !strings.EqualFold(address, declared) {
+		return "", fmt.Errorf("external dependency %q request address is outside declared endpoint", spec.Name)
+	}
+	return address, nil
 }
 
 // beforeRequest 检查熔断窗口并记录并发请求数。成功进入请求路径后，
@@ -2642,18 +2724,26 @@ func (c pluginExternalClient) recordTrace(ctx context.Context, start time.Time, 
 		Status:       status,
 		DurationMS:   time.Since(start).Milliseconds(),
 	}, map[string]string{
-		"endpoint": redactEndpoint(c.runtime.spec.Endpoint),
-		"purpose":  redactSensitive(c.runtime.spec.Purpose),
+		"endpoint":    redactEndpoint(c.runtime.spec.Endpoint),
+		"purpose":     redactSensitive(c.runtime.spec.Purpose),
+		"timeout_ms":  fmt.Sprintf("%d", parseDurationDefault(c.runtime.spec.Timeout, DefaultExternalTimeout).Milliseconds()),
+		"fail_policy": normalizeExternalFailPolicy(c.runtime.spec),
 	})
 }
 
 // summary 返回外部依赖的可展示状态，并隐藏 endpoint 中可能带账号的信息。
-func (rt *externalRuntime) summary(pluginID, name string) ExternalDependencySummary {
+func (rt *externalRuntime) summary(pluginID, name, runtimeType string) ExternalDependencySummary {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	state := circuitClosed
 	if time.Now().Before(rt.circuitUntil) {
 		state = circuitOpen
+	}
+	networkBoundary := "native go plugins can bypass ExternalClient; gateway observes declared clients but does not provide strong network isolation"
+	networkEnforced := false
+	if runtimeType == RuntimeSandbox {
+		networkBoundary = "sandbox-process raw network is disabled; declared external dependencies use host-mediated ExternalClient policy"
+		networkEnforced = true
 	}
 	return ExternalDependencySummary{
 		PluginID:            pluginID,
@@ -2673,8 +2763,8 @@ func (rt *externalRuntime) summary(pluginID, name string) ExternalDependencySumm
 		RecentError:         rt.recentError,
 		LastStatus:          rt.lastStatus,
 		LastSeenAt:          rt.lastSeenAt,
-		NetworkBoundary:     "native go plugins can bypass ExternalClient; gateway observes declared clients but does not provide strong network isolation",
-		NetworkEnforced:     false,
+		NetworkBoundary:     networkBoundary,
+		NetworkEnforced:     networkEnforced,
 	}
 }
 

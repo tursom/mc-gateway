@@ -17,6 +17,12 @@ type Repository struct {
 	now func() time.Time
 }
 
+type secretMaterial struct {
+	SecretRecord
+	CurrentValue  string
+	PreviousValue string
+}
+
 func NewRepository(db *sql.DB) Repository {
 	return Repository{
 		db:  db,
@@ -820,6 +826,24 @@ SELECT plugin_id, name, current_version, previous_version, reload_required, hot_
 FROM plugin_secrets
 WHERE plugin_id = ? AND name = ?`, pluginID, name)
 	return scanSecret(row)
+}
+
+func (r Repository) SecretMaterial(ctx context.Context, pluginID, name string) (secretMaterial, error) {
+	row := r.db.QueryRowContext(ctx, `
+SELECT plugin_id, name, current_version, previous_version, current_value, previous_value, reload_required, hot_reload, updated_by, created_at, updated_at
+FROM plugin_secrets
+WHERE plugin_id = ? AND name = ?`, pluginID, name)
+	var material secretMaterial
+	var reloadRequired int
+	var hotReload int
+	err := row.Scan(
+		&material.PluginID, &material.Name, &material.CurrentVersion, &material.PreviousVersion,
+		&material.CurrentValue, &material.PreviousValue, &reloadRequired, &hotReload,
+		&material.UpdatedBy, &material.CreatedAt, &material.UpdatedAt,
+	)
+	material.ReloadRequired = reloadRequired != 0
+	material.HotReload = hotReload != 0
+	return material, err
 }
 
 func (r Repository) ListSecrets(ctx context.Context, pluginID string) ([]SecretRecord, error) {

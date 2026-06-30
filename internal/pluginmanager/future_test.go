@@ -772,13 +772,13 @@ func TestSandboxRequiredCapabilityMatrixAndExternalDeps(t *testing.T) {
 		t.Fatalf("preflight = %+v, want supported sandbox capabilities to pass enforcement matrix", preflight)
 	}
 
-	egress := uploadTestArtifactWithManifest(t, manager, "sandbox-egress-blocked", func(manifest *Manifest) {
+	egress := uploadTestArtifactWithManifest(t, manager, "sandbox-egress-supported", func(manifest *Manifest) {
 		manifest.Runtime.Type = RuntimeSandbox
 		manifest.Capabilities = json.RawMessage(`{"runtime":{"required_capabilities":["network.egress"]}}`)
 	})
 	preflight = manager.preflightChecks(context.Background(), PluginRecord{ID: egress.PluginID, ConfigJSON: `{}`}, egress, mustManifestFromArtifact(t, egress), PolicyProfileDev, GovernanceActionEnable, `{}`)
-	if preflight.OK || !preflightCheckCodes(preflight.Checks)["capability_enforcement_unavailable"] {
-		t.Fatalf("preflight = %+v, want network.egress blocked until egress proxy/firewall is implemented", preflight)
+	if preflightCheckCodes(preflight.Checks)["capability_enforcement_unavailable"] {
+		t.Fatalf("preflight = %+v, want network.egress satisfied by external isolation host-mediated policy", preflight)
 	}
 
 	missingEgress := uploadTestArtifactWithManifest(t, manager, "sandbox-external-missing-egress", func(manifest *Manifest) {
@@ -801,19 +801,23 @@ func TestSandboxPolicyDiagnosticsAndSecretHandle(t *testing.T) {
 	if _, err := manager.UpsertSecret(context.Background(), "admin", "sandbox-secret", artifact.ID, "api_token", "plain-secret-value", false, false); err != nil {
 		t.Fatalf("UpsertSecret() error = %v", err)
 	}
-	resp, err := manager.ResolveSandboxSecret(context.Background(), SandboxSecretRequest{PluginID: "sandbox-secret", Handle: "api_token"})
+	plugin, err := manager.repo.UpsertDesired(context.Background(), "admin", "sandbox-secret", artifact.ID, DesiredDisabled, `{"api_secret_ref":"api_token"}`, 10)
+	if err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	resp, err := manager.ResolveSandboxSecret(context.Background(), SandboxSecretRequest{PluginID: "sandbox-secret", ArtifactID: artifact.ID, Generation: plugin.DesiredGeneration, Handle: "api_token"})
 	if err != nil {
 		t.Fatalf("ResolveSandboxSecret() error = %v", err)
 	}
-	if !resp.OK || resp.Version != 1 {
-		t.Fatalf("ResolveSandboxSecret() = %+v, want version-only handle response", resp)
+	if !resp.OK || resp.Version != 1 || resp.Value != "plain-secret-value" || resp.TTLSeconds <= 0 || resp.RedactionHandle == "" {
+		t.Fatalf("ResolveSandboxSecret() = %+v, want short-lived authorized handle response", resp)
 	}
-	missing, err := manager.ResolveSandboxSecret(context.Background(), SandboxSecretRequest{PluginID: "sandbox-secret", Handle: "missing"})
+	missing, err := manager.ResolveSandboxSecret(context.Background(), SandboxSecretRequest{PluginID: "sandbox-secret", ArtifactID: artifact.ID, Generation: plugin.DesiredGeneration, Handle: "missing"})
 	if err != nil {
 		t.Fatalf("ResolveSandboxSecret(missing) error = %v", err)
 	}
-	if missing.OK || !strings.Contains(missing.Error, "not authorized") {
-		t.Fatalf("ResolveSandboxSecret(missing) = %+v, want unauthorized handle", missing)
+	if missing.OK || missing.ErrorCode != "secret_not_declared" {
+		t.Fatalf("ResolveSandboxSecret(missing) = %+v, want undeclared handle denial", missing)
 	}
 	process := &SandboxProcess{
 		PluginID:          "sandbox-secret",
@@ -853,11 +857,11 @@ func TestSandboxPolicyDiagnosticsAndSecretHandle(t *testing.T) {
 		PluginID:          "sandbox-secret",
 		ArtifactID:        artifact.ID,
 		RuntimeInstanceID: "sandbox-secret-runtime",
-		Generation:        1,
+		Generation:        plugin.DesiredGeneration,
 		Payload:           payload,
 	}, manager)
-	if !control.OK || control.Secret == nil || !control.Secret.OK || control.Secret.Version != 1 || control.Secret.Error != "" {
-		t.Fatalf("HandleControlRequest(secret) = %+v, want version-only authorized handle", control)
+	if !control.OK || control.Secret == nil || !control.Secret.OK || control.Secret.Version != 1 || control.Secret.Value != "plain-secret-value" || control.Secret.Error != "" {
+		t.Fatalf("HandleControlRequest(secret) = %+v, want authorized short-lived handle", control)
 	}
 	diagControl := process.HandleControlRequest(context.Background(), SandboxControlRequest{Command: sandboxControlCommandDiagnostics, Protocol: sandboxProcessProtocol}, manager)
 	if !diagControl.OK || diagControl.Diagnostics == nil || !diagControl.Diagnostics.ControlRPC || diagControl.Diagnostics.ControlSocket != "unix:///run/control.sock" {

@@ -429,14 +429,51 @@ type SandboxPolicy struct {
 }
 
 type SandboxSecretRequest struct {
-	PluginID string `json:"plugin_id"`
-	Handle   string `json:"handle"`
+	PluginID          string `json:"plugin_id"`
+	ArtifactID        string `json:"artifact_id,omitempty"`
+	RuntimeInstanceID string `json:"runtime_instance_id,omitempty"`
+	Generation        int64  `json:"generation,omitempty"`
+	Handle            string `json:"handle"`
+	Scope             string `json:"scope,omitempty"`
+	Version           int64  `json:"version,omitempty"`
+	Mode              string `json:"mode,omitempty"`
 }
 
 type SandboxSecretResponse struct {
-	OK      bool   `json:"ok"`
-	Version int64  `json:"version,omitempty"`
-	Error   string `json:"error,omitempty"`
+	OK              bool   `json:"ok"`
+	Value           string `json:"value,omitempty"`
+	Token           string `json:"token,omitempty"`
+	TTLSeconds      int64  `json:"ttl_seconds,omitempty"`
+	ExpiresAt       int64  `json:"expires_at,omitempty"`
+	Version         int64  `json:"version,omitempty"`
+	Scope           string `json:"scope,omitempty"`
+	RedactionHandle string `json:"redaction_handle,omitempty"`
+	ErrorCode       string `json:"error_code,omitempty"`
+	Error           string `json:"error,omitempty"`
+}
+
+type SandboxExternalRequest struct {
+	Name        string              `json:"name"`
+	Protocol    string              `json:"protocol,omitempty"`
+	Method      string              `json:"method,omitempty"`
+	URL         string              `json:"url,omitempty"`
+	Headers     map[string][]string `json:"headers,omitempty"`
+	Body        []byte              `json:"body,omitempty"`
+	TimeoutMS   int64               `json:"timeout_ms,omitempty"`
+	HealthCheck bool                `json:"health_check,omitempty"`
+}
+
+type SandboxExternalResponse struct {
+	OK         bool                       `json:"ok"`
+	Name       string                     `json:"name,omitempty"`
+	StatusCode int                        `json:"status_code,omitempty"`
+	Headers    map[string][]string        `json:"headers,omitempty"`
+	Body       []byte                     `json:"body,omitempty"`
+	TimeoutMS  int64                      `json:"timeout_ms,omitempty"`
+	FailPolicy string                     `json:"fail_policy,omitempty"`
+	Summary    *ExternalDependencySummary `json:"summary,omitempty"`
+	ErrorCode  string                     `json:"error_code,omitempty"`
+	Error      string                     `json:"error,omitempty"`
 }
 
 type SandboxDiagnosticSummary struct {
@@ -1660,13 +1697,16 @@ type ExternalDependencySummary struct {
 }
 
 type ExternalDependencyHealthCheck struct {
-	PluginID  string                    `json:"plugin_id"`
-	Name      string                    `json:"name"`
-	OK        bool                      `json:"ok"`
-	Error     string                    `json:"error,omitempty"`
-	Summary   ExternalDependencySummary `json:"summary"`
-	CheckedBy string                    `json:"checked_by"`
-	CheckedAt int64                     `json:"checked_at"`
+	PluginID          string                    `json:"plugin_id"`
+	ArtifactID        string                    `json:"artifact_id,omitempty"`
+	Name              string                    `json:"name"`
+	OK                bool                      `json:"ok"`
+	Error             string                    `json:"error,omitempty"`
+	Summary           ExternalDependencySummary `json:"summary"`
+	RuntimeStatus     string                    `json:"runtime_status,omitempty"`
+	RuntimeGeneration int64                     `json:"runtime_generation,omitempty"`
+	CheckedBy         string                    `json:"checked_by"`
+	CheckedAt         int64                     `json:"checked_at"`
 }
 
 type DiagnosticPackageSummary struct {

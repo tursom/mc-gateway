@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,6 +42,7 @@ const (
 	sandboxControlCommandHealth          = "health"
 	sandboxControlCommandDiagnostics     = "diagnostics"
 	sandboxControlCommandSecret          = "secret.resolve"
+	sandboxControlCommandExternal        = "external.request"
 	sandboxControlErrorProtocolMismatch  = "protocol_mismatch"
 	sandboxControlErrorABIMismatch       = "abi_mismatch"
 	sandboxControlErrorUnknownCommand    = "unknown_command"
@@ -52,10 +55,13 @@ const (
 	sandboxControlErrorRegisterFailed    = "register_failed"
 	sandboxControlErrorNotImplemented    = "not_implemented"
 	sandboxControlErrorSecretUnavailable = "secret_unavailable"
+	sandboxControlErrorExternalDenied    = "external_dependency_denied"
 	sandboxControlErrorBadResponse       = "bad_response"
 	sandboxControlErrorProcessExited     = "process_exited"
 	sandboxDefaultWritableRuntimeDir     = "/tmp"
 	sandboxControlRuntimeDir             = "/run"
+	sandboxSecretDefaultTTL              = 60 * time.Second
+	sandboxSecretMaxTTL                  = 5 * time.Minute
 )
 
 type SandboxProcessAdapter struct {
@@ -155,6 +161,7 @@ type SandboxControlResponse struct {
 	Health            *RuntimeHealth             `json:"health,omitempty"`
 	Diagnostics       *SandboxDiagnosticSummary  `json:"diagnostics,omitempty"`
 	Secret            *SandboxSecretResponse     `json:"secret,omitempty"`
+	External          *SandboxExternalResponse   `json:"external,omitempty"`
 	Invoke            *SandboxInvokeResponse     `json:"invoke,omitempty"`
 	Stream            *SandboxStreamOpenResponse `json:"stream,omitempty"`
 }
@@ -472,11 +479,14 @@ func sandboxEnforcementFacts(policy SandboxPolicy) []SandboxEnforcementFact {
 			Category: "network",
 			Key:      "egress_policy",
 			Required: true,
-			Enforced: !policy.NetworkEnabled,
-			Method:   "default-deny-no-egress-proxy",
+			Enforced: !policy.NetworkEnabled && policy.ExternalIsolation,
+			Method:   sandboxEgressPolicyMethod(policy),
 			UnsupportedReason: func() string {
 				if policy.NetworkEnabled {
 					return "egress proxy/firewall/sidecar enforcement is not configured"
+				}
+				if !policy.ExternalIsolation {
+					return "host-mediated external dependency policy requires sandbox policy external_isolation=true"
 				}
 				return ""
 			}(),
@@ -513,6 +523,13 @@ func sandboxEnforcementFacts(policy SandboxPolicy) []SandboxEnforcementFact {
 
 func sandboxEnforcementReportForPolicy(policy SandboxPolicy) sandboxEnforcementReport {
 	return sandboxEnforcementReport{Facts: sandboxEnforcementFacts(policy)}
+}
+
+func sandboxEgressPolicyMethod(policy SandboxPolicy) string {
+	if policy.ExternalIsolation && !policy.NetworkEnabled {
+		return "default-deny-raw-network+host-mediated-external-client"
+	}
+	return "default-deny-no-egress-proxy"
 }
 
 func sandboxEnforcementMethod(parts ...string) string {
@@ -581,6 +598,10 @@ func sandboxControlCommands() []string {
 		sandboxControlCommandMetrics,
 		sandboxControlCommandDrain,
 		sandboxControlCommandStop,
+		sandboxControlCommandHealth,
+		sandboxControlCommandDiagnostics,
+		sandboxControlCommandSecret,
+		sandboxControlCommandExternal,
 	}
 }
 
@@ -594,6 +615,8 @@ func sandboxControlCapabilities() []string {
 		"control.drain",
 		"control.stop",
 		"secret.handle",
+		"external.dependency",
+		"network.egress",
 		StreamProxyProtocolV1,
 		"stream.open",
 		"stream.close",
@@ -1169,6 +1192,15 @@ func (p *SandboxProcess) HandleControlRequest(ctx context.Context, req SandboxCo
 		if strings.TrimSpace(payload.PluginID) == "" {
 			payload.PluginID = p.PluginID
 		}
+		if strings.TrimSpace(payload.ArtifactID) == "" {
+			payload.ArtifactID = req.ArtifactID
+		}
+		if strings.TrimSpace(payload.RuntimeInstanceID) == "" {
+			payload.RuntimeInstanceID = req.RuntimeInstanceID
+		}
+		if payload.Generation == 0 {
+			payload.Generation = req.Generation
+		}
 		secret, err := resolver.ResolveSandboxSecret(ctx, payload)
 		if err != nil {
 			resp = setSandboxControlError(resp, sandboxControlErrorSecretUnavailable, err.Error())
@@ -1180,6 +1212,27 @@ func (p *SandboxProcess) HandleControlRequest(ctx context.Context, req SandboxCo
 		if !secret.OK && resp.ErrorCode == "" {
 			resp.Code = sandboxControlErrorSecretUnavailable
 			resp.ErrorCode = sandboxControlErrorSecretUnavailable
+			if secret.ErrorCode != "" {
+				resp.Code = secret.ErrorCode
+				resp.ErrorCode = secret.ErrorCode
+			}
+		}
+	case sandboxControlCommandExternal:
+		external, err := p.handleSandboxExternalRequest(ctx, req)
+		if err != nil {
+			resp = setSandboxControlError(resp, sandboxControlErrorExternalDenied, err.Error())
+			break
+		}
+		resp.OK = external.OK
+		resp.External = &external
+		resp.Error = redactSandboxControlMessage(external.Error)
+		if !external.OK {
+			resp.Code = sandboxControlErrorExternalDenied
+			resp.ErrorCode = sandboxControlErrorExternalDenied
+			if external.ErrorCode != "" {
+				resp.Code = external.ErrorCode
+				resp.ErrorCode = external.ErrorCode
+			}
 		}
 	case sandboxControlCommandStop:
 		resp.OK = true
@@ -1191,6 +1244,131 @@ func (p *SandboxProcess) HandleControlRequest(ctx context.Context, req SandboxCo
 	}
 	if !resp.OK {
 		p.failSandboxStartupCommand(command, resp.ErrorCode, resp.Error)
+	}
+	return resp
+}
+
+func (p *SandboxProcess) handleSandboxExternalRequest(ctx context.Context, envelope SandboxControlRequest) (SandboxExternalResponse, error) {
+	var payload SandboxExternalRequest
+	if err := decodeSandboxControlPayload(envelope.Payload, &payload); err != nil {
+		return SandboxExternalResponse{
+			OK:        false,
+			ErrorCode: sandboxControlErrorSchemaInvalid,
+			Error:     redactSensitive(err.Error()),
+		}, nil
+	}
+	payload.Name = strings.TrimSpace(payload.Name)
+	if payload.Name == "" {
+		return SandboxExternalResponse{OK: false, ErrorCode: "external_dependency_name_required", Error: "external dependency name is required"}, nil
+	}
+	if p == nil || p.operations == nil {
+		return SandboxExternalResponse{OK: false, Name: payload.Name, ErrorCode: "external_dependency_unavailable", Error: "sandbox external dependency client is unavailable"}, nil
+	}
+	if envelope.TraceID != "" {
+		ctx = context.WithValue(ctx, traceContextKey{}, traceContext{PluginID: p.PluginID, TraceID: envelope.TraceID})
+	}
+	if envelope.DeadlineUnixMS > 0 {
+		deadline := time.UnixMilli(envelope.DeadlineUnixMS)
+		if time.Until(deadline) <= 0 {
+			return SandboxExternalResponse{OK: false, Name: payload.Name, ErrorCode: "external_dependency_deadline_exceeded", Error: "external dependency request deadline exceeded"}, nil
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	}
+	summary, err := p.operations.ExternalDependencySummary(payload.Name)
+	if err != nil {
+		return sandboxExternalDeniedResponse(payload.Name, "external_dependency_not_declared", err, nil), nil
+	}
+	client := p.operations.ExternalClient(payload.Name)
+	timeout := time.Duration(payload.TimeoutMS) * time.Millisecond
+	if payload.HealthCheck {
+		err := client.HealthCheck(ctx)
+		refreshed, summaryErr := p.operations.ExternalDependencySummary(payload.Name)
+		if summaryErr == nil {
+			summary = refreshed
+		}
+		if err != nil {
+			return sandboxExternalDeniedResponse(payload.Name, "external_dependency_health_failed", err, &summary), nil
+		}
+		return SandboxExternalResponse{
+			OK:         true,
+			Name:       payload.Name,
+			TimeoutMS:  payload.TimeoutMS,
+			FailPolicy: summary.FailPolicy,
+			Summary:    &summary,
+		}, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(payload.Protocol)) {
+	case "", "http", "https":
+		resp, err := client.DoHTTP(ctx, api.ExternalRequest{
+			Method:  payload.Method,
+			URL:     payload.URL,
+			Header:  http.Header(payload.Headers),
+			Body:    bytes.NewReader(payload.Body),
+			Timeout: timeout,
+		})
+		refreshed, summaryErr := p.operations.ExternalDependencySummary(payload.Name)
+		if summaryErr == nil {
+			summary = refreshed
+		}
+		if err != nil {
+			return sandboxExternalDeniedResponse(payload.Name, "external_dependency_request_failed", err, &summary), nil
+		}
+		return SandboxExternalResponse{
+			OK:         true,
+			Name:       payload.Name,
+			StatusCode: resp.StatusCode,
+			Headers:    map[string][]string(resp.Header),
+			Body:       resp.Body,
+			TimeoutMS:  payload.TimeoutMS,
+			FailPolicy: summary.FailPolicy,
+			Summary:    &summary,
+		}, nil
+	case "tcp":
+		conn, err := client.DialTCP(ctx, payload.URL, timeout)
+		if conn != nil {
+			_ = conn.Close()
+		}
+		refreshed, summaryErr := p.operations.ExternalDependencySummary(payload.Name)
+		if summaryErr == nil {
+			summary = refreshed
+		}
+		if err != nil {
+			return sandboxExternalDeniedResponse(payload.Name, "external_dependency_request_failed", err, &summary), nil
+		}
+		return SandboxExternalResponse{
+			OK:         true,
+			Name:       payload.Name,
+			TimeoutMS:  payload.TimeoutMS,
+			FailPolicy: summary.FailPolicy,
+			Summary:    &summary,
+		}, nil
+	default:
+		return SandboxExternalResponse{
+			OK:        false,
+			Name:      payload.Name,
+			ErrorCode: "external_dependency_protocol_unsupported",
+			Error:     "external dependency protocol is unsupported",
+			Summary:   &summary,
+		}, nil
+	}
+}
+
+func sandboxExternalDeniedResponse(name, code string, err error, summary *ExternalDependencySummary) SandboxExternalResponse {
+	message := "external dependency request denied"
+	if err != nil {
+		message = redactSensitive(err.Error())
+	}
+	resp := SandboxExternalResponse{
+		OK:        false,
+		Name:      name,
+		ErrorCode: code,
+		Error:     message,
+		Summary:   summary,
+	}
+	if summary != nil {
+		resp.FailPolicy = summary.FailPolicy
 	}
 	return resp
 }
@@ -1278,7 +1456,8 @@ func sandboxControlCommandKnown(command string) bool {
 		sandboxControlCommandStop,
 		sandboxControlCommandHealth,
 		sandboxControlCommandDiagnostics,
-		sandboxControlCommandSecret:
+		sandboxControlCommandSecret,
+		sandboxControlCommandExternal:
 		return true
 	default:
 		return false
@@ -1297,7 +1476,8 @@ func sandboxControlCommandRequiresIdentity(command string) bool {
 		sandboxControlCommandMetrics,
 		sandboxControlCommandDrain,
 		sandboxControlCommandStop,
-		sandboxControlCommandSecret:
+		sandboxControlCommandSecret,
+		sandboxControlCommandExternal:
 		return true
 	default:
 		return false
@@ -2794,17 +2974,188 @@ func sandboxTraceID(ctx context.Context) string {
 }
 
 func (m *Manager) ResolveSandboxSecret(ctx context.Context, req SandboxSecretRequest) (SandboxSecretResponse, error) {
-	if strings.TrimSpace(req.PluginID) == "" || strings.TrimSpace(req.Handle) == "" {
-		return SandboxSecretResponse{OK: false, Error: "plugin_id and handle are required"}, nil
+	req.PluginID = strings.TrimSpace(req.PluginID)
+	req.ArtifactID = strings.TrimSpace(req.ArtifactID)
+	req.Handle = strings.TrimSpace(req.Handle)
+	if req.PluginID == "" || req.ArtifactID == "" || req.Handle == "" || req.Generation <= 0 {
+		resp := sandboxSecretDeny("invalid_request", "plugin_id, artifact_id, generation and handle are required")
+		m.auditSandboxSecretDenial(ctx, req, resp)
+		return resp, nil
 	}
-	secrets, err := m.repo.ListSecrets(ctx, req.PluginID)
+	plugin, err := m.repo.Plugin(ctx, req.PluginID)
 	if err != nil {
+		resp := sandboxSecretDeny("plugin_not_found", "plugin is not configured")
+		m.auditSandboxSecretDenial(ctx, req, resp)
+		return resp, nil
+	}
+	artifact, err := m.repo.Artifact(ctx, req.ArtifactID)
+	if err != nil {
+		resp := sandboxSecretDeny("artifact_not_found", "artifact is not configured")
+		m.auditSandboxSecretDenial(ctx, req, resp)
+		return resp, nil
+	}
+	if artifact.PluginID != req.PluginID || !sandboxSecretArtifactCurrent(plugin, req.ArtifactID) {
+		resp := sandboxSecretDeny("artifact_mismatch", "secret request artifact does not match current plugin state")
+		m.auditSandboxSecretDenial(ctx, req, resp)
+		return resp, nil
+	}
+	if req.Generation != plugin.DesiredGeneration && (plugin.AppliedGeneration == 0 || req.Generation != plugin.AppliedGeneration) {
+		resp := sandboxSecretDeny("generation_mismatch", "secret request generation does not match current plugin state")
+		m.auditSandboxSecretDenial(ctx, req, resp)
+		return resp, nil
+	}
+	var manifest Manifest
+	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err != nil {
+		resp := sandboxSecretDeny("manifest_invalid", "artifact manifest is invalid")
+		m.auditSandboxSecretDenial(ctx, req, resp)
+		return resp, nil
+	}
+	spec, declared := sandboxManifestSecretSpec(manifest, req.Handle)
+	if !declared {
+		resp := sandboxSecretDeny("secret_not_declared", "secret handle is not declared by manifest")
+		m.auditSandboxSecretDenial(ctx, req, resp)
+		return resp, nil
+	}
+	inScope, err := sandboxSecretInCurrentConfigScope(manifest, plugin.ConfigJSON, req.Handle)
+	if err != nil {
+		resp := sandboxSecretDeny("config_scope_invalid", "current config secret scope is invalid")
+		m.auditSandboxSecretDenial(ctx, req, resp)
+		return resp, nil
+	}
+	if !inScope {
+		resp := sandboxSecretDeny("secret_not_in_config_scope", "secret handle is not in current config scope")
+		m.auditSandboxSecretDenial(ctx, req, resp)
+		return resp, nil
+	}
+	material, err := m.repo.SecretMaterial(ctx, req.PluginID, req.Handle)
+	if err != nil {
+		code := "secret_not_configured"
+		if !errors.Is(err, sql.ErrNoRows) {
+			code = "secret_lookup_failed"
+		}
+		resp := sandboxSecretDeny(code, "secret handle is not configured")
+		m.auditSandboxSecretDenial(ctx, req, resp)
+		if errors.Is(err, sql.ErrNoRows) {
+			return resp, nil
+		}
 		return SandboxSecretResponse{}, err
 	}
-	for _, secret := range secrets {
-		if secret.Name == req.Handle && secret.CurrentVersion > 0 {
-			return SandboxSecretResponse{OK: true, Version: secret.CurrentVersion}, nil
+	value, version, ttl, errCode, errMessage := sandboxSecretVersionValue(req, spec, material, m.repo.now())
+	if errCode != "" {
+		resp := sandboxSecretDeny(errCode, errMessage)
+		m.auditSandboxSecretDenial(ctx, req, resp)
+		return resp, nil
+	}
+	scope := strings.TrimSpace(req.Scope)
+	if scope == "" {
+		scope = "plugin:" + req.PluginID + ":secret:" + req.Handle
+	}
+	now := m.repo.now()
+	ttlSeconds := int64((ttl + time.Second - 1) / time.Second)
+	expiresAt := now.Add(ttl).Unix()
+	resp := SandboxSecretResponse{
+		OK:              true,
+		TTLSeconds:      ttlSeconds,
+		ExpiresAt:       expiresAt,
+		Version:         version,
+		Scope:           scope,
+		RedactionHandle: sandboxSecretRedactionHandle(req.PluginID, req.Handle, version),
+	}
+	mode := strings.ToLower(strings.TrimSpace(req.Mode))
+	secretType := strings.ToLower(strings.TrimSpace(spec.Type))
+	if mode == "token" || (mode == "" && strings.Contains(secretType, "token")) {
+		resp.Token = value
+	} else {
+		resp.Value = value
+	}
+	return resp, nil
+}
+
+func sandboxSecretArtifactCurrent(plugin PluginRecord, artifactID string) bool {
+	for _, candidate := range []string{plugin.ActiveArtifactID, plugin.LoadedArtifactID} {
+		if candidate != "" && candidate == artifactID {
+			return true
 		}
 	}
-	return SandboxSecretResponse{OK: false, Error: "secret handle is not authorized or configured"}, nil
+	return plugin.ActiveArtifactID == "" && plugin.LoadedArtifactID == "" && plugin.DesiredArtifactID == artifactID
+}
+
+func sandboxManifestSecretSpec(manifest Manifest, handle string) (SecretSpec, bool) {
+	for _, spec := range manifest.Secrets {
+		if strings.TrimSpace(spec.Name) == handle {
+			return spec, true
+		}
+	}
+	return SecretSpec{}, false
+}
+
+func sandboxSecretInCurrentConfigScope(manifest Manifest, configJSON, handle string) (bool, error) {
+	refs, err := collectConfigSecretRefs(configJSON)
+	if err != nil {
+		return false, err
+	}
+	for _, spec := range manifest.Secrets {
+		if spec.Required && strings.TrimSpace(spec.Name) != "" {
+			refs[spec.Name] = true
+		}
+	}
+	return refs[handle], nil
+}
+
+func sandboxSecretVersionValue(req SandboxSecretRequest, spec SecretSpec, material secretMaterial, now time.Time) (string, int64, time.Duration, string, string) {
+	version := material.CurrentVersion
+	value := material.CurrentValue
+	ttl := sandboxSecretDefaultTTL
+	if ttl > sandboxSecretMaxTTL {
+		ttl = sandboxSecretMaxTTL
+	}
+	if req.Version == 0 || req.Version == material.CurrentVersion {
+		if material.CurrentVersion <= 0 || material.CurrentValue == "" {
+			return "", 0, 0, "secret_not_configured", "secret handle is not configured"
+		}
+		return value, version, ttl, "", ""
+	}
+	if req.Version != material.PreviousVersion || material.PreviousVersion <= 0 || material.PreviousValue == "" {
+		return "", 0, 0, "secret_version_not_available", "requested secret version is not available"
+	}
+	grace := parseDurationDefault(spec.Rotation.GracePeriod, 30*time.Second)
+	if grace <= 0 {
+		return "", 0, 0, "previous_secret_expired", "previous secret version grace period has expired"
+	}
+	expiresAt := time.Unix(material.UpdatedAt, 0).Add(grace)
+	remaining := expiresAt.Sub(now)
+	if remaining <= 0 {
+		return "", 0, 0, "previous_secret_expired", "previous secret version grace period has expired"
+	}
+	if remaining < ttl {
+		ttl = remaining
+	}
+	return material.PreviousValue, material.PreviousVersion, ttl, "", ""
+}
+
+func sandboxSecretRedactionHandle(pluginID, handle string, version int64) string {
+	return fmt.Sprintf("plugin-secret://%s/%s@v%d#redacted", pluginID, handle, version)
+}
+
+func sandboxSecretDeny(code, message string) SandboxSecretResponse {
+	return SandboxSecretResponse{
+		OK:        false,
+		ErrorCode: code,
+		Error:     redactSensitive(message),
+	}
+}
+
+func (m *Manager) auditSandboxSecretDenial(ctx context.Context, req SandboxSecretRequest, resp SandboxSecretResponse) {
+	if m == nil {
+		return
+	}
+	_ = m.repo.RecordOperation(ctx, req.PluginID, req.ArtifactID, "sandbox_secret_resolve", "failed", "sandbox", "sandbox secret request denied", map[string]any{
+		"handle":      req.Handle,
+		"version":     req.Version,
+		"generation":  req.Generation,
+		"error_code":  resp.ErrorCode,
+		"redacted":    true,
+		"secret_ref":  "plugin://" + req.PluginID + "/" + req.Handle,
+		"artifact_id": req.ArtifactID,
+	})
 }

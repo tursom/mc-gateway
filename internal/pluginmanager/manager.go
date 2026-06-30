@@ -1889,12 +1889,15 @@ func (m *Manager) HealthCheckExternalDependency(ctx context.Context, actor, plug
 	}
 	summary, healthErr := m.operations.ForPlugin(plugin.ID, artifact.ID, manifest).HealthCheckExternalDependency(ctx, dependency)
 	result := ExternalDependencyHealthCheck{
-		PluginID:  plugin.ID,
-		Name:      dependency,
-		OK:        healthErr == nil,
-		Summary:   summary,
-		CheckedBy: actor,
-		CheckedAt: m.repo.now().Unix(),
+		PluginID:          plugin.ID,
+		ArtifactID:        artifact.ID,
+		Name:              dependency,
+		OK:                healthErr == nil,
+		Summary:           summary,
+		RuntimeStatus:     plugin.RuntimeState,
+		RuntimeGeneration: plugin.AppliedGeneration,
+		CheckedBy:         actor,
+		CheckedAt:         m.repo.now().Unix(),
 	}
 	status := "succeeded"
 	message := "external dependency health check succeeded"
@@ -1904,10 +1907,12 @@ func (m *Manager) HealthCheckExternalDependency(ctx context.Context, actor, plug
 		result.Error = redactSensitive(healthErr.Error())
 	}
 	_ = m.repo.RecordOperation(ctx, plugin.ID, artifact.ID, "external_dependency_health_check", status, actor, message, map[string]any{
-		"dependency":    dependency,
-		"ok":            result.OK,
-		"status":        summary.LastStatus,
-		"circuit_state": summary.CircuitState,
+		"dependency":         dependency,
+		"ok":                 result.OK,
+		"status":             summary.LastStatus,
+		"circuit_state":      summary.CircuitState,
+		"runtime_status":     result.RuntimeStatus,
+		"runtime_generation": result.RuntimeGeneration,
 	})
 	return result, nil
 }
@@ -2903,6 +2908,10 @@ func unsupportedSandboxRequiredCapabilities(policy SandboxPolicy, capabilities [
 		switch strings.ToLower(strings.TrimSpace(capability)) {
 		case "", "filesystem.read", "filesystem.write", "network.none", "env", "secret.handle", "cpu.memory":
 			continue
+		case "network.egress":
+			if sandboxFactsAllRequiredEnforced(sandboxEnforcementFacts(policy), "network", "egress_policy") {
+				continue
+			}
 		case "process.restricted":
 			if sandboxFactsAllRequiredEnforced(
 				sandboxEnforcementFacts(policy),
