@@ -134,6 +134,122 @@ func TestGovernanceStrictPolicyBlocksMissingConformance(t *testing.T) {
 	}
 }
 
+func TestWASMGovernanceBlocksHighRiskExtensionPoint(t *testing.T) {
+	manager := newManagerForTest(t, &fakeAdapter{})
+	artifact := uploadTestArtifactWithManifestBytes(t, manager, "wasm-status-risk", wasmOKModule, func(manifest *Manifest) {
+		manifest.Runtime.Type = RuntimeWASM
+		manifest.Runtime.Entry = RuntimeWASMEntry
+		manifest.Runtime.ABI = wasmHostABIV1
+		manifest.RuntimeLimits.HandlerTimeoutMS = 100
+		manifest.RuntimeLimits.MemoryBytes = 64 * 1024
+		manifest.ExtensionPoints = []ExtensionPoint{{Type: "hook", Key: ExtensionStatusPing}}
+		manifest.Capabilities = json.RawMessage(`{"extension_points":["status.ping/v1"],"status":{"hosts":["*"]}}`)
+	})
+	manifest := mustManifestFromArtifact(t, artifact)
+	preflight := manager.preflightChecks(context.Background(), PluginRecord{ID: artifact.PluginID, ConfigJSON: `{}`}, artifact, manifest, PolicyProfileProd, GovernanceActionEnable, `{}`)
+	if preflight.OK || !preflightCheckCodes(preflight.Checks)["wasm_extension_point_unsupported"] {
+		t.Fatalf("preflight = %+v, want wasm_extension_point_unsupported block", preflight)
+	}
+	decision, _, err := manager.evaluateGovernance(context.Background(), artifact.PluginID, artifact.ID, GovernanceActionEnable, PolicyProfileProd, `{}`, true)
+	if err != nil {
+		t.Fatalf("evaluateGovernance() error = %v", err)
+	}
+	if decision.OK || !governanceIssueCodes(decision.Issues)["wasm_extension_point_unsupported"] {
+		t.Fatalf("decision = %+v, want wasm_extension_point_unsupported issue", decision)
+	}
+}
+
+func TestWASMPreflightAndGovernanceBlockHostCapabilities(t *testing.T) {
+	manager := newManagerForTestWithBuildersProfile(t, &fakeAdapter{}, nil, PolicyProfileDev)
+	artifact := uploadTestArtifactWithManifestBytes(t, manager, "wasm-host-capability", wasmOKModule, func(manifest *Manifest) {
+		manifest.Runtime.Type = RuntimeWASM
+		manifest.Runtime.Entry = RuntimeWASMEntry
+		manifest.Runtime.ABI = wasmHostABIV1
+		manifest.RuntimeLimits.HandlerTimeoutMS = 100
+		manifest.RuntimeLimits.MemoryBytes = 64 * 1024
+		manifest.ExtensionPoints = []ExtensionPoint{{Type: "rule", Key: ExtensionRuleEvaluate}}
+		manifest.Capabilities = json.RawMessage(`{"env":{"FOO":"bar"},"network":{"egress":["*"]}}`)
+		manifest.Secrets = []SecretSpec{{Name: "api_token", Required: true}}
+		manifest.ExternalDeps = []ExternalSpec{{Name: "profile-api", Endpoint: "https://profile.example", Required: true}}
+		manifest.FileStores = []FileStoreSpec{{Namespace: "cache"}}
+	})
+	result, err := manager.DryRunConfig(context.Background(), artifact.PluginID, artifact.ID, `{}`)
+	if err == nil || result.OK || !strings.Contains(err.Error(), "wasm runtime does not support host capabilities") {
+		t.Fatalf("DryRunConfig() = %+v err=%v, want wasm capability block", result, err)
+	}
+	manifest := mustManifestFromArtifact(t, artifact)
+	preflight := manager.preflightChecks(context.Background(), PluginRecord{ID: artifact.PluginID, ConfigJSON: `{}`}, artifact, manifest, PolicyProfileDev, GovernanceActionEnable, `{}`)
+	if preflight.OK || !preflightCheckCodes(preflight.Checks)["wasm_capability_blocked"] {
+		t.Fatalf("preflight = %+v, want wasm_capability_blocked", preflight)
+	}
+	decision, _, err := manager.evaluateGovernance(context.Background(), artifact.PluginID, artifact.ID, GovernanceActionEnable, PolicyProfileDev, `{}`, true)
+	if err != nil {
+		t.Fatalf("evaluateGovernance() error = %v", err)
+	}
+	if decision.OK || !governanceIssueCodes(decision.Issues)["wasm_capability_blocked"] {
+		t.Fatalf("decision = %+v, want wasm_capability_blocked issue", decision)
+	}
+}
+
+func TestWASMProdReleaseGateRequiresConformanceAndResourceSmoke(t *testing.T) {
+	manager := newManagerForTest(t, &fakeAdapter{})
+	artifact := uploadTestArtifactWithManifestBytes(t, manager, "wasm-release-gate", wasmOKModule, func(manifest *Manifest) {
+		manifest.Runtime.Type = RuntimeWASM
+		manifest.Runtime.Entry = RuntimeWASMEntry
+		manifest.Runtime.ABI = wasmHostABIV1
+		manifest.RuntimeLimits.HandlerTimeoutMS = 100
+		manifest.RuntimeLimits.MemoryBytes = 64 * 1024
+		manifest.ExtensionPoints = []ExtensionPoint{{Type: "rule", Key: ExtensionRuleEvaluate}}
+		manifest.Capabilities = json.RawMessage(`{}`)
+	})
+	if _, err := manager.SetDesired(context.Background(), "admin", artifact.PluginID, artifact.ID, DesiredDisabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	preflight := manager.preflightChecks(context.Background(), PluginRecord{ID: artifact.PluginID, ConfigJSON: `{}`}, artifact, mustManifestFromArtifact(t, artifact), PolicyProfileProd, GovernanceActionEnable, `{}`)
+	codes := preflightCheckCodes(preflight.Checks)
+	if preflight.OK || !codes["conformance_fixture_missing"] || !codes["wasm_resource_limit_smoke_passed"] {
+		t.Fatalf("preflight = %+v, want conformance block and resource smoke pass", preflight)
+	}
+	decision, err := manager.EvaluateReleaseGate(context.Background(), artifact.PluginID, artifact.ID, GovernanceActionEnable, PolicyProfileProd, `{}`)
+	if err == nil || decision.OK || !governanceIssueCodes(decision.Issues)["conformance_fixture_missing"] {
+		t.Fatalf("EvaluateReleaseGate() decision=%+v err=%v, want missing conformance block", decision, err)
+	}
+}
+
+func TestWASMAdvisoryGateBlocksArtifact(t *testing.T) {
+	manager := newManagerForTest(t, &fakeAdapter{})
+	packagePath := writeTestMCGP(t, map[string][]byte{
+		"manifest.json":  testWASMManifestBytes(t, "wasm-advisory", wasmHostABIV1),
+		RuntimeWASMEntry: wasmOKModule,
+		"conformance.json": []byte(`{
+			"fixtures":[{"name":"wasm.release","status":"pass","extension":"rule.evaluate/v1"}]
+		}`),
+	})
+	artifact, err := manager.UploadArtifact(context.Background(), ArtifactUpload{
+		SourcePath: packagePath,
+		FileName:   "wasm-advisory.mcgp",
+		Actor:      "admin",
+	})
+	if err != nil {
+		t.Fatalf("UploadArtifact() error = %v", err)
+	}
+	if _, err := manager.SetDesired(context.Background(), "admin", artifact.PluginID, artifact.ID, DesiredDisabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	if _, err := manager.UpsertAdvisory(context.Background(), "security", AdvisoryRequest{
+		AdvisoryID:     "MCG-WASM-2026-0001",
+		Status:         AdvisoryStatusRevoked,
+		Action:         AdvisoryActionRevoke,
+		ArtifactSHA256: artifact.SHA256,
+	}); err != nil {
+		t.Fatalf("UpsertAdvisory() error = %v", err)
+	}
+	decision, err := manager.EvaluateReleaseGate(context.Background(), artifact.PluginID, artifact.ID, GovernanceActionEnable, PolicyProfileProd, `{}`)
+	if err == nil || decision.OK || !governanceIssueCodes(decision.Issues)["advisory_revoke"] {
+		t.Fatalf("EvaluateReleaseGate() decision=%+v err=%v, want advisory_revoke block", decision, err)
+	}
+}
+
 func TestGovernanceBlocksProtocolProxyScopeOverlap(t *testing.T) {
 	manager := newManagerForTest(t, &fakeAdapter{})
 	first := enableProtocolProxyTestPlugin(t, manager, "proxy-a")

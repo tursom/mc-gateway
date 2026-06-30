@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -313,10 +315,84 @@ func validateWASMExtensionPoints(manifest Manifest) error {
 		switch point.Key {
 		case ExtensionRuleEvaluate, ExtensionRouteResolve, ExtensionConfigValidate:
 		default:
-			return fmt.Errorf("wasm extension point %q is not supported by contained validation", point.Key)
+			return fmt.Errorf("wasm extension point %q is not supported; allowed extension points are %s, %s, %s", point.Key, ExtensionConfigValidate, ExtensionRuleEvaluate, ExtensionRouteResolve)
 		}
 	}
 	return nil
+}
+
+func wasmBlockedHostCapabilities(manifest Manifest, artifact ArtifactRecord) []string {
+	blocked := map[string]bool{}
+	add := func(name string) {
+		name = strings.TrimSpace(name)
+		if name != "" {
+			blocked[name] = true
+		}
+	}
+	for _, capability := range requiredRuntimeCapabilities(artifact) {
+		if wasmHostCapabilityNameBlocked(capability) {
+			add("runtime.required_capabilities:" + capability)
+		}
+	}
+	if len(manifest.Secrets) > 0 {
+		add("secrets")
+	}
+	if len(manifest.ExternalDeps) > 0 {
+		add("external_dependencies")
+	}
+	if len(manifest.FileStores) > 0 {
+		add("file_stores")
+	}
+	var caps map[string]any
+	if json.Unmarshal(manifest.Capabilities, &caps) == nil {
+		for _, key := range []string{
+			"env", "environment", "secret_env", "secret_envs", "secret", "secrets",
+			"file", "files", "filesystem", "file_stores", "network", "net", "external_dependencies", "external_deps",
+			"upstream_connect", "status", "providers", "provider", "event_subscriber", "ingress",
+		} {
+			if metadataFieldPresent(caps[key]) {
+				add("capabilities." + key)
+			}
+		}
+		if runtimeCaps := jsonMapFromAny(caps["runtime"]); runtimeCaps != nil {
+			for _, key := range []string{"env", "environment", "secret_env", "secret", "file", "filesystem", "network"} {
+				if metadataFieldPresent(runtimeCaps[key]) {
+					add("capabilities.runtime." + key)
+				}
+			}
+		}
+	}
+	return sortedStringKeys(blocked)
+}
+
+func wasmHostCapabilityNameBlocked(capability string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(capability))
+	normalized = strings.ReplaceAll(normalized, "_", ".")
+	switch {
+	case normalized == "":
+		return false
+	case strings.Contains(normalized, "secret.env"):
+		return true
+	case strings.Contains(normalized, "secret"):
+		return true
+	case strings.Contains(normalized, "env"):
+		return true
+	case strings.Contains(normalized, "network") || strings.Contains(normalized, "net.") || strings.Contains(normalized, ".net"):
+		return true
+	case strings.Contains(normalized, "file") || strings.Contains(normalized, "filesystem") || strings.Contains(normalized, "fs."):
+		return true
+	default:
+		return false
+	}
+}
+
+func sortedStringKeys(values map[string]bool) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func validateWASMRuntimeLimits(manifest Manifest) error {

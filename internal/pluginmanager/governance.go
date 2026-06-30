@@ -838,6 +838,10 @@ func (m *Manager) evaluateGovernance(ctx context.Context, pluginID, artifactID, 
 
 func (m *Manager) preflightChecks(ctx context.Context, plugin PluginRecord, artifact ArtifactRecord, manifest Manifest, profile, action, configJSON string) PreflightResult {
 	result := PreflightResult{Profile: normalizeProfile(profile), CreatedAt: m.repo.now().Unix()}
+	policy := m.policySnapshot(profile)
+	if artifact.RuntimeType == RuntimeWASM && normalizeProfile(profile) == PolicyProfileProd {
+		policy.RequireConformanceFixture = true
+	}
 	if configJSON == "" {
 		configJSON = "{}"
 	}
@@ -859,21 +863,33 @@ func (m *Manager) preflightChecks(ctx context.Context, plugin PluginRecord, arti
 			Details:  map[string]any{"features": missing},
 		})
 	}
-	if check, ok := conformancePreflightCheck(artifact.MetadataJSON, m.policySnapshot(profile)); ok {
+	if check, ok := conformancePreflightCheck(artifact.MetadataJSON, policy); ok {
 		result.Checks = append(result.Checks, check)
 	}
 	if artifact.RuntimeType == RuntimeSandbox && (m.serviceMode != PluginServiceModeSandboxProcess || !m.futureGates.SandboxEnabled()) {
 		result.Checks = append(result.Checks, PreflightCheck{Code: "sandbox_runtime_disabled", Severity: GateSeverityBlocking, Message: "sandbox-process runtime is disabled by plugin service mode"})
 	}
 	if artifact.RuntimeType == RuntimeWASM {
+		wasmGateOK := true
 		if err := validateWASMExtensionPoints(manifest); err != nil {
+			wasmGateOK = false
 			result.Checks = append(result.Checks, PreflightCheck{
 				Code:     "wasm_extension_point_unsupported",
 				Severity: GateSeverityBlocking,
 				Message:  err.Error(),
 			})
 		}
+		if blocked := wasmBlockedHostCapabilities(manifest, artifact); len(blocked) > 0 {
+			wasmGateOK = false
+			result.Checks = append(result.Checks, PreflightCheck{
+				Code:     "wasm_capability_blocked",
+				Severity: GateSeverityBlocking,
+				Message:  "wasm runtime does not support file, network, env, or secret host capabilities",
+				Details:  map[string]any{"capabilities": blocked},
+			})
+		}
 		if err := validateWASMArtifactABI(ctx, artifact, manifest); err != nil {
+			wasmGateOK = false
 			result.Checks = append(result.Checks, PreflightCheck{
 				Code:     "wasm_abi_invalid",
 				Severity: GateSeverityBlocking,
@@ -884,6 +900,9 @@ func (m *Manager) preflightChecks(ctx context.Context, plugin PluginRecord, arti
 					"imports":  wasmABIImportMap(),
 				},
 			})
+		}
+		if wasmGateOK {
+			result.Checks = append(result.Checks, m.wasmResourceLimitSmokePreflightCheck(ctx, artifact, manifest))
 		}
 	}
 	if caps := requiredRuntimeCapabilities(artifact); runtimeRequiredCapabilitiesUnsupported(artifact.RuntimeType) && len(caps) > 0 {
@@ -1087,6 +1106,51 @@ func conformanceSummaryFromMetadata(metadataJSON string) (ConformanceSummary, bo
 	return summary, true, nil
 }
 
+func (m *Manager) wasmResourceLimitSmokePreflightCheck(ctx context.Context, artifact ArtifactRecord, manifest Manifest) PreflightCheck {
+	module, err := wasmArtifactModule(artifact)
+	if err != nil {
+		return PreflightCheck{
+			Code:     "wasm_resource_limit_smoke_failed",
+			Severity: GateSeverityBlocking,
+			Message:  err.Error(),
+		}
+	}
+	runner := m.wasmRunner
+	if runner == nil {
+		runner = NewWASMRunner()
+	}
+	moduleHash, cacheStatus, err := runner.PrepareModule(ctx, WASMInvocation{
+		ArtifactID:  artifact.ID,
+		Module:      module,
+		Manifest:    manifest,
+		Function:    wasmDefaultExport(manifest),
+		Timeout:     wasmTimeout(manifest),
+		MemoryBytes: manifest.RuntimeLimits.MemoryBytes,
+	})
+	if err != nil {
+		return PreflightCheck{
+			Code:     "wasm_resource_limit_smoke_failed",
+			Severity: GateSeverityBlocking,
+			Message:  err.Error(),
+			Details: map[string]any{
+				"handler_timeout_ms": manifest.RuntimeLimits.HandlerTimeoutMS,
+				"memory_bytes":       manifest.RuntimeLimits.MemoryBytes,
+			},
+		}
+	}
+	return PreflightCheck{
+		Code:     "wasm_resource_limit_smoke_passed",
+		Severity: GateSeverityInfo,
+		Message:  "wasm module compiled and validated within declared resource limits",
+		Details: map[string]any{
+			"module_sha256":      moduleHash,
+			"module_cache":       cacheStatus,
+			"handler_timeout_ms": manifest.RuntimeLimits.HandlerTimeoutMS,
+			"memory_bytes":       manifest.RuntimeLimits.MemoryBytes,
+		},
+	}
+}
+
 func (m *Manager) sourceBuildProvenancePreflightChecks(ctx context.Context, artifact ArtifactRecord) []PreflightCheck {
 	build, ok, err := m.sourceBuildForArtifact(ctx, artifact)
 	if err != nil {
@@ -1189,6 +1253,28 @@ func (m *Manager) sourceBuildProvenancePreflightChecks(ctx context.Context, arti
 			Details:  map[string]any{"missing": missing, "build_id": build.ID, "builder_type": build.BuilderType},
 		})
 	}
+	if artifact.RuntimeType == RuntimeWASM {
+		if missing := missingWASMSourceBuildProvenanceFields(artifact, build); len(missing) > 0 {
+			checks = append(checks, PreflightCheck{
+				Code:     "wasm_source_build_provenance_incomplete",
+				Severity: GateSeverityBlocking,
+				Message:  "wasm source build provenance is missing required fields for prod admission",
+				Details:  map[string]any{"missing": missing, "build_id": build.ID, "builder_type": build.BuilderType},
+			})
+		}
+		if moduleSHA := wasmSourceBuildModuleSHA(build); moduleSHA != "" && artifact.SHA256 != "" && !strings.EqualFold(moduleSHA, artifact.SHA256) {
+			checks = append(checks, PreflightCheck{
+				Code:     "wasm_source_build_module_hash_mismatch",
+				Severity: GateSeverityBlocking,
+				Message:  "wasm source build module hash does not match stored artifact",
+				Details: map[string]any{
+					"build_id":               build.ID,
+					"build_module_sha256":    moduleSHA,
+					"artifact_module_sha256": artifact.SHA256,
+				},
+			})
+		}
+	}
 	if build.ArtifactSHA256 != "" && artifact.SHA256 != "" && build.ArtifactSHA256 != artifact.SHA256 {
 		checks = append(checks, PreflightCheck{
 			Code:     "source_build_artifact_hash_mismatch",
@@ -1233,6 +1319,27 @@ func missingSourceBuildProvenanceFields(build BuildRecord) []string {
 	}
 	if strings.TrimSpace(build.ABIFingerprint) == "" {
 		missing = append(missing, "abi_fingerprint")
+	}
+	return missing
+}
+
+func missingWASMSourceBuildProvenanceFields(artifact ArtifactRecord, build BuildRecord) []string {
+	metadata := sourceBuildMetadata(build)
+	var missing []string
+	if wasmSourceBuildToolchain(metadata) == "" {
+		missing = append(missing, "wasm_toolchain")
+	}
+	if wasmSourceBuildTarget(metadata) == "" {
+		missing = append(missing, "wasm_target")
+	}
+	if wasmSourceBuildModuleSHA(build) == "" {
+		missing = append(missing, "wasm_module_sha256")
+	}
+	var manifest Manifest
+	if json.Unmarshal([]byte(defaultJSONObject(artifact.MetadataJSON)), &manifest) != nil || len(sbomDependencies(manifest)) == 0 {
+		if !metadataFieldPresent(metadata["sbom"]) && !metadataFieldPresent(metadata["sbom_dependencies"]) {
+			missing = append(missing, "sbom")
+		}
 	}
 	return missing
 }
@@ -1368,6 +1475,22 @@ func sourceBuildMetadata(build BuildRecord) map[string]any {
 	return metadata
 }
 
+func wasmSourceBuildToolchain(metadata map[string]any) string {
+	return firstMetadataString(metadata, "wasm_toolchain", "toolchain", "runtime_toolchain")
+}
+
+func wasmSourceBuildTarget(metadata map[string]any) string {
+	return firstMetadataString(metadata, "wasm_target", "target", "runtime_target")
+}
+
+func wasmSourceBuildModuleSHA(build BuildRecord) string {
+	metadata := sourceBuildMetadata(build)
+	if value := firstMetadataString(metadata, "wasm_module_sha256", "module_sha256"); value != "" {
+		return value
+	}
+	return strings.TrimSpace(build.ArtifactSHA256)
+}
+
 func (m *Manager) attachSourceBuildAssessmentMetadata(ctx context.Context, artifact ArtifactRecord, metadata map[string]any) (map[string]any, error) {
 	build, ok, err := m.sourceBuildForArtifact(ctx, artifact)
 	if err != nil || !ok {
@@ -1398,6 +1521,31 @@ func (m *Manager) attachSourceBuildAssessmentMetadata(ctx context.Context, artif
 	builderIdentity := sourceBuildBuilderIdentity(build)
 	for k, v := range builderIdentity {
 		sourceBuild[k] = v
+	}
+	if artifact.RuntimeType == RuntimeWASM {
+		buildMetadata := sourceBuildMetadata(build)
+		if toolchain := wasmSourceBuildToolchain(buildMetadata); toolchain != "" {
+			sourceBuild["wasm_toolchain"] = toolchain
+		}
+		if target := wasmSourceBuildTarget(buildMetadata); target != "" {
+			sourceBuild["wasm_target"] = target
+		}
+		if moduleSHA := wasmSourceBuildModuleSHA(build); moduleSHA != "" {
+			sourceBuild["wasm_module_sha256"] = moduleSHA
+			sourceBuild["wasm_module_sha256_matches"] = artifact.SHA256 == "" || strings.EqualFold(moduleSHA, artifact.SHA256)
+		}
+		if sbom := buildMetadata["sbom"]; metadataFieldPresent(sbom) {
+			sourceBuild["sbom"] = sbom
+		}
+		if deps := buildMetadata["sbom_dependencies"]; metadataFieldPresent(deps) {
+			sourceBuild["sbom_dependencies"] = deps
+		}
+		if wasmMissing := missingWASMSourceBuildProvenanceFields(artifact, build); len(wasmMissing) > 0 {
+			sourceBuild["wasm_missing_fields"] = wasmMissing
+			sourceBuild["wasm_provenance_complete"] = false
+		} else {
+			sourceBuild["wasm_provenance_complete"] = true
+		}
 	}
 	missing := missingSourceBuildProvenanceFields(build)
 	sourceBuild["provenance_complete"] = len(missing) == 0

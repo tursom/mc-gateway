@@ -2052,8 +2052,13 @@ func normalizeExternalCIArtifactMetadata(artifact ArtifactRecord, metadata map[s
 	if packageSHA := metadataString(externalCI["package_sha256"]); packageSHA != "" && artifact.PackageSHA256 != "" {
 		externalCI["package_sha256_matches"] = strings.EqualFold(packageSHA, artifact.PackageSHA256)
 	}
+	if artifact.RuntimeType == RuntimeWASM {
+		if moduleSHA := wasmExternalCIModuleSHA(externalCI); moduleSHA != "" && artifact.SHA256 != "" {
+			externalCI["wasm_module_sha256_matches"] = strings.EqualFold(moduleSHA, artifact.SHA256)
+		}
+	}
 	if externalCIRequired(externalCI) {
-		missing := missingExternalCIProvenanceMetadataFields(metadata, externalCI)
+		missing := missingExternalCIProvenanceMetadataFieldsForArtifact(artifact, metadata, externalCI)
 		externalCI["provenance_complete"] = len(missing) == 0
 		if len(missing) > 0 {
 			externalCI["missing_fields"] = missing
@@ -2084,8 +2089,16 @@ func externalCITrustIssues(artifact ArtifactRecord, signature, sbom, externalCI 
 	if !required {
 		return issues
 	}
-	if missing := missingExternalCIProvenanceMetadataFields(map[string]any{"signature": signature, "sbom": sbom}, externalCI); len(missing) > 0 {
+	if missing := missingExternalCIProvenanceMetadataFieldsForArtifact(artifact, map[string]any{"signature": signature, "sbom": sbom}, externalCI); len(missing) > 0 {
 		issues = append(issues, issue("external_ci_provenance_incomplete", GateSeverityBlocking, "external CI provenance is missing required fields", artifact.PluginID, artifact.ID, map[string]any{"missing": missing}))
+	}
+	if artifact.RuntimeType == RuntimeWASM {
+		if moduleSHA := wasmExternalCIModuleSHA(externalCI); moduleSHA != "" && artifact.SHA256 != "" && !strings.EqualFold(moduleSHA, artifact.SHA256) {
+			issues = append(issues, issue("external_ci_wasm_module_hash_mismatch", GateSeverityBlocking, "external CI WASM module hash does not match stored artifact", artifact.PluginID, artifact.ID, map[string]any{
+				"expected": artifact.SHA256,
+				"actual":   moduleSHA,
+			}))
+		}
 	}
 	if !requiredBool(signature, "verified") {
 		issues = append(issues, issue("external_ci_signature_unverified", GateSeverityBlocking, "external CI artifact signature is not verified", artifact.PluginID, artifact.ID, nil))
@@ -2097,7 +2110,22 @@ func externalCITrustIssues(artifact ArtifactRecord, signature, sbom, externalCI 
 }
 
 func missingExternalCIProvenanceMetadataFields(metadata map[string]any, externalCI map[string]any) []string {
+	return missingExternalCIProvenanceMetadataFieldsForArtifact(ArtifactRecord{}, metadata, externalCI)
+}
+
+func missingExternalCIProvenanceMetadataFieldsForArtifact(artifact ArtifactRecord, metadata map[string]any, externalCI map[string]any) []string {
 	missing := missingExternalCIProvenanceFields(externalCI)
+	if artifact.RuntimeType == RuntimeWASM {
+		if wasmExternalCIToolchain(externalCI) == "" {
+			missing = append(missing, "wasm_toolchain")
+		}
+		if wasmExternalCITarget(externalCI) == "" {
+			missing = append(missing, "wasm_target")
+		}
+		if wasmExternalCIModuleSHA(externalCI) == "" {
+			missing = append(missing, "wasm_module_sha256")
+		}
+	}
 	if !metadataFieldPresent(metadata["signature"]) {
 		missing = append(missing, "signature")
 	}
@@ -2105,6 +2133,18 @@ func missingExternalCIProvenanceMetadataFields(metadata map[string]any, external
 		missing = append(missing, "sbom_metadata")
 	}
 	return missing
+}
+
+func wasmExternalCIToolchain(externalCI map[string]any) string {
+	return firstMetadataString(externalCI, "wasm_toolchain", "toolchain", "runtime_toolchain")
+}
+
+func wasmExternalCITarget(externalCI map[string]any) string {
+	return firstMetadataString(externalCI, "wasm_target", "target", "runtime_target")
+}
+
+func wasmExternalCIModuleSHA(externalCI map[string]any) string {
+	return firstMetadataString(externalCI, "wasm_module_sha256", "module_sha256")
 }
 
 func externalCIRequired(externalCI map[string]any) bool {

@@ -2125,6 +2125,9 @@ func (m *Manager) validateArtifactGate(artifact ArtifactRecord) error {
 		if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err != nil {
 			return fmt.Errorf("decode wasm manifest: %w", err)
 		}
+		if blocked := wasmBlockedHostCapabilities(manifest, artifact); len(blocked) > 0 {
+			return fmt.Errorf("wasm runtime does not support host capabilities: %s", strings.Join(blocked, ","))
+		}
 		if err := validateWASMExtensionPoints(manifest); err != nil {
 			return err
 		}

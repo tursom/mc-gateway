@@ -1991,6 +1991,91 @@ func TestSupplyChainAssessmentBlocksUntrustedExternalCIArtifact(t *testing.T) {
 	}
 }
 
+func TestWASMSupplyChainExternalCIRequiresToolchainTargetModuleAndSBOM(t *testing.T) {
+	manager := newManagerForTest(t, &fakeAdapter{})
+	artifact := uploadTestArtifactWithManifestBytes(t, manager, "wasm-external-ci", wasmOKModule, func(manifest *Manifest) {
+		manifest.Runtime.Type = RuntimeWASM
+		manifest.Runtime.Entry = RuntimeWASMEntry
+		manifest.Runtime.ABI = wasmHostABIV1
+		manifest.RuntimeLimits.HandlerTimeoutMS = 100
+		manifest.RuntimeLimits.MemoryBytes = 64 * 1024
+		manifest.ExtensionPoints = []ExtensionPoint{{Type: "rule", Key: ExtensionRuleEvaluate}}
+		manifest.Capabilities = json.RawMessage(`{}`)
+		manifest.SupplyChain = json.RawMessage(`{"dependencies":[{"name":"example.com/wasm-external-ci","version":"v0.1.0"}]}`)
+	})
+	assessment, err := manager.AssessSupplyChain(context.Background(), "admin", artifact.PluginID, artifact.ID, map[string]any{
+		"signature": map[string]any{"verified": true},
+		"sbom":      map[string]any{"required": true, "scan_ok": true},
+		"external_ci": map[string]any{
+			"required":        true,
+			"trusted":         true,
+			"source_sha256":   "src-sha",
+			"artifact_sha256": artifact.SHA256,
+			"package_sha256":  artifact.PackageSHA256,
+			"run_id":          "github-actions/run-wasm",
+			"builder_id":      "github-actions/mc-gateway-wasm-build",
+			"attestation":     "slsa-v1",
+			"sbom":            "sbom.spdx.json",
+			"release_provenance": map[string]any{
+				"gateway_release": "v0.1.0",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("AssessSupplyChain(wasm missing metadata) error = %v", err)
+	}
+	if assessment.Status != SupplyChainStatusBlocked || !hasIssueCode(assessment.Issues, "external_ci_provenance_incomplete") {
+		t.Fatalf("assessment = %+v, want missing WASM external CI provenance block", assessment)
+	}
+	missing := stringSlice(jsonMapFromAny(assessment.Metadata["external_ci"])["missing_fields"])
+	for _, want := range []string{"wasm_toolchain", "wasm_target", "wasm_module_sha256"} {
+		if !containsString(missing, want) {
+			t.Fatalf("missing fields = %+v, want %s", missing, want)
+		}
+	}
+
+	trustedManager := newManagerForTest(t, &fakeAdapter{})
+	trusted := uploadTestArtifactWithManifestBytes(t, trustedManager, "wasm-external-ci-trusted", wasmOKModule, func(manifest *Manifest) {
+		manifest.Runtime.Type = RuntimeWASM
+		manifest.Runtime.Entry = RuntimeWASMEntry
+		manifest.Runtime.ABI = wasmHostABIV1
+		manifest.RuntimeLimits.HandlerTimeoutMS = 100
+		manifest.RuntimeLimits.MemoryBytes = 64 * 1024
+		manifest.ExtensionPoints = []ExtensionPoint{{Type: "rule", Key: ExtensionRuleEvaluate}}
+		manifest.Capabilities = json.RawMessage(`{}`)
+		manifest.SupplyChain = json.RawMessage(`{"dependencies":[{"name":"example.com/wasm-external-ci-trusted","version":"v0.1.0"}]}`)
+	})
+	assessment, err = trustedManager.AssessSupplyChain(context.Background(), "admin", trusted.PluginID, trusted.ID, map[string]any{
+		"signature": map[string]any{"verified": true},
+		"sbom":      map[string]any{"required": true, "scan_ok": true},
+		"external_ci": map[string]any{
+			"required":           true,
+			"trusted":            true,
+			"source_sha256":      "src-sha",
+			"artifact_sha256":    trusted.SHA256,
+			"package_sha256":     trusted.PackageSHA256,
+			"wasm_toolchain":     "tinygo 0.34.0",
+			"wasm_target":        "wasm32-wasip1",
+			"wasm_module_sha256": trusted.SHA256,
+			"run_id":             "github-actions/run-wasm-trusted",
+			"builder_id":         "github-actions/mc-gateway-wasm-build",
+			"attestation":        "slsa-v1",
+			"sbom":               "sbom.spdx.json",
+			"release_provenance": map[string]any{"gateway_release": "v0.1.0"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("AssessSupplyChain(wasm trusted) error = %v", err)
+	}
+	if assessment.Status != SupplyChainStatusAllowed || len(assessment.Issues) != 0 {
+		t.Fatalf("assessment = %+v, want allowed WASM external CI provenance", assessment)
+	}
+	externalCI := jsonMapFromAny(assessment.Metadata["external_ci"])
+	if externalCI["wasm_module_sha256_matches"] != true || externalCI["provenance_complete"] != true {
+		t.Fatalf("external CI metadata = %+v, want WASM hash match and complete provenance", externalCI)
+	}
+}
+
 func TestSupplyChainAssessmentEvaluatesLicensePolicy(t *testing.T) {
 	manager := newManagerForTest(t, &fakeAdapter{})
 	artifact := uploadTestArtifactWithManifest(t, manager, "license-plugin", func(manifest *Manifest) {
