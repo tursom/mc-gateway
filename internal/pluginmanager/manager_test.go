@@ -5,7 +5,9 @@ package pluginmanager
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,6 +37,75 @@ func TestManagerUploadDoesNotLoadPlugin(t *testing.T) {
 	}
 	if adapter.loads != 0 {
 		t.Fatalf("adapter loads = %d, want 0 for upload-only validation", adapter.loads)
+	}
+}
+
+func TestSandboxArtifactGateBlocksTargetMismatch(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Manifest)
+		want   string
+	}{
+		{
+			name: "os mismatch",
+			mutate: func(manifest *Manifest) {
+				manifest.Runtime.OS = "not-" + runtime.GOOS
+			},
+			want: "runtime.os",
+		},
+		{
+			name: "abi mismatch",
+			mutate: func(manifest *Manifest) {
+				manifest.Runtime.ABIVersion = "mc-gateway.sandbox-process.abi/v0"
+			},
+			want: "runtime.abi_version",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manager := newManagerForTest(t, nil)
+			var manifest Manifest
+			if err := json.Unmarshal(testSandboxManifestBytes(t, "sandbox-gate-"+strings.ReplaceAll(tt.name, " ", "-"), runtime.GOOS, runtime.GOARCH, SandboxProcessABIVersionV1), &manifest); err != nil {
+				t.Fatalf("Unmarshal sandbox manifest error = %v", err)
+			}
+			tt.mutate(&manifest)
+			entryBytes := []byte("sandbox gate bytes " + tt.name)
+			entrySum := sha256.Sum256(entryBytes)
+			entrySHA := hex.EncodeToString(entrySum[:])
+			packageSHA := "package-" + entrySHA
+			metadata, err := artifactMetadataJSON(manifest, ConformanceSummary{}, false, map[string]any{
+				"sandbox": runtimeArtifactMetadata(manifest, entryBytes, packageSHA),
+			})
+			if err != nil {
+				t.Fatalf("artifactMetadataJSON() error = %v", err)
+			}
+			artifact := ArtifactRecord{
+				ID:            entrySHA,
+				PluginID:      manifest.ID,
+				Version:       manifest.Version,
+				FileName:      manifest.ID + ".mcgp",
+				SHA256:        entrySHA,
+				PackageSHA256: packageSHA,
+				ArtifactType:  ArtifactTypeBinary,
+				RuntimeType:   RuntimeSandbox,
+				RuntimeEntry:  manifest.Runtime.Entry,
+				Status:        ArtifactStatusLoadable,
+				MetadataJSON:  string(metadata),
+				APIVersion:    APIVersion,
+				GOOS:          manifest.Runtime.OS,
+				GOARCH:        manifest.Runtime.Arch,
+				UploadedBy:    "test",
+				CreatedAt:     time.Now().Unix(),
+				UpdatedAt:     time.Now().Unix(),
+			}
+			if err := manager.repo.SaveArtifact(context.Background(), artifact); err != nil {
+				t.Fatalf("SaveArtifact() error = %v", err)
+			}
+			_, err = manager.SetDesired(context.Background(), "admin", manifest.ID, artifact.ID, DesiredEnabled, `{}`, 10)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("SetDesired(%s) error = %v, want containing %q", tt.name, err, tt.want)
+			}
+		})
 	}
 }
 
@@ -3649,6 +3720,23 @@ func uploadTestArtifactWithManifestBytes(t *testing.T, manager *Manager, pluginI
 	if mutate != nil {
 		mutate(&manifest)
 	}
+	if manifest.Runtime.Type == RuntimeSandbox {
+		if manifest.Runtime.Entry == "" {
+			manifest.Runtime.Entry = RuntimeEntry
+		}
+		if manifest.Runtime.Protocol == "" {
+			manifest.Runtime.Protocol = SandboxProcessProtocolV1
+		}
+		if manifest.Runtime.OS == "" {
+			manifest.Runtime.OS = runtime.GOOS
+		}
+		if manifest.Runtime.Arch == "" {
+			manifest.Runtime.Arch = runtime.GOARCH
+		}
+		if manifest.Runtime.ABIVersion == "" {
+			manifest.Runtime.ABIVersion = SandboxProcessABIVersionV1
+		}
+	}
 	manifestBytes, err := json.Marshal(manifest)
 	if err != nil {
 		t.Fatalf("Marshal manifest error = %v", err)
@@ -3657,10 +3745,14 @@ func uploadTestArtifactWithManifestBytes(t *testing.T, manager *Manager, pluginI
 	if entry == "" {
 		entry = RuntimeEntry
 	}
-	packagePath := writeTestMCGP(t, map[string][]byte{
+	modes := map[string]os.FileMode{}
+	if manifest.Runtime.Type == RuntimeSandbox {
+		modes[entry] = 0755
+	}
+	packagePath := writeTestMCGPWithModes(t, map[string][]byte{
 		"manifest.json": manifestBytes,
 		entry:           runtimeBytes,
-	})
+	}, modes)
 	artifact, err := manager.UploadArtifact(context.Background(), ArtifactUpload{
 		SourcePath: packagePath,
 		FileName:   pluginID + ".mcgp",

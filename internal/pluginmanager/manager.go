@@ -2326,6 +2326,13 @@ func (m *Manager) validateArtifactGate(artifact ArtifactRecord) error {
 		return nil
 	}
 	if artifact.RuntimeType == RuntimeSandbox {
+		var manifest Manifest
+		if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err != nil {
+			return fmt.Errorf("decode sandbox manifest: %w", err)
+		}
+		if err := validateSandboxArtifactMetadata(artifact, manifest); err != nil {
+			return err
+		}
 		if m.serviceMode != PluginServiceModeSandboxProcess {
 			return errors.New("sandbox-process runtime is disabled by plugin service mode")
 		}

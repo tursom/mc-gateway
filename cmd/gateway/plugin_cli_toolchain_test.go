@@ -5,6 +5,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
@@ -16,6 +17,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -31,12 +33,18 @@ func TestPluginRuntimeCLIAdapterWASMImplemented(t *testing.T) {
 		t.Fatalf("adapter.RuntimeType() = %q, want wasm", adapter.RuntimeType())
 	}
 
-	for _, runtimeType := range []string{pluginmanager.RuntimeBuiltin, pluginmanager.RuntimeSandbox} {
-		if _, err := pluginCLIAdapterForRuntime(runtimeType); err == nil {
-			t.Fatalf("pluginCLIAdapterForRuntime(%s) error = nil, want reserved error", runtimeType)
-		} else if !strings.Contains(err.Error(), "reserved; no CLI build/test adapter is implemented yet") {
-			t.Fatalf("pluginCLIAdapterForRuntime(%s) error = %q, want reserved adapter message", runtimeType, err)
-		}
+	sandbox, err := pluginCLIAdapterForRuntime(pluginmanager.RuntimeSandbox)
+	if err != nil {
+		t.Fatalf("pluginCLIAdapterForRuntime(sandbox-process) error = %v, want manifest/package adapter", err)
+	}
+	if sandbox.RuntimeType() != pluginmanager.RuntimeSandbox {
+		t.Fatalf("sandbox RuntimeType() = %q, want sandbox-process", sandbox.RuntimeType())
+	}
+
+	if _, err := pluginCLIAdapterForRuntime(pluginmanager.RuntimeBuiltin); err == nil {
+		t.Fatal("pluginCLIAdapterForRuntime(builtin) error = nil, want reserved error")
+	} else if !strings.Contains(err.Error(), "reserved; no CLI build/test adapter is implemented yet") {
+		t.Fatalf("pluginCLIAdapterForRuntime(builtin) error = %q, want reserved adapter message", err)
 	}
 }
 
@@ -334,6 +342,72 @@ func TestPluginWASMCLIValidateBlocksMissingEntryABIMismatchAndMissingExport(t *t
 	}), false)
 	if _, err := validatePluginPathForCLI(missingExport, ""); err == nil || !strings.Contains(err.Error(), "required export") {
 		t.Fatalf("validate missing export error = %v, want required export block", err)
+	}
+}
+
+func TestPluginSandboxCLIValidateBuildAndManifestTest(t *testing.T) {
+	dir := writeSandboxCLIFixture(t, "sandbox-cli", runtime.GOOS, runtime.GOARCH, pluginmanager.SandboxProcessABIVersionV1, 0755, []byte("sandbox native executable bytes"))
+	if artifact, err := validatePluginPathForCLI(dir, ""); err != nil {
+		t.Fatalf("validatePluginPathForCLI(sandbox dir) error = %v", err)
+	} else if artifact.RuntimeType != pluginmanager.RuntimeSandbox || artifact.RuntimeEntry != "bin/plugin" {
+		t.Fatalf("sandbox dir artifact = %+v, want sandbox bin/plugin", artifact)
+	}
+
+	handled, code := runPluginCLI([]string{"plugin", "test", dir, "--profile", "manifest"})
+	if !handled || code != 0 {
+		t.Fatalf("runPluginCLI(test sandbox manifest) = (%v, %d), want handled code 0", handled, code)
+	}
+
+	out := filepath.Join(t.TempDir(), "sandbox-cli.mcgp")
+	handled, code = runPluginCLI([]string{"plugin", "build", dir, "--type", "binary", "--out", out, "--skip-tests"})
+	if !handled || code != 0 {
+		t.Fatalf("runPluginCLI(build sandbox binary) = (%v, %d), want handled code 0", handled, code)
+	}
+	if artifact, err := validatePluginPathForCLI(out, pluginmanager.ArtifactTypeBinary); err != nil {
+		t.Fatalf("validatePluginPathForCLI(sandbox package) error = %v", err)
+	} else if artifact.RuntimeType != pluginmanager.RuntimeSandbox || artifact.RuntimeEntry != "bin/plugin" {
+		t.Fatalf("sandbox package artifact = %+v, want sandbox bin/plugin", artifact)
+	}
+
+	badPackage := writeSandboxCLIPackage(t, "sandbox-cli-bad", runtime.GOOS, runtime.GOARCH, pluginmanager.SandboxProcessABIVersionV1, 0644, []byte("sandbox bytes"))
+	_, cliErr := validatePluginPathForCLI(badPackage, "")
+	store := pluginmanager.NewArtifactStore(t.TempDir())
+	_, serverErr := store.ValidateAndStore(pluginmanager.ArtifactUpload{SourcePath: badPackage, FileName: filepath.Base(badPackage), Actor: "test"})
+	if cliErr == nil || serverErr == nil || cliErr.Error() != serverErr.Error() {
+		t.Fatalf("sandbox bad package errors cli=%v server=%v, want identical validation message", cliErr, serverErr)
+	}
+}
+
+func TestPluginSandboxCLIRejectsSymlinkParentRuntimeEntry(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "plugin")
+	outside := filepath.Join(root, "outside")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("MkdirAll(plugin) error = %v", err)
+	}
+	if err := os.MkdirAll(outside, 0755); err != nil {
+		t.Fatalf("MkdirAll(outside) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), sandboxCLIManifestJSON("sandbox-symlink-parent", runtime.GOOS, runtime.GOARCH, pluginmanager.SandboxProcessABIVersionV1), 0644); err != nil {
+		t.Fatalf("WriteFile(sandbox manifest) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "plugin"), []byte("outside executable bytes"), 0755); err != nil {
+		t.Fatalf("WriteFile(outside plugin) error = %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, "bin")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	want := `must not contain symlink path component "bin"`
+	if _, err := validatePluginPathForCLI(dir, ""); err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("validatePluginPathForCLI(symlink parent) error = %v, want %q", err, want)
+	}
+	manifest, raw, err := readPluginDirManifest(dir, "")
+	if err != nil {
+		t.Fatalf("readPluginDirManifest(sandbox symlink fixture) error = %v", err)
+	}
+	if _, err := buildSandboxPluginPackageContext(context.Background(), dir, manifest, raw, filepath.Join(root, "sandbox-symlink-parent.mcgp")); err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("buildSandboxPluginPackageContext(symlink parent) error = %v, want %q", err, want)
 	}
 }
 
@@ -2274,6 +2348,84 @@ type wasmCLIExportResponse struct {
 	Name     string
 	Offset   uint32
 	Response string
+}
+
+func writeSandboxCLIFixture(t *testing.T, id, goos, goarch, abiVersion string, mode os.FileMode, entryBytes []byte) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), id)
+	if err := os.MkdirAll(filepath.Join(dir, "bin"), 0755); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", dir, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), sandboxCLIManifestJSON(id, goos, goarch, abiVersion), 0644); err != nil {
+		t.Fatalf("WriteFile(sandbox manifest) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "bin", "plugin"), entryBytes, mode); err != nil {
+		t.Fatalf("WriteFile(sandbox entry) error = %v", err)
+	}
+	return dir
+}
+
+func writeSandboxCLIPackage(t *testing.T, id, goos, goarch, abiVersion string, mode os.FileMode, entryBytes []byte) string {
+	t.Helper()
+	packagePath := filepath.Join(t.TempDir(), id+".mcgp")
+	file, err := os.Create(packagePath)
+	if err != nil {
+		t.Fatalf("Create sandbox package error = %v", err)
+	}
+	zw := zip.NewWriter(file)
+	writeTestZipEntry(t, zw, "manifest.json", 0644, sandboxCLIManifestJSON(id, goos, goarch, abiVersion))
+	writeTestZipEntry(t, zw, "bin/plugin", mode, entryBytes)
+	if err := zw.Close(); err != nil {
+		t.Fatalf("Close sandbox package zip error = %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("Close sandbox package error = %v", err)
+	}
+	return packagePath
+}
+
+func writeTestZipEntry(t *testing.T, zw *zip.Writer, name string, mode os.FileMode, data []byte) {
+	t.Helper()
+	header := &zip.FileHeader{Name: name, Method: zip.Deflate}
+	header.SetMode(mode)
+	writer, err := zw.CreateHeader(header)
+	if err != nil {
+		t.Fatalf("CreateHeader(%s) error = %v", name, err)
+	}
+	if _, err := writer.Write(data); err != nil {
+		t.Fatalf("Write(%s) error = %v", name, err)
+	}
+}
+
+func sandboxCLIManifestJSON(id, goos, goarch, abiVersion string) []byte {
+	return []byte(fmt.Sprintf(`{
+  "schema_version": "mc-gateway.plugin/v1",
+  "id": %q,
+  "name": "Sandbox CLI Plugin",
+  "version": "0.1.0",
+  "artifact_type": "binary",
+  "runtime": {
+    "type": "sandbox-process",
+    "entry": "bin/plugin",
+    "protocol": %q,
+    "os": %q,
+    "arch": %q,
+    "abi_version": %q
+  },
+  "api_version": "plugin-api/v1",
+  "extension_points": [
+    {"type": "validator", "key": "config.validate/v1"}
+  ],
+  "capabilities": {
+    "extension_points": ["config.validate/v1"]
+  },
+  "runtime_limits": {
+    "handler_timeout_ms": 100
+  },
+  "config_schema": {
+    "type": "object"
+  }
+}`, id, pluginmanager.SandboxProcessProtocolV1, goos, goarch, abiVersion))
 }
 
 func writeWASMCLIFixture(t *testing.T, id, abi string, module []byte, conformance bool) string {

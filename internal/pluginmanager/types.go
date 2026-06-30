@@ -28,6 +28,9 @@ const (
 	RuntimeWASMEntry   = "plugin.wasm"
 	SourceBuildEntry   = "."
 
+	SandboxProcessProtocolV1   = "mc-gateway-sandbox-process/v1"
+	SandboxProcessABIVersionV1 = "mc-gateway.sandbox-process.abi/v1"
+
 	ExtensionUpstreamConnect   = "upstream.connect/v1"
 	ExtensionRouteResolve      = "route.resolve/v1"
 	ExtensionRouteResolver     = "route.resolver/v1"
@@ -226,7 +229,11 @@ type Manifest struct {
 type RuntimeManifest struct {
 	Type        string `json:"type"`
 	Entry       string `json:"entry"`
+	Protocol    string `json:"protocol,omitempty"`
+	OS          string `json:"os,omitempty"`
+	Arch        string `json:"arch,omitempty"`
 	ABI         string `json:"abi,omitempty"`
+	ABIVersion  string `json:"abi_version,omitempty"`
 	BuildEntry  string `json:"build_entry"`
 	EntrySymbol string `json:"entry_symbol"`
 }

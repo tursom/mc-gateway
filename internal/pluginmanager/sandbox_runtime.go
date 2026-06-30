@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	sandboxProcessProtocol           = "mc-gateway-sandbox-process/v1"
+	sandboxProcessProtocol           = SandboxProcessProtocolV1
 	sandboxControlChannelUnix        = "sandbox-control-rpc"
 	sandboxControlCommandHealth      = "health"
 	sandboxControlCommandDiagnostics = "diagnostics"

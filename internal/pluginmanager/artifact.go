@@ -101,12 +101,19 @@ func (s ArtifactStore) StoreBuiltBinary(upload ArtifactUpload, manifest Manifest
 		s.now = time.Now
 	}
 	manifest.ArtifactType = ArtifactTypeBinary
-	manifest.Runtime.Entry = RuntimeEntry
+	if manifest.Runtime.Type == RuntimeWASM {
+		manifest.Runtime.Entry = RuntimeWASMEntry
+	} else if manifest.Runtime.Type == RuntimeGoPlugin || manifest.Runtime.Entry == "" {
+		manifest.Runtime.Entry = RuntimeEntry
+	}
 	if err := validateManifest(manifest); err != nil {
 		return ArtifactRecord{}, err
 	}
 	if len(pluginBytes) == 0 {
 		return ArtifactRecord{}, errors.New("built runtime entry is empty")
+	}
+	if err := validateRuntimeEntryBytes(manifest, pluginBytes); err != nil {
+		return ArtifactRecord{}, err
 	}
 	pluginSum := sha256.Sum256(pluginBytes)
 	artifactID := hex.EncodeToString(pluginSum[:])
@@ -115,7 +122,10 @@ func (s ArtifactStore) StoreBuiltBinary(upload ArtifactUpload, manifest Manifest
 		return ArtifactRecord{}, err
 	}
 	pluginPath := filepath.Join(artifactDir, manifest.Runtime.Entry)
-	if err := os.WriteFile(pluginPath, pluginBytes, 0644); err != nil {
+	if err := os.MkdirAll(filepath.Dir(pluginPath), 0755); err != nil {
+		return ArtifactRecord{}, err
+	}
+	if err := os.WriteFile(pluginPath, pluginBytes, runtimeEntryStoredMode(manifest, nil)); err != nil {
 		return ArtifactRecord{}, err
 	}
 	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
@@ -125,6 +135,7 @@ func (s ArtifactStore) StoreBuiltBinary(upload ArtifactUpload, manifest Manifest
 	if err := os.WriteFile(filepath.Join(artifactDir, "manifest.json"), manifestBytes, 0644); err != nil {
 		return ArtifactRecord{}, err
 	}
+	metadata = mergeRuntimeArtifactMetadata(metadata, manifest, pluginBytes, packageSHA)
 	if err := writeBinaryDistributionPackage(filepath.Join(artifactDir, distributionPackageName), manifestBytes, pluginBytes, manifest.Runtime.Entry, metadata); err != nil {
 		return ArtifactRecord{}, err
 	}
@@ -164,8 +175,8 @@ func (s ArtifactStore) StoreBuiltBinary(upload ArtifactUpload, manifest Manifest
 		ExtensionPointsJSON:     string(extensionPoints),
 		APIVersion:              manifest.APIVersion,
 		GoVersion:               manifest.GoVersion,
-		GOOS:                    manifest.GOOS,
-		GOARCH:                  manifest.GOARCH,
+		GOOS:                    manifestTargetOS(manifest),
+		GOARCH:                  manifestTargetArch(manifest),
 		UploadedBy:              upload.Actor,
 		CreatedAt:               now,
 		UpdatedAt:               now,
@@ -284,6 +295,9 @@ func (s ArtifactStore) validateAndStore(upload ArtifactUpload, expectedArtifactT
 	if !ok {
 		return ArtifactRecord{}, fmt.Errorf("runtime entry %q is required", entry)
 	}
+	if err := validateRuntimeEntryZipFile(manifest, pluginFile); err != nil {
+		return ArtifactRecord{}, err
+	}
 	if pluginFile.UncompressedSize64 == 0 {
 		return ArtifactRecord{}, errors.New("runtime entry is empty")
 	}
@@ -313,7 +327,10 @@ func (s ArtifactStore) validateAndStore(upload ArtifactUpload, expectedArtifactT
 		return ArtifactRecord{}, err
 	}
 	pluginPath := filepath.Join(artifactDir, entry)
-	if err := os.WriteFile(pluginPath, pluginBytes, 0644); err != nil {
+	if err := os.MkdirAll(filepath.Dir(pluginPath), 0755); err != nil {
+		return ArtifactRecord{}, err
+	}
+	if err := os.WriteFile(pluginPath, pluginBytes, runtimeEntryStoredMode(manifest, pluginFile)); err != nil {
 		return ArtifactRecord{}, err
 	}
 	if err := os.WriteFile(filepath.Join(artifactDir, "manifest.json"), manifestBytes, 0644); err != nil {
@@ -332,12 +349,7 @@ func (s ArtifactStore) validateAndStore(upload ArtifactUpload, expectedArtifactT
 		return ArtifactRecord{}, err
 	}
 	manifest = mergeSBOMDependenciesIntoManifest(manifest, sbomSummary.Dependencies)
-	if runtimeMetadata := runtimeArtifactMetadata(manifest, pluginBytes, packageSHA); len(runtimeMetadata) > 0 {
-		if provenance == nil {
-			provenance = map[string]any{}
-		}
-		provenance["wasm"] = runtimeMetadata
-	}
+	provenance = mergeRuntimeArtifactMetadata(provenance, manifest, pluginBytes, packageSHA)
 	metadataJSON, err := artifactMetadataJSON(manifest, conformance, hasConformance, provenance)
 	if err != nil {
 		return ArtifactRecord{}, err
@@ -369,8 +381,8 @@ func (s ArtifactStore) validateAndStore(upload ArtifactUpload, expectedArtifactT
 		ExtensionPointsJSON:     string(extensionPoints),
 		APIVersion:              manifest.APIVersion,
 		GoVersion:               manifest.GoVersion,
-		GOOS:                    manifest.GOOS,
-		GOARCH:                  manifest.GOARCH,
+		GOOS:                    manifestTargetOS(manifest),
+		GOARCH:                  manifestTargetArch(manifest),
 		UploadedBy:              upload.Actor,
 		CreatedAt:               now,
 		UpdatedAt:               now,
@@ -486,13 +498,48 @@ func artifactMetadataJSON(manifest Manifest, conformance ConformanceSummary, has
 }
 
 func validateRuntimeEntryBytes(manifest Manifest, pluginBytes []byte) error {
-	if manifest.Runtime.Type != RuntimeWASM {
+	switch manifest.Runtime.Type {
+	case RuntimeWASM:
+		if err := validateWASMRuntimeLimits(manifest); err != nil {
+			return err
+		}
+		return validateWASMPackageModuleABI(context.Background(), pluginBytes, manifest)
+	case RuntimeSandbox:
+		if bytes.HasPrefix(pluginBytes, []byte("#!")) {
+			return fmt.Errorf("sandbox-process runtime entry %q must be a native executable; scripts are not allowed", manifest.Runtime.Entry)
+		}
+	}
+	return nil
+}
+
+func validateRuntimeEntryZipFile(manifest Manifest, file *zip.File) error {
+	if manifest.Runtime.Type != RuntimeSandbox {
 		return nil
 	}
-	if err := validateWASMRuntimeLimits(manifest); err != nil {
-		return err
+	if file == nil {
+		return fmt.Errorf("runtime entry %q is required", manifest.Runtime.Entry)
 	}
-	return validateWASMPackageModuleABI(context.Background(), pluginBytes, manifest)
+	mode := file.FileInfo().Mode()
+	if !mode.IsRegular() || mode&os.ModeType != 0 {
+		return fmt.Errorf("sandbox-process runtime entry %q must be a regular executable file", manifest.Runtime.Entry)
+	}
+	if mode.Perm()&0111 == 0 {
+		return fmt.Errorf("sandbox-process runtime entry %q is not executable", manifest.Runtime.Entry)
+	}
+	return nil
+}
+
+func runtimeEntryStoredMode(manifest Manifest, file *zip.File) os.FileMode {
+	if manifest.Runtime.Type != RuntimeSandbox {
+		return 0644
+	}
+	if file == nil {
+		return 0755
+	}
+	if mode := file.FileInfo().Mode().Perm(); mode != 0 {
+		return mode
+	}
+	return 0755
 }
 
 func validateWASMPackageModuleABI(ctx context.Context, module []byte, manifest Manifest) error {
@@ -510,26 +557,145 @@ func validateWASMPackageModuleABI(ctx context.Context, module []byte, manifest M
 }
 
 func runtimeArtifactMetadata(manifest Manifest, pluginBytes []byte, packageSHA string) map[string]any {
-	if manifest.Runtime.Type != RuntimeWASM {
+	switch manifest.Runtime.Type {
+	case RuntimeWASM:
+		requiredExports, err := wasmRequiredExports(manifest)
+		if err != nil {
+			requiredExports = nil
+		}
+		moduleSHA := wasmModuleHash(pluginBytes)
+		return map[string]any{
+			"abi":              manifest.Runtime.ABI,
+			"entry":            manifest.Runtime.Entry,
+			"artifact_sha256":  moduleSHA,
+			"module_sha256":    moduleSHA,
+			"package_sha256":   packageSHA,
+			"required_exports": requiredExports,
+			"limits": map[string]any{
+				"handler_timeout_ms": manifest.RuntimeLimits.HandlerTimeoutMS,
+				"memory_bytes":       manifest.RuntimeLimits.MemoryBytes,
+			},
+		}
+	case RuntimeSandbox:
+		entrySum := sha256.Sum256(pluginBytes)
+		entrySHA := hex.EncodeToString(entrySum[:])
+		return map[string]any{
+			"type":            RuntimeSandbox,
+			"protocol":        manifest.Runtime.Protocol,
+			"entry":           manifest.Runtime.Entry,
+			"entry_sha256":    entrySHA,
+			"artifact_sha256": entrySHA,
+			"package_sha256":  packageSHA,
+			"os":              manifest.Runtime.OS,
+			"arch":            manifest.Runtime.Arch,
+			"abi_version":     manifest.Runtime.ABIVersion,
+		}
+	default:
 		return nil
 	}
-	requiredExports, err := wasmRequiredExports(manifest)
-	if err != nil {
-		requiredExports = nil
+}
+
+func mergeRuntimeArtifactMetadata(metadata map[string]any, manifest Manifest, pluginBytes []byte, packageSHA string) map[string]any {
+	runtimeMetadata := runtimeArtifactMetadata(manifest, pluginBytes, packageSHA)
+	if len(runtimeMetadata) == 0 {
+		return metadata
 	}
-	moduleSHA := wasmModuleHash(pluginBytes)
-	return map[string]any{
-		"abi":              manifest.Runtime.ABI,
-		"entry":            manifest.Runtime.Entry,
-		"artifact_sha256":  moduleSHA,
-		"module_sha256":    moduleSHA,
-		"package_sha256":   packageSHA,
-		"required_exports": requiredExports,
-		"limits": map[string]any{
-			"handler_timeout_ms": manifest.RuntimeLimits.HandlerTimeoutMS,
-			"memory_bytes":       manifest.RuntimeLimits.MemoryBytes,
-		},
+	if metadata == nil {
+		metadata = map[string]any{}
 	}
+	switch manifest.Runtime.Type {
+	case RuntimeWASM:
+		metadata["wasm"] = runtimeMetadata
+	case RuntimeSandbox:
+		metadata["sandbox"] = runtimeMetadata
+	}
+	return metadata
+}
+
+func manifestTargetOS(manifest Manifest) string {
+	if manifest.Runtime.Type == RuntimeSandbox && manifest.Runtime.OS != "" {
+		return manifest.Runtime.OS
+	}
+	return manifest.GOOS
+}
+
+func manifestTargetArch(manifest Manifest) string {
+	if manifest.Runtime.Type == RuntimeSandbox && manifest.Runtime.Arch != "" {
+		return manifest.Runtime.Arch
+	}
+	return manifest.GOARCH
+}
+
+func validateSandboxRuntimeTarget(manifest Manifest) error {
+	if manifest.Runtime.Protocol != SandboxProcessProtocolV1 {
+		return fmt.Errorf("unsupported runtime.protocol %q", manifest.Runtime.Protocol)
+	}
+	if manifest.Runtime.OS != runtime.GOOS {
+		return fmt.Errorf("runtime.os %q does not match gateway %q", manifest.Runtime.OS, runtime.GOOS)
+	}
+	if manifest.Runtime.Arch != runtime.GOARCH {
+		return fmt.Errorf("runtime.arch %q does not match gateway %q", manifest.Runtime.Arch, runtime.GOARCH)
+	}
+	if manifest.Runtime.ABIVersion != SandboxProcessABIVersionV1 {
+		return fmt.Errorf("unsupported runtime.abi_version %q", manifest.Runtime.ABIVersion)
+	}
+	return nil
+}
+
+func validateSandboxArtifactMetadata(artifact ArtifactRecord, manifest Manifest) error {
+	if manifest.Runtime.Type != RuntimeSandbox {
+		return nil
+	}
+	if err := validateSandboxRuntimeTarget(manifest); err != nil {
+		return err
+	}
+	if artifact.RuntimeEntry != "" && artifact.RuntimeEntry != manifest.Runtime.Entry {
+		return fmt.Errorf("sandbox-process runtime entry %q does not match artifact runtime_entry %q", manifest.Runtime.Entry, artifact.RuntimeEntry)
+	}
+	metadata := jsonMapFromJSONString(artifact.MetadataJSON)
+	sandbox := jsonMapFromAny(metadata["sandbox"])
+	if sandbox == nil {
+		return errors.New("sandbox-process runtime metadata is missing")
+	}
+	checks := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"type", metadataString(sandbox["type"]), RuntimeSandbox},
+		{"protocol", metadataString(sandbox["protocol"]), manifest.Runtime.Protocol},
+		{"entry", metadataString(sandbox["entry"]), manifest.Runtime.Entry},
+		{"os", metadataString(sandbox["os"]), manifest.Runtime.OS},
+		{"arch", metadataString(sandbox["arch"]), manifest.Runtime.Arch},
+		{"abi_version", metadataString(sandbox["abi_version"]), manifest.Runtime.ABIVersion},
+	}
+	if artifact.SHA256 != "" {
+		entrySHA := metadataString(sandbox["entry_sha256"])
+		if entrySHA == "" {
+			entrySHA = metadataString(sandbox["artifact_sha256"])
+		}
+		checks = append(checks, struct {
+			name string
+			got  string
+			want string
+		}{"entry_sha256", entrySHA, artifact.SHA256})
+	}
+	if artifact.PackageSHA256 != "" {
+		checks = append(checks, struct {
+			name string
+			got  string
+			want string
+		}{"package_sha256", metadataString(sandbox["package_sha256"]), artifact.PackageSHA256})
+	}
+	for _, check := range checks {
+		if check.got == "" {
+			return fmt.Errorf("sandbox-process runtime metadata %s is required", check.name)
+		}
+		if check.got != check.want {
+			return fmt.Errorf("sandbox-process runtime metadata %s %q does not match %q", check.name, check.got, check.want)
+		}
+	}
+	return nil
 }
 
 func (s ArtifactStore) uploadFailureAuditDetails(upload ArtifactUpload, cause error) artifactUploadAuditDetails {
@@ -1115,12 +1281,26 @@ func validateManifest(manifest Manifest) error {
 		return fmt.Errorf("unsupported artifact_type %q", manifest.ArtifactType)
 	case manifest.Runtime.Type != RuntimeGoPlugin && manifest.Runtime.Type != RuntimeBuiltin && manifest.Runtime.Type != RuntimeSandbox && manifest.Runtime.Type != RuntimeWASM:
 		return fmt.Errorf("unsupported runtime.type %q", manifest.Runtime.Type)
+	case manifest.ArtifactType == ArtifactTypeBinary && strings.TrimSpace(manifest.Runtime.Entry) == "":
+		return errors.New("runtime.entry is required")
 	case manifest.ArtifactType == ArtifactTypeBinary && manifest.Runtime.Type == RuntimeGoPlugin && manifest.Runtime.Entry != RuntimeEntry:
 		return fmt.Errorf("unsupported runtime.entry %q", manifest.Runtime.Entry)
 	case manifest.ArtifactType == ArtifactTypeBinary && manifest.Runtime.Type == RuntimeWASM && manifest.Runtime.Entry != RuntimeWASMEntry:
 		return fmt.Errorf("unsupported runtime.entry %q", manifest.Runtime.Entry)
 	case manifest.Runtime.Type == RuntimeWASM && manifest.Runtime.ABI != wasmHostABIV1:
 		return fmt.Errorf("unsupported runtime.abi %q", manifest.Runtime.ABI)
+	case manifest.ArtifactType == ArtifactTypeBinary && manifest.Runtime.Type == RuntimeSandbox && strings.TrimSpace(manifest.Runtime.Protocol) == "":
+		return errors.New("runtime.protocol is required for sandbox-process")
+	case manifest.ArtifactType == ArtifactTypeBinary && manifest.Runtime.Type == RuntimeSandbox && manifest.Runtime.Protocol != SandboxProcessProtocolV1:
+		return fmt.Errorf("unsupported runtime.protocol %q", manifest.Runtime.Protocol)
+	case manifest.ArtifactType == ArtifactTypeBinary && manifest.Runtime.Type == RuntimeSandbox && strings.TrimSpace(manifest.Runtime.OS) == "":
+		return errors.New("runtime.os is required for sandbox-process")
+	case manifest.ArtifactType == ArtifactTypeBinary && manifest.Runtime.Type == RuntimeSandbox && strings.TrimSpace(manifest.Runtime.Arch) == "":
+		return errors.New("runtime.arch is required for sandbox-process")
+	case manifest.ArtifactType == ArtifactTypeBinary && manifest.Runtime.Type == RuntimeSandbox && strings.TrimSpace(manifest.Runtime.ABIVersion) == "":
+		return errors.New("runtime.abi_version is required for sandbox-process")
+	case manifest.ArtifactType == ArtifactTypeBinary && manifest.Runtime.Type == RuntimeSandbox && manifest.Runtime.ABIVersion != SandboxProcessABIVersionV1:
+		return fmt.Errorf("unsupported runtime.abi_version %q", manifest.Runtime.ABIVersion)
 	case manifest.ArtifactType == ArtifactTypeSource && rawSourceBuildEntry(manifest) == "":
 		return errors.New("build.entry is required for source artifacts")
 	case manifest.APIVersion != APIVersion:
@@ -1137,6 +1317,14 @@ func validateManifest(manifest Manifest) error {
 	}
 	if manifest.ArtifactType == ArtifactTypeBinary && manifest.Runtime.Type == RuntimeGoPlugin && manifest.GOARCH != "" && manifest.GOARCH != runtime.GOARCH {
 		return fmt.Errorf("go_arch %q does not match gateway %q", manifest.GOARCH, runtime.GOARCH)
+	}
+	if manifest.ArtifactType == ArtifactTypeBinary && manifest.Runtime.Type == RuntimeSandbox {
+		if _, err := cleanZipName(manifest.Runtime.Entry); err != nil {
+			return fmt.Errorf("invalid runtime.entry: %w", err)
+		}
+		if err := validateSandboxRuntimeTarget(manifest); err != nil {
+			return err
+		}
 	}
 	found := false
 	for _, ep := range manifest.ExtensionPoints {

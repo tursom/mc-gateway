@@ -1137,6 +1137,18 @@ func NewPromotionBundle(source string, profile string, artifact ArtifactRecord, 
 			"package_name":  artifact.FileName,
 		},
 	}
+	if manifest.Runtime.Type == RuntimeSandbox {
+		plugin.Provenance["runtime_entry"] = manifest.Runtime.Entry
+		plugin.Provenance["runtime_protocol"] = manifest.Runtime.Protocol
+		plugin.Provenance["runtime_os"] = manifest.Runtime.OS
+		plugin.Provenance["runtime_arch"] = manifest.Runtime.Arch
+		plugin.Provenance["runtime_abi_version"] = manifest.Runtime.ABIVersion
+		if metadata := jsonMapFromJSONString(artifact.MetadataJSON); metadata != nil {
+			if sandbox := jsonMapFromAny(metadata["sandbox"]); sandbox != nil {
+				plugin.Provenance["runtime_entry_sha256"] = metadataString(sandbox["entry_sha256"])
+			}
+		}
+	}
 	bundle := PromotionBundle{
 		SchemaVersion: SchemaVersion,
 		APIVersion:    APIVersion,

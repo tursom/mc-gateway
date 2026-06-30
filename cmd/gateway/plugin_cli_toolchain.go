@@ -168,6 +168,8 @@ type goPluginCLIAdapter struct{}
 
 type wasmPluginCLIAdapter struct{}
 
+type sandboxProcessCLIAdapter struct{}
+
 func (goPluginCLIAdapter) RuntimeType() string {
 	return pluginmanager.RuntimeGoPlugin
 }
@@ -260,6 +262,50 @@ func (wasmPluginCLIAdapter) Test(ctx context.Context, opts pluginTestCLIOptions)
 	return nil
 }
 
+func (sandboxProcessCLIAdapter) RuntimeType() string {
+	return pluginmanager.RuntimeSandbox
+}
+
+func (sandboxProcessCLIAdapter) Init(context.Context, pluginInitCLIOptions) error {
+	return errors.New("sandbox-process plugin init template is not implemented yet")
+}
+
+func (sandboxProcessCLIAdapter) BuildBinary(ctx context.Context, req pluginBuildRuntimeRequest) (pluginmanager.ArtifactRecord, error) {
+	return buildSandboxPluginPackageContext(ctx, req.Dir, req.Manifest, req.Raw, req.OutPath)
+}
+
+func (sandboxProcessCLIAdapter) BuildSource(context.Context, pluginBuildRuntimeRequest) (pluginmanager.ArtifactRecord, error) {
+	return pluginmanager.ArtifactRecord{}, errors.New("sandbox-process source packages are not implemented yet; build an executable and package a binary .mcgp")
+}
+
+func (sandboxProcessCLIAdapter) Test(ctx context.Context, opts pluginTestCLIOptions) error {
+	for _, item := range strings.Split(opts.Profile, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		switch item {
+		case "unit", "manifest":
+			if _, err := validateSandboxPluginDirectoryForCLI(ctx, opts.Target, opts.Manifest); err != nil {
+				return err
+			}
+		case "harness", "protocol-smoke", "conformance":
+			if err := validateTestFileIfSet(opts.ConfigPath, "config"); err != nil {
+				return err
+			}
+			if err := validateTestFileIfSet(opts.FixturePath, "fixture"); err != nil {
+				return err
+			}
+			if _, err := validateSandboxPluginDirectoryForCLI(ctx, opts.Target, opts.Manifest); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unsupported test profile %q", item)
+		}
+	}
+	return nil
+}
+
 func pluginCLIAdapterForRuntime(runtimeType string) (pluginRuntimeCLIAdapter, error) {
 	if runtimeType == "" {
 		runtimeType = pluginmanager.RuntimeGoPlugin
@@ -267,8 +313,10 @@ func pluginCLIAdapterForRuntime(runtimeType string) (pluginRuntimeCLIAdapter, er
 	switch runtimeType {
 	case pluginmanager.RuntimeGoPlugin:
 		return goPluginCLIAdapter{}, nil
-	case pluginmanager.RuntimeBuiltin, pluginmanager.RuntimeSandbox:
+	case pluginmanager.RuntimeBuiltin:
 		return nil, fmt.Errorf("runtime %q is reserved; no CLI build/test adapter is implemented yet", runtimeType)
+	case pluginmanager.RuntimeSandbox:
+		return sandboxProcessCLIAdapter{}, nil
 	case pluginmanager.RuntimeWASM:
 		return wasmPluginCLIAdapter{}, nil
 	default:
@@ -322,7 +370,7 @@ func pluginFeatureFactsFor(options pluginmanager.RuntimeFeatureFactsOptions) map
 		"plugin_host":      pluginmanager.PluginHostProtocolFeature(),
 		"extension_points": pluginmanager.ExtensionPointFeatures(),
 		"build": map[string]any{
-			"implemented_runtimes": []string{pluginmanager.RuntimeGoPlugin, pluginmanager.RuntimeWASM},
+			"implemented_runtimes": []string{pluginmanager.RuntimeGoPlugin, pluginmanager.RuntimeSandbox, pluginmanager.RuntimeWASM},
 			"builder_types": []string{
 				pluginmanager.BuilderTypeLocalProcess,
 				pluginmanager.BuilderTypeContainer,
@@ -3197,11 +3245,15 @@ func manifestSchemaForCLI() map[string]any {
 			"schema_version", "id", "name", "version", "artifact_type", "runtime", "api_version", "extension_points", "capabilities",
 		},
 		"properties": map[string]any{
-			"schema_version": map[string]any{"const": pluginmanager.SchemaVersion},
-			"artifact_type":  map[string]any{"enum": []string{pluginmanager.ArtifactTypeBinary, pluginmanager.ArtifactTypeSource}},
-			"runtime.type":   map[string]any{"enum": runtimeTypeKeysForCLI()},
-			"runtime.entry":  map[string]any{"enum": []string{pluginmanager.RuntimeEntry, pluginmanager.RuntimeWASMEntry}},
-			"runtime.abi":    map[string]any{"enum": []string{pluginmanager.WASMHostABIVersion()}},
+			"schema_version":      map[string]any{"const": pluginmanager.SchemaVersion},
+			"artifact_type":       map[string]any{"enum": []string{pluginmanager.ArtifactTypeBinary, pluginmanager.ArtifactTypeSource}},
+			"runtime.type":        map[string]any{"enum": runtimeTypeKeysForCLI()},
+			"runtime.entry":       map[string]any{"type": "string"},
+			"runtime.protocol":    map[string]any{"enum": []string{pluginmanager.SandboxProcessProtocolV1}},
+			"runtime.os":          map[string]any{"type": "string"},
+			"runtime.arch":        map[string]any{"type": "string"},
+			"runtime.abi":         map[string]any{"enum": []string{pluginmanager.WASMHostABIVersion()}},
+			"runtime.abi_version": map[string]any{"enum": []string{pluginmanager.SandboxProcessABIVersionV1}},
 			"runtime_limits.handler_timeout_ms": map[string]any{
 				"type":    "integer",
 				"minimum": 1,
@@ -4756,7 +4808,7 @@ func manifestExplanation(key string) (map[string]any, bool) {
 			"key":      "runtime.type",
 			"required": true,
 			"values":   []string{pluginmanager.RuntimeGoPlugin, pluginmanager.RuntimeBuiltin, pluginmanager.RuntimeSandbox, pluginmanager.RuntimeWASM},
-			"summary":  "Selects the runtime adapter. Only go-plugin build/test is implemented by this CLI slice.",
+			"summary":  "Selects the runtime adapter. The CLI can build Go/WASM packages and validate or package an existing sandbox-process executable.",
 		},
 		"runtime.entry": {
 			"key":      "runtime.entry",
@@ -4764,10 +4816,28 @@ func manifestExplanation(key string) (map[string]any, bool) {
 			"default":  pluginmanager.RuntimeEntry,
 			"summary":  "Path of the runtime entry inside a binary .mcgp package.",
 		},
+		"runtime.protocol": {
+			"key":     "runtime.protocol",
+			"values":  []string{pluginmanager.SandboxProcessProtocolV1},
+			"summary": "Sandbox-process control protocol required when runtime.type is sandbox-process.",
+		},
+		"runtime.os": {
+			"key":     "runtime.os",
+			"summary": "Target operating system required when runtime.type is sandbox-process.",
+		},
+		"runtime.arch": {
+			"key":     "runtime.arch",
+			"summary": "Target architecture required when runtime.type is sandbox-process.",
+		},
 		"runtime.abi": {
 			"key":     "runtime.abi",
 			"values":  []string{pluginmanager.WASMHostABIVersion()},
 			"summary": "WASM host ABI version required when runtime.type is wasm.",
+		},
+		"runtime.abi_version": {
+			"key":     "runtime.abi_version",
+			"values":  []string{pluginmanager.SandboxProcessABIVersionV1},
+			"summary": "Sandbox-process ABI version required when runtime.type is sandbox-process.",
 		},
 		"runtime.entry_symbol": {
 			"key":     "runtime.entry_symbol",
@@ -5435,6 +5505,9 @@ func validatePluginDirectoryForCLI(dir, manifestPath string) (pluginmanager.Arti
 	if manifest.Runtime.Type == pluginmanager.RuntimeWASM {
 		return validateWASMPluginDirectoryForCLI(context.Background(), dir, manifestPath)
 	}
+	if manifest.Runtime.Type == pluginmanager.RuntimeSandbox {
+		return validateSandboxPluginDirectoryForCLI(context.Background(), dir, manifestPath)
+	}
 	tmpRoot, err := os.MkdirTemp("", "mcgp-dir-validate-*")
 	if err != nil {
 		return pluginmanager.ArtifactRecord{}, err
@@ -5460,6 +5533,24 @@ func validateWASMPluginDirectoryForCLI(ctx context.Context, dir, manifestPath st
 	defer os.RemoveAll(tmpRoot)
 	packagePath := filepath.Join(tmpRoot, manifest.ID+".mcgp")
 	if _, err := buildWASMPluginPackageContext(ctx, dir, manifest, raw, packagePath); err != nil {
+		return pluginmanager.ArtifactRecord{}, err
+	}
+	store := pluginmanager.NewArtifactStore(filepath.Join(tmpRoot, "store"))
+	return store.ValidateAndStoreBinary(pluginmanager.ArtifactUpload{SourcePath: packagePath, FileName: filepath.Base(packagePath), Actor: "cli"})
+}
+
+func validateSandboxPluginDirectoryForCLI(ctx context.Context, dir, manifestPath string) (pluginmanager.ArtifactRecord, error) {
+	manifest, raw, err := readPluginDirManifest(dir, manifestPath)
+	if err != nil {
+		return pluginmanager.ArtifactRecord{}, err
+	}
+	tmpRoot, err := os.MkdirTemp("", "mcgp-sandbox-dir-validate-*")
+	if err != nil {
+		return pluginmanager.ArtifactRecord{}, err
+	}
+	defer os.RemoveAll(tmpRoot)
+	packagePath := filepath.Join(tmpRoot, manifest.ID+".mcgp")
+	if _, err := buildSandboxPluginPackageContext(ctx, dir, manifest, raw, packagePath); err != nil {
 		return pluginmanager.ArtifactRecord{}, err
 	}
 	store := pluginmanager.NewArtifactStore(filepath.Join(tmpRoot, "store"))
@@ -5528,6 +5619,91 @@ func buildWASMPluginPackageContext(ctx context.Context, dir string, manifest plu
 		return pluginmanager.ArtifactRecord{}, err
 	}
 	return validatePluginPathForCLI(outPath, pluginmanager.ArtifactTypeBinary)
+}
+
+func buildSandboxPluginPackageContext(ctx context.Context, dir string, manifest pluginmanager.Manifest, raw map[string]any, outPath string) (pluginmanager.ArtifactRecord, error) {
+	_ = ctx
+	entryPath, entryName, err := ensureSandboxRuntimeEntryForCLI(dir, manifest)
+	if err != nil {
+		return pluginmanager.ArtifactRecord{}, err
+	}
+	manifestBytes, err := materializedManifestJSON(raw, manifest, pluginmanager.ArtifactTypeBinary, false)
+	if err != nil {
+		return pluginmanager.ArtifactRecord{}, err
+	}
+	if err := writeBinaryPackage(entryPath, entryName, manifestBytes, dir, outPath); err != nil {
+		return pluginmanager.ArtifactRecord{}, err
+	}
+	return validatePluginPathForCLI(outPath, pluginmanager.ArtifactTypeBinary)
+}
+
+func ensureSandboxRuntimeEntryForCLI(dir string, manifest pluginmanager.Manifest) (string, string, error) {
+	entry := strings.TrimSpace(manifest.Runtime.Entry)
+	if entry == "" {
+		return "", "", errors.New("runtime.entry is required")
+	}
+	clean, err := cleanPackageEntryNameForCLI(entry)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid runtime.entry: %w", err)
+	}
+	entryPath, info, err := sandboxRuntimeEntryPathInfoForCLI(dir, clean)
+	if err != nil {
+		return "", "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", "", fmt.Errorf("sandbox-process runtime entry %q must be a regular executable file", clean)
+	}
+	if info.Mode().Perm()&0111 == 0 {
+		return "", "", fmt.Errorf("sandbox-process runtime entry %q is not executable", clean)
+	}
+	file, err := os.Open(entryPath)
+	if err != nil {
+		return "", "", err
+	}
+	defer file.Close()
+	var prefix [2]byte
+	n, err := io.ReadFull(file, prefix[:])
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return "", "", err
+	}
+	if n == len(prefix) && bytes.Equal(prefix[:], []byte("#!")) {
+		return "", "", fmt.Errorf("sandbox-process runtime entry %q must be a native executable; scripts are not allowed", clean)
+	}
+	return entryPath, clean, nil
+}
+
+func sandboxRuntimeEntryPathInfoForCLI(dir, clean string) (string, os.FileInfo, error) {
+	root, err := filepath.Abs(dir)
+	if err != nil {
+		return "", nil, err
+	}
+	current := root
+	var info os.FileInfo
+	parts := strings.Split(clean, "/")
+	for i, part := range parts {
+		current = filepath.Join(current, part)
+		info, err = os.Lstat(current)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return "", nil, fmt.Errorf("runtime entry %q is required", clean)
+			}
+			return "", nil, err
+		}
+		if i < len(parts)-1 && info.Mode()&os.ModeSymlink != 0 {
+			return "", nil, fmt.Errorf("sandbox-process runtime entry %q must not contain symlink path component %q", clean, path.Join(parts[:i+1]...))
+		}
+		if i < len(parts)-1 && !info.IsDir() {
+			return "", nil, fmt.Errorf("sandbox-process runtime entry %q parent %q must be a directory", clean, path.Join(parts[:i+1]...))
+		}
+	}
+	rel, err := filepath.Rel(root, current)
+	if err != nil {
+		return "", nil, err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", nil, fmt.Errorf("invalid runtime.entry: unsafe zip entry %q", clean)
+	}
+	return current, info, nil
 }
 
 func ensureWASMModuleForCLI(ctx context.Context, dir string, manifest pluginmanager.Manifest) (string, func(), error) {
@@ -5762,6 +5938,10 @@ func materializedManifestJSON(raw map[string]any, manifest pluginmanager.Manifes
 		if runtimeMap["abi"] == nil || runtimeMap["abi"] == "" {
 			runtimeMap["abi"] = manifest.Runtime.ABI
 		}
+	} else if artifactType == pluginmanager.ArtifactTypeBinary && runtimeType == pluginmanager.RuntimeSandbox {
+		if runtimeMap["entry"] == nil || runtimeMap["entry"] == "" {
+			runtimeMap["entry"] = manifest.Runtime.Entry
+		}
 	} else if artifactType == pluginmanager.ArtifactTypeBinary {
 		runtimeMap["entry"] = pluginmanager.RuntimeEntry
 	} else if runtimeMap["entry"] == nil || runtimeMap["entry"] == "" {
@@ -5970,6 +6150,22 @@ func sourcePackageEntryAllowed(name string) bool {
 	default:
 		return false
 	}
+}
+
+func cleanPackageEntryNameForCLI(name string) (string, error) {
+	if name == "" || strings.Contains(name, `\`) || strings.HasPrefix(name, "/") || windowsVolumeEntryNameForCLI(name) {
+		return "", fmt.Errorf("unsafe zip entry %q", name)
+	}
+	clean := path.Clean(name)
+	if clean == "." || clean != name || strings.HasPrefix(clean, "../") || clean == ".." || path.IsAbs(clean) {
+		return "", fmt.Errorf("unsafe zip entry %q", name)
+	}
+	return clean, nil
+}
+
+func windowsVolumeEntryNameForCLI(name string) bool {
+	return len(name) >= 2 && name[1] == ':' &&
+		((name[0] >= 'A' && name[0] <= 'Z') || (name[0] >= 'a' && name[0] <= 'z'))
 }
 
 func optionalPackageDocs(sourceDir string) []string {

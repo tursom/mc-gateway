@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestArtifactStoreValidateAndStore(t *testing.T) {
@@ -238,6 +239,119 @@ func TestArtifactStoreStoresWASMMetadata(t *testing.T) {
 	}
 }
 
+func TestArtifactStoreStoresSandboxMetadata(t *testing.T) {
+	packagePath := writeTestMCGPWithModes(t, map[string][]byte{
+		"manifest.json": testSandboxManifestBytes(t, "sandbox-metadata", runtime.GOOS, runtime.GOARCH, SandboxProcessABIVersionV1),
+		"bin/plugin":    []byte("sandbox native executable bytes"),
+	}, map[string]os.FileMode{"bin/plugin": 0755})
+	store := NewArtifactStore(t.TempDir())
+	artifact, err := store.ValidateAndStore(ArtifactUpload{
+		SourcePath: packagePath,
+		FileName:   "sandbox-metadata.mcgp",
+		Actor:      "admin",
+	})
+	if err != nil {
+		t.Fatalf("ValidateAndStore(sandbox metadata) error = %v", err)
+	}
+	if artifact.RuntimeType != RuntimeSandbox || artifact.RuntimeEntry != "bin/plugin" {
+		t.Fatalf("artifact runtime = %s entry = %s, want sandbox bin/plugin", artifact.RuntimeType, artifact.RuntimeEntry)
+	}
+	if artifact.GOOS != runtime.GOOS || artifact.GOARCH != runtime.GOARCH {
+		t.Fatalf("artifact target = %s/%s, want %s/%s", artifact.GOOS, artifact.GOARCH, runtime.GOOS, runtime.GOARCH)
+	}
+	metadata := jsonMap(artifact.MetadataJSON)
+	sandbox := jsonMapFromAny(metadata["sandbox"])
+	if sandbox == nil ||
+		sandbox["type"] != RuntimeSandbox ||
+		sandbox["protocol"] != SandboxProcessProtocolV1 ||
+		sandbox["entry"] != "bin/plugin" ||
+		sandbox["entry_sha256"] != artifact.SHA256 ||
+		sandbox["artifact_sha256"] != artifact.SHA256 ||
+		sandbox["package_sha256"] != artifact.PackageSHA256 ||
+		sandbox["os"] != runtime.GOOS ||
+		sandbox["arch"] != runtime.GOARCH ||
+		sandbox["abi_version"] != SandboxProcessABIVersionV1 {
+		t.Fatalf("sandbox metadata = %+v artifact=%+v, want runtime target and hashes", sandbox, artifact)
+	}
+}
+
+func TestArtifactStoreRejectsInvalidSandboxPackage(t *testing.T) {
+	baseManifest := testSandboxManifestBytes(t, "sandbox-invalid", runtime.GOOS, runtime.GOARCH, SandboxProcessABIVersionV1)
+	tests := []struct {
+		name    string
+		entries map[string][]byte
+		modes   map[string]os.FileMode
+		want    string
+	}{
+		{
+			name: "missing entry",
+			entries: map[string][]byte{
+				"manifest.json": baseManifest,
+				RuntimeEntry:    []byte("wrong entry"),
+			},
+			want: `runtime entry "bin/plugin" is required`,
+		},
+		{
+			name: "non executable entry",
+			entries: map[string][]byte{
+				"manifest.json": baseManifest,
+				"bin/plugin":    []byte("sandbox bytes"),
+			},
+			modes: map[string]os.FileMode{"bin/plugin": 0644},
+			want:  `sandbox-process runtime entry "bin/plugin" is not executable`,
+		},
+		{
+			name: "script entry",
+			entries: map[string][]byte{
+				"manifest.json": baseManifest,
+				"bin/plugin":    []byte("#!/bin/sh\nexit 0\n"),
+			},
+			modes: map[string]os.FileMode{"bin/plugin": 0755},
+			want:  `sandbox-process runtime entry "bin/plugin" must be a native executable; scripts are not allowed`,
+		},
+		{
+			name: "symlink entry",
+			entries: map[string][]byte{
+				"manifest.json": baseManifest,
+				"bin/plugin":    []byte("../escape"),
+			},
+			modes: map[string]os.FileMode{"bin/plugin": os.ModeSymlink | 0777},
+			want:  `unsupported zip entry type "bin/plugin"`,
+		},
+		{
+			name: "os mismatch",
+			entries: map[string][]byte{
+				"manifest.json": testSandboxManifestBytes(t, "sandbox-invalid", "not-"+runtime.GOOS, runtime.GOARCH, SandboxProcessABIVersionV1),
+				"bin/plugin":    []byte("sandbox bytes"),
+			},
+			modes: map[string]os.FileMode{"bin/plugin": 0755},
+			want:  "runtime.os",
+		},
+		{
+			name: "abi mismatch",
+			entries: map[string][]byte{
+				"manifest.json": testSandboxManifestBytes(t, "sandbox-invalid", runtime.GOOS, runtime.GOARCH, "mc-gateway.sandbox-process.abi/v0"),
+				"bin/plugin":    []byte("sandbox bytes"),
+			},
+			modes: map[string]os.FileMode{"bin/plugin": 0755},
+			want:  "unsupported runtime.abi_version",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewArtifactStore(t.TempDir())
+			_, err := store.ValidateAndStore(ArtifactUpload{
+				SourcePath: writeTestMCGPWithModes(t, tt.entries, tt.modes),
+				FileName:   "sandbox-invalid.mcgp",
+				Actor:      "admin",
+			})
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("ValidateAndStore(%s) error = %v, want containing %q", tt.name, err, tt.want)
+			}
+		})
+	}
+}
+
 func TestArtifactStoreRejectsUnsafePackage(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -315,6 +429,38 @@ func testWASMManifestBytes(t *testing.T, pluginID, abi string) []byte {
 	data, err := json.Marshal(manifest)
 	if err != nil {
 		t.Fatalf("Marshal wasm manifest error = %v", err)
+	}
+	return data
+}
+
+func testSandboxManifestBytes(t *testing.T, pluginID, goos, goarch, abiVersion string) []byte {
+	t.Helper()
+	manifest := Manifest{
+		SchemaVersion: SchemaVersion,
+		ID:            pluginID,
+		Name:          "Sandbox Test Plugin",
+		Version:       "0.1.0",
+		ArtifactType:  ArtifactTypeBinary,
+		Runtime: RuntimeManifest{
+			Type:       RuntimeSandbox,
+			Entry:      "bin/plugin",
+			Protocol:   SandboxProcessProtocolV1,
+			OS:         goos,
+			Arch:       goarch,
+			ABIVersion: abiVersion,
+		},
+		APIVersion: APIVersion,
+		ExtensionPoints: []ExtensionPoint{{
+			Type: "hook",
+			Key:  ExtensionConfigValidate,
+		}},
+		Capabilities:  json.RawMessage(`{"extension_points":["config.validate/v1"]}`),
+		ConfigSchema:  json.RawMessage(`{"type":"object"}`),
+		RuntimeLimits: RuntimeLimits{HandlerTimeoutMS: 3000},
+	}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("Marshal sandbox manifest error = %v", err)
 	}
 	return data
 }
@@ -413,6 +559,10 @@ func testManifestBytesWithCapabilities(t *testing.T, pluginID string, capabiliti
 }
 
 func writeTestMCGP(t *testing.T, entries map[string][]byte) string {
+	return writeTestMCGPWithModes(t, entries, nil)
+}
+
+func writeTestMCGPWithModes(t *testing.T, entries map[string][]byte, modes map[string]os.FileMode) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "plugin.mcgp")
 	file, err := os.Create(path)
@@ -421,7 +571,14 @@ func writeTestMCGP(t *testing.T, entries map[string][]byte) string {
 	}
 	zipWriter := zip.NewWriter(file)
 	for name, data := range entries {
-		writer, err := zipWriter.Create(name)
+		header := &zip.FileHeader{Name: name, Method: zip.Deflate}
+		mode := os.FileMode(0644)
+		if modes != nil && modes[name] != 0 {
+			mode = modes[name]
+		}
+		header.SetMode(mode)
+		header.Modified = time.Unix(0, 0).UTC()
+		writer, err := zipWriter.CreateHeader(header)
 		if err != nil {
 			t.Fatalf("Create zip entry error = %v", err)
 		}
