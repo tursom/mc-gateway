@@ -372,12 +372,16 @@ func packageBinaryArtifact(artifact pluginmanager.ArtifactRecord, outPath string
 	}
 	defer out.Close()
 	zw := zip.NewWriter(out)
+	runtimeEntry := artifact.RuntimeEntry
+	if runtimeEntry == "" {
+		runtimeEntry = pluginmanager.RuntimeEntry
+	}
 	for _, entry := range []struct {
 		name string
 		path string
 	}{
 		{name: "manifest.json", path: filepath.Join(filepath.Dir(artifact.FilePath), "manifest.json")},
-		{name: pluginmanager.RuntimeEntry, path: artifact.FilePath},
+		{name: runtimeEntry, path: artifact.FilePath},
 	} {
 		if err := addZipFile(zw, entry.name, entry.path); err != nil {
 			zw.Close()

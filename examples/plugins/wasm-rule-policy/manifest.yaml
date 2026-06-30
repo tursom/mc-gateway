@@ -1,0 +1,31 @@
+# examples/plugins/wasm-rule-policy/manifest.yaml demonstrates the WASM host ABI package shape.
+
+schema_version: mc-gateway.plugin/v1
+id: wasm-rule-policy
+name: WASM Rule Policy
+version: 0.1.0
+description: Minimal WASM policy plugin for config validation, rule evaluation, and route resolution.
+artifact_type: binary
+runtime:
+  type: wasm
+  entry: plugin.wasm
+  abi: mc-gateway.wasm.host/v1
+api_version: plugin-api/v1
+extension_points:
+  - type: validator
+    key: config.validate/v1
+  - type: rule
+    key: rule.evaluate/v1
+  - type: provider
+    key: route.resolve/v1
+capabilities:
+  extension_points:
+    - config.validate/v1
+    - rule.evaluate/v1
+    - route.resolve/v1
+runtime_limits:
+  handler_timeout_ms: 100
+  memory_bytes: 65536
+config_schema:
+  type: object
+  additionalProperties: true

@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -20,12 +21,13 @@ import (
 	"github.com/tursom/mc-gateway/internal/pluginmanager"
 )
 
-func TestPluginRuntimeCLIAdapterWASMErrorIsNotReserved(t *testing.T) {
-	if _, err := pluginCLIAdapterForRuntime(pluginmanager.RuntimeWASM); err == nil {
-		t.Fatal("pluginCLIAdapterForRuntime(wasm) error = nil, want not implemented error")
-	} else if strings.Contains(err.Error(), "reserved") ||
-		!strings.Contains(err.Error(), "wasm CLI build/test adapter is not implemented yet") {
-		t.Fatalf("pluginCLIAdapterForRuntime(wasm) error = %q, want non-reserved wasm not implemented message", err)
+func TestPluginRuntimeCLIAdapterWASMImplemented(t *testing.T) {
+	adapter, err := pluginCLIAdapterForRuntime(pluginmanager.RuntimeWASM)
+	if err != nil {
+		t.Fatalf("pluginCLIAdapterForRuntime(wasm) error = %v, want implemented adapter", err)
+	}
+	if adapter.RuntimeType() != pluginmanager.RuntimeWASM {
+		t.Fatalf("adapter.RuntimeType() = %q, want wasm", adapter.RuntimeType())
 	}
 
 	for _, runtimeType := range []string{pluginmanager.RuntimeBuiltin, pluginmanager.RuntimeSandbox} {
@@ -250,6 +252,87 @@ func TestPluginTestManifestProfile(t *testing.T) {
 	}
 	if code != 0 {
 		t.Fatalf("runPluginCLI(test manifest) code = %d, want 0", code)
+	}
+}
+
+func TestPluginWASMCLIValidateBuildTestAndConformance(t *testing.T) {
+	dir := writeWASMCLIFixture(t, "wasm-cli-policy", pluginmanager.WASMHostABIVersion(), wasmCLIModule(t), true)
+	for _, args := range [][]string{
+		{"plugin", "validate", dir},
+		{"plugin", "test", dir, "--profile", "manifest"},
+		{"plugin", "test", dir, "--profile", "conformance"},
+	} {
+		handled, code := runPluginCLI(args)
+		if !handled || code != 0 {
+			t.Fatalf("runPluginCLI(%v) = (%v, %d), want handled code 0", args, handled, code)
+		}
+	}
+
+	out := filepath.Join(t.TempDir(), "wasm-cli-policy.mcgp")
+	handled, code := runPluginCLI([]string{"plugin", "build", dir, "--type", "binary", "--out", out, "--skip-tests"})
+	if !handled || code != 0 {
+		t.Fatalf("runPluginCLI(build wasm) = (%v, %d), want handled code 0", handled, code)
+	}
+	assertZipContains(t, out, "manifest.json", pluginmanager.RuntimeWASMEntry, "conformance.json")
+	artifact, err := validatePluginPathForCLI(out, pluginmanager.ArtifactTypeBinary)
+	if err != nil {
+		t.Fatalf("validatePluginPathForCLI(wasm package) error = %v", err)
+	}
+	metadata := map[string]any{}
+	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &metadata); err != nil {
+		t.Fatalf("Unmarshal wasm artifact metadata error = %v", err)
+	}
+	if wasm, _ := metadata["wasm"].(map[string]any); wasm == nil || wasm["abi"] != pluginmanager.WASMHostABIVersion() || wasm["module_sha256"] != artifact.SHA256 {
+		t.Fatalf("wasm metadata = %+v artifact=%+v, want ABI and module hash", wasm, artifact)
+	}
+
+	output := captureStdout(t, func() {
+		handled, code := runPluginCLI([]string{"plugin", "conformance", dir})
+		if !handled || code != 0 {
+			t.Fatalf("runPluginCLI(conformance wasm) = (%v, %d), want handled code 0", handled, code)
+		}
+	})
+	var report struct {
+		OK       bool             `json:"ok"`
+		Fixtures []map[string]any `json:"fixtures"`
+	}
+	if err := json.Unmarshal([]byte(output), &report); err != nil {
+		t.Fatalf("Unmarshal(wasm conformance) error = %v\n%s", err, output)
+	}
+	if !report.OK ||
+		!hasFixture(report.Fixtures, "config.validate/v1", "pass") ||
+		!hasFixture(report.Fixtures, "rule.evaluate/v1.deny", "pass") ||
+		!hasFixture(report.Fixtures, "route.resolve/v1.override", "pass") {
+		t.Fatalf("wasm conformance report = %+v, want executable config/rule/route pass", report)
+	}
+	for _, name := range []string{"config.validate/v1", "rule.evaluate/v1.deny", "route.resolve/v1.override"} {
+		fixture, ok := findFixture(report.Fixtures, name)
+		if !ok || fixture["mode"] != "executable" || fixture["target_plugin"] != "wasm-cli-policy" {
+			t.Fatalf("%s fixture = %+v, want executable target wasm evidence", name, fixture)
+		}
+	}
+}
+
+func TestPluginWASMCLIValidateBlocksMissingEntryABIMismatchAndMissingExport(t *testing.T) {
+	missingEntry := writeWASMCLIFixture(t, "wasm-missing-entry", pluginmanager.WASMHostABIVersion(), nil, false)
+	if _, err := validatePluginPathForCLI(missingEntry, ""); err == nil || !strings.Contains(err.Error(), `wasm runtime entry "plugin.wasm" is required`) {
+		t.Fatalf("validate missing plugin.wasm error = %v, want plugin.wasm required", err)
+	}
+
+	abiMismatch := writeWASMCLIFixture(t, "wasm-abi-mismatch", "mc-gateway.wasm.host/v0", wasmCLIModule(t), false)
+	if _, err := validatePluginPathForCLI(abiMismatch, ""); err == nil || !strings.Contains(err.Error(), "unsupported runtime.abi") {
+		t.Fatalf("validate ABI mismatch error = %v, want unsupported runtime.abi", err)
+	}
+
+	missingExport := writeWASMCLIFixture(t, "wasm-missing-export", pluginmanager.WASMHostABIVersion(), wasmCLIModuleWithExports(t, []wasmCLIExportResponse{
+		{
+			Name:     "mcgw_config_validate_v1",
+			Offset:   4096,
+			Response: `{"abi":"mc-gateway.wasm.host/v1","extension_point":"config.validate/v1","ok":true,"valid":true}`,
+		},
+	}), false)
+	if _, err := validatePluginPathForCLI(missingExport, ""); err == nil || !strings.Contains(err.Error(), "required export") {
+		t.Fatalf("validate missing export error = %v, want required export block", err)
 	}
 }
 
@@ -2139,6 +2222,186 @@ func hasCheck(checks []map[string]any, code, severity string) bool {
 		}
 	}
 	return false
+}
+
+type wasmCLIExportResponse struct {
+	Name     string
+	Offset   uint32
+	Response string
+}
+
+func writeWASMCLIFixture(t *testing.T, id, abi string, module []byte, conformance bool) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), id)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("MkdirAll(%s) error = %v", dir, err)
+	}
+	manifest := fmt.Sprintf(`{
+  "schema_version": "mc-gateway.plugin/v1",
+  "id": %q,
+  "name": "WASM CLI Policy",
+  "version": "0.1.0",
+  "artifact_type": "binary",
+  "runtime": {
+    "type": "wasm",
+    "entry": "plugin.wasm",
+    "abi": %q
+  },
+  "api_version": "plugin-api/v1",
+  "extension_points": [
+    {"type": "validator", "key": "config.validate/v1"},
+    {"type": "rule", "key": "rule.evaluate/v1"},
+    {"type": "provider", "key": "route.resolve/v1"}
+  ],
+  "capabilities": {
+    "extension_points": ["config.validate/v1", "rule.evaluate/v1", "route.resolve/v1"]
+  },
+  "runtime_limits": {
+    "handler_timeout_ms": 100,
+    "memory_bytes": 65536
+  },
+  "config_schema": {
+    "type": "object"
+  }
+}`, id, abi)
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(manifest), 0644); err != nil {
+		t.Fatalf("WriteFile(manifest) error = %v", err)
+	}
+	if len(module) > 0 {
+		if err := os.WriteFile(filepath.Join(dir, pluginmanager.RuntimeWASMEntry), module, 0644); err != nil {
+			t.Fatalf("WriteFile(plugin.wasm) error = %v", err)
+		}
+	}
+	if conformance {
+		data := []byte(`{
+  "route_decisions": ["override"],
+  "rule_evaluation_outcomes": ["deny"],
+  "fixtures": [
+    {"name": "wasm.package_metadata", "status": "pass", "expected": "abi_metadata"}
+  ]
+}`)
+		if err := os.WriteFile(filepath.Join(dir, "conformance.json"), data, 0644); err != nil {
+			t.Fatalf("WriteFile(conformance) error = %v", err)
+		}
+	}
+	return dir
+}
+
+func wasmCLIModule(t *testing.T) []byte {
+	t.Helper()
+	return wasmCLIModuleWithExports(t, []wasmCLIExportResponse{
+		{
+			Name:     "mcgw_config_validate_v1",
+			Offset:   4096,
+			Response: `{"abi":"mc-gateway.wasm.host/v1","extension_point":"config.validate/v1","ok":true,"valid":true}`,
+		},
+		{
+			Name:     "mcgw_rule_evaluate_v1",
+			Offset:   8192,
+			Response: `{"abi":"mc-gateway.wasm.host/v1","extension_point":"rule.evaluate/v1","ok":true,"decision":"deny","reason":"blocked by wasm rule policy"}`,
+		},
+		{
+			Name:     "mcgw_route_resolve_v1",
+			Offset:   12288,
+			Response: `{"abi":"mc-gateway.wasm.host/v1","extension_point":"route.resolve/v1","ok":true,"decision":"override","route":"wasm-policy:25565","reason":"routed by wasm policy"}`,
+		},
+	})
+}
+
+func wasmCLIModuleWithExports(t *testing.T, exports []wasmCLIExportResponse) []byte {
+	t.Helper()
+	module := []byte{0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00}
+	module = append(module, wasmCLISection(1, []byte{0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7e})...)
+	functions := appendU32LEBForCLITest(nil, uint32(len(exports)))
+	for range exports {
+		functions = append(functions, 0x00)
+	}
+	module = append(module, wasmCLISection(3, functions)...)
+	module = append(module, wasmCLISection(5, []byte{0x01, 0x00, 0x01})...)
+	exportPayload := appendU32LEBForCLITest(nil, uint32(len(exports)+1))
+	for index, item := range exports {
+		exportPayload = appendU32LEBForCLITest(exportPayload, uint32(len(item.Name)))
+		exportPayload = append(exportPayload, item.Name...)
+		exportPayload = append(exportPayload, 0x00)
+		exportPayload = appendU32LEBForCLITest(exportPayload, uint32(index))
+	}
+	exportPayload = appendU32LEBForCLITest(exportPayload, uint32(len("memory")))
+	exportPayload = append(exportPayload, "memory"...)
+	exportPayload = append(exportPayload, 0x02, 0x00)
+	module = append(module, wasmCLISection(7, exportPayload)...)
+	code := appendU32LEBForCLITest(nil, uint32(len(exports)))
+	for _, item := range exports {
+		responseLen := uint32(len([]byte(item.Response)))
+		result := int64(uint64(item.Offset)<<32 | uint64(responseLen))
+		body := []byte{0x00, 0x42}
+		body = appendI64LEBForCLITest(body, result)
+		body = append(body, 0x0b)
+		code = appendU32LEBForCLITest(code, uint32(len(body)))
+		code = append(code, body...)
+	}
+	module = append(module, wasmCLISection(10, code)...)
+	data := appendU32LEBForCLITest(nil, uint32(len(exports)))
+	for _, item := range exports {
+		responseBytes := []byte(item.Response)
+		data = append(data, 0x00, 0x41)
+		data = appendI32LEBForCLITest(data, int32(item.Offset))
+		data = append(data, 0x0b)
+		data = appendU32LEBForCLITest(data, uint32(len(responseBytes)))
+		data = append(data, responseBytes...)
+	}
+	module = append(module, wasmCLISection(11, data)...)
+	return module
+}
+
+func wasmCLISection(id byte, payload []byte) []byte {
+	section := []byte{id}
+	section = appendU32LEBForCLITest(section, uint32(len(payload)))
+	section = append(section, payload...)
+	return section
+}
+
+func appendU32LEBForCLITest(out []byte, value uint32) []byte {
+	for {
+		b := byte(value & 0x7f)
+		value >>= 7
+		if value != 0 {
+			b |= 0x80
+		}
+		out = append(out, b)
+		if value == 0 {
+			return out
+		}
+	}
+}
+
+func appendI32LEBForCLITest(out []byte, value int32) []byte {
+	for {
+		b := byte(value & 0x7f)
+		value >>= 7
+		done := (value == 0 && b&0x40 == 0) || (value == -1 && b&0x40 != 0)
+		if !done {
+			b |= 0x80
+		}
+		out = append(out, b)
+		if done {
+			return out
+		}
+	}
+}
+
+func appendI64LEBForCLITest(out []byte, value int64) []byte {
+	for {
+		b := byte(value & 0x7f)
+		value >>= 7
+		done := (value == 0 && b&0x40 == 0) || (value == -1 && b&0x40 != 0)
+		if !done {
+			b |= 0x80
+		}
+		out = append(out, b)
+		if done {
+			return out
+		}
+	}
 }
 
 type observedRemoteRequest struct {

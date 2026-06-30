@@ -173,6 +173,71 @@ func TestArtifactStoreRejectsWASMMissingOrMismatchedRuntimeABI(t *testing.T) {
 	}
 }
 
+func TestArtifactStoreRejectsWASMMissingEntryAndExport(t *testing.T) {
+	store := NewArtifactStore(t.TempDir())
+	_, err := store.ValidateAndStore(ArtifactUpload{
+		SourcePath: writeTestMCGP(t, map[string][]byte{
+			"manifest.json": testWASMManifestBytes(t, "wasm-missing-entry", wasmHostABIV1),
+			RuntimeEntry:    wasmOKModule,
+		}),
+		FileName: "wasm-missing-entry.mcgp",
+		Actor:    "admin",
+	})
+	if err == nil || !strings.Contains(err.Error(), `runtime entry "plugin.wasm" is required`) {
+		t.Fatalf("ValidateAndStore(missing wasm entry) error = %v, want plugin.wasm required", err)
+	}
+
+	store = NewArtifactStore(t.TempDir())
+	_, err = store.ValidateAndStore(ArtifactUpload{
+		SourcePath: writeTestMCGP(t, map[string][]byte{
+			"manifest.json":  testWASMManifestBytes(t, "wasm-missing-export", wasmHostABIV1),
+			RuntimeWASMEntry: wasmLegacyValidateModule(),
+		}),
+		FileName: "wasm-missing-export.mcgp",
+		Actor:    "admin",
+	})
+	if err == nil || !strings.Contains(err.Error(), "required export") {
+		t.Fatalf("ValidateAndStore(missing wasm export) error = %v, want required export block", err)
+	}
+}
+
+func TestArtifactStoreStoresWASMMetadata(t *testing.T) {
+	packagePath := writeTestMCGP(t, map[string][]byte{
+		"manifest.json":  testWASMManifestBytes(t, "wasm-metadata", wasmHostABIV1),
+		RuntimeWASMEntry: wasmOKModule,
+	})
+	store := NewArtifactStore(t.TempDir())
+	artifact, err := store.ValidateAndStore(ArtifactUpload{
+		SourcePath: packagePath,
+		FileName:   "wasm-metadata.mcgp",
+		Actor:      "admin",
+	})
+	if err != nil {
+		t.Fatalf("ValidateAndStore(wasm metadata) error = %v", err)
+	}
+	if !strings.HasSuffix(artifact.FilePath, filepath.Join("wasm-metadata", artifact.ID, RuntimeWASMEntry)) {
+		t.Fatalf("artifact file path = %q, want plugin.wasm path", artifact.FilePath)
+	}
+	metadata := jsonMap(artifact.MetadataJSON)
+	wasm := jsonMapFromAny(metadata["wasm"])
+	if wasm == nil ||
+		wasm["abi"] != wasmHostABIV1 ||
+		wasm["entry"] != RuntimeWASMEntry ||
+		wasm["module_sha256"] != artifact.SHA256 ||
+		wasm["artifact_sha256"] != artifact.SHA256 ||
+		wasm["package_sha256"] != artifact.PackageSHA256 {
+		t.Fatalf("wasm metadata = %+v artifact=%+v, want ABI/module/package hashes", wasm, artifact)
+	}
+	exports, ok := wasm["required_exports"].([]any)
+	if !ok || len(exports) != 1 || exports[0] != wasmExportRuleEvaluateV1 {
+		t.Fatalf("required_exports = %#v, want rule export", wasm["required_exports"])
+	}
+	limits := jsonMapFromAny(wasm["limits"])
+	if limits["memory_bytes"] != float64(64*1024) || limits["handler_timeout_ms"] != float64(3000) {
+		t.Fatalf("wasm limits = %+v, want manifest limits", limits)
+	}
+}
+
 func TestArtifactStoreRejectsUnsafePackage(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -245,7 +310,7 @@ func testWASMManifestBytes(t *testing.T, pluginID, abi string) []byte {
 		}},
 		Capabilities:  json.RawMessage(`{"extension_points":["rule.evaluate/v1"]}`),
 		ConfigSchema:  json.RawMessage(`{"type":"object"}`),
-		RuntimeLimits: RuntimeLimits{HandlerTimeoutMS: 3000},
+		RuntimeLimits: RuntimeLimits{HandlerTimeoutMS: 3000, MemoryBytes: 64 * 1024},
 	}
 	data, err := json.Marshal(manifest)
 	if err != nil {

@@ -5,6 +5,7 @@ package pluginmanager
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -107,7 +108,7 @@ func (s ArtifactStore) StoreBuiltBinary(upload ArtifactUpload, manifest Manifest
 	if err := os.MkdirAll(artifactDir, 0755); err != nil {
 		return ArtifactRecord{}, err
 	}
-	pluginPath := filepath.Join(artifactDir, RuntimeEntry)
+	pluginPath := filepath.Join(artifactDir, manifest.Runtime.Entry)
 	if err := os.WriteFile(pluginPath, pluginBytes, 0644); err != nil {
 		return ArtifactRecord{}, err
 	}
@@ -302,7 +303,10 @@ func (s ArtifactStore) validateAndStore(upload ArtifactUpload, expectedArtifactT
 	if err := os.MkdirAll(artifactDir, 0755); err != nil {
 		return ArtifactRecord{}, err
 	}
-	pluginPath := filepath.Join(artifactDir, RuntimeEntry)
+	if err := validateRuntimeEntryBytes(manifest, pluginBytes); err != nil {
+		return ArtifactRecord{}, err
+	}
+	pluginPath := filepath.Join(artifactDir, entry)
 	if err := os.WriteFile(pluginPath, pluginBytes, 0644); err != nil {
 		return ArtifactRecord{}, err
 	}
@@ -322,6 +326,12 @@ func (s ArtifactStore) validateAndStore(upload ArtifactUpload, expectedArtifactT
 		return ArtifactRecord{}, err
 	}
 	manifest = mergeSBOMDependenciesIntoManifest(manifest, sbomSummary.Dependencies)
+	if runtimeMetadata := runtimeArtifactMetadata(manifest, pluginBytes, packageSHA); len(runtimeMetadata) > 0 {
+		if provenance == nil {
+			provenance = map[string]any{}
+		}
+		provenance["wasm"] = runtimeMetadata
+	}
 	metadataJSON, err := artifactMetadataJSON(manifest, conformance, hasConformance, provenance)
 	if err != nil {
 		return ArtifactRecord{}, err
@@ -467,6 +477,53 @@ func artifactMetadataJSON(manifest Manifest, conformance ConformanceSummary, has
 		metadata["conformance"] = conformance
 	}
 	return json.Marshal(metadata)
+}
+
+func validateRuntimeEntryBytes(manifest Manifest, pluginBytes []byte) error {
+	if manifest.Runtime.Type != RuntimeWASM {
+		return nil
+	}
+	if err := validateWASMRuntimeLimits(manifest); err != nil {
+		return err
+	}
+	return validateWASMPackageModuleABI(context.Background(), pluginBytes, manifest)
+}
+
+func validateWASMPackageModuleABI(ctx context.Context, module []byte, manifest Manifest) error {
+	if manifest.Runtime.ABI != wasmHostABIV1 {
+		return newWASMABIError(wasmABIErrorABIMismatch, "", fmt.Sprintf("runtime.abi %q does not match %q", manifest.Runtime.ABI, wasmHostABIV1))
+	}
+	packageManifest := manifest
+	packageManifest.ExtensionPoints = nil
+	for _, point := range manifest.ExtensionPoints {
+		if _, ok := WASMABIExportForExtension(point.Key); ok {
+			packageManifest.ExtensionPoints = append(packageManifest.ExtensionPoints, point)
+		}
+	}
+	return validateWASMModuleABI(ctx, module, packageManifest, manifest.RuntimeLimits.MemoryBytes)
+}
+
+func runtimeArtifactMetadata(manifest Manifest, pluginBytes []byte, packageSHA string) map[string]any {
+	if manifest.Runtime.Type != RuntimeWASM {
+		return nil
+	}
+	requiredExports, err := wasmRequiredExports(manifest)
+	if err != nil {
+		requiredExports = nil
+	}
+	moduleSHA := wasmModuleHash(pluginBytes)
+	return map[string]any{
+		"abi":              manifest.Runtime.ABI,
+		"entry":            manifest.Runtime.Entry,
+		"artifact_sha256":  moduleSHA,
+		"module_sha256":    moduleSHA,
+		"package_sha256":   packageSHA,
+		"required_exports": requiredExports,
+		"limits": map[string]any{
+			"handler_timeout_ms": manifest.RuntimeLimits.HandlerTimeoutMS,
+			"memory_bytes":       manifest.RuntimeLimits.MemoryBytes,
+		},
+	}
 }
 
 func artifactProvenanceFromEntries(entries map[string]*zip.File, maxBytes int64) (map[string]any, error) {

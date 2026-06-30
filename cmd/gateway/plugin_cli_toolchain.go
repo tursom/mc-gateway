@@ -166,6 +166,8 @@ func (cliStaticRuntimeAdapter) Load(context.Context, pluginmanager.ArtifactRecor
 
 type goPluginCLIAdapter struct{}
 
+type wasmPluginCLIAdapter struct{}
+
 func (goPluginCLIAdapter) RuntimeType() string {
 	return pluginmanager.RuntimeGoPlugin
 }
@@ -214,6 +216,50 @@ func (goPluginCLIAdapter) Test(ctx context.Context, opts pluginTestCLIOptions) e
 	return nil
 }
 
+func (wasmPluginCLIAdapter) RuntimeType() string {
+	return pluginmanager.RuntimeWASM
+}
+
+func (wasmPluginCLIAdapter) Init(context.Context, pluginInitCLIOptions) error {
+	return errors.New("wasm plugin init template is not implemented yet")
+}
+
+func (wasmPluginCLIAdapter) BuildBinary(ctx context.Context, req pluginBuildRuntimeRequest) (pluginmanager.ArtifactRecord, error) {
+	return buildWASMPluginPackageContext(ctx, req.Dir, req.Manifest, req.Raw, req.OutPath)
+}
+
+func (wasmPluginCLIAdapter) BuildSource(context.Context, pluginBuildRuntimeRequest) (pluginmanager.ArtifactRecord, error) {
+	return pluginmanager.ArtifactRecord{}, errors.New("wasm source packages are not implemented yet; build a binary .mcgp with plugin.wasm")
+}
+
+func (wasmPluginCLIAdapter) Test(ctx context.Context, opts pluginTestCLIOptions) error {
+	for _, item := range strings.Split(opts.Profile, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		switch item {
+		case "unit", "manifest":
+			if _, err := validateWASMPluginDirectoryForCLI(ctx, opts.Target, opts.Manifest); err != nil {
+				return err
+			}
+		case "harness", "protocol-smoke", "conformance":
+			if err := validateTestFileIfSet(opts.ConfigPath, "config"); err != nil {
+				return err
+			}
+			if err := validateTestFileIfSet(opts.FixturePath, "fixture"); err != nil {
+				return err
+			}
+			if err := runWASMFixtureTestForCLI(ctx, opts); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unsupported test profile %q", item)
+		}
+	}
+	return nil
+}
+
 func pluginCLIAdapterForRuntime(runtimeType string) (pluginRuntimeCLIAdapter, error) {
 	if runtimeType == "" {
 		runtimeType = pluginmanager.RuntimeGoPlugin
@@ -224,7 +270,7 @@ func pluginCLIAdapterForRuntime(runtimeType string) (pluginRuntimeCLIAdapter, er
 	case pluginmanager.RuntimeBuiltin, pluginmanager.RuntimeSandbox:
 		return nil, fmt.Errorf("runtime %q is reserved; no CLI build/test adapter is implemented yet", runtimeType)
 	case pluginmanager.RuntimeWASM:
-		return nil, errors.New("wasm CLI build/test adapter is not implemented yet")
+		return wasmPluginCLIAdapter{}, nil
 	default:
 		return nil, fmt.Errorf("unsupported runtime %q", runtimeType)
 	}
@@ -251,7 +297,7 @@ func pluginFeatureFacts() map[string]any {
 		"plugin_host":      pluginmanager.PluginHostProtocolFeature(),
 		"extension_points": pluginmanager.ExtensionPointFeatures(),
 		"build": map[string]any{
-			"implemented_runtimes": []string{pluginmanager.RuntimeGoPlugin},
+			"implemented_runtimes": []string{pluginmanager.RuntimeGoPlugin, pluginmanager.RuntimeWASM},
 			"builder_types": []string{
 				pluginmanager.BuilderTypeLocalProcess,
 				pluginmanager.BuilderTypeContainer,
@@ -910,7 +956,11 @@ func conformanceFixturesForCLI(opts pluginContractCLIOptions, manifest pluginman
 		if hasExtensionPointForCLI(manifest, item.key) {
 			status = "pass"
 		}
-		fixtures = append(fixtures, map[string]any{"name": item.name, "status": status, "extension": item.key})
+		fixture := map[string]any{"name": item.name, "status": status, "extension": item.key}
+		if item.key == pluginmanager.ExtensionConfigValidate && status == "pass" && manifest.Runtime.Type == pluginmanager.RuntimeWASM {
+			executeConformanceWASMConfigValidateFixtureForCLI(opts, fixture, executor)
+		}
+		fixtures = append(fixtures, fixture)
 	}
 	invalidConfig := map[string]any{"name": "invalid_config", "status": "skip", "expected": "config_schema_declared"}
 	if schema := strings.TrimSpace(string(manifest.ConfigSchema)); schema != "" && schema != "null" {
@@ -1288,9 +1338,6 @@ func (e *conformanceExecutorForCLI) prepare(adapter pluginmanager.RuntimeAdapter
 	if e.manager != nil {
 		return e.manager, e.artifact, e.configJSON, nil
 	}
-	if adapter == nil {
-		adapter = pluginmanager.GoPluginAdapter{}
-	}
 	tmpRoot, err := os.MkdirTemp("", "mcgp-conformance-cli-*")
 	if err != nil {
 		e.prepareErr = err
@@ -1322,13 +1369,16 @@ func (e *conformanceExecutorForCLI) prepare(adapter pluginmanager.RuntimeAdapter
 		return nil, pluginmanager.ArtifactRecord{}, "", err
 	}
 	e.dbClose = func() { _ = db.Close() }
-	manager := pluginmanager.New(pluginmanager.Options{
+	managerOptions := pluginmanager.Options{
 		DB:            db,
 		ArtifactRoot:  filepath.Join(tmpRoot, "artifacts"),
 		Now:           pluginConformanceNow,
-		Adapter:       adapter,
 		PolicyProfile: e.opts.Profile,
-	})
+	}
+	if adapter != nil {
+		managerOptions.Adapter = adapter
+	}
+	manager := pluginmanager.New(managerOptions)
 	artifact, err := manager.UploadArtifact(context.Background(), pluginmanager.ArtifactUpload{
 		SourcePath: targetPath,
 		FileName:   filepath.Base(targetPath),
@@ -1395,7 +1445,7 @@ func executeNamedConformanceFixtureForCLI(_ pluginContractCLIOptions, fixture ma
 			fixture["expected"] = "config_schema_declared"
 			return
 		}
-		manager, artifact, _, err := executor.prepare(pluginmanager.GoPluginAdapter{})
+		manager, artifact, _, err := executor.prepare(nil)
 		if err != nil {
 			conformanceFail(fixture, err)
 			return
@@ -1429,7 +1479,7 @@ func executeNamedConformanceFixtureForCLI(_ pluginContractCLIOptions, fixture ma
 			return
 		}
 		fixture["secrets"] = required
-		manager, artifact, configJSON, err := executor.prepare(pluginmanager.GoPluginAdapter{})
+		manager, artifact, configJSON, err := executor.prepare(nil)
 		if err != nil {
 			conformanceFail(fixture, err)
 			return
@@ -1453,6 +1503,10 @@ func executeNamedConformanceFixtureForCLI(_ pluginContractCLIOptions, fixture ma
 
 func executeConformanceRouteFixtureForCLI(_ pluginContractCLIOptions, fixture map[string]any, executor *conformanceExecutorForCLI) {
 	if !conformanceRequireExtension(fixture, executor, pluginmanager.ExtensionRouteResolve) {
+		return
+	}
+	if executor.manifest.Runtime.Type == pluginmanager.RuntimeWASM {
+		executeConformanceWASMRouteFixtureForCLI(fixture, executor)
 		return
 	}
 	decision := strings.TrimSpace(fmt.Sprint(fixture["decision"]))
@@ -1577,6 +1631,10 @@ func executeConformanceRuleFixtureForCLI(_ pluginContractCLIOptions, fixture map
 		return
 	}
 	fixture["mode"] = "executable"
+	if executor.manifest.Runtime.Type == pluginmanager.RuntimeWASM {
+		executeConformanceWASMRuleFixtureForCLI(fixture, executor)
+		return
+	}
 	if !hasExtensionPointForCLI(executor.manifest, pluginmanager.ExtensionRuleEvaluate) && !hasRulePolicyExtensionsForCLI(executor.manifest) {
 		fixture["status"] = "fail"
 		fixture["error"] = "rule scenario requires rule.evaluate/v1 or rule-policy data-plane extensions"
@@ -1587,6 +1645,125 @@ func executeConformanceRuleFixtureForCLI(_ pluginContractCLIOptions, fixture map
 		return
 	}
 	conformancePass(fixture)
+}
+
+func executeConformanceWASMConfigValidateFixtureForCLI(_ pluginContractCLIOptions, fixture map[string]any, executor *conformanceExecutorForCLI) {
+	if executor == nil || executor.manifest.Runtime.Type != pluginmanager.RuntimeWASM {
+		return
+	}
+	fixture["mode"] = "executable"
+	manager, artifact, configJSON, err := executor.prepare(nil)
+	if err != nil {
+		conformanceFail(fixture, err)
+		return
+	}
+	result, err := manager.DryRunConfig(context.Background(), artifact.PluginID, artifact.ID, configJSON)
+	fixture["target_plugin"] = artifact.PluginID
+	fixture["artifact_id"] = artifact.ID
+	fixture["actual_ok"] = result.OK
+	if err != nil {
+		conformanceFail(fixture, err)
+		return
+	}
+	conformancePass(fixture)
+}
+
+func executeConformanceWASMRouteFixtureForCLI(fixture map[string]any, executor *conformanceExecutorForCLI) {
+	decision := strings.TrimSpace(fmt.Sprint(fixture["decision"]))
+	manager, artifact, _, err := executor.ensureDesiredEnabled(nil)
+	if err != nil {
+		conformanceFail(fixture, err)
+		return
+	}
+	req := api.RouteResolveRequest{
+		Host:             conformanceRouteHost(decision),
+		FallbackUpstream: "fallback:25565",
+		FallbackHit:      decision == "fallback" || decision == "pass",
+		Refresh:          true,
+	}
+	result, err := manager.ResolveRoute(context.Background(), req, nil)
+	if err != nil {
+		conformanceFail(fixture, err)
+		return
+	}
+	fixture["target_plugin"] = artifact.PluginID
+	fixture["actual_action"] = result.Decision.Action
+	fixture["actual_source"] = result.Source
+	fixture["actual_upstream"] = result.Decision.Upstream
+	fixture["actual_reason"] = result.Decision.Reason
+	switch decision {
+	case "override":
+		if result.Decision.Action == api.RouteDecisionOverride && result.Decision.Upstream != "" {
+			conformancePass(fixture)
+			return
+		}
+	case "reject":
+		if result.Decision.Action == api.RouteDecisionReject {
+			conformancePass(fixture)
+			return
+		}
+	case "fallback", "pass":
+		if result.Decision.Action == api.RouteDecisionFallback && result.Decision.Upstream != "" {
+			conformancePass(fixture)
+			return
+		}
+	default:
+		if result.Decision.Action != "" {
+			conformancePass(fixture)
+			return
+		}
+	}
+	fixture["status"] = "fail"
+	fixture["error"] = "wasm route fixture returned unexpected decision"
+}
+
+func executeConformanceWASMRuleFixtureForCLI(fixture map[string]any, executor *conformanceExecutorForCLI) {
+	if !hasExtensionPointForCLI(executor.manifest, pluginmanager.ExtensionRuleEvaluate) {
+		fixture["status"] = "fail"
+		fixture["error"] = "rule scenario requires rule.evaluate/v1"
+		return
+	}
+	outcome := strings.TrimSpace(fmt.Sprint(fixture["outcome"]))
+	manager, artifact, _, err := executor.ensureDesiredEnabled(nil)
+	if err != nil {
+		conformanceFail(fixture, err)
+		return
+	}
+	result, err := manager.EvaluateRule(context.Background(), api.RuleEvaluateRequest{
+		Subject:  "wasm-conformance",
+		Action:   "join",
+		Resource: "server-a",
+		Host:     "play.example",
+	})
+	if err != nil {
+		conformanceFail(fixture, err)
+		return
+	}
+	fixture["target_plugin"] = artifact.PluginID
+	fixture["actual_handled"] = result.Handled
+	fixture["actual_plugin"] = result.PluginID
+	fixture["actual_allow"] = result.Decision.Allow
+	fixture["actual_deny"] = result.Decision.Deny
+	fixture["actual_reason"] = result.Decision.Reason
+	switch outcome {
+	case "allow":
+		if result.Handled && result.Decision.Allow && !result.Decision.Deny {
+			conformancePass(fixture)
+			return
+		}
+	case "deny":
+		if result.Handled && result.Decision.Deny {
+			conformancePass(fixture)
+			return
+		}
+	default:
+		if result.Handled {
+			conformancePass(fixture)
+			return
+		}
+	}
+	fixture["status"] = "fail"
+	fixture["error"] = "wasm rule fixture returned unexpected decision"
 }
 
 func executeConformanceConnectionFilterFixtureForCLI(_ pluginContractCLIOptions, fixture map[string]any, executor *conformanceExecutorForCLI) {
@@ -2993,10 +3170,19 @@ func manifestSchemaForCLI() map[string]any {
 			"schema_version", "id", "name", "version", "artifact_type", "runtime", "api_version", "extension_points", "capabilities",
 		},
 		"properties": map[string]any{
-			"schema_version":   map[string]any{"const": pluginmanager.SchemaVersion},
-			"artifact_type":    map[string]any{"enum": []string{pluginmanager.ArtifactTypeBinary, pluginmanager.ArtifactTypeSource}},
-			"runtime.type":     map[string]any{"enum": runtimeTypeKeysForCLI()},
-			"runtime.abi":      map[string]any{"enum": []string{pluginmanager.WASMHostABIVersion()}},
+			"schema_version": map[string]any{"const": pluginmanager.SchemaVersion},
+			"artifact_type":  map[string]any{"enum": []string{pluginmanager.ArtifactTypeBinary, pluginmanager.ArtifactTypeSource}},
+			"runtime.type":   map[string]any{"enum": runtimeTypeKeysForCLI()},
+			"runtime.entry":  map[string]any{"enum": []string{pluginmanager.RuntimeEntry, pluginmanager.RuntimeWASMEntry}},
+			"runtime.abi":    map[string]any{"enum": []string{pluginmanager.WASMHostABIVersion()}},
+			"runtime_limits.handler_timeout_ms": map[string]any{
+				"type":    "integer",
+				"minimum": 1,
+			},
+			"runtime_limits.memory_bytes": map[string]any{
+				"type":    "integer",
+				"minimum": 1,
+			},
 			"extension_points": map[string]any{"type": "array", "items": supportedExtensionPointKeysForCLI()},
 			"config_schema":    map[string]any{"type": "object"},
 			"background_tasks": map[string]any{
@@ -4816,7 +5002,12 @@ func runPluginBuildCLI(args []string) error {
 		return err
 	}
 	if !opts.SkipTests {
-		if err := runGoCommand(context.Background(), opts.Dir, "go", "test", "./..."); err != nil {
+		if err := adapter.Test(context.Background(), pluginTestCLIOptions{
+			Target:   opts.Dir,
+			Manifest: opts.Manifest,
+			Profile:  "unit",
+			Source:   manifest,
+		}); err != nil {
 			return err
 		}
 	}
@@ -5214,6 +5405,9 @@ func validatePluginDirectoryForCLI(dir, manifestPath string) (pluginmanager.Arti
 	if err != nil {
 		return pluginmanager.ArtifactRecord{}, err
 	}
+	if manifest.Runtime.Type == pluginmanager.RuntimeWASM {
+		return validateWASMPluginDirectoryForCLI(context.Background(), dir, manifestPath)
+	}
 	tmpRoot, err := os.MkdirTemp("", "mcgp-dir-validate-*")
 	if err != nil {
 		return pluginmanager.ArtifactRecord{}, err
@@ -5227,6 +5421,24 @@ func validatePluginDirectoryForCLI(dir, manifestPath string) (pluginmanager.Arti
 	return store.ValidateAndStoreSource(pluginmanager.ArtifactUpload{SourcePath: packagePath, FileName: filepath.Base(packagePath), Actor: "cli"})
 }
 
+func validateWASMPluginDirectoryForCLI(ctx context.Context, dir, manifestPath string) (pluginmanager.ArtifactRecord, error) {
+	manifest, raw, err := readPluginDirManifest(dir, manifestPath)
+	if err != nil {
+		return pluginmanager.ArtifactRecord{}, err
+	}
+	tmpRoot, err := os.MkdirTemp("", "mcgp-wasm-dir-validate-*")
+	if err != nil {
+		return pluginmanager.ArtifactRecord{}, err
+	}
+	defer os.RemoveAll(tmpRoot)
+	packagePath := filepath.Join(tmpRoot, manifest.ID+".mcgp")
+	if _, err := buildWASMPluginPackageContext(ctx, dir, manifest, raw, packagePath); err != nil {
+		return pluginmanager.ArtifactRecord{}, err
+	}
+	store := pluginmanager.NewArtifactStore(filepath.Join(tmpRoot, "store"))
+	return store.ValidateAndStoreBinary(pluginmanager.ArtifactUpload{SourcePath: packagePath, FileName: filepath.Base(packagePath), Actor: "cli"})
+}
+
 func buildBinaryPluginPackage(dir string, manifest pluginmanager.Manifest, raw map[string]any, outPath string) (pluginmanager.ArtifactRecord, error) {
 	return buildBinaryPluginPackageContext(context.Background(), dir, manifest, raw, outPath)
 }
@@ -5236,7 +5448,16 @@ func buildBinaryPluginPackageContext(ctx context.Context, dir string, manifest p
 }
 
 func buildBinaryPluginPackageForConformance(ctx context.Context, dir string, manifest pluginmanager.Manifest, raw map[string]any, outPath string) (pluginmanager.ArtifactRecord, error) {
-	return buildBinaryPluginPackageWithArgs(ctx, dir, manifest, raw, outPath)
+	adapter, err := pluginCLIAdapterForRuntime(manifest.Runtime.Type)
+	if err != nil {
+		return pluginmanager.ArtifactRecord{}, err
+	}
+	return adapter.BuildBinary(ctx, pluginBuildRuntimeRequest{
+		Dir:      dir,
+		Manifest: manifest,
+		Raw:      raw,
+		OutPath:  outPath,
+	})
 }
 
 func buildBinaryPluginPackageWithArgs(ctx context.Context, dir string, manifest pluginmanager.Manifest, raw map[string]any, outPath string, extraArgs ...string) (pluginmanager.ArtifactRecord, error) {
@@ -5260,10 +5481,182 @@ func buildBinaryPluginPackageWithArgs(ctx context.Context, dir string, manifest 
 	if err != nil {
 		return pluginmanager.ArtifactRecord{}, err
 	}
-	if err := writeBinaryPackage(pluginPath, manifestBytes, dir, outPath); err != nil {
+	if err := writeBinaryPackage(pluginPath, pluginmanager.RuntimeEntry, manifestBytes, dir, outPath); err != nil {
 		return pluginmanager.ArtifactRecord{}, err
 	}
 	return validatePluginPathForCLI(outPath, pluginmanager.ArtifactTypeBinary)
+}
+
+func buildWASMPluginPackageContext(ctx context.Context, dir string, manifest pluginmanager.Manifest, raw map[string]any, outPath string) (pluginmanager.ArtifactRecord, error) {
+	modulePath, cleanup, err := ensureWASMModuleForCLI(ctx, dir, manifest)
+	if err != nil {
+		return pluginmanager.ArtifactRecord{}, err
+	}
+	defer cleanup()
+	manifestBytes, err := materializedManifestJSON(raw, manifest, pluginmanager.ArtifactTypeBinary, false)
+	if err != nil {
+		return pluginmanager.ArtifactRecord{}, err
+	}
+	if err := writeBinaryPackage(modulePath, pluginmanager.RuntimeWASMEntry, manifestBytes, dir, outPath); err != nil {
+		return pluginmanager.ArtifactRecord{}, err
+	}
+	return validatePluginPathForCLI(outPath, pluginmanager.ArtifactTypeBinary)
+}
+
+func ensureWASMModuleForCLI(ctx context.Context, dir string, manifest pluginmanager.Manifest) (string, func(), error) {
+	entry := strings.TrimSpace(manifest.Runtime.Entry)
+	if entry == "" {
+		entry = pluginmanager.RuntimeWASMEntry
+	}
+	if entry != pluginmanager.RuntimeWASMEntry {
+		return "", func() {}, fmt.Errorf("unsupported wasm runtime.entry %q", manifest.Runtime.Entry)
+	}
+	modulePath := filepath.Join(dir, filepath.FromSlash(entry))
+	if info, err := os.Stat(modulePath); err == nil && !info.IsDir() && info.Size() > 0 {
+		return modulePath, func() {}, nil
+	}
+	scriptPath := filepath.Join(dir, "build.sh")
+	if info, err := os.Stat(scriptPath); err != nil || info.IsDir() {
+		return "", func() {}, fmt.Errorf("wasm runtime entry %q is required", entry)
+	}
+	scriptPath, err := filepath.Abs(scriptPath)
+	if err != nil {
+		return "", func() {}, err
+	}
+	tmpRoot, err := os.MkdirTemp("", "mcgp-wasm-build-*")
+	if err != nil {
+		return "", func() {}, err
+	}
+	cleanup := func() { _ = os.RemoveAll(tmpRoot) }
+	outPath := filepath.Join(tmpRoot, pluginmanager.RuntimeWASMEntry)
+	cmd := exec.CommandContext(ctx, "sh", scriptPath, outPath)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "MC_GATEWAY_WASM_OUT="+outPath)
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Run(); err != nil {
+		cleanup()
+		if strings.TrimSpace(output.String()) == "" {
+			return "", func() {}, fmt.Errorf("run wasm build script: %w", err)
+		}
+		return "", func() {}, fmt.Errorf("run wasm build script: %w\n%s", err, strings.TrimSpace(output.String()))
+	}
+	info, err := os.Stat(outPath)
+	if err != nil {
+		cleanup()
+		return "", func() {}, fmt.Errorf("wasm build script did not create %s: %w", outPath, err)
+	}
+	if info.IsDir() || info.Size() == 0 {
+		cleanup()
+		return "", func() {}, fmt.Errorf("wasm build script created empty runtime entry %s", outPath)
+	}
+	return outPath, cleanup, nil
+}
+
+func runWASMFixtureTestForCLI(ctx context.Context, opts pluginTestCLIOptions) error {
+	manifest, raw, err := readPluginDirManifest(opts.Target, opts.Manifest)
+	if err != nil {
+		return err
+	}
+	tmpRoot, err := os.MkdirTemp("", "mcgp-wasm-test-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpRoot)
+	packagePath := filepath.Join(tmpRoot, manifest.ID+".mcgp")
+	if _, err := buildWASMPluginPackageContext(ctx, opts.Target, manifest, raw, packagePath); err != nil {
+		return err
+	}
+	db, err := openPluginCLIDB(filepath.Join(tmpRoot, "plugins.db"))
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	manager := pluginmanager.New(pluginmanager.Options{
+		DB:            db,
+		ArtifactRoot:  filepath.Join(tmpRoot, "artifacts"),
+		PolicyProfile: pluginmanager.PolicyProfileDev,
+	})
+	artifact, err := manager.UploadArtifact(ctx, pluginmanager.ArtifactUpload{
+		SourcePath: packagePath,
+		FileName:   filepath.Base(packagePath),
+		Actor:      "cli",
+	})
+	if err != nil {
+		return err
+	}
+	configJSON, err := pluginTestConfigJSON(opts)
+	if err != nil {
+		return err
+	}
+	if wasmManifestHasPointForCLI(manifest, pluginmanager.ExtensionConfigValidate) {
+		if _, err := manager.DryRunConfig(ctx, artifact.PluginID, artifact.ID, configJSON); err != nil {
+			return err
+		}
+	}
+	if !wasmManifestHasPointForCLI(manifest, pluginmanager.ExtensionRuleEvaluate) && !wasmManifestHasPointForCLI(manifest, pluginmanager.ExtensionRouteResolve) {
+		return nil
+	}
+	if _, err := manager.SetDesired(ctx, "cli", artifact.PluginID, artifact.ID, pluginmanager.DesiredEnabled, configJSON, pluginmanager.DefaultPriority); err != nil {
+		return err
+	}
+	if _, err := manager.Enable(ctx, "cli", artifact.PluginID); err != nil {
+		return err
+	}
+	if wasmManifestHasPointForCLI(manifest, pluginmanager.ExtensionRuleEvaluate) {
+		if _, err := manager.EvaluateRule(ctx, api.RuleEvaluateRequest{
+			Subject:  "wasm-fixture",
+			Action:   "join",
+			Resource: "server-a",
+			Host:     "play.example",
+			Context:  ctx,
+		}); err != nil {
+			return err
+		}
+	}
+	if wasmManifestHasPointForCLI(manifest, pluginmanager.ExtensionRouteResolve) {
+		if _, err := manager.ResolveRoute(ctx, api.RouteResolveRequest{
+			Host:             "play.example",
+			FallbackUpstream: "fallback:25565",
+			FallbackHit:      true,
+			Refresh:          true,
+			Context:          ctx,
+		}, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func pluginTestConfigJSON(opts pluginTestCLIOptions) (string, error) {
+	if opts.ConfigPath != "" {
+		data, err := os.ReadFile(opts.ConfigPath)
+		if err != nil {
+			return "", err
+		}
+		if !json.Valid(data) {
+			return "", fmt.Errorf("config file %q must contain valid JSON", opts.ConfigPath)
+		}
+		return string(data), nil
+	}
+	defaultConfig := filepath.Join(opts.Target, "testdata", "config.json")
+	if data, err := os.ReadFile(defaultConfig); err == nil {
+		if !json.Valid(data) {
+			return "", fmt.Errorf("default config file %q must contain valid JSON", defaultConfig)
+		}
+		return string(data), nil
+	}
+	return "{}", nil
+}
+
+func wasmManifestHasPointForCLI(manifest pluginmanager.Manifest, point string) bool {
+	for _, extension := range manifest.ExtensionPoints {
+		if extension.Key == point {
+			return true
+		}
+	}
+	return false
 }
 
 func buildSourcePluginPackage(dir string, manifest pluginmanager.Manifest, raw map[string]any, outPath string, vendor bool) (pluginmanager.ArtifactRecord, error) {
@@ -5330,10 +5723,19 @@ func materializedManifestJSON(raw map[string]any, manifest pluginmanager.Manifes
 	if runtimeMap["type"] == nil || runtimeMap["type"] == "" {
 		runtimeMap["type"] = pluginmanager.RuntimeGoPlugin
 	}
-	if runtimeMap["entry_symbol"] == nil || runtimeMap["entry_symbol"] == "" {
+	runtimeType, _ := runtimeMap["type"].(string)
+	if runtimeType == "" {
+		runtimeType = manifest.Runtime.Type
+	}
+	if runtimeType != pluginmanager.RuntimeWASM && (runtimeMap["entry_symbol"] == nil || runtimeMap["entry_symbol"] == "") {
 		runtimeMap["entry_symbol"] = "Plugin"
 	}
-	if artifactType == pluginmanager.ArtifactTypeBinary {
+	if artifactType == pluginmanager.ArtifactTypeBinary && runtimeType == pluginmanager.RuntimeWASM {
+		runtimeMap["entry"] = pluginmanager.RuntimeWASMEntry
+		if runtimeMap["abi"] == nil || runtimeMap["abi"] == "" {
+			runtimeMap["abi"] = manifest.Runtime.ABI
+		}
+	} else if artifactType == pluginmanager.ArtifactTypeBinary {
 		runtimeMap["entry"] = pluginmanager.RuntimeEntry
 	} else if runtimeMap["entry"] == nil || runtimeMap["entry"] == "" {
 		runtimeMap["entry"] = pluginmanager.RuntimeEntry
@@ -5369,7 +5771,7 @@ func materializedManifestJSON(raw map[string]any, manifest pluginmanager.Manifes
 	return append(data, '\n'), nil
 }
 
-func writeBinaryPackage(pluginPath string, manifestBytes []byte, sourceDir, outPath string) error {
+func writeBinaryPackage(pluginPath, entryName string, manifestBytes []byte, sourceDir, outPath string) error {
 	if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
 		return err
 	}
@@ -5383,7 +5785,10 @@ func writeBinaryPackage(pluginPath string, manifestBytes []byte, sourceDir, outP
 		zw.Close()
 		return err
 	}
-	if err := addZipFileStable(zw, pluginmanager.RuntimeEntry, pluginPath); err != nil {
+	if entryName == "" {
+		entryName = pluginmanager.RuntimeEntry
+	}
+	if err := addZipFileStable(zw, entryName, pluginPath); err != nil {
 		zw.Close()
 		return err
 	}

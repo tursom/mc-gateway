@@ -1,0 +1,16 @@
+{
+  "fixtures": [
+    {
+      "name": "wasm.package_metadata",
+      "status": "pass",
+      "expected": "abi_metadata",
+      "extension": "mc-gateway.wasm.host/v1"
+    }
+  ],
+  "route_decisions": [
+    "override"
+  ],
+  "rule_evaluation_outcomes": [
+    "deny"
+  ]
+}
