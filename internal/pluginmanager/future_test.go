@@ -738,10 +738,13 @@ func TestSandboxPolicyDiagnosticsAndSecretHandle(t *testing.T) {
 		t.Fatalf("ResolveSandboxSecret(missing) = %+v, want unauthorized handle", missing)
 	}
 	process := &SandboxProcess{
-		PluginID:   "sandbox-secret",
-		ArtifactID: artifact.ID,
-		PID:        1234,
-		StartedAt:  time.Now().Unix(),
+		PluginID:          "sandbox-secret",
+		ArtifactID:        artifact.ID,
+		RuntimeInstanceID: "sandbox-secret-runtime",
+		Generation:        1,
+		Protocol:          sandboxProcessProtocol,
+		PID:               1234,
+		StartedAt:         time.Now().Unix(),
 		Policy: SandboxPolicy{
 			Env:           map[string]string{"SAFE": "1", "API_SECRET": "must-not-enter-env"},
 			SecretHandles: []string{"api_token"},
@@ -763,14 +766,18 @@ func TestSandboxPolicyDiagnosticsAndSecretHandle(t *testing.T) {
 		t.Fatalf("Marshal(secret request) error = %v", err)
 	}
 	control := process.HandleControlRequest(context.Background(), SandboxControlRequest{
-		Command:  sandboxControlCommandSecret,
-		Protocol: sandboxProcessProtocol,
-		Payload:  payload,
+		Command:           sandboxControlCommandSecret,
+		Protocol:          sandboxProcessProtocol,
+		PluginID:          "sandbox-secret",
+		ArtifactID:        artifact.ID,
+		RuntimeInstanceID: "sandbox-secret-runtime",
+		Generation:        1,
+		Payload:           payload,
 	}, manager)
 	if !control.OK || control.Secret == nil || !control.Secret.OK || control.Secret.Version != 1 || control.Secret.Error != "" {
 		t.Fatalf("HandleControlRequest(secret) = %+v, want version-only authorized handle", control)
 	}
-	diagControl := process.HandleControlRequest(context.Background(), SandboxControlRequest{Command: sandboxControlCommandDiagnostics}, manager)
+	diagControl := process.HandleControlRequest(context.Background(), SandboxControlRequest{Command: sandboxControlCommandDiagnostics, Protocol: sandboxProcessProtocol}, manager)
 	if !diagControl.OK || diagControl.Diagnostics == nil || !diagControl.Diagnostics.ControlRPC || diagControl.Diagnostics.ControlSocket != "unix:///run/control.sock" {
 		t.Fatalf("HandleControlRequest(diagnostics) = %+v, want control RPC diagnostics", diagControl)
 	}
