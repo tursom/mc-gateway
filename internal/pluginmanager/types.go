@@ -72,6 +72,7 @@ const (
 	RuntimeFailed    = "failed"
 	RuntimeDisabled  = "disabled"
 	RuntimeDraining  = "draining"
+	RuntimeStopped   = "stopped"
 
 	PluginServiceModeInProcess       = "in-process"
 	PluginServiceModeGoPluginProcess = "go-plugin-process"

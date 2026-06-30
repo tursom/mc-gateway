@@ -201,7 +201,7 @@ func TestRuntimeAdapterFactoryProcessModeSupportsProcessDataPlane(t *testing.T) 
 		PluginID:     "wasm-low-risk",
 		ArtifactType: ArtifactTypeBinary,
 		RuntimeType:  RuntimeWASM,
-		MetadataJSON: `{"schema_version":"mc-gateway.plugin/v1","id":"wasm-low-risk","name":"WASM Low Risk","version":"0.1.0","artifact_type":"binary","runtime":{"type":"wasm","entry":"plugin.wasm","abi":"mc-gateway.wasm.host/v1"},"api_version":"plugin-api/v1","extension_points":[{"type":"provider","key":"route.resolve/v1"}],"capabilities":{}}`,
+		MetadataJSON: `{"schema_version":"mc-gateway.plugin/v1","id":"wasm-low-risk","name":"WASM Low Risk","version":"0.1.0","artifact_type":"binary","runtime":{"type":"wasm","entry":"plugin.wasm","abi":"mc-gateway.wasm.host/v1"},"api_version":"plugin-api/v1","extension_points":[{"type":"provider","key":"route.resolve/v1"}],"capabilities":{},"runtime_limits":{"handler_timeout_ms":100,"memory_bytes":65536}}`,
 	}
 	prepared, err := lifecycle.Prepare(context.Background(), artifact, PluginRecord{ID: artifact.PluginID})
 	if err != nil {
@@ -704,6 +704,8 @@ func TestWASMRequiredCapabilityBlocksEnable(t *testing.T) {
 		manifest.Runtime.Type = RuntimeWASM
 		manifest.Runtime.Entry = RuntimeWASMEntry
 		manifest.Runtime.ABI = wasmHostABIV1
+		manifest.RuntimeLimits.HandlerTimeoutMS = 100
+		manifest.RuntimeLimits.MemoryBytes = 64 * 1024
 		manifest.ExtensionPoints = []ExtensionPoint{{Type: "rule", Key: ExtensionRuleEvaluate}}
 		manifest.Capabilities = json.RawMessage(`{"runtime":{"required_capabilities":["network.egress","secret.env"]}}`)
 	})
@@ -738,6 +740,7 @@ func TestWASMValidationContainment(t *testing.T) {
 		manifest.Runtime.Entry = RuntimeWASMEntry
 		manifest.Runtime.ABI = wasmHostABIV1
 		manifest.RuntimeLimits.HandlerTimeoutMS = 10
+		manifest.RuntimeLimits.MemoryBytes = 64 * 1024
 		manifest.ExtensionPoints = []ExtensionPoint{{Type: "rule", Key: ExtensionRuleEvaluate}, {Type: "validator", Key: ExtensionConfigValidate}}
 	})
 	for _, behavior := range []string{"timeout", "panic", "memory"} {
@@ -761,6 +764,8 @@ func TestWASMValidationRejectsUnsupportedExtensionPoint(t *testing.T) {
 		manifest.Runtime.Type = RuntimeWASM
 		manifest.Runtime.Entry = RuntimeWASMEntry
 		manifest.Runtime.ABI = wasmHostABIV1
+		manifest.RuntimeLimits.HandlerTimeoutMS = 100
+		manifest.RuntimeLimits.MemoryBytes = 64 * 1024
 		manifest.ExtensionPoints = []ExtensionPoint{{Type: "hook", Key: ExtensionUpstreamConnect}}
 	})
 	err := manager.RunWASMValidation(context.Background(), "wasm-upstream", artifact.ID, "ok")
