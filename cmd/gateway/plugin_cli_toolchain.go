@@ -113,6 +113,7 @@ type pluginSBOMFile struct {
 
 type pluginConformanceFixtureFile struct {
 	Fixtures                             []map[string]any                   `json:"fixtures"`
+	SandboxFixtures                      []string                           `json:"sandbox_fixtures"`
 	RouteDecisions                       []string                           `json:"route_decisions"`
 	StatusHosts                          []string                           `json:"status_hosts"`
 	StreamProxyScenarios                 []pluginmanager.StreamProxyFixture `json:"stream_proxy_scenarios"`
@@ -289,7 +290,7 @@ func (sandboxProcessCLIAdapter) Test(ctx context.Context, opts pluginTestCLIOpti
 			if _, err := validateSandboxPluginDirectoryForCLI(ctx, opts.Target, opts.Manifest); err != nil {
 				return err
 			}
-		case "harness", "protocol-smoke", "conformance":
+		case "harness", "protocol-smoke":
 			if err := validateTestFileIfSet(opts.ConfigPath, "config"); err != nil {
 				return err
 			}
@@ -297,6 +298,10 @@ func (sandboxProcessCLIAdapter) Test(ctx context.Context, opts pluginTestCLIOpti
 				return err
 			}
 			if _, err := validateSandboxPluginDirectoryForCLI(ctx, opts.Target, opts.Manifest); err != nil {
+				return err
+			}
+		case "conformance":
+			if err := runSandboxFixtureTestForCLI(ctx, opts); err != nil {
 				return err
 			}
 		default:
@@ -580,6 +585,7 @@ func pluginFeatureFactsFor(options pluginmanager.RuntimeFeatureFactsOptions) map
 			"status_hosts":                             true,
 			"stream_proxy_protocol":                    pluginmanager.StreamProxyProtocolV1,
 			"stream_proxy_semantics":                   []string{"half_close", "deadline", "backpressure", "cancel", "byte_accounting"},
+			"sandbox_required_coverage":                pluginmanager.SandboxConformanceRequiredCoverage(),
 			"protocol_proxy_scenarios": []string{
 				"initial_data_once",
 				"panic_recovered",
@@ -786,13 +792,21 @@ func runPluginConformanceCLI(args []string) error {
 	if err != nil {
 		return err
 	}
+	report, err := pluginConformanceReportForCLI(opts)
+	if err != nil {
+		return err
+	}
+	return encodePluginCLIJSON(report)
+}
+
+func pluginConformanceReportForCLI(opts pluginContractCLIOptions) (map[string]any, error) {
 	report := pluginContractReport(opts)
 	manifest, _, _ := readPluginTargetManifestForCLI(opts.Target, opts.Manifest)
 	executor := newConformanceExecutorForCLI(opts, manifest)
 	defer executor.Close()
 	goldenFixtures, fixtureSource, err := loadConformanceFixtureFileForCLI(opts, executor)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	fixtures := conformanceFixturesForCLI(opts, manifest, report["ok"] == true, goldenFixtures, executor)
 	ok := report["ok"] == true
@@ -802,7 +816,7 @@ func runPluginConformanceCLI(args []string) error {
 			break
 		}
 	}
-	return encodePluginCLIJSON(map[string]any{
+	return map[string]any{
 		"schema_version": pluginmanager.SchemaVersion,
 		"api_version":    pluginmanager.APIVersion,
 		"command":        "conformance",
@@ -812,7 +826,7 @@ func runPluginConformanceCLI(args []string) error {
 		"contract":       report,
 		"fixtures":       fixtures,
 		"fixture_source": fixtureSource,
-	})
+	}, nil
 }
 
 func parsePluginContractCLIOptions(args []string) (pluginContractCLIOptions, error) {
@@ -1368,7 +1382,247 @@ func normalizeConformanceFixtureFileForCLI(opts pluginContractCLIOptions, file p
 			"expected": "local_login_available",
 		})
 	}
+	fixtures = append(fixtures, executeSandboxConformanceFixturesForCLI(opts, file, executor)...)
+	fixtures = append(fixtures, sandboxConformanceCoverageFixturesForCLI(opts, executor, fixtures)...)
 	return fixtures
+}
+
+func executeSandboxConformanceFixturesForCLI(opts pluginContractCLIOptions, file pluginConformanceFixtureFile, executor *conformanceExecutorForCLI) []map[string]any {
+	if executor == nil || executor.manifest.Runtime.Type != pluginmanager.RuntimeSandbox || len(file.SandboxFixtures) == 0 {
+		return nil
+	}
+	configJSON, configErr := conformanceConfigJSON(opts)
+	var out []map[string]any
+	seen := map[string]bool{}
+	for _, item := range file.SandboxFixtures {
+		declared := strings.TrimSpace(item)
+		coverage := normalizeSandboxConformanceCoverageForCLI(declared)
+		fixture := map[string]any{
+			"name":         firstNonEmptyStringForCLI(coverage, "sandbox.invalid."+declared),
+			"status":       "pass",
+			"extension":    pluginmanager.RuntimeSandbox,
+			"coverage":     coverage,
+			"mode":         "executable",
+			"declared":     declared,
+			"validated_by": pluginmanager.SandboxConformanceValidatedByCLI,
+		}
+		if coverage == "" {
+			fixture["status"] = "fail"
+			fixture["error"] = "unknown sandbox conformance coverage"
+			out = append(out, fixture)
+			continue
+		}
+		if seen[coverage] {
+			continue
+		}
+		seen[coverage] = true
+		if configErr != nil {
+			conformanceFail(fixture, configErr)
+			out = append(out, fixture)
+			continue
+		}
+		evidence, err := pluginmanager.RunSandboxConformanceScenario(context.Background(), pluginmanager.SandboxConformanceScenario{
+			Coverage:               coverage,
+			Manifest:               executor.manifest,
+			ConfigJSON:             configJSON,
+			RouteDecisions:         file.RouteDecisions,
+			RuleEvaluationOutcomes: file.RuleEvaluationOutcomes,
+			StreamProxyScenarios:   file.StreamProxyScenarios,
+			ProtocolProxyScenarios: file.ProtocolProxyScenarios,
+		})
+		fixture["evidence"] = evidence
+		if err != nil {
+			conformanceFail(fixture, err)
+		} else {
+			conformancePass(fixture)
+		}
+		out = append(out, fixture)
+	}
+	return out
+}
+
+func sandboxConformanceCoverageFixturesForCLI(opts pluginContractCLIOptions, executor *conformanceExecutorForCLI, fixtures []map[string]any) []map[string]any {
+	if executor == nil || executor.manifest.Runtime.Type != pluginmanager.RuntimeSandbox {
+		return nil
+	}
+	profile := strings.TrimSpace(opts.Profile)
+	if profile != "strict" && profile != pluginmanager.PolicyProfileProd {
+		return nil
+	}
+	present := sandboxConformanceCoverageFromFixturesForCLI(fixtures)
+	var missing []string
+	for _, item := range pluginmanager.SandboxConformanceRequiredCoverage() {
+		if !present[item] {
+			missing = append(missing, item)
+		}
+	}
+	if len(missing) == 0 {
+		return []map[string]any{{
+			"name":      "sandbox.required_coverage",
+			"status":    "pass",
+			"extension": pluginmanager.RuntimeSandbox,
+			"coverage":  pluginmanager.SandboxConformanceRequiredCoverage(),
+		}}
+	}
+	out := make([]map[string]any, 0, len(missing))
+	for _, item := range missing {
+		out = append(out, map[string]any{
+			"name":      "sandbox.missing." + item,
+			"status":    "fail",
+			"extension": pluginmanager.RuntimeSandbox,
+			"expected":  item,
+			"error":     "strict sandbox conformance profile requires fixture coverage " + item,
+		})
+	}
+	return out
+}
+
+func sandboxConformanceCoverageFromFixturesForCLI(fixtures []map[string]any) map[string]bool {
+	present := map[string]bool{}
+	for _, fixture := range fixtures {
+		if conformanceFixtureFailed(fixture) {
+			continue
+		}
+		status := strings.TrimSpace(fmt.Sprint(fixture["status"]))
+		if status == "skip" || status == "skipped" {
+			continue
+		}
+		if sandboxConformanceFixtureHasCoverageForCLI(fixture) && !sandboxConformanceFixtureHasEvidenceForCLI(fixture) {
+			continue
+		}
+		addSandboxConformanceCoverageForCLI(present, fixture["coverage"])
+		addSandboxConformanceCoverageForCLI(present, fixture["covers"])
+		for _, key := range []string{"name", "expected", "scenario"} {
+			if coverage := normalizeSandboxConformanceCoverageForCLI(fmt.Sprint(fixture[key])); coverage != "" {
+				present[coverage] = true
+			}
+		}
+	}
+	return present
+}
+
+func sandboxConformanceFixtureHasCoverageForCLI(fixture map[string]any) bool {
+	for _, key := range []string{"coverage", "covers", "name", "expected", "scenario"} {
+		if sandboxConformanceValueHasCoverageForCLI(fixture[key]) {
+			return true
+		}
+	}
+	return false
+}
+
+func sandboxConformanceValueHasCoverageForCLI(value any) bool {
+	switch typed := value.(type) {
+	case string:
+		return strings.HasPrefix(normalizeSandboxConformanceCoverageForCLI(typed), "sandbox.")
+	case []string:
+		for _, item := range typed {
+			if sandboxConformanceValueHasCoverageForCLI(item) {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range typed {
+			if sandboxConformanceValueHasCoverageForCLI(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func sandboxConformanceFixtureHasEvidenceForCLI(fixture map[string]any) bool {
+	if strings.TrimSpace(fmt.Sprint(fixture["mode"])) != "executable" {
+		return false
+	}
+	switch evidence := fixture["evidence"].(type) {
+	case pluginmanager.SandboxConformanceEvidence:
+		return evidence.Executed && evidence.ValidatedBy == pluginmanager.SandboxConformanceValidatedByCLI
+	case map[string]any:
+		return evidence["executed"] == true && strings.TrimSpace(fmt.Sprint(evidence["validated_by"])) == pluginmanager.SandboxConformanceValidatedByCLI
+	default:
+		return strings.TrimSpace(fmt.Sprint(fixture["validated_by"])) == pluginmanager.SandboxConformanceValidatedByCLI
+	}
+}
+
+func addSandboxConformanceCoverageForCLI(present map[string]bool, value any) {
+	switch typed := value.(type) {
+	case string:
+		if coverage := normalizeSandboxConformanceCoverageForCLI(typed); coverage != "" {
+			present[coverage] = true
+		}
+	case []string:
+		for _, item := range typed {
+			if coverage := normalizeSandboxConformanceCoverageForCLI(item); coverage != "" {
+				present[coverage] = true
+			}
+		}
+	case []any:
+		for _, item := range typed {
+			if coverage := normalizeSandboxConformanceCoverageForCLI(fmt.Sprint(item)); coverage != "" {
+				present[coverage] = true
+			}
+		}
+	}
+}
+
+func firstNonEmptyStringForCLI(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func normalizeSandboxConformanceCoverageForCLI(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.TrimPrefix(value, "coverage:")
+	switch value {
+	case "", "<nil>":
+		return ""
+	case pluginmanager.SandboxConformanceHandshakeInitRegister,
+		pluginmanager.SandboxConformanceRequestResponse,
+		pluginmanager.SandboxConformanceSecretDenial,
+		pluginmanager.SandboxConformanceFileDenial,
+		pluginmanager.SandboxConformanceNetworkDenial,
+		pluginmanager.SandboxConformanceCPUMemoryExceeded,
+		pluginmanager.SandboxConformanceCrashLoop,
+		pluginmanager.SandboxConformanceStreamHalfClose,
+		pluginmanager.SandboxConformanceStreamBackpressure,
+		pluginmanager.SandboxConformanceStreamCancel:
+		return value
+	case "handshake", "init", "register", "handshake/init/register":
+		return pluginmanager.SandboxConformanceHandshakeInitRegister
+	case "route/rule/config", "request-response", "request_response":
+		return pluginmanager.SandboxConformanceRequestResponse
+	case "secret_denial", "secret-denial":
+		return pluginmanager.SandboxConformanceSecretDenial
+	case "file_denial", "file-denial":
+		return pluginmanager.SandboxConformanceFileDenial
+	case "network_denial", "network-denial":
+		return pluginmanager.SandboxConformanceNetworkDenial
+	case "cpu_memory_exceeded", "cpu-memory-exceeded", "resource_exceeded":
+		return pluginmanager.SandboxConformanceCPUMemoryExceeded
+	case "crash_loop", "crash-loop":
+		return pluginmanager.SandboxConformanceCrashLoop
+	case "stream_half_close", "stream-half-close", "half_close", "half-close", "endpoint_close", "client_close":
+		return pluginmanager.SandboxConformanceStreamHalfClose
+	case "stream_backpressure", "stream-backpressure", "backpressure", "backpressure_large_packet":
+		return pluginmanager.SandboxConformanceStreamBackpressure
+	case "stream_cancel", "stream-cancel", "cancel":
+		return pluginmanager.SandboxConformanceStreamCancel
+	default:
+		if strings.Contains(value, "half_close") {
+			return pluginmanager.SandboxConformanceStreamHalfClose
+		}
+		if strings.Contains(value, "backpressure") {
+			return pluginmanager.SandboxConformanceStreamBackpressure
+		}
+		if strings.Contains(value, "cancel") {
+			return pluginmanager.SandboxConformanceStreamCancel
+		}
+		return ""
+	}
 }
 
 type conformanceExecutorForCLI struct {
@@ -3568,6 +3822,7 @@ func conformanceFixtureSchemaForCLI() map[string]any {
 				"type":  "array",
 				"items": map[string]any{"$ref": "#/$defs/fixture"},
 			},
+			"sandbox_fixtures": stringArray(pluginmanager.SandboxConformanceRequiredCoverage()...),
 			"route_decisions": stringArray(
 				"override",
 				"fallback",
@@ -5334,7 +5589,7 @@ func prepareLocalGovernanceManager(opts pluginGovernanceCLIOptions) (*pluginmana
 			return nil, func() {}, pluginmanager.ArtifactRecord{}, "", err
 		}
 		targetPath = filepath.Join(tmpRoot, manifest.ID+".mcgp")
-		if _, err := buildBinaryPluginPackage(opts.Target, manifest, raw, targetPath); err != nil {
+		if _, err := buildBinaryPluginPackageForConformance(context.Background(), opts.Target, manifest, raw, targetPath); err != nil {
 			cleanup()
 			return nil, func() {}, pluginmanager.ArtifactRecord{}, "", err
 		}
@@ -5344,9 +5599,10 @@ func prepareLocalGovernanceManager(opts pluginGovernanceCLIOptions) (*pluginmana
 		cleanup()
 		return nil, func() {}, pluginmanager.ArtifactRecord{}, "", err
 	}
+	artifactRoot := filepath.Join(tmpRoot, "artifacts")
 	manager := pluginmanager.New(pluginmanager.Options{
 		DB:                        db,
-		ArtifactRoot:              filepath.Join(tmpRoot, "artifacts"),
+		ArtifactRoot:              artifactRoot,
 		Adapter:                   cliStaticRuntimeAdapter{},
 		PolicyProfile:             opts.Profile,
 		RequireConformanceFixture: opts.RequireConformanceFixture,
@@ -5371,6 +5627,37 @@ func prepareLocalGovernanceManager(opts pluginGovernanceCLIOptions) (*pluginmana
 		_ = db.Close()
 		cleanup()
 		return nil, func() {}, pluginmanager.ArtifactRecord{}, "", err
+	}
+	if artifact.RuntimeType == pluginmanager.RuntimeSandbox {
+		manager = pluginmanager.New(pluginmanager.Options{
+			DB:                        db,
+			ArtifactRoot:              artifactRoot,
+			PolicyProfile:             opts.Profile,
+			RequireConformanceFixture: opts.RequireConformanceFixture,
+			FutureRuntimeGates:        pluginmanager.FutureRuntimeGates{SandboxProcess: true},
+			SandboxPolicy:             pluginmanager.SandboxPolicy{CPUSeconds: 1, MemoryBytes: 8 * 1024 * 1024, ExternalIsolation: true},
+			SandboxSelfCheck:          func(pluginmanager.SandboxPolicy) error { return nil },
+		})
+		if _, err := manager.SetPluginServiceDesired(context.Background(), "cli", pluginmanager.PluginServiceModeSandboxProcess); err != nil {
+			_ = db.Close()
+			cleanup()
+			return nil, func() {}, pluginmanager.ArtifactRecord{}, "", err
+		}
+		if err := manager.ApplyPluginServiceMode(context.Background()); err != nil {
+			_ = db.Close()
+			cleanup()
+			return nil, func() {}, pluginmanager.ArtifactRecord{}, "", err
+		}
+		repo := pluginmanager.NewRepository(db)
+		if _, err := repo.UpsertDesired(context.Background(), "cli", artifact.PluginID, artifact.ID, pluginmanager.DesiredDisabled, configJSON, opts.Priority); err != nil {
+			_ = db.Close()
+			cleanup()
+			return nil, func() {}, pluginmanager.ArtifactRecord{}, "", err
+		}
+		return manager, func() {
+			_ = db.Close()
+			cleanup()
+		}, artifact, configJSON, nil
 	}
 	if _, err := manager.SetDesired(context.Background(), "cli", artifact.PluginID, artifact.ID, pluginmanager.DesiredDisabled, configJSON, opts.Priority); err != nil {
 		_ = db.Close()
@@ -5566,6 +5853,9 @@ func buildBinaryPluginPackageContext(ctx context.Context, dir string, manifest p
 }
 
 func buildBinaryPluginPackageForConformance(ctx context.Context, dir string, manifest pluginmanager.Manifest, raw map[string]any, outPath string) (pluginmanager.ArtifactRecord, error) {
+	if manifest.Runtime.Type == pluginmanager.RuntimeSandbox {
+		return buildSandboxPluginPackageContextForConformance(ctx, dir, manifest, raw, outPath)
+	}
 	adapter, err := pluginCLIAdapterForRuntime(manifest.Runtime.Type)
 	if err != nil {
 		return pluginmanager.ArtifactRecord{}, err
@@ -5622,54 +5912,217 @@ func buildWASMPluginPackageContext(ctx context.Context, dir string, manifest plu
 }
 
 func buildSandboxPluginPackageContext(ctx context.Context, dir string, manifest pluginmanager.Manifest, raw map[string]any, outPath string) (pluginmanager.ArtifactRecord, error) {
+	return buildSandboxPluginPackageContextWithOptions(ctx, dir, manifest, raw, outPath, true)
+}
+
+func buildSandboxPluginPackageContextForConformance(ctx context.Context, dir string, manifest pluginmanager.Manifest, raw map[string]any, outPath string) (pluginmanager.ArtifactRecord, error) {
+	return buildSandboxPluginPackageContextWithOptions(ctx, dir, manifest, raw, outPath, false)
+}
+
+func buildSandboxPluginPackageContextWithOptions(ctx context.Context, dir string, manifest pluginmanager.Manifest, raw map[string]any, outPath string, materializeConformance bool) (pluginmanager.ArtifactRecord, error) {
 	_ = ctx
-	entryPath, entryName, err := ensureSandboxRuntimeEntryForCLI(dir, manifest)
+	entryPath, entryName, cleanup, err := ensureSandboxRuntimeEntryForCLI(ctx, dir, manifest)
 	if err != nil {
 		return pluginmanager.ArtifactRecord{}, err
 	}
+	defer cleanup()
 	manifestBytes, err := materializedManifestJSON(raw, manifest, pluginmanager.ArtifactTypeBinary, false)
 	if err != nil {
 		return pluginmanager.ArtifactRecord{}, err
 	}
-	if err := writeBinaryPackage(entryPath, entryName, manifestBytes, dir, outPath); err != nil {
+	generatedDocs := map[string][]byte{}
+	if materializeConformance {
+		conformanceBytes, err := sandboxValidatedConformancePackageBytesForCLI(ctx, dir)
+		if err != nil {
+			return pluginmanager.ArtifactRecord{}, err
+		}
+		if len(conformanceBytes) > 0 {
+			generatedDocs["conformance.json"] = conformanceBytes
+		}
+	}
+	if err := writeBinaryPackageWithGeneratedDocs(entryPath, entryName, manifestBytes, dir, outPath, generatedDocs); err != nil {
 		return pluginmanager.ArtifactRecord{}, err
 	}
 	return validatePluginPathForCLI(outPath, pluginmanager.ArtifactTypeBinary)
 }
 
-func ensureSandboxRuntimeEntryForCLI(dir string, manifest pluginmanager.Manifest) (string, string, error) {
+func sandboxValidatedConformancePackageBytesForCLI(ctx context.Context, dir string) ([]byte, error) {
+	_ = ctx
+	opts := pluginContractCLIOptions{Target: dir, Profile: "strict"}
+	manifest, _, err := readPluginTargetManifestForCLI(opts.Target, opts.Manifest)
+	if err != nil {
+		return nil, err
+	}
+	executor := newConformanceExecutorForCLI(opts, manifest)
+	defer executor.Close()
+	goldenFixtures, _, err := loadConformanceFixtureFileForCLI(opts, executor)
+	if err != nil {
+		return nil, err
+	}
+	fixtures := conformanceFixturesForCLI(opts, manifest, true, goldenFixtures, executor)
+	ok := true
+	for _, fixture := range fixtures {
+		if conformanceFixtureFailed(fixture) {
+			ok = false
+			break
+		}
+	}
+	if !ok {
+		return nil, sandboxConformanceFixturesErrorForCLI(fixtures)
+	}
+	doc := map[string]any{
+		"generated_by": pluginmanager.SandboxConformanceValidatedByCLI,
+		"generated_at": pluginConformanceNow().Unix(),
+		"fixtures":     fixtures,
+	}
+	data, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(data, '\n'), nil
+}
+
+func sandboxConformanceFixturesErrorForCLI(fixtures []map[string]any) error {
+	var failed []string
+	for _, fixture := range fixtures {
+		if !conformanceFixtureFailed(fixture) {
+			continue
+		}
+		name := strings.TrimSpace(fmt.Sprint(fixture["name"]))
+		if errText := strings.TrimSpace(fmt.Sprint(fixture["error"])); errText != "" && errText != "<nil>" {
+			name += ": " + errText
+		}
+		if name != "" {
+			failed = append(failed, name)
+		}
+	}
+	sort.Strings(failed)
+	if len(failed) == 0 {
+		return errors.New("sandbox conformance failed")
+	}
+	return fmt.Errorf("sandbox conformance failed: %s", strings.Join(failed, "; "))
+}
+
+func ensureSandboxRuntimeEntryForCLI(ctx context.Context, dir string, manifest pluginmanager.Manifest) (string, string, func(), error) {
 	entry := strings.TrimSpace(manifest.Runtime.Entry)
 	if entry == "" {
-		return "", "", errors.New("runtime.entry is required")
+		return "", "", func() {}, errors.New("runtime.entry is required")
 	}
 	clean, err := cleanPackageEntryNameForCLI(entry)
 	if err != nil {
-		return "", "", fmt.Errorf("invalid runtime.entry: %w", err)
+		return "", "", func() {}, fmt.Errorf("invalid runtime.entry: %w", err)
 	}
 	entryPath, info, err := sandboxRuntimeEntryPathInfoForCLI(dir, clean)
 	if err != nil {
-		return "", "", err
+		if !strings.Contains(err.Error(), " is required") {
+			return "", "", func() {}, err
+		}
+		builtPath, cleanup, buildErr := runSandboxBuildScriptForCLI(ctx, dir, clean)
+		if buildErr != nil {
+			if errors.Is(buildErr, os.ErrNotExist) {
+				return "", "", func() {}, err
+			}
+			return "", "", cleanup, buildErr
+		}
+		info, err = os.Stat(builtPath)
+		if err != nil {
+			cleanup()
+			return "", "", func() {}, err
+		}
+		entryPath = builtPath
+		defer func() {
+			if err != nil {
+				cleanup()
+			}
+		}()
+		if !info.Mode().IsRegular() {
+			cleanup()
+			return "", "", func() {}, fmt.Errorf("sandbox-process runtime entry %q must be a regular executable file", clean)
+		}
+		if info.Mode().Perm()&0111 == 0 {
+			cleanup()
+			return "", "", func() {}, fmt.Errorf("sandbox-process runtime entry %q is not executable", clean)
+		}
+		file, openErr := os.Open(entryPath)
+		if openErr != nil {
+			cleanup()
+			return "", "", func() {}, openErr
+		}
+		defer file.Close()
+		var prefix [2]byte
+		n, readErr := io.ReadFull(file, prefix[:])
+		if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+			cleanup()
+			return "", "", func() {}, readErr
+		}
+		if n == len(prefix) && bytes.Equal(prefix[:], []byte("#!")) {
+			cleanup()
+			return "", "", func() {}, fmt.Errorf("sandbox-process runtime entry %q must be a native executable; scripts are not allowed", clean)
+		}
+		return entryPath, clean, cleanup, nil
 	}
 	if !info.Mode().IsRegular() {
-		return "", "", fmt.Errorf("sandbox-process runtime entry %q must be a regular executable file", clean)
+		return "", "", func() {}, fmt.Errorf("sandbox-process runtime entry %q must be a regular executable file", clean)
 	}
 	if info.Mode().Perm()&0111 == 0 {
-		return "", "", fmt.Errorf("sandbox-process runtime entry %q is not executable", clean)
+		return "", "", func() {}, fmt.Errorf("sandbox-process runtime entry %q is not executable", clean)
 	}
 	file, err := os.Open(entryPath)
 	if err != nil {
-		return "", "", err
+		return "", "", func() {}, err
 	}
 	defer file.Close()
 	var prefix [2]byte
 	n, err := io.ReadFull(file, prefix[:])
 	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-		return "", "", err
+		return "", "", func() {}, err
 	}
 	if n == len(prefix) && bytes.Equal(prefix[:], []byte("#!")) {
-		return "", "", fmt.Errorf("sandbox-process runtime entry %q must be a native executable; scripts are not allowed", clean)
+		return "", "", func() {}, fmt.Errorf("sandbox-process runtime entry %q must be a native executable; scripts are not allowed", clean)
 	}
-	return entryPath, clean, nil
+	return entryPath, clean, func() {}, nil
+}
+
+func runSandboxBuildScriptForCLI(ctx context.Context, dir, entry string) (string, func(), error) {
+	scriptPath := filepath.Join(dir, "build.sh")
+	if info, err := os.Stat(scriptPath); err != nil || info.IsDir() {
+		if err == nil {
+			err = fmt.Errorf("%s is a directory", scriptPath)
+		}
+		return "", func() {}, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	tmpRoot, err := os.MkdirTemp("", "mcgp-sandbox-build-*")
+	if err != nil {
+		return "", func() {}, err
+	}
+	cleanup := func() { _ = os.RemoveAll(tmpRoot) }
+	entryPath := filepath.Join(tmpRoot, filepath.FromSlash(entry))
+	if err := os.MkdirAll(filepath.Dir(entryPath), 0755); err != nil {
+		cleanup()
+		return "", func() {}, err
+	}
+	scriptPath, err = filepath.Abs(scriptPath)
+	if err != nil {
+		cleanup()
+		return "", func() {}, err
+	}
+	cmd := exec.CommandContext(ctx, "sh", scriptPath, entryPath)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "MC_GATEWAY_SANDBOX_OUT="+entryPath)
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Run(); err != nil {
+		cleanup()
+		if strings.TrimSpace(output.String()) == "" {
+			return "", func() {}, fmt.Errorf("run sandbox build script: %w", err)
+		}
+		return "", func() {}, fmt.Errorf("run sandbox build script: %w\n%s", err, strings.TrimSpace(output.String()))
+	}
+	return entryPath, cleanup, nil
 }
 
 func sandboxRuntimeEntryPathInfoForCLI(dir, clean string) (string, os.FileInfo, error) {
@@ -5832,6 +6285,33 @@ func runWASMFixtureTestForCLI(ctx context.Context, opts pluginTestCLIOptions) er
 	return nil
 }
 
+func runSandboxFixtureTestForCLI(ctx context.Context, opts pluginTestCLIOptions) error {
+	_ = ctx
+	if err := validateTestFileIfSet(opts.ConfigPath, "config"); err != nil {
+		return err
+	}
+	if err := validateTestFileIfSet(opts.FixturePath, "fixture"); err != nil {
+		return err
+	}
+	if _, err := validateSandboxPluginDirectoryForCLI(context.Background(), opts.Target, opts.Manifest); err != nil {
+		return err
+	}
+	report, err := pluginConformanceReportForCLI(pluginContractCLIOptions{
+		Target:      opts.Target,
+		Manifest:    opts.Manifest,
+		ConfigPath:  opts.ConfigPath,
+		FixturePath: opts.FixturePath,
+		Profile:     "strict",
+	})
+	if err != nil {
+		return err
+	}
+	if ok, _ := report["ok"].(bool); !ok {
+		return fmt.Errorf("sandbox conformance failed under strict profile")
+	}
+	return nil
+}
+
 func pluginTestConfigJSON(opts pluginTestCLIOptions) (string, error) {
 	if opts.ConfigPath != "" {
 		data, err := os.ReadFile(opts.ConfigPath)
@@ -5979,6 +6459,10 @@ func materializedManifestJSON(raw map[string]any, manifest pluginmanager.Manifes
 }
 
 func writeBinaryPackage(pluginPath, entryName string, manifestBytes []byte, sourceDir, outPath string) error {
+	return writeBinaryPackageWithGeneratedDocs(pluginPath, entryName, manifestBytes, sourceDir, outPath, nil)
+}
+
+func writeBinaryPackageWithGeneratedDocs(pluginPath, entryName string, manifestBytes []byte, sourceDir, outPath string, generatedDocs map[string][]byte) error {
 	if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
 		return err
 	}
@@ -5992,6 +6476,7 @@ func writeBinaryPackage(pluginPath, entryName string, manifestBytes []byte, sour
 		zw.Close()
 		return err
 	}
+	written := map[string]bool{"manifest.json": true}
 	if entryName == "" {
 		entryName = pluginmanager.RuntimeEntry
 	}
@@ -5999,11 +6484,33 @@ func writeBinaryPackage(pluginPath, entryName string, manifestBytes []byte, sour
 		zw.Close()
 		return err
 	}
+	written[filepath.ToSlash(entryName)] = true
 	for _, name := range optionalPackageDocs(sourceDir) {
-		if err := addZipFileStable(zw, filepath.ToSlash(name), filepath.Join(sourceDir, name)); err != nil {
+		entry := filepath.ToSlash(name)
+		if data, ok := generatedDocs[entry]; ok {
+			if err := addZipBytes(zw, entry, data); err != nil {
+				zw.Close()
+				return err
+			}
+			written[entry] = true
+			continue
+		}
+		if err := addZipFileStable(zw, entry, filepath.Join(sourceDir, name)); err != nil {
 			zw.Close()
 			return err
 		}
+		written[entry] = true
+	}
+	for name, data := range generatedDocs {
+		entry := filepath.ToSlash(name)
+		if written[entry] {
+			continue
+		}
+		if err := addZipBytes(zw, entry, data); err != nil {
+			zw.Close()
+			return err
+		}
+		written[entry] = true
 	}
 	if err := zw.Close(); err != nil {
 		return err

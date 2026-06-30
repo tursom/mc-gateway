@@ -1,0 +1,57 @@
+{
+  "fixtures": [
+    {
+      "name": "contract",
+      "status": "pass"
+    },
+    {
+      "name": "sandbox.stream_proxy",
+      "status": "pass",
+      "extension": "upstream.connect/v1",
+      "expected": "stream.proxy/v1",
+      "coverage": ["sandbox.stream_half_close", "sandbox.stream_backpressure", "sandbox.stream_cancel"]
+    }
+  ],
+  "sandbox_fixtures": [
+    "sandbox.handshake_init_register",
+    "sandbox.route_rule_config_request_response",
+    "sandbox.secret_denial",
+    "sandbox.file_denial",
+    "sandbox.network_denial",
+    "sandbox.cpu_memory_exceeded",
+    "sandbox.crash_loop",
+    "sandbox.stream_half_close",
+    "sandbox.stream_backpressure",
+    "sandbox.stream_cancel"
+  ],
+  "stream_proxy_scenarios": [
+    {
+      "name": "half-close",
+      "protocol": "stream.proxy/v1",
+      "expected": "half_close",
+      "frames": [
+        {"type": "data", "direction": "gateway_to_plugin", "bytes": 16},
+        {"type": "half_close", "direction": "gateway_to_plugin"}
+      ]
+    },
+    {
+      "name": "backpressure",
+      "protocol": "stream.proxy/v1",
+      "expected": "backpressure_window_respected",
+      "backpressure_bytes": 65536,
+      "frames": [
+        {"type": "window", "direction": "plugin_to_gateway", "window_bytes": 32768},
+        {"type": "data", "direction": "gateway_to_plugin", "bytes": 65536}
+      ]
+    },
+    {
+      "name": "cancel",
+      "protocol": "stream.proxy/v1",
+      "expected": "cancel_closes_stream",
+      "frames": [
+        {"type": "cancel", "reason": "fixture cancel"}
+      ]
+    }
+  ],
+  "protocol_proxy_scenarios": ["endpoint_close", "backpressure_large_packet"]
+}

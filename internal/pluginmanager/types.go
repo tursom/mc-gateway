@@ -692,6 +692,7 @@ type ConformanceSummary struct {
 	Passed         int                         `json:"passed"`
 	Skipped        int                         `json:"skipped"`
 	Failed         int                         `json:"failed"`
+	Coverage       []string                    `json:"coverage,omitempty"`
 	FailedFixtures []ConformanceFixtureSummary `json:"failed_fixtures,omitempty"`
 }
 

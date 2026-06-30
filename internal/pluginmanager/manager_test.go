@@ -3770,10 +3770,14 @@ func uploadTestArtifactWithManifestBytes(t *testing.T, manager *Manager, pluginI
 	if manifest.Runtime.Type == RuntimeSandbox {
 		modes[entry] = 0755
 	}
-	packagePath := writeTestMCGPWithModes(t, map[string][]byte{
+	entries := map[string][]byte{
 		"manifest.json": manifestBytes,
 		entry:           runtimeBytes,
-	}, modes)
+	}
+	if manifest.Runtime.Type == RuntimeSandbox {
+		entries["conformance.json"] = sandboxConformanceFixtureBytesForTest(t)
+	}
+	packagePath := writeTestMCGPWithModes(t, entries, modes)
 	artifact, err := manager.UploadArtifact(context.Background(), ArtifactUpload{
 		SourcePath: packagePath,
 		FileName:   pluginID + ".mcgp",
@@ -3783,6 +3787,35 @@ func uploadTestArtifactWithManifestBytes(t *testing.T, manager *Manager, pluginI
 		t.Fatalf("UploadArtifact(%s) error = %v", pluginID, err)
 	}
 	return artifact
+}
+
+func sandboxConformanceFixtureBytesForTest(t *testing.T) []byte {
+	t.Helper()
+	var fixtures []map[string]any
+	fixtures = append(fixtures, map[string]any{"name": "contract", "status": "pass"})
+	for _, coverage := range SandboxConformanceRequiredCoverage() {
+		fixtures = append(fixtures, map[string]any{
+			"name":         coverage,
+			"status":       "pass",
+			"extension":    RuntimeSandbox,
+			"coverage":     coverage,
+			"mode":         "executable",
+			"validated_by": SandboxConformanceValidatedByCLI,
+			"evidence": SandboxConformanceEvidence{
+				Coverage:    coverage,
+				Executed:    true,
+				ValidatedBy: SandboxConformanceValidatedByCLI,
+				Checks:      []string{"unit.fixture"},
+			},
+		})
+	}
+	data, err := json.Marshal(map[string]any{
+		"fixtures": fixtures,
+	})
+	if err != nil {
+		t.Fatalf("Marshal sandbox conformance fixture error = %v", err)
+	}
+	return data
 }
 
 func uploadTestArtifactWithProvenance(t *testing.T, manager *Manager, pluginID string, provenance map[string]any) ArtifactRecord {

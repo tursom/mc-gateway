@@ -1,0 +1,45 @@
+# examples/plugins/sandbox-rule-policy/manifest.yaml demonstrates sandbox-process rule policy packaging.
+
+schema_version: mc-gateway.plugin/v1
+id: sandbox-rule-policy
+name: Sandbox Rule Policy
+version: 0.1.0
+description: Sandbox-process example for rule.evaluate/v1 and config.validate/v1.
+artifact_type: binary
+runtime:
+  type: sandbox-process
+  entry: bin/plugin
+  protocol: mc-gateway-sandbox-process/v1
+  os: linux
+  arch: amd64
+  abi_version: mc-gateway.sandbox-process.abi/v1
+api_version: plugin-api/v1
+sdk_module: github.com/tursom/mc-gateway/plugin/sandboxsdk
+sdk_module_version: v0.1.0
+go_version: go1.25.0
+go_os: linux
+go_arch: amd64
+extension_points:
+  - type: rule
+    key: rule.evaluate/v1
+  - type: validator
+    key: config.validate/v1
+capabilities:
+  extension_points:
+    - rule.evaluate/v1
+    - config.validate/v1
+  runtime:
+    required_capabilities:
+      - cpu.memory
+      - process.restricted
+runtime_limits:
+  handler_timeout_ms: 1000
+  memory_bytes: 8388608
+config_schema:
+  type: object
+  properties:
+    denied_subjects:
+      type: array
+      items:
+        type: string
+  additionalProperties: false

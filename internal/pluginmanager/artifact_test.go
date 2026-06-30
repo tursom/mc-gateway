@@ -275,6 +275,79 @@ func TestArtifactStoreStoresSandboxMetadata(t *testing.T) {
 	}
 }
 
+func TestArtifactStoreStoresSandboxConformanceCoverage(t *testing.T) {
+	packagePath := writeTestMCGPWithModes(t, map[string][]byte{
+		"manifest.json":    testSandboxManifestBytes(t, "sandbox-conformance", runtime.GOOS, runtime.GOARCH, SandboxProcessABIVersionV1),
+		"bin/plugin":       []byte("sandbox native executable bytes"),
+		"conformance.json": sandboxConformanceFixtureBytesForTest(t),
+	}, map[string]os.FileMode{"bin/plugin": 0755})
+	store := NewArtifactStore(t.TempDir())
+	artifact, err := store.ValidateAndStore(ArtifactUpload{
+		SourcePath: packagePath,
+		FileName:   "sandbox-conformance.mcgp",
+		Actor:      "admin",
+	})
+	if err != nil {
+		t.Fatalf("ValidateAndStore(sandbox conformance) error = %v", err)
+	}
+	var metadata struct {
+		Conformance ConformanceSummary `json:"conformance"`
+	}
+	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &metadata); err != nil {
+		t.Fatalf("Unmarshal metadata error = %v\n%s", err, artifact.MetadataJSON)
+	}
+	coverage := map[string]bool{}
+	for _, item := range metadata.Conformance.Coverage {
+		coverage[item] = true
+	}
+	for _, item := range SandboxConformanceRequiredCoverage() {
+		if !coverage[item] {
+			t.Fatalf("conformance coverage = %+v, missing %s", metadata.Conformance.Coverage, item)
+		}
+	}
+	if !metadata.Conformance.OK || metadata.Conformance.Failed != 0 {
+		t.Fatalf("conformance summary = %+v, want passing sandbox coverage", metadata.Conformance)
+	}
+}
+
+func TestArtifactStoreDoesNotCountRawSandboxConformanceDeclarations(t *testing.T) {
+	data, err := json.Marshal(map[string]any{
+		"fixtures": []map[string]any{
+			{"name": "contract", "status": "pass"},
+			{"name": "sandbox.self_declared", "status": "pass", "coverage": SandboxConformanceRequiredCoverage()},
+		},
+		"sandbox_fixtures":         SandboxConformanceRequiredCoverage(),
+		"stream_proxy_scenarios":   []StreamProxyFixture{{Name: "cancel", Protocol: StreamProxyProtocolV1, Expected: "cancel", Frames: []StreamProxyFrame{{Type: StreamFrameCancel}}}},
+		"protocol_proxy_scenarios": []string{"endpoint_close", "backpressure_large_packet"},
+	})
+	if err != nil {
+		t.Fatalf("Marshal raw sandbox conformance declarations error = %v", err)
+	}
+	packagePath := writeTestMCGPWithModes(t, map[string][]byte{
+		"manifest.json":    testSandboxManifestBytes(t, "sandbox-raw-conformance", runtime.GOOS, runtime.GOARCH, SandboxProcessABIVersionV1),
+		"bin/plugin":       []byte("sandbox native executable bytes"),
+		"conformance.json": data,
+	}, map[string]os.FileMode{"bin/plugin": 0755})
+	store := NewArtifactStore(t.TempDir())
+	artifact, err := store.ValidateAndStore(ArtifactUpload{
+		SourcePath: packagePath,
+		FileName:   "sandbox-raw-conformance.mcgp",
+		Actor:      "admin",
+	})
+	if err != nil {
+		t.Fatalf("ValidateAndStore(raw sandbox conformance) error = %v", err)
+	}
+	var metadata struct {
+		Conformance ConformanceSummary `json:"conformance"`
+	}
+	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &metadata); err != nil {
+		t.Fatalf("Unmarshal metadata error = %v\n%s", err, artifact.MetadataJSON)
+	}
+	if len(metadata.Conformance.Coverage) != 0 {
+		t.Fatalf("raw sandbox conformance coverage = %+v, want no validated coverage", metadata.Conformance.Coverage)
+	}
+}
+
 func TestArtifactStoreRejectsInvalidSandboxPackage(t *testing.T) {
 	baseManifest := testSandboxManifestBytes(t, "sandbox-invalid", runtime.GOOS, runtime.GOARCH, SandboxProcessABIVersionV1)
 	tests := []struct {

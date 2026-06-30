@@ -842,6 +842,15 @@ func (m *Manager) preflightChecks(ctx context.Context, plugin PluginRecord, arti
 	if artifact.RuntimeType == RuntimeWASM && normalizeProfile(profile) == PolicyProfileProd {
 		policy.RequireConformanceFixture = true
 	}
+	var requiredConformanceCoverage []string
+	if artifact.RuntimeType == RuntimeSandbox {
+		if normalizeProfile(profile) == PolicyProfileProd {
+			policy.RequireConformanceFixture = true
+		}
+		if policy.RequireConformanceFixture {
+			requiredConformanceCoverage = SandboxConformanceRequiredCoverage()
+		}
+	}
 	if configJSON == "" {
 		configJSON = "{}"
 	}
@@ -863,7 +872,7 @@ func (m *Manager) preflightChecks(ctx context.Context, plugin PluginRecord, arti
 			Details:  map[string]any{"features": missing},
 		})
 	}
-	if check, ok := conformancePreflightCheck(artifact.MetadataJSON, policy); ok {
+	if check, ok := conformancePreflightCheck(artifact.MetadataJSON, policy, requiredConformanceCoverage); ok {
 		result.Checks = append(result.Checks, check)
 	}
 	if artifact.RuntimeType == RuntimeSandbox {
@@ -1079,7 +1088,7 @@ func (m *Manager) preflightChecks(ctx context.Context, plugin PluginRecord, arti
 	return result
 }
 
-func conformancePreflightCheck(metadataJSON string, policy PolicySnapshot) (PreflightCheck, bool) {
+func conformancePreflightCheck(metadataJSON string, policy PolicySnapshot, requiredCoverage []string) (PreflightCheck, bool) {
 	summary, ok, err := conformanceSummaryFromMetadata(metadataJSON)
 	if err != nil {
 		return PreflightCheck{
@@ -1115,6 +1124,16 @@ func conformancePreflightCheck(metadataJSON string, policy PolicySnapshot) (Pref
 			Code:     "conformance_fixture_failed",
 			Severity: GateSeverityBlocking,
 			Message:  "packaged conformance fixture failed",
+			Details:  details,
+		}, true
+	}
+	if missing := missingConformanceCoverage(summary, requiredCoverage); len(missing) > 0 {
+		details["coverage"] = summary.Coverage
+		details["missing_coverage"] = missing
+		return PreflightCheck{
+			Code:     "sandbox_conformance_fixture_missing",
+			Severity: GateSeverityBlocking,
+			Message:  "packaged sandbox conformance fixture coverage is incomplete",
 			Details:  details,
 		}, true
 	}

@@ -1014,12 +1014,18 @@ func conformanceSummaryFromEntries(entries map[string]*zip.File, maxBytes int64)
 		return ConformanceSummary{}, false, err
 	}
 	var fixtureFile struct {
-		Fixtures []map[string]any `json:"fixtures"`
+		Fixtures               []map[string]any     `json:"fixtures"`
+		SandboxFixtures        []string             `json:"sandbox_fixtures"`
+		RouteDecisions         []string             `json:"route_decisions"`
+		RuleEvaluationOutcomes []string             `json:"rule_evaluation_outcomes"`
+		StreamProxyScenarios   []StreamProxyFixture `json:"stream_proxy_scenarios"`
+		ProtocolProxyScenarios []string             `json:"protocol_proxy_scenarios"`
 	}
 	if err := json.Unmarshal(data, &fixtureFile); err != nil {
 		return ConformanceSummary{}, false, fmt.Errorf("invalid conformance.json: %w", err)
 	}
 	summary := ConformanceSummary{Source: "conformance.json", OK: true}
+	coverage := map[string]bool{}
 	for _, fixture := range fixtureFile.Fixtures {
 		name := strings.TrimSpace(fmt.Sprint(fixture["name"]))
 		if name == "" {
@@ -1045,10 +1051,87 @@ func conformanceSummaryFromEntries(entries map[string]*zip.File, maxBytes int64)
 			summary.Skipped++
 		default:
 			summary.Passed++
+			addConformanceFixtureCoverage(coverage, fixture)
 		}
 	}
+	for item := range coverage {
+		summary.Coverage = append(summary.Coverage, item)
+	}
+	sort.Strings(summary.Coverage)
 	summary.OK = summary.Failed == 0
 	return summary, true, nil
+}
+
+func addConformanceFixtureCoverage(coverage map[string]bool, fixture map[string]any) {
+	if conformanceFixtureHasSandboxCoverage(fixture) && !conformanceFixtureHasExecutableSandboxEvidence(fixture) {
+		return
+	}
+	for _, key := range []string{"coverage", "covers"} {
+		switch value := fixture[key].(type) {
+		case string:
+			if normalized := normalizeConformanceCoverage(value); normalized != "" {
+				coverage[normalized] = true
+			}
+		case []any:
+			for _, item := range value {
+				if normalized := normalizeConformanceCoverage(fmt.Sprint(item)); normalized != "" {
+					coverage[normalized] = true
+				}
+			}
+		}
+	}
+	name := normalizeConformanceCoverage(fmt.Sprint(fixture["name"]))
+	if name != "" && strings.HasPrefix(name, "sandbox.") {
+		coverage[name] = true
+	}
+	expected := normalizeConformanceCoverage(fmt.Sprint(fixture["expected"]))
+	if expected != "" && strings.HasPrefix(expected, "sandbox.") {
+		coverage[expected] = true
+	}
+}
+
+func conformanceFixtureHasSandboxCoverage(fixture map[string]any) bool {
+	for _, key := range []string{"coverage", "covers", "name", "expected", "scenario"} {
+		if conformanceValueHasSandboxCoverage(fixture[key]) {
+			return true
+		}
+	}
+	return false
+}
+
+func conformanceValueHasSandboxCoverage(value any) bool {
+	switch typed := value.(type) {
+	case string:
+		normalized := normalizeConformanceCoverage(typed)
+		return strings.HasPrefix(normalized, "sandbox.")
+	case []any:
+		for _, item := range typed {
+			if conformanceValueHasSandboxCoverage(item) {
+				return true
+			}
+		}
+	case []string:
+		for _, item := range typed {
+			if conformanceValueHasSandboxCoverage(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func conformanceFixtureHasExecutableSandboxEvidence(fixture map[string]any) bool {
+	if strings.TrimSpace(fmt.Sprint(fixture["mode"])) != "executable" {
+		return false
+	}
+	switch evidence := fixture["evidence"].(type) {
+	case map[string]any:
+		return evidence["executed"] == true && strings.TrimSpace(fmt.Sprint(evidence["validated_by"])) == SandboxConformanceValidatedByCLI
+	case SandboxConformanceEvidence:
+		return evidence.Executed && evidence.ValidatedBy == SandboxConformanceValidatedByCLI
+	default:
+		return strings.TrimSpace(fmt.Sprint(fixture["validated_by"])) == SandboxConformanceValidatedByCLI
+	}
 }
 
 func conformanceFixtureStatusFailed(status, expected string) bool {

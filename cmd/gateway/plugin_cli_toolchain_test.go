@@ -187,6 +187,59 @@ func TestPluginExamplePackagesCoverM1SourceBinaryFixtures(t *testing.T) {
 	}
 }
 
+func TestPluginSandboxExamplesValidateConformancePackagePreflight(t *testing.T) {
+	examples := []struct {
+		id  string
+		dir string
+	}{
+		{id: "sandbox-rule-policy", dir: "../../examples/plugins/sandbox-rule-policy"},
+		{id: "sandbox-route-resolver", dir: "../../examples/plugins/sandbox-route-resolver"},
+		{id: "sandbox-stream-proxy", dir: "../../examples/plugins/sandbox-stream-proxy"},
+	}
+	for _, example := range examples {
+		t.Run(example.id, func(t *testing.T) {
+			dir := filepath.Clean(example.dir)
+			handled, code := runPluginCLI([]string{"plugin", "validate", dir})
+			if !handled || code != 0 {
+				t.Fatalf("runPluginCLI(validate %s) = (%v, %d), want handled code 0", example.id, handled, code)
+			}
+			handled, code = runPluginCLI([]string{"plugin", "test", dir, "--profile", "conformance"})
+			if !handled || code != 0 {
+				t.Fatalf("runPluginCLI(test conformance %s) = (%v, %d), want handled code 0", example.id, handled, code)
+			}
+			out := filepath.Join(t.TempDir(), example.id+".mcgp")
+			handled, code = runPluginCLI([]string{"plugin", "build", dir, "--type", "binary", "--out", out})
+			if !handled || code != 0 {
+				t.Fatalf("runPluginCLI(build binary %s) = (%v, %d), want handled code 0", example.id, handled, code)
+			}
+			if _, err := validatePluginPathForCLI(out, pluginmanager.ArtifactTypeBinary); err != nil {
+				t.Fatalf("validatePluginPathForCLI(%s binary) error = %v", example.id, err)
+			}
+			assertZipContains(t, out, "manifest.json", "bin/plugin", "README.md", "conformance.json")
+
+			preflightOutput := captureStdout(t, func() {
+				handled, code = runPluginCLI([]string{
+					"plugin", "preflight", out,
+					"--profile", pluginmanager.PolicyProfileProd,
+					"--config", filepath.Join(dir, "testdata", "config.json"),
+				})
+			})
+			if !handled || code != 0 {
+				t.Fatalf("runPluginCLI(preflight %s) = (%v, %d), want handled code 0", example.id, handled, code)
+			}
+			var report struct {
+				Preflight pluginmanager.PreflightResult `json:"preflight"`
+			}
+			if err := json.Unmarshal([]byte(preflightOutput), &report); err != nil {
+				t.Fatalf("Unmarshal(preflight %s) error = %v\n%s", example.id, err, preflightOutput)
+			}
+			if !report.Preflight.OK || !hasPreflightCheck(report.Preflight.Checks, "conformance_fixture_passed", "info") {
+				t.Fatalf("preflight %s = %+v, want passing conformance fixture", example.id, report.Preflight)
+			}
+		})
+	}
+}
+
 func TestPluginBuilderImageWorkflowReleaseContract(t *testing.T) {
 	root := filepath.Clean("../..")
 	workflowBytes, err := os.ReadFile(filepath.Join(root, ".github/workflows/plugin-builder-image.yml"))
@@ -375,6 +428,47 @@ func TestPluginSandboxCLIValidateBuildAndManifestTest(t *testing.T) {
 	_, serverErr := store.ValidateAndStore(pluginmanager.ArtifactUpload{SourcePath: badPackage, FileName: filepath.Base(badPackage), Actor: "test"})
 	if cliErr == nil || serverErr == nil || cliErr.Error() != serverErr.Error() {
 		t.Fatalf("sandbox bad package errors cli=%v server=%v, want identical validation message", cliErr, serverErr)
+	}
+}
+
+func TestPluginSandboxCLIConformanceRequiresStrictFixtures(t *testing.T) {
+	dir := writeSandboxCLIFixture(t, "sandbox-cli-strict-missing", runtime.GOOS, runtime.GOARCH, pluginmanager.SandboxProcessABIVersionV1, 0755, []byte("sandbox native executable bytes"))
+	if err := os.WriteFile(filepath.Join(dir, "conformance.json"), []byte(`{"fixtures":[{"name":"contract","status":"pass"}]}`), 0644); err != nil {
+		t.Fatalf("WriteFile(conformance) error = %v", err)
+	}
+	handled, code := runPluginCLI([]string{"plugin", "test", dir, "--profile", "conformance"})
+	if !handled {
+		t.Fatal("runPluginCLI() handled = false")
+	}
+	if code == 0 {
+		t.Fatal("runPluginCLI(test sandbox conformance) code = 0, want strict fixture failure")
+	}
+}
+
+func TestPluginSandboxCLIRejectsSelfDeclaredSandboxCoverage(t *testing.T) {
+	dir := writeSandboxCLIFixture(t, "sandbox-cli-self-declared", runtime.GOOS, runtime.GOARCH, pluginmanager.SandboxProcessABIVersionV1, 0755, []byte("sandbox native executable bytes"))
+	data, err := json.Marshal(map[string]any{
+		"fixtures": []map[string]any{
+			{
+				"name":      "sandbox.self_declared",
+				"status":    "pass",
+				"extension": pluginmanager.RuntimeSandbox,
+				"coverage":  pluginmanager.SandboxConformanceRequiredCoverage(),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Marshal self-declared conformance error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "conformance.json"), data, 0644); err != nil {
+		t.Fatalf("WriteFile(conformance) error = %v", err)
+	}
+	handled, code := runPluginCLI([]string{"plugin", "test", dir, "--profile", "conformance"})
+	if !handled {
+		t.Fatal("runPluginCLI() handled = false")
+	}
+	if code == 0 {
+		t.Fatal("runPluginCLI(test sandbox self-declared conformance) code = 0, want strict evidence failure")
 	}
 }
 
@@ -623,6 +717,7 @@ func TestPluginFeaturesAndManifestCommands(t *testing.T) {
 			StatusHosts                          bool     `json:"status_hosts"`
 			StreamProxyProtocol                  string   `json:"stream_proxy_protocol"`
 			StreamProxySemantics                 []string `json:"stream_proxy_semantics"`
+			SandboxRequiredCoverage              []string `json:"sandbox_required_coverage"`
 			ProtocolProxyScenarios               []string `json:"protocol_proxy_scenarios"`
 			RuleEvaluationOutcomes               []string `json:"rule_evaluation_outcomes"`
 			ConnectionFilterScenarios            []string `json:"connection_filter_scenarios"`
@@ -957,6 +1052,8 @@ func TestPluginFeaturesAndManifestCommands(t *testing.T) {
 		!containsString(features.Conformance.StreamProxySemantics, "half_close") ||
 		!containsString(features.Conformance.StreamProxySemantics, "backpressure") ||
 		!containsString(features.Conformance.StreamProxySemantics, "byte_accounting") ||
+		!containsString(features.Conformance.SandboxRequiredCoverage, pluginmanager.SandboxConformanceCrashLoop) ||
+		!containsString(features.Conformance.SandboxRequiredCoverage, pluginmanager.SandboxConformanceStreamCancel) ||
 		!containsString(features.Conformance.ProtocolProxyScenarios, "force_close_draining") ||
 		!containsString(features.Conformance.ProtocolProxyScenarios, "backpressure_large_packet") ||
 		!containsString(features.Conformance.RuleEvaluationOutcomes, "timeout_fail_closed") ||
@@ -2384,6 +2481,15 @@ func findFixture(fixtures []map[string]any, name string) (map[string]any, bool) 
 func hasCheck(checks []map[string]any, code, severity string) bool {
 	for _, check := range checks {
 		if check["code"] == code && check["severity"] == severity {
+			return true
+		}
+	}
+	return false
+}
+
+func hasPreflightCheck(checks []pluginmanager.PreflightCheck, code, severity string) bool {
+	for _, check := range checks {
+		if check.Code == code && check.Severity == severity {
 			return true
 		}
 	}

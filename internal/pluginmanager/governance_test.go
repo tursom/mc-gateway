@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net"
+	"os"
 	"runtime"
 	"strings"
 	"testing"
@@ -134,6 +135,113 @@ func TestGovernanceStrictPolicyBlocksMissingConformance(t *testing.T) {
 	}
 }
 
+func TestSandboxProdRequiresStrictConformanceCoverage(t *testing.T) {
+	manager := newSandboxServiceModeManagerForTest(t, SandboxPolicy{CPUSeconds: 1, MemoryBytes: 8 * 1024 * 1024, ExternalIsolation: true})
+	manifest := sandboxConformanceTestManifest(t, "sandbox-missing-conformance")
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("Marshal manifest error = %v", err)
+	}
+	packagePath := writeTestMCGPWithModes(t, map[string][]byte{
+		"manifest.json": manifestBytes,
+		RuntimeEntry:    []byte("fake sandbox runtime"),
+		"conformance.json": []byte(`{
+			"fixtures":[{"name":"contract","status":"pass"}],
+			"sandbox_fixtures":["sandbox.handshake_init_register"]
+		}`),
+	}, map[string]os.FileMode{RuntimeEntry: 0755})
+	artifact, err := manager.UploadArtifact(context.Background(), ArtifactUpload{
+		SourcePath: packagePath,
+		FileName:   "sandbox-missing-conformance.mcgp",
+		Actor:      "admin",
+	})
+	if err != nil {
+		t.Fatalf("UploadArtifact() error = %v", err)
+	}
+	if _, err := manager.repo.UpsertDesired(context.Background(), "admin", artifact.PluginID, artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("UpsertDesired() error = %v", err)
+	}
+	preflight, err := manager.RunPreflight(context.Background(), "admin", artifact.PluginID, PreflightRequest{
+		ArtifactID: artifact.ID,
+		Profile:    PolicyProfileProd,
+		Action:     GovernanceActionEnable,
+		ConfigJSON: `{}`,
+	})
+	if err != nil {
+		t.Fatalf("RunPreflight() error = %v", err)
+	}
+	if preflight.OK || !preflightCheckCodes(preflight.Checks)["sandbox_conformance_fixture_missing"] {
+		t.Fatalf("preflight = %+v, want sandbox conformance coverage block", preflight)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", artifact.PluginID); err == nil || !strings.Contains(err.Error(), "sandbox_conformance_fixture_missing") {
+		t.Fatalf("Enable() error = %v, want sandbox conformance coverage block", err)
+	}
+}
+
+func TestSandboxProdBlocksFailedConformanceCoverage(t *testing.T) {
+	manager := newSandboxServiceModeManagerForTest(t, SandboxPolicy{CPUSeconds: 1, MemoryBytes: 8 * 1024 * 1024, ExternalIsolation: true})
+	manifest := sandboxConformanceTestManifest(t, "sandbox-failed-conformance")
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("Marshal manifest error = %v", err)
+	}
+	var fixtures []map[string]any
+	for _, coverage := range SandboxConformanceRequiredCoverage() {
+		status := "pass"
+		if coverage == SandboxConformanceNetworkDenial {
+			status = "fail"
+		}
+		fixtures = append(fixtures, map[string]any{
+			"name":         coverage,
+			"status":       status,
+			"extension":    RuntimeSandbox,
+			"coverage":     coverage,
+			"mode":         "executable",
+			"validated_by": SandboxConformanceValidatedByCLI,
+			"evidence": SandboxConformanceEvidence{
+				Coverage:    coverage,
+				Executed:    true,
+				ValidatedBy: SandboxConformanceValidatedByCLI,
+			},
+		})
+	}
+	conformanceBytes, err := json.Marshal(map[string]any{"fixtures": fixtures})
+	if err != nil {
+		t.Fatalf("Marshal conformance error = %v", err)
+	}
+	packagePath := writeTestMCGPWithModes(t, map[string][]byte{
+		"manifest.json":    manifestBytes,
+		RuntimeEntry:       []byte("fake sandbox runtime"),
+		"conformance.json": conformanceBytes,
+	}, map[string]os.FileMode{RuntimeEntry: 0755})
+	artifact, err := manager.UploadArtifact(context.Background(), ArtifactUpload{
+		SourcePath: packagePath,
+		FileName:   "sandbox-failed-conformance.mcgp",
+		Actor:      "admin",
+	})
+	if err != nil {
+		t.Fatalf("UploadArtifact() error = %v", err)
+	}
+	if _, err := manager.repo.UpsertDesired(context.Background(), "admin", artifact.PluginID, artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("UpsertDesired() error = %v", err)
+	}
+	preflight, err := manager.RunPreflight(context.Background(), "admin", artifact.PluginID, PreflightRequest{
+		ArtifactID: artifact.ID,
+		Profile:    PolicyProfileProd,
+		Action:     GovernanceActionEnable,
+		ConfigJSON: `{}`,
+	})
+	if err != nil {
+		t.Fatalf("RunPreflight() error = %v", err)
+	}
+	if preflight.OK || !preflightCheckCodes(preflight.Checks)["conformance_fixture_failed"] {
+		t.Fatalf("preflight = %+v, want failed sandbox conformance block", preflight)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", artifact.PluginID); err == nil || !strings.Contains(err.Error(), "conformance_fixture_failed") {
+		t.Fatalf("Enable() error = %v, want failed sandbox conformance block", err)
+	}
+}
+
 func TestSandboxUnenforceableCapabilityBlocksGovernanceAndOverride(t *testing.T) {
 	manager := newSandboxServiceModeManagerForTest(t, SandboxPolicy{})
 	artifact := uploadTestArtifactWithManifest(t, manager, "sandbox-unenforceable", func(manifest *Manifest) {
@@ -177,6 +285,30 @@ func TestSandboxUnenforceableCapabilityBlocksGovernanceAndOverride(t *testing.T)
 	}); err == nil || !strings.Contains(err.Error(), "blocking governance issues cannot be overridden") {
 		t.Fatalf("CreateWarningOverride() error = %v, want blocking override rejection", err)
 	}
+}
+
+func sandboxConformanceTestManifest(t *testing.T, pluginID string) Manifest {
+	t.Helper()
+	var manifest Manifest
+	if err := json.Unmarshal(testManifestBytesWithCapabilities(t, pluginID, nil), &manifest); err != nil {
+		t.Fatalf("Unmarshal manifest error = %v", err)
+	}
+	manifest.Runtime = RuntimeManifest{
+		Type:       RuntimeSandbox,
+		Entry:      RuntimeEntry,
+		Protocol:   SandboxProcessProtocolV1,
+		OS:         runtime.GOOS,
+		Arch:       runtime.GOARCH,
+		ABIVersion: SandboxProcessABIVersionV1,
+	}
+	manifest.ExtensionPoints = []ExtensionPoint{
+		{Type: "provider", Key: ExtensionRouteResolve},
+		{Type: "rule", Key: ExtensionRuleEvaluate},
+		{Type: "validator", Key: ExtensionConfigValidate},
+	}
+	manifest.Capabilities = json.RawMessage(`{"extension_points":["route.resolve/v1","rule.evaluate/v1","config.validate/v1"]}`)
+	manifest.RuntimeLimits = RuntimeLimits{HandlerTimeoutMS: 1000, MemoryBytes: 8388608}
+	return manifest
 }
 
 func TestSandboxPreflightBlocksProtocolABIMetadataMismatch(t *testing.T) {
