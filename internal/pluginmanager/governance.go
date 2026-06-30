@@ -867,6 +867,20 @@ func (m *Manager) preflightChecks(ctx context.Context, plugin PluginRecord, arti
 		result.Checks = append(result.Checks, check)
 	}
 	if artifact.RuntimeType == RuntimeSandbox {
+		if err := validateSandboxArtifactMetadata(artifact, manifest); err != nil {
+			result.Checks = append(result.Checks, PreflightCheck{
+				Code:     "sandbox_artifact_metadata_invalid",
+				Severity: GateSeverityBlocking,
+				Message:  err.Error(),
+				Details: map[string]any{
+					"runtime_type": artifact.RuntimeType,
+					"protocol":     manifest.Runtime.Protocol,
+					"abi_version":  manifest.Runtime.ABIVersion,
+					"os":           manifest.Runtime.OS,
+					"arch":         manifest.Runtime.Arch,
+				},
+			})
+		}
 		if m.serviceMode != PluginServiceModeSandboxProcess {
 			result.Checks = append(result.Checks, PreflightCheck{Code: "sandbox_runtime_disabled", Severity: GateSeverityBlocking, Message: "sandbox-process runtime is disabled by plugin service mode"})
 		} else if reasonCode, message := m.validateSandboxServiceModeApply(); reasonCode != "" {
@@ -922,7 +936,7 @@ func (m *Manager) preflightChecks(ctx context.Context, plugin PluginRecord, arti
 			result.Checks = append(result.Checks, PreflightCheck{
 				Code:     "capability_enforcement_unavailable",
 				Severity: GateSeverityBlocking,
-				Message:  "runtime required capabilities cannot be enforced by this gateway",
+				Message:  "runtime required capabilities cannot be enforced by this gateway: " + strings.Join(unsupported, ","),
 				Details:  map[string]any{"runtime_type": artifact.RuntimeType, "capabilities": unsupported},
 			})
 		}
@@ -930,7 +944,7 @@ func (m *Manager) preflightChecks(ctx context.Context, plugin PluginRecord, arti
 		result.Checks = append(result.Checks, PreflightCheck{
 			Code:     "capability_enforcement_unavailable",
 			Severity: GateSeverityBlocking,
-			Message:  "runtime required capabilities cannot be enforced by this gateway",
+			Message:  "runtime required capabilities cannot be enforced by this gateway: " + strings.Join(caps, ","),
 			Details:  map[string]any{"runtime_type": artifact.RuntimeType, "capabilities": caps},
 		})
 	}
@@ -2030,7 +2044,7 @@ func governanceFingerprint(plugin PluginRecord, artifact ArtifactRecord, manifes
 		ScopeHash:         stableHash(manifestScope(manifest).Values),
 		RolloutHash:       stableHash(manifestRollout(manifest)),
 		RuntimeLimitsHash: stableHash(manifest.RuntimeLimits),
-		FeaturesHash:      stableHash(requiredFeatures(manifest)),
+		FeaturesHash:      stableHash(requiredFeatureInputs(manifest)),
 		PolicyHash:        policyHash,
 	}
 }
@@ -2093,10 +2107,24 @@ func riskLevel(manifest Manifest, artifact ArtifactRecord) string {
 	if upstreamModeFromArtifact(artifact) == UpstreamModeProtocolProxy {
 		return RiskHigh
 	}
+	if artifact.RuntimeType == RuntimeSandbox && len(highRiskSandboxRequiredCapabilities(requiredRuntimeCapabilities(artifact))) > 0 {
+		return RiskHigh
+	}
 	if len(manifest.Secrets) > 0 || len(externalDependencies(manifest)) > 0 {
 		return RiskMedium
 	}
 	return RiskLow
+}
+
+func highRiskSandboxRequiredCapabilities(capabilities []string) []string {
+	var highRisk []string
+	for _, capability := range capabilities {
+		switch strings.ToLower(strings.TrimSpace(capability)) {
+		case "filesystem.write", "network.egress", "secret.handle", "process.restricted":
+			highRisk = append(highRisk, capability)
+		}
+	}
+	return uniqueSortedStrings(highRisk)
 }
 
 func reviewRequired(profile, risk string, policy PolicySnapshot) bool {
@@ -2465,6 +2493,8 @@ func issueRank(code string) int {
 	case "scope_overlap":
 		return 10
 	case "review_required":
+		return 9
+	case "capability_enforcement_unavailable":
 		return 9
 	case "feature_missing", "secret_missing":
 		return 8

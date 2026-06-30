@@ -3681,6 +3681,27 @@ func newManagerForTestWithBuildersProfile(t *testing.T, adapter RuntimeAdapter, 
 	})
 }
 
+func newSandboxServiceModeManagerForTest(t *testing.T, policy SandboxPolicy) *Manager {
+	t.Helper()
+	manager := New(Options{
+		DB:                 openPluginManagerTestDB(t),
+		ArtifactRoot:       t.TempDir(),
+		FutureRuntimeGates: FutureRuntimeGates{SandboxProcess: true},
+		SandboxPolicy:      policy,
+		SandboxSelfCheck:   func(SandboxPolicy) error { return nil },
+	})
+	if _, err := manager.SetPluginServiceDesired(context.Background(), "admin", PluginServiceModeSandboxProcess); err != nil {
+		t.Fatalf("SetPluginServiceDesired(sandbox) error = %v", err)
+	}
+	if err := manager.ApplyPluginServiceMode(context.Background()); err != nil {
+		t.Fatalf("ApplyPluginServiceMode(sandbox) error = %v", err)
+	}
+	if manager.serviceMode != PluginServiceModeSandboxProcess {
+		t.Fatalf("serviceMode = %q, want %q", manager.serviceMode, PluginServiceModeSandboxProcess)
+	}
+	return manager
+}
+
 func openPluginManagerTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 	db, err := admindb.Open(filepath.Join(t.TempDir(), "gateway.sqlite3"))

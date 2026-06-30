@@ -134,6 +134,88 @@ func TestGovernanceStrictPolicyBlocksMissingConformance(t *testing.T) {
 	}
 }
 
+func TestSandboxUnenforceableCapabilityBlocksGovernanceAndOverride(t *testing.T) {
+	manager := newSandboxServiceModeManagerForTest(t, SandboxPolicy{})
+	artifact := uploadTestArtifactWithManifest(t, manager, "sandbox-unenforceable", func(manifest *Manifest) {
+		manifest.Runtime.Type = RuntimeSandbox
+		manifest.Capabilities = json.RawMessage(`{"runtime":{"required_capabilities":["network.egress"]}}`)
+	})
+	if _, err := manager.repo.UpsertDesired(context.Background(), "admin", artifact.PluginID, artifact.ID, DesiredDisabled, `{}`, 10); err != nil {
+		t.Fatalf("UpsertDesired() error = %v", err)
+	}
+
+	preflight, err := manager.RunPreflight(context.Background(), "admin", artifact.PluginID, PreflightRequest{
+		ArtifactID: artifact.ID,
+		Profile:    PolicyProfileProd,
+		Action:     GovernanceActionEnable,
+		ConfigJSON: `{}`,
+	})
+	if err != nil {
+		t.Fatalf("RunPreflight() error = %v", err)
+	}
+	if preflight.OK || !preflightCheckCodes(preflight.Checks)["capability_enforcement_unavailable"] {
+		t.Fatalf("preflight = %+v, want capability enforcement block", preflight)
+	}
+
+	decision, err := manager.EvaluateGovernance(context.Background(), artifact.PluginID, artifact.ID, GovernanceActionEnable, PolicyProfileProd, `{}`)
+	if err != nil {
+		t.Fatalf("EvaluateGovernance() error = %v", err)
+	}
+	issueCodes := governanceIssueCodes(decision.Issues)
+	if decision.OK || !decision.ReviewRequired || !issueCodes["capability_enforcement_unavailable"] || !issueCodes["review_required"] {
+		t.Fatalf("decision = %+v, want capability block and high-risk review requirement", decision)
+	}
+	releaseDecision, err := manager.EvaluateReleaseGate(context.Background(), artifact.PluginID, artifact.ID, GovernanceActionEnable, PolicyProfileProd, `{}`)
+	if err == nil || releaseDecision.OK || !governanceIssueCodes(releaseDecision.Issues)["capability_enforcement_unavailable"] {
+		t.Fatalf("EvaluateReleaseGate() decision=%+v err=%v, want enforcement block", releaseDecision, err)
+	}
+	if _, err := manager.CreateWarningOverride(context.Background(), "admin", artifact.PluginID, WarningOverrideRequest{
+		ArtifactID: artifact.ID,
+		Profile:    PolicyProfileProd,
+		Action:     GovernanceActionEnable,
+		Reason:     "attempt to override sandbox enforcement",
+	}); err == nil || !strings.Contains(err.Error(), "blocking governance issues cannot be overridden") {
+		t.Fatalf("CreateWarningOverride() error = %v, want blocking override rejection", err)
+	}
+}
+
+func TestSandboxPreflightBlocksProtocolABIMetadataMismatch(t *testing.T) {
+	manager := newSandboxServiceModeManagerForTest(t, SandboxPolicy{ExternalIsolation: true})
+	artifact := uploadTestArtifactWithManifest(t, manager, "sandbox-abi-preflight", func(manifest *Manifest) {
+		manifest.Runtime.Type = RuntimeSandbox
+	})
+	var metadata map[string]any
+	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &metadata); err != nil {
+		t.Fatalf("Unmarshal metadata error = %v", err)
+	}
+	runtimeMetadata := jsonMapFromAny(metadata["runtime"])
+	runtimeMetadata["abi_version"] = "mc-gateway.sandbox-process.abi/v0"
+	metadata["runtime"] = runtimeMetadata
+	data, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatalf("Marshal tampered metadata error = %v", err)
+	}
+	artifact.MetadataJSON = string(data)
+	if err := manager.repo.SaveArtifact(context.Background(), artifact); err != nil {
+		t.Fatalf("SaveArtifact(tampered) error = %v", err)
+	}
+	if _, err := manager.repo.UpsertDesired(context.Background(), "admin", artifact.PluginID, artifact.ID, DesiredDisabled, `{}`, 10); err != nil {
+		t.Fatalf("UpsertDesired() error = %v", err)
+	}
+	preflight, err := manager.RunPreflight(context.Background(), "admin", artifact.PluginID, PreflightRequest{
+		ArtifactID: artifact.ID,
+		Profile:    PolicyProfileDev,
+		Action:     GovernanceActionEnable,
+		ConfigJSON: `{}`,
+	})
+	if err != nil {
+		t.Fatalf("RunPreflight() error = %v", err)
+	}
+	if preflight.OK || !preflightCheckCodes(preflight.Checks)["sandbox_artifact_metadata_invalid"] {
+		t.Fatalf("preflight = %+v, want sandbox artifact metadata block", preflight)
+	}
+}
+
 func TestWASMGovernanceBlocksHighRiskExtensionPoint(t *testing.T) {
 	manager := newManagerForTest(t, &fakeAdapter{})
 	artifact := uploadTestArtifactWithManifestBytes(t, manager, "wasm-status-risk", wasmOKModule, func(manifest *Manifest) {

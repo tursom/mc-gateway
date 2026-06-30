@@ -1365,6 +1365,34 @@ func TestRepositoryImportCreatesLocalArtifactWithoutEnable(t *testing.T) {
 	}
 }
 
+func TestRepositoryImportApplyRejectsAutoEnableWithoutDesiredState(t *testing.T) {
+	manager := newManagerForTest(t, &fakeAdapter{})
+	artifact := uploadTestArtifact(t, manager, "repo-auto-enable")
+	record, err := manager.repo.SaveRepositoryImport(context.Background(), RepositoryImportRecord{
+		RepositoryType: RepositoryTypeFile,
+		RepositoryName: "unit-test",
+		CandidateID:    "repo-auto-enable-0.1.0",
+		PluginID:       artifact.PluginID,
+		Version:        artifact.Version,
+		ArtifactID:     artifact.ID,
+		PackageSHA256:  artifact.PackageSHA256,
+		ImportedBy:     "admin",
+	})
+	if err != nil {
+		t.Fatalf("SaveRepositoryImport() error = %v", err)
+	}
+	result, err := manager.ApplyRepositoryImport(context.Background(), "admin", record.ID, `{}`, DesiredEnabled, 10, false)
+	if err != nil {
+		t.Fatalf("ApplyRepositoryImport(auto-enable) error = %v", err)
+	}
+	if result.OK || !hasPromotionCheckCode(result.Checks, "repository_import_auto_enable") {
+		t.Fatalf("repository import apply = %+v, want auto-enable block", result)
+	}
+	if _, err := manager.Plugin(context.Background(), artifact.PluginID); err != ErrPluginNotFound {
+		t.Fatalf("Plugin(after blocked repository import apply) error = %v, want not found", err)
+	}
+}
+
 func testManifestBytesWithVersion(t *testing.T, pluginID, version string) []byte {
 	t.Helper()
 	var manifest Manifest
@@ -1895,6 +1923,70 @@ func TestPromotionApplyUnsupportedRuntimeDoesNotCreateDesired(t *testing.T) {
 	}
 	if _, err := manager.Plugin(context.Background(), "promotion-runtime-unsupported"); err != ErrPluginNotFound {
 		t.Fatalf("Plugin(after unsupported runtime apply) error = %v, want not found", err)
+	}
+}
+
+func TestSandboxPromotionApplyBlocksUnenforceableCapabilityWithoutDesiredState(t *testing.T) {
+	manager := newSandboxServiceModeManagerForTest(t, SandboxPolicy{})
+	artifact := uploadTestArtifactWithManifest(t, manager, "sandbox-promotion-capability", func(manifest *Manifest) {
+		manifest.Runtime.Type = RuntimeSandbox
+		manifest.Capabilities = json.RawMessage(`{"runtime":{"required_capabilities":["network.egress"]}}`)
+	})
+	bundle, err := manager.ExportPromotionBundle(context.Background(), "test", PolicyProfileProd, artifact.PluginID, artifact.ID, `{}`)
+	if err != nil {
+		t.Fatalf("ExportPromotionBundle() error = %v", err)
+	}
+	result, err := manager.ApplyPromotionBundle(context.Background(), "admin", bundle, map[string]string{
+		artifact.PluginID: `{}`,
+	}, false)
+	if err != nil {
+		t.Fatalf("ApplyPromotionBundle() error = %v", err)
+	}
+	if result.OK || !hasPromotionCheckCode(result.Checks, "capability_enforcement_unavailable") {
+		t.Fatalf("promotion apply result = %+v, want capability enforcement block", result)
+	}
+	if _, err := manager.Plugin(context.Background(), artifact.PluginID); err != ErrPluginNotFound {
+		t.Fatalf("Plugin(after blocked sandbox promotion apply) error = %v, want not found", err)
+	}
+}
+
+func TestSandboxPromotionTargetRuntimeGateBlocksApplyAndDRDrill(t *testing.T) {
+	manager := newManagerForTest(t, nil)
+	artifact := uploadTestArtifactWithManifest(t, manager, "sandbox-promotion-runtime", func(manifest *Manifest) {
+		manifest.Runtime.Type = RuntimeSandbox
+	})
+	bundle, err := manager.ExportPromotionBundle(context.Background(), "test", PolicyProfileProd, artifact.PluginID, artifact.ID, `{}`)
+	if err != nil {
+		t.Fatalf("ExportPromotionBundle() error = %v", err)
+	}
+	bundle.Plugins[0].DesiredState = DesiredEnabled
+	result, err := manager.ApplyPromotionBundle(context.Background(), "admin", bundle, map[string]string{
+		artifact.PluginID: `{}`,
+	}, false)
+	if err != nil {
+		t.Fatalf("ApplyPromotionBundle() error = %v", err)
+	}
+	if result.OK ||
+		!hasPromotionCheckCode(result.Checks, "sandbox_runtime_disabled") ||
+		!hasPromotionCheckCode(result.Checks, "auto_enable_disabled") {
+		t.Fatalf("promotion apply result = %+v, want sandbox runtime and auto-enable blocks", result)
+	}
+	if _, err := manager.Plugin(context.Background(), artifact.PluginID); err != ErrPluginNotFound {
+		t.Fatalf("Plugin(after blocked sandbox promotion apply) error = %v, want not found", err)
+	}
+
+	bundle.Plugins[0].DesiredState = DesiredDisabled
+	drill, err := manager.RunPromotionDRDrill(context.Background(), bundle, map[string]string{
+		artifact.PluginID: `{}`,
+	})
+	if err != nil {
+		t.Fatalf("RunPromotionDRDrill() error = %v", err)
+	}
+	if drill.OK || !hasPromotionCheckCode(drill.Checks, "sandbox_runtime_disabled") {
+		t.Fatalf("DR drill result = %+v, want sandbox runtime gate block", drill)
+	}
+	if _, err := manager.Plugin(context.Background(), artifact.PluginID); err != ErrPluginNotFound {
+		t.Fatalf("Plugin(after blocked sandbox DR drill) error = %v, want not found", err)
 	}
 }
 

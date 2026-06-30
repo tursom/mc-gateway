@@ -892,6 +892,19 @@ func (m *Manager) ApplyRepositoryImport(ctx context.Context, actor string, impor
 			Details:  map[string]any{"desired_state": desiredState},
 		})
 	}
+	result.Checks = append(result.Checks, m.promotionTargetArtifactChecks(PromotionPlugin{
+		PluginID:       record.PluginID,
+		Version:        record.Version,
+		RuntimeType:    artifact.RuntimeType,
+		APIVersion:     artifact.APIVersion,
+		ArtifactSHA256: artifact.SHA256,
+		PackageSHA256:  artifact.PackageSHA256,
+	}, artifact)...)
+	if promotionHasBlocking(result.Checks) {
+		result.Status = PromotionStatusBlocked
+		result.OK = false
+		return result, nil
+	}
 	if configJSON == "" {
 		configJSON = "{}"
 		if current, err := m.repo.Plugin(ctx, record.PluginID); err == nil && current.ConfigJSON != "" {
@@ -1176,7 +1189,7 @@ func EvaluatePromotionBundle(bundle PromotionBundle) PromotionReport {
 }
 
 func (m *Manager) ApplyPromotionBundle(ctx context.Context, actor string, bundle PromotionBundle, configByPlugin map[string]string, dryRun bool) (PromotionApplyResult, error) {
-	checks := promotionBundleChecks(bundle)
+	checks := promotionBundleChecksFor(bundle, m.RuntimeFeatureFactsOptions())
 	candidates := make([]promotionApplyCandidate, 0, len(bundle.Plugins))
 	for _, plugin := range bundle.Plugins {
 		artifact, ok, err := m.promotionApplyArtifact(ctx, plugin)
@@ -1195,6 +1208,11 @@ func (m *Manager) ApplyPromotionBundle(ctx context.Context, actor string, bundle
 			continue
 		}
 		checks = append(checks, promotionApplyArtifactChecks(plugin, artifact)...)
+		targetChecks := m.promotionTargetArtifactChecks(plugin, artifact)
+		checks = append(checks, targetChecks...)
+		if promotionHasBlocking(targetChecks) {
+			continue
+		}
 		configJSON, err := m.promotionApplyConfigJSON(ctx, plugin, configByPlugin)
 		if err != nil {
 			checks = append(checks, PromotionCheck{Code: "environment_override_invalid", Severity: GateSeverityBlocking, Message: err.Error(), PluginID: plugin.PluginID})
@@ -1338,7 +1356,16 @@ func PromotionDrift(current, baseline PromotionBundle) PromotionDriftReport {
 }
 
 func RunPromotionDRDrill(bundle PromotionBundle) PromotionDRDrillReport {
-	checks := promotionBundleChecks(bundle)
+	checks := promotionDRDrillChecks(bundle, RuntimeFeatureFactsOptions{})
+	status := PromotionStatusReady
+	if promotionHasBlocking(checks) {
+		status = PromotionStatusBlocked
+	}
+	return PromotionDRDrillReport{Status: status, OK: status == PromotionStatusReady, Checks: checks}
+}
+
+func promotionDRDrillChecks(bundle PromotionBundle, facts RuntimeFeatureFactsOptions) []PromotionCheck {
+	checks := promotionBundleChecksFor(bundle, facts)
 	for _, plugin := range bundle.Plugins {
 		if plugin.DesiredState == DesiredEnabled {
 			checks = append(checks, PromotionCheck{
@@ -1357,16 +1384,11 @@ func RunPromotionDRDrill(bundle PromotionBundle) PromotionDRDrillReport {
 			})
 		}
 	}
-	status := PromotionStatusReady
-	if promotionHasBlocking(checks) {
-		status = PromotionStatusBlocked
-	}
-	return PromotionDRDrillReport{Status: status, OK: status == PromotionStatusReady, Checks: checks}
+	return checks
 }
 
 func (m *Manager) RunPromotionDRDrill(ctx context.Context, bundle PromotionBundle, configByPlugin map[string]string) (PromotionDRDrillReport, error) {
-	report := RunPromotionDRDrill(bundle)
-	checks := append([]PromotionCheck(nil), report.Checks...)
+	checks := promotionDRDrillChecks(bundle, m.RuntimeFeatureFactsOptions())
 	for _, plugin := range bundle.Plugins {
 		if plugin.PluginID == "" || plugin.ArtifactSHA256 == "" {
 			continue
@@ -1387,6 +1409,11 @@ func (m *Manager) RunPromotionDRDrill(ctx context.Context, bundle PromotionBundl
 			continue
 		}
 		checks = append(checks, promotionApplyArtifactChecks(plugin, artifact)...)
+		targetChecks := m.promotionTargetArtifactChecks(plugin, artifact)
+		checks = append(checks, targetChecks...)
+		if promotionHasBlocking(targetChecks) {
+			continue
+		}
 		configJSON, err := m.promotionApplyConfigJSON(ctx, plugin, configByPlugin)
 		if err != nil {
 			checks = append(checks, PromotionCheck{Code: "environment_override_invalid", Severity: GateSeverityBlocking, Message: err.Error(), PluginID: plugin.PluginID})
@@ -1448,6 +1475,10 @@ func promotionBundleID(bundle PromotionBundle) string {
 }
 
 func promotionBundleChecks(bundle PromotionBundle) []PromotionCheck {
+	return promotionBundleChecksFor(bundle, RuntimeFeatureFactsOptions{})
+}
+
+func promotionBundleChecksFor(bundle PromotionBundle, facts RuntimeFeatureFactsOptions) []PromotionCheck {
 	var checks []PromotionCheck
 	if bundle.SchemaVersion != SchemaVersion {
 		checks = append(checks, PromotionCheck{Code: "schema_version", Severity: GateSeverityBlocking, Message: "unsupported promotion schema version", Details: map[string]any{"schema_version": bundle.SchemaVersion}})
@@ -1482,7 +1513,7 @@ func promotionBundleChecks(bundle PromotionBundle) []PromotionCheck {
 				Details:  map[string]any{"desired_state": plugin.DesiredState},
 			})
 		}
-		feature := RuntimeTypeFeature(plugin.RuntimeType)
+		feature := RuntimeTypeFeatureFor(plugin.RuntimeType, facts)
 		if !feature.Implemented || !feature.DataPlane {
 			checks = append(checks, PromotionCheck{
 				Code:     "runtime_unsupported",
@@ -1519,6 +1550,99 @@ func promotionBundleChecks(bundle PromotionBundle) []PromotionCheck {
 				})
 			}
 		}
+	}
+	return checks
+}
+
+func (m *Manager) promotionTargetArtifactChecks(plugin PromotionPlugin, artifact ArtifactRecord) []PromotionCheck {
+	if artifact.RuntimeType != RuntimeSandbox && plugin.RuntimeType != RuntimeSandbox {
+		return nil
+	}
+	if artifact.RuntimeType != RuntimeSandbox {
+		return nil
+	}
+	manifest := Manifest{}
+	if err := json.Unmarshal([]byte(defaultJSONObject(artifact.MetadataJSON)), &manifest); err != nil {
+		return []PromotionCheck{{
+			Code:     "sandbox_artifact_metadata_invalid",
+			Severity: GateSeverityBlocking,
+			Message:  "sandbox-process artifact metadata could not be parsed",
+			PluginID: plugin.PluginID,
+			Details:  map[string]any{"error": err.Error()},
+		}}
+	}
+	var checks []PromotionCheck
+	if err := validateSandboxArtifactMetadata(artifact, manifest); err != nil {
+		checks = append(checks, PromotionCheck{
+			Code:     "sandbox_artifact_metadata_invalid",
+			Severity: GateSeverityBlocking,
+			Message:  err.Error(),
+			PluginID: plugin.PluginID,
+			Details: map[string]any{
+				"runtime_type": artifact.RuntimeType,
+				"protocol":     manifest.Runtime.Protocol,
+				"abi_version":  manifest.Runtime.ABIVersion,
+				"os":           manifest.Runtime.OS,
+				"arch":         manifest.Runtime.Arch,
+			},
+		})
+	}
+	feature := RuntimeTypeFeatureFor(RuntimeSandbox, m.RuntimeFeatureFactsOptions())
+	if !feature.Implemented || !feature.DataPlane {
+		reason := feature.UnsupportedReason
+		if reason == "" {
+			reason = "target gateway cannot enable sandbox-process runtime"
+		}
+		checks = append(checks, PromotionCheck{
+			Code:     "sandbox_runtime_disabled",
+			Severity: GateSeverityBlocking,
+			Message:  reason,
+			PluginID: plugin.PluginID,
+			Details: map[string]any{
+				"runtime_type": RuntimeSandbox,
+				"maturity":     feature.Maturity,
+			},
+		})
+		return checks
+	}
+	if m.serviceMode != PluginServiceModeSandboxProcess {
+		checks = append(checks, PromotionCheck{
+			Code:     "sandbox_runtime_disabled",
+			Severity: GateSeverityBlocking,
+			Message:  "sandbox-process runtime is disabled by plugin service mode",
+			PluginID: plugin.PluginID,
+			Details:  map[string]any{"reason_code": "sandbox_service_mode_inactive", "service_mode": m.serviceMode},
+		})
+		return checks
+	}
+	if reasonCode, message := m.validateSandboxServiceModeApply(); reasonCode != "" {
+		checks = append(checks, PromotionCheck{
+			Code:     "sandbox_runtime_disabled",
+			Severity: GateSeverityBlocking,
+			Message:  message,
+			PluginID: plugin.PluginID,
+			Details:  map[string]any{"reason_code": reasonCode},
+		})
+		return checks
+	}
+	caps := requiredRuntimeCapabilities(artifact)
+	if missing := sandboxExternalDependencyCapabilityMissing(manifest, caps); len(missing) > 0 {
+		checks = append(checks, PromotionCheck{
+			Code:     "sandbox_external_dependency_capability_missing",
+			Severity: GateSeverityBlocking,
+			Message:  "sandbox-process external dependencies must declare runtime capability network.egress",
+			PluginID: plugin.PluginID,
+			Details:  map[string]any{"dependencies": missing, "required_capability": "network.egress"},
+		})
+	}
+	if unsupported := unsupportedSandboxRequiredCapabilities(m.sandboxPolicy, caps); len(unsupported) > 0 {
+		checks = append(checks, PromotionCheck{
+			Code:     "capability_enforcement_unavailable",
+			Severity: GateSeverityBlocking,
+			Message:  "runtime required capabilities cannot be enforced by this gateway: " + strings.Join(unsupported, ","),
+			PluginID: plugin.PluginID,
+			Details:  map[string]any{"runtime_type": artifact.RuntimeType, "capabilities": unsupported},
+		})
 	}
 	return checks
 }
@@ -1707,6 +1831,11 @@ func requiredFeatureInputs(manifest Manifest) []string {
 	var features []string
 	for _, rawKey := range []string{"required_features", "features"} {
 		features = append(features, stringSlice(caps[rawKey])...)
+	}
+	if runtimeCaps := jsonMapFromAny(caps["runtime"]); runtimeCaps != nil {
+		for _, capability := range stringSlice(runtimeCaps["required_capabilities"]) {
+			features = append(features, "runtime_capability:"+capability)
+		}
 	}
 	return uniqueSortedStrings(features)
 }
