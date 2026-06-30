@@ -296,12 +296,14 @@ func runPluginRemoteOperationsSectionCLI(command string, args []string) error {
 	case "logs":
 		result["logs"] = operations["logs"]
 		result["traces"] = operations["traces"]
+		result["sandbox_runtimes"] = operations["sandbox_runtimes"]
 	case "events":
 		result["events"] = operations["events"]
 		result["event_queue"] = operations["event_queue"]
 	case "metrics":
 		result["handlers"] = operations["handlers"]
 		result["custom_metrics"] = operations["custom_metrics"]
+		result["sandbox_runtimes"] = operations["sandbox_runtimes"]
 	default:
 		return fmt.Errorf("unknown operations section %q", command)
 	}

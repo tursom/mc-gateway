@@ -1958,8 +1958,16 @@ func TestPluginRemoteCLIRequests(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/admin/api/plugin-service" {
+			_, _ = io.WriteString(w, `{"plugin_service":{"service":{"desired_mode":"sandbox-process","active_mode":"in-process","data_plane_mode":"in-process","restart_required":true},"sandbox_environment":{"gate_enabled":false,"self_check_ok":false,"data_plane_eligible":false,"reason_code":"sandbox_future_gate_closed"}}}`)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/diagnostics") {
+			_, _ = io.WriteString(w, `{"summary":{"plugin_id":"demo","sections":["sandbox_runtime"]},"diagnostic":{"sandbox_runtime":{"runtime_status":{"runtime_instance_id":"runtime-demo","reason_code":"sandbox_crash_loop"}}}}`)
+			return
+		}
 		if strings.HasSuffix(r.URL.Path, "/operations") {
-			_, _ = io.WriteString(w, `{"operations":{"logs":[{"message":"ok"}],"traces":[],"events":[{"name":"evt"}],"event_queue":{"queued":1},"handlers":[{"plugin_id":"demo"}],"custom_metrics":[],"background_tasks":[{"id":"sync"}],"external_dependencies":[{"name":"session","circuit_state":"closed"}],"plugin_data":[{"key":"k"}],"plugin_files":[{"name":"f"}],"gc":[]}}`)
+			_, _ = io.WriteString(w, `{"operations":{"logs":[{"message":"ok"}],"traces":[],"events":[{"name":"evt"}],"event_queue":{"queued":1},"handlers":[{"plugin_id":"demo"}],"custom_metrics":[],"sandbox_runtimes":[{"plugin_id":"demo","runtime_instance_id":"runtime-demo","reason_code":"sandbox_crash_loop","active_calls":1}],"background_tasks":[{"id":"sync"}],"external_dependencies":[{"name":"session","circuit_state":"closed"}],"plugin_data":[{"key":"k"}],"plugin_files":[{"name":"f"}],"gc":[]}}`)
 			return
 		}
 		_, _ = io.WriteString(w, `{"ok":true}`)
@@ -2052,8 +2060,46 @@ func TestPluginRemoteCLIRequests(t *testing.T) {
 		t.Fatalf("enable body = %#v", enableReq.Body)
 	}
 
-	runRemotePluginCLI(t, "plugin", "logs", "demo")
+	featuresOutput := captureStdout(t, func() {
+		runRemotePluginCLI(t, "plugin", "runtime", "features")
+	})
+	if !strings.Contains(featuresOutput, "service_modes") || !strings.Contains(featuresOutput, "runtime_types") {
+		t.Fatalf("plugin runtime features output = %s, want feature facts", featuresOutput)
+	}
+
+	runRemotePluginCLI(t, "plugin", "runtime", "status")
+	assertRemoteRequest(t, <-requests, http.MethodGet, "/admin/api/plugin-service")
+	runRemotePluginCLI(t, "plugin", "runtime", "apply")
+	assertRemoteRequest(t, <-requests, http.MethodPost, "/admin/api/plugin-service")
+
+	logsOutput := captureStdout(t, func() {
+		runRemotePluginCLI(t, "plugin", "logs", "demo")
+	})
+	if !strings.Contains(logsOutput, "sandbox_runtimes") || !strings.Contains(logsOutput, "runtime-demo") {
+		t.Fatalf("plugin logs output = %s, want sandbox runtime summary", logsOutput)
+	}
 	assertRemoteRequest(t, <-requests, http.MethodGet, "/admin/api/plugins/demo/operations")
+	eventsOutput := captureStdout(t, func() {
+		runRemotePluginCLI(t, "plugin", "events", "demo")
+	})
+	if !strings.Contains(eventsOutput, "event_queue") || strings.Contains(eventsOutput, "sandbox_runtimes") {
+		t.Fatalf("plugin events output = %s, want events-only operation section", eventsOutput)
+	}
+	assertRemoteRequest(t, <-requests, http.MethodGet, "/admin/api/plugins/demo/operations")
+	metricsOutput := captureStdout(t, func() {
+		runRemotePluginCLI(t, "plugin", "metrics", "demo")
+	})
+	if !strings.Contains(metricsOutput, "sandbox_runtimes") || !strings.Contains(metricsOutput, "custom_metrics") {
+		t.Fatalf("plugin metrics output = %s, want metrics and sandbox runtime summary", metricsOutput)
+	}
+	assertRemoteRequest(t, <-requests, http.MethodGet, "/admin/api/plugins/demo/operations")
+	diagnoseOutput := captureStdout(t, func() {
+		runRemotePluginCLI(t, "plugin", "diagnose", "demo")
+	})
+	if !strings.Contains(diagnoseOutput, "sandbox_runtime") || !strings.Contains(diagnoseOutput, "runtime-demo") {
+		t.Fatalf("plugin diagnose output = %s, want diagnostic package sandbox runtime data", diagnoseOutput)
+	}
+	assertRemoteRequest(t, <-requests, http.MethodGet, "/admin/api/plugins/demo/diagnostics")
 
 	runRemotePluginCLI(t, "plugin", "task", "run", "demo", "sync", "--confirm-token", "confirm")
 	taskReq := <-requests

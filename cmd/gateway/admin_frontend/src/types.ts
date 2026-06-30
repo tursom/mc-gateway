@@ -171,10 +171,31 @@ export interface PluginServiceState {
   restart_required: boolean;
   live_migration?: string;
   crash_policy?: PluginHostCrashPolicy;
+  reason_code?: string;
   unsupported_reason?: string;
   last_error?: string;
   updated_by?: string;
   updated_at?: number;
+}
+
+export interface SandboxEnforcementFact {
+  category: string;
+  key: string;
+  required: boolean;
+  enforced: boolean;
+  method?: string;
+  unsupported_reason?: string;
+  details?: Record<string, string>;
+}
+
+export interface SandboxEnvironmentStatus {
+  gate_enabled: boolean;
+  self_check_ok: boolean;
+  data_plane_eligible: boolean;
+  policy_profile?: string;
+  reason_code?: string;
+  reason?: string;
+  enforcement_facts?: SandboxEnforcementFact[];
 }
 
 export interface PluginHostCrashPolicy {
@@ -200,6 +221,7 @@ export interface PluginRuntimeFeature {
   maturity: string;
   data_plane: boolean;
   requires_restart: boolean;
+  reason_code?: string;
   unsupported_reason?: string;
   entry?: string;
 }
@@ -245,6 +267,7 @@ export interface PluginHostRuntimeSummary {
   drain_mode: string;
   crash_loop: boolean;
   crash_count: number;
+  reason_code?: string;
   last_error?: string;
   started_at?: number;
   draining_at?: number;
@@ -308,6 +331,7 @@ export interface PluginServiceStatus {
   service_modes?: PluginServiceModeFeature[];
   runtime_types?: PluginRuntimeFeature[];
   runtime_adapters?: PluginRuntimeAdapterStatus[];
+  sandbox_environment?: SandboxEnvironmentStatus;
   hosts?: PluginHostRuntimeSummary[];
   nodes?: PluginNodeState[];
 }
@@ -433,6 +457,7 @@ export interface PluginOperations {
   gc?: Record<string, unknown>[];
   event_queue?: Record<string, unknown>;
   diagnostics?: Record<string, unknown>[];
+  sandbox_runtimes?: Record<string, unknown>[];
 }
 
 export interface PluginDryRunResult {

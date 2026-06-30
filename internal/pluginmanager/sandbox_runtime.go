@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tursom/mc-gateway/plugin/api"
@@ -117,9 +118,59 @@ type SandboxProcess struct {
 	exitedAt    int64
 	lastCrashAt int64
 
+	activeCalls   atomic.Int64
+	activeStreams atomic.Int64
+	stdoutSummary *sandboxLogSummary
+	stderrSummary *sandboxLogSummary
+
 	controlInvoker sandboxControlInvoker
 	streamDialer   sandboxStreamDialer
 	operations     *PluginOperations
+}
+
+type sandboxLogSummary struct {
+	mu        sync.Mutex
+	buf       []byte
+	limit     int
+	truncated bool
+}
+
+func newSandboxLogSummary(limit int) *sandboxLogSummary {
+	if limit <= 0 {
+		limit = 4096
+	}
+	return &sandboxLogSummary{limit: limit}
+}
+
+func (s *sandboxLogSummary) Write(data []byte) (int, error) {
+	if s == nil {
+		return len(data), nil
+	}
+	redacted := []byte(redactSensitive(sanitizeLog(string(data))))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.buf = append(s.buf, redacted...)
+	if len(s.buf) > s.limit {
+		s.buf = append([]byte(nil), s.buf[len(s.buf)-s.limit:]...)
+		s.truncated = true
+	}
+	return len(data), nil
+}
+
+func (s *sandboxLogSummary) Summary() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.buf) == 0 {
+		return ""
+	}
+	out := strings.TrimSpace(string(s.buf))
+	if s.truncated {
+		out = "[truncated]\n" + out
+	}
+	return redactSensitive(out)
 }
 
 type SandboxSecretResolver interface {
@@ -869,6 +920,10 @@ func (s SandboxSupervisor) Start(ctx context.Context, pluginID, artifactID, exec
 	args := append([]string{}, s.ArgsPrefix...)
 	cmd := exec.CommandContext(ctx, "/plugin", args...)
 	cmd.Env = sandboxProcessEnv(policy, pluginID, artifactID, runtimeInstanceID, generation)
+	stdoutSummary := newSandboxLogSummary(4096)
+	stderrSummary := newSandboxLogSummary(4096)
+	cmd.Stdout = stdoutSummary
+	cmd.Stderr = stderrSummary
 	configureSandboxCommand(cmd, rootDir, policy)
 	cmd.Dir = "/"
 	if policy.CPUSeconds > 0 {
@@ -905,6 +960,8 @@ func (s SandboxSupervisor) Start(ctx context.Context, pluginID, artifactID, exec
 		RootDir:           rootDir,
 		SocketPath:        socketPath,
 		ConfigJSON:        configJSON,
+		stdoutSummary:     stdoutSummary,
+		stderrSummary:     stderrSummary,
 		cmd:               cmd,
 		done:              make(chan struct{}),
 		release:           release,
@@ -1982,6 +2039,13 @@ func (p *SandboxProcess) Diagnostics() SandboxDiagnosticSummary {
 	if p.crashLoop {
 		state = RuntimeFailed
 	}
+	reasonCode := reasonCodeFromMessage(p.lastError)
+	if p.crashLoop && reasonCode == "" {
+		reasonCode = ReasonSandboxCrashLoop
+	}
+	if startupErrorCode != "" {
+		reasonCode = startupErrorCode
+	}
 	policy := normalizeSandboxPolicy(p.Policy)
 	envKeys := make([]string, 0, len(policy.Env))
 	for key := range policy.Env {
@@ -1996,8 +2060,10 @@ func (p *SandboxProcess) Diagnostics() SandboxDiagnosticSummary {
 	return SandboxDiagnosticSummary{
 		PluginID:           p.PluginID,
 		ArtifactID:         p.ArtifactID,
+		RuntimeInstanceID:  p.RuntimeInstanceID,
 		PID:                p.PID,
 		State:              state,
+		ReasonCode:         reasonCode,
 		NamespaceEnforced:  sandboxFactsAllRequiredEnforced(facts, "namespace", "mount", "network", "pid", "uts", "ipc", "user"),
 		ControlRPC:         true,
 		FilesystemEnforced: sandboxFactsAllRequiredEnforced(facts, "filesystem", "readonly_root", "artifact_readonly_staging", "runtime_writable_volume", "path_allowlist"),
@@ -2009,10 +2075,14 @@ func (p *SandboxProcess) Diagnostics() SandboxDiagnosticSummary {
 		SecretRPC:          true,
 		CrashLoop:          p.crashLoop,
 		CrashCount:         p.crashCount,
+		ActiveCalls:        p.activeCalls.Load(),
+		ActiveStreams:      p.activeStreams.Load(),
 		LastError:          p.lastError,
 		SecretHandles:      append([]string(nil), policy.SecretHandles...),
 		EnvKeys:            envKeys,
 		ControlSocket:      "unix:///run/control.sock",
+		Cgroup:             sandboxProcessCgroup(p.PID),
+		NetworkNamespace:   sandboxNetworkNamespace(p.PID),
 		UnsupportedReason:  unsupportedSandboxRuntimeReason(startupErrorCode),
 		EnforcementFacts:   facts,
 		EnforcementAttributes: map[string]string{
@@ -2026,8 +2096,36 @@ func (p *SandboxProcess) Diagnostics() SandboxDiagnosticSummary {
 			"process":         "pid-user-namespace-no-new-privs-capability-drop-external-seccomp-required",
 			"cleanup":         "pid-namespace-process-group-kill-pdeathsig",
 			"secret_delivery": "handle-rpc-version-only",
+			"stdout_summary":  p.stdoutSummary.Summary(),
+			"stderr_summary":  p.stderrSummary.Summary(),
 		},
 	}
+}
+
+func sandboxProcessCgroup(pid int) string {
+	if pid <= 0 {
+		return ""
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+	if err != nil {
+		return ""
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) == 0 {
+		return ""
+	}
+	return redactSensitive(lines[0])
+}
+
+func sandboxNetworkNamespace(pid int) string {
+	if pid <= 0 {
+		return ""
+	}
+	target, err := os.Readlink(fmt.Sprintf("/proc/%d/ns/net", pid))
+	if err != nil {
+		return ""
+	}
+	return target
 }
 
 func unsupportedSandboxRuntimeReason(code string) string {
@@ -2049,7 +2147,9 @@ func sandboxDiagnosticsDetails(summary SandboxDiagnosticSummary) map[string]any 
 		"protocol":               sandboxProcessProtocol,
 		"control_channel":        sandboxControlChannelUnix,
 		"stream_protocol":        StreamProxyProtocolV1,
+		"runtime_instance_id":    summary.RuntimeInstanceID,
 		"pid":                    summary.PID,
+		"reason_code":            summary.ReasonCode,
 		"namespace_enforced":     summary.NamespaceEnforced,
 		"control_rpc":            summary.ControlRPC,
 		"filesystem_enforced":    summary.FilesystemEnforced,
@@ -2061,14 +2161,27 @@ func sandboxDiagnosticsDetails(summary SandboxDiagnosticSummary) map[string]any 
 		"secret_rpc":             summary.SecretRPC,
 		"crash_loop":             summary.CrashLoop,
 		"crash_count":            summary.CrashCount,
+		"active_calls":           summary.ActiveCalls,
+		"active_streams":         summary.ActiveStreams,
 		"last_error":             summary.LastError,
 		"unsupported_reason":     summary.UnsupportedReason,
 		"secret_handles":         append([]string(nil), summary.SecretHandles...),
 		"env_keys":               append([]string(nil), summary.EnvKeys...),
 		"control_socket":         summary.ControlSocket,
+		"cgroup":                 summary.Cgroup,
+		"network_namespace":      summary.NetworkNamespace,
 		"enforcement_attributes": summary.EnforcementAttributes,
 		"enforcement_facts":      append([]SandboxEnforcementFact(nil), summary.EnforcementFacts...),
 	}
+}
+
+func sandboxDiagnosticSummaryMap(summary SandboxDiagnosticSummary) map[string]any {
+	out := sandboxDiagnosticsDetails(summary)
+	out["plugin_id"] = summary.PluginID
+	out["artifact_id"] = summary.ArtifactID
+	out["runtime_type"] = RuntimeSandbox
+	out["runtime_state"] = summary.State
+	return out
 }
 
 func (p sandboxHostedPlugin) Init(gateway api.Gateway) error {
@@ -2518,12 +2631,24 @@ func bindSandboxStreamEndpoint(ctx context.Context, process *SandboxProcess, str
 	if conn == nil {
 		return nil
 	}
+	if process != nil {
+		process.activeStreams.Add(1)
+	}
 	done := make(chan struct{})
 	closeSignal := make(chan struct{})
 	var once sync.Once
 	var signalOnce sync.Once
+	var releaseOnce sync.Once
 	stop := func() {
 		once.Do(func() { close(done) })
+	}
+	release := func() {
+		releaseOnce.Do(func() {
+			if process != nil {
+				process.activeStreams.Add(-1)
+			}
+			stop()
+		})
 	}
 	signalClose := func() {
 		signalOnce.Do(func() { close(closeSignal) })
@@ -2541,14 +2666,16 @@ func bindSandboxStreamEndpoint(ctx context.Context, process *SandboxProcess, str
 		case <-ctxDone:
 			signalClose()
 			_ = conn.Close()
+			release()
 		case <-processDone:
 			signalClose()
 			_ = conn.Close()
+			release()
 		case <-done:
 		}
 	}()
 	return &sandboxStreamConn{
-		Conn:        &contextBoundConn{Conn: conn, stop: stop},
+		Conn:        &contextBoundConn{Conn: conn, stop: release},
 		process:     process,
 		streamID:    streamID,
 		closeSignal: closeSignal,
@@ -2669,6 +2796,8 @@ func (p sandboxHostedPlugin) invoke(ctx context.Context, reg SandboxHandlerRegis
 		return SandboxInvokeResponse{}, err
 	}
 	start := time.Now()
+	p.process.activeCalls.Add(1)
+	defer p.process.activeCalls.Add(-1)
 	resp, err := p.process.sendControlRequest(ctx, sandboxControlCommandInvoke, reg.ExtensionPoint, payload)
 	duration := time.Since(start)
 	if err != nil {
@@ -3158,9 +3287,10 @@ func sandboxSecretRedactionHandle(pluginID, handle string, version int64) string
 
 func sandboxSecretDeny(code, message string) SandboxSecretResponse {
 	return SandboxSecretResponse{
-		OK:        false,
-		ErrorCode: code,
-		Error:     redactSensitive(message),
+		OK:         false,
+		ErrorCode:  code,
+		ReasonCode: ReasonSandboxSecretDenied,
+		Error:      redactSensitive(message),
 	}
 }
 
@@ -3173,6 +3303,7 @@ func (m *Manager) auditSandboxSecretDenial(ctx context.Context, req SandboxSecre
 		"version":     req.Version,
 		"generation":  req.Generation,
 		"error_code":  resp.ErrorCode,
+		"reason_code": resp.ReasonCode,
 		"redacted":    true,
 		"secret_ref":  "plugin://" + req.PluginID + "/" + req.Handle,
 		"artifact_id": req.ArtifactID,

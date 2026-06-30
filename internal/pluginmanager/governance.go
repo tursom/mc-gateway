@@ -873,6 +873,7 @@ func (m *Manager) preflightChecks(ctx context.Context, plugin PluginRecord, arti
 				Severity: GateSeverityBlocking,
 				Message:  err.Error(),
 				Details: map[string]any{
+					"reason_code":  reasonCodeFromError(err),
 					"runtime_type": artifact.RuntimeType,
 					"protocol":     manifest.Runtime.Protocol,
 					"abi_version":  manifest.Runtime.ABIVersion,
@@ -929,7 +930,7 @@ func (m *Manager) preflightChecks(ctx context.Context, plugin PluginRecord, arti
 				Code:     "sandbox_external_dependency_capability_missing",
 				Severity: GateSeverityBlocking,
 				Message:  "sandbox-process external dependencies must declare runtime capability network.egress",
-				Details:  map[string]any{"dependencies": missing, "required_capability": "network.egress"},
+				Details:  map[string]any{"reason_code": ReasonSandboxExternalCapabilityMissing, "dependencies": missing, "required_capability": "network.egress"},
 			})
 		}
 		if unsupported := unsupportedSandboxRequiredCapabilities(m.sandboxPolicy, caps); len(unsupported) > 0 {
@@ -937,7 +938,7 @@ func (m *Manager) preflightChecks(ctx context.Context, plugin PluginRecord, arti
 				Code:     "capability_enforcement_unavailable",
 				Severity: GateSeverityBlocking,
 				Message:  "runtime required capabilities cannot be enforced by this gateway: " + strings.Join(unsupported, ","),
-				Details:  map[string]any{"runtime_type": artifact.RuntimeType, "capabilities": unsupported},
+				Details:  map[string]any{"reason_code": ReasonSandboxCapabilityBlock, "runtime_type": artifact.RuntimeType, "capabilities": unsupported},
 			})
 		}
 	} else if caps := requiredRuntimeCapabilities(artifact); runtimeRequiredCapabilitiesUnsupported(artifact.RuntimeType) && len(caps) > 0 {

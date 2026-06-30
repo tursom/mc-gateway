@@ -100,6 +100,17 @@ state.pluginService = {
   service_modes: state.pluginFeatures.service_modes,
   runtime_types: state.pluginFeatures.runtime_types,
   runtime_adapters: [],
+  sandbox_environment: {
+    gate_enabled: false,
+    self_check_ok: false,
+    data_plane_eligible: false,
+    policy_profile: "prod",
+    reason_code: "sandbox_future_gate_closed",
+    reason: "sandbox-process service mode is disabled by future runtime gate",
+    enforcement_facts: [
+      { category: "namespace", key: "network", required: true, enforced: false, method: "netns", unsupported_reason: "future runtime gate closed" },
+    ],
+  },
   hosts: [],
   nodes: [],
 };
@@ -209,6 +220,11 @@ for (const expected of [
   "预留认证提供方",
   "admin.auth.provider/v1",
   "ingress.service/v1",
+  "Sandbox 环境",
+  "运行时开关",
+  "环境自检",
+  "数据面可用",
+  "原因码",
 ]) {
   assert.match(serviceHTML, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `service panel should include ${expected}`);
 }
@@ -245,6 +261,10 @@ for (const untranslated of [
   "Current data plane remains",
   "Runtime maturity",
   "Value visibility",
+  "Sandbox environment",
+  "Runtime gate",
+  "Self-check",
+  "Reason code",
 ]) {
   assert.doesNotMatch(`${serviceHTML}\n${detailHTML}`, new RegExp(untranslated.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `Chinese UI should not include ${untranslated}`);
 }
@@ -252,5 +272,61 @@ for (const untranslated of [
 assert.equal(ui("No builds"), "暂无构建");
 assert.equal(t("action"), "动作");
 assert.doesNotMatch(serviceHTML, /sandbox-process[^<]*(active|current data plane)/i, "future runtime must not read as the active data plane");
+
+const sandboxPlugin = {
+  ...plugin,
+  runtime_type: "sandbox-process",
+  active_artifact: { ...plugin.active_artifact, runtime_type: "sandbox-process" },
+  desired_artifact: { ...plugin.desired_artifact, runtime_type: "sandbox-process" },
+  runtime_summary: {
+    runtime_type: "sandbox-process",
+    runtime_instance_id: "runtime-acceptance",
+    pid: 4242,
+    control_socket: "unix:///run/control.sock",
+    cgroup: "0::/mc-gateway/sandbox",
+    network_namespace: "net:[4026532442]",
+    active_calls: 2,
+    active_streams: 1,
+    reason_code: "sandbox_crash_loop",
+    last_error: "sandbox crash loop",
+    namespace_enforced: true,
+    filesystem_enforced: true,
+    network_enforced: false,
+    env_enforced: true,
+    cpu_memory_enforced: true,
+    process_enforced: true,
+    cleanup_enforced: true,
+    secret_rpc: true,
+    enforcement_facts: [
+      { category: "network", key: "network.none", required: true, enforced: false, method: "netns", unsupported_reason: "netns unavailable" },
+    ],
+  },
+};
+renderPluginDetail(sandboxPlugin);
+const sandboxDetailHTML = element("pluginDetail").innerHTML;
+for (const expected of [
+  "Sandbox 运行时",
+  "运行时实例",
+  "runtime-acceptance",
+  "控制套接字",
+  "网络命名空间",
+  "活跃调用",
+  "活跃流",
+  "sandbox_crash_loop",
+  "密钥 RPC",
+]) {
+  assert.match(sandboxDetailHTML, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `sandbox detail should include ${expected}`);
+}
+for (const untranslated of [
+  "Sandbox runtime",
+  "Runtime instance",
+  "Control socket",
+  "Network namespace",
+  "Active calls",
+  "Active streams",
+  "Secret RPC",
+]) {
+  assert.doesNotMatch(sandboxDetailHTML, new RegExp(untranslated.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `Chinese sandbox detail should not include ${untranslated}`);
+}
 
 console.log("plugin UI acceptance passed");

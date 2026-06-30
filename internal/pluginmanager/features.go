@@ -38,6 +38,7 @@ func RuntimeTypeFeaturesFor(options RuntimeFeatureFactsOptions) []RuntimeFeature
 			Maturity:          sandboxFeature.maturity,
 			DataPlane:         sandboxFeature.dataPlane,
 			RequiresRestart:   true,
+			ReasonCode:        sandboxFeature.reasonCode,
 			UnsupportedReason: sandboxFeature.runtimeReason,
 			Entry:             RuntimeEntry,
 		},
@@ -82,6 +83,7 @@ func PluginServiceModeFeaturesFor(options RuntimeFeatureFactsOptions) []PluginSe
 			Maturity:          sandboxFeature.maturity,
 			DataPlane:         sandboxFeature.dataPlane,
 			RequiresRestart:   true,
+			ReasonCode:        sandboxFeature.reasonCode,
 			UnsupportedReason: sandboxFeature.serviceModeReason,
 		},
 	}
@@ -149,6 +151,7 @@ type sandboxProductionFeature struct {
 	implemented       bool
 	maturity          string
 	dataPlane         bool
+	reasonCode        string
 	runtimeReason     string
 	serviceModeReason string
 }
@@ -168,6 +171,7 @@ func sandboxRuntimeFeature(options RuntimeFeatureFactsOptions) sandboxProduction
 			implemented:       false,
 			maturity:          FeatureMaturityReserved,
 			dataPlane:         false,
+			reasonCode:        ReasonSandboxFutureGateClosed,
 			runtimeReason:     "sandbox-process runtime is reserved; current gateway releases do not expose a sandbox data-plane without FutureRuntimeGates.SandboxProcess",
 			serviceModeReason: "sandbox-process service mode is reserved; current data-plane modes are in-process and go-plugin-process until FutureRuntimeGates.SandboxProcess is enabled",
 		}
@@ -178,6 +182,7 @@ func sandboxRuntimeFeature(options RuntimeFeatureFactsOptions) sandboxProduction
 			implemented:       true,
 			maturity:          FeatureMaturityPartial,
 			dataPlane:         false,
+			reasonCode:        ReasonSandboxEnvironmentSelfCheckFailed,
 			runtimeReason:     reason,
 			serviceModeReason: reason,
 		}
@@ -187,6 +192,7 @@ func sandboxRuntimeFeature(options RuntimeFeatureFactsOptions) sandboxProduction
 		implemented:       true,
 		maturity:          FeatureMaturityPartial,
 		dataPlane:         true,
+		reasonCode:        "sandbox_data_plane_partial",
 		runtimeReason:     reason,
 		serviceModeReason: reason,
 	}

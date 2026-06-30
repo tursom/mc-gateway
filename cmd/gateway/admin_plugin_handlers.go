@@ -1523,6 +1523,14 @@ func pluginView(r *http.Request, plugin pluginmanager.PluginRecord, detail bool)
 			return nil, err
 		}
 		view["proxy_connections"] = connections
+		if operations, err := pluginsManager.OperationsSnapshot(r.Context(), plugin.ID); err == nil {
+			for _, summary := range operations.SandboxRuntimes {
+				if summary.PluginID == plugin.ID {
+					view["runtime_summary"] = jsonObjectValue(summary)
+					break
+				}
+			}
+		}
 	}
 	return view, nil
 }
@@ -1636,6 +1644,18 @@ func jsonObjectString(raw string) any {
 		return map[string]any{}
 	}
 	return value
+}
+
+func jsonObjectValue(value any) any {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return map[string]any{}
+	}
+	var out any
+	if err := json.Unmarshal(data, &out); err != nil {
+		return map[string]any{}
+	}
+	return out
 }
 
 func jsonArrayString(raw string) any {

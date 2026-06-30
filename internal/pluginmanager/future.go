@@ -64,12 +64,13 @@ func (m *Manager) PluginServiceStatus(ctx context.Context) (PluginServiceStatus,
 		return PluginServiceStatus{}, err
 	}
 	return PluginServiceStatus{
-		Service:         state,
-		Modes:           PluginServiceModeFeaturesFor(m.RuntimeFeatureFactsOptions()),
-		RuntimeTypes:    RuntimeTypeFeaturesFor(m.RuntimeFeatureFactsOptions()),
-		RuntimeAdapters: RuntimeAdapterFactoryStatusesFor(m.RuntimeFeatureFactsOptions()),
-		Hosts:           m.pluginHostSummaries(ctx),
-		Nodes:           nodes,
+		Service:            state,
+		Modes:              PluginServiceModeFeaturesFor(m.RuntimeFeatureFactsOptions()),
+		RuntimeTypes:       RuntimeTypeFeaturesFor(m.RuntimeFeatureFactsOptions()),
+		RuntimeAdapters:    RuntimeAdapterFactoryStatusesFor(m.RuntimeFeatureFactsOptions()),
+		SandboxEnvironment: m.sandboxEnvironmentStatus(),
+		Hosts:              m.pluginHostSummaries(ctx),
+		Nodes:              nodes,
 	}, nil
 }
 
@@ -228,10 +229,10 @@ func (m *Manager) ApplyPluginServiceMode(ctx context.Context) error {
 
 func (m *Manager) validateSandboxServiceModeApply() (string, string) {
 	if !m.futureGates.SandboxEnabled() {
-		return "sandbox_future_gate_closed", "sandbox-process service mode is disabled by future runtime gate"
+		return ReasonSandboxFutureGateClosed, "sandbox-process service mode is disabled by future runtime gate"
 	}
 	if !m.adapterManaged {
-		return "sandbox_adapter_factory_unavailable", "sandbox-process service mode requires the managed runtime adapter factory"
+		return ReasonSandboxAdapterUnavailable, "sandbox-process service mode requires the managed runtime adapter factory"
 	}
 	switch m.currentPolicyProfile() {
 	case PolicyProfileDev, PolicyProfileStaging, PolicyProfileProd:
@@ -243,7 +244,7 @@ func (m *Manager) validateSandboxServiceModeApply() (string, string) {
 		selfCheck = defaultSandboxEnvironmentSelfCheck
 	}
 	if err := selfCheck(m.sandboxPolicy); err != nil {
-		return "sandbox_environment_self_check_failed", "sandbox-process environment self-check failed: " + err.Error()
+		return ReasonSandboxEnvironmentSelfCheckFailed, "sandbox-process environment self-check failed: " + err.Error()
 	}
 	_, status := RuntimeAdapterFactory{Facts: m.RuntimeFeatureFactsOptions()}.AdapterFor(PluginServiceModeSandboxProcess, RuntimeSandbox)
 	if !status.Implemented || !status.DataPlane || !status.Lifecycle {
@@ -251,7 +252,7 @@ func (m *Manager) validateSandboxServiceModeApply() (string, string) {
 		if message == "" {
 			message = "sandbox-process runtime adapter is not available for the data plane"
 		}
-		return "sandbox_adapter_factory_unavailable", message
+		return ReasonSandboxAdapterUnavailable, message
 	}
 	return "", ""
 }
@@ -259,6 +260,9 @@ func (m *Manager) validateSandboxServiceModeApply() (string, string) {
 func (m *Manager) recordPluginServiceModeApplyFailure(ctx context.Context, state PluginServiceState, desiredFeature PluginServiceModeFeature, reasonCode, message string) error {
 	if message == "" {
 		message = "plugin service mode is not implemented for the data plane"
+	}
+	if reasonCode == "" {
+		reasonCode = reasonCodeFromMessage(message)
 	}
 	if err := m.repo.SetPluginServiceError(ctx, message); err != nil {
 		return err
@@ -311,13 +315,47 @@ func (m *Manager) enrichPluginServiceState(state PluginServiceState) PluginServi
 		switch {
 		case !desiredFeature.Implemented || !desiredFeature.DataPlane:
 			state.UnsupportedReason = desiredFeature.UnsupportedReason
+			state.ReasonCode = desiredFeature.ReasonCode
 		case !activeFeature.Implemented || !activeFeature.DataPlane:
 			state.UnsupportedReason = activeFeature.UnsupportedReason
+			state.ReasonCode = activeFeature.ReasonCode
 		case !dataPlaneFeature.Implemented || !dataPlaneFeature.DataPlane:
 			state.UnsupportedReason = dataPlaneFeature.UnsupportedReason
+			state.ReasonCode = dataPlaneFeature.ReasonCode
 		}
 	}
+	if state.ReasonCode == "" {
+		state.ReasonCode = reasonCodeFromMessage(firstRuntimeUnsupportedReason(state.LastError, state.UnsupportedReason))
+	}
 	return state
+}
+
+func (m *Manager) sandboxEnvironmentStatus() SandboxEnvironmentStatus {
+	status := SandboxEnvironmentStatus{
+		GateEnabled:      m.futureGates.SandboxEnabled(),
+		PolicyProfile:    m.currentPolicyProfile(),
+		EnforcementFacts: sandboxEnforcementFacts(m.sandboxPolicy),
+	}
+	if !status.GateEnabled {
+		status.ReasonCode = ReasonSandboxFutureGateClosed
+		status.Reason = "sandbox-process service mode is disabled by future runtime gate"
+		return status
+	}
+	selfCheck := m.sandboxSelfCheck
+	if selfCheck == nil {
+		selfCheck = defaultSandboxEnvironmentSelfCheck
+	}
+	if err := selfCheck(m.sandboxPolicy); err != nil {
+		status.ReasonCode = ReasonSandboxEnvironmentSelfCheckFailed
+		status.Reason = "sandbox-process environment self-check failed: " + err.Error()
+		return status
+	}
+	status.SelfCheckOK = true
+	feature := PluginServiceModeFeatureForOptions(PluginServiceModeSandboxProcess, m.RuntimeFeatureFactsOptions())
+	status.DataPlaneEligible = feature.Implemented && feature.DataPlane
+	status.ReasonCode = feature.ReasonCode
+	status.Reason = feature.UnsupportedReason
+	return status
 }
 
 func (m *Manager) pluginHostCrashPolicy(ctx context.Context) PluginHostCrashPolicy {
@@ -597,9 +635,19 @@ func (m *Manager) hostSummary(pluginID string) PluginHostRuntimeSummary {
 func (h *pluginHostProcess) summary() PluginHostRuntimeSummary {
 	return PluginHostRuntimeSummary{
 		PluginID: h.PluginID, ArtifactID: h.ArtifactID, State: h.State, DrainMode: h.DrainMode,
-		PID: h.PID, CrashLoop: h.CrashLoop, CrashCount: h.CrashCount, LastError: h.LastError,
+		PID: h.PID, CrashLoop: h.CrashLoop, CrashCount: h.CrashCount, ReasonCode: reasonCodeFromPluginHost(h), LastError: h.LastError,
 		StartedAt: h.StartedAt, DrainingAt: h.DrainingAt, ExitedAt: h.ExitedAt, LastCrashAt: h.LastCrashAt, BackoffUntil: h.BackoffUntil, Isolated: h.Isolated,
 	}
+}
+
+func reasonCodeFromPluginHost(host *pluginHostProcess) string {
+	if host == nil {
+		return ""
+	}
+	if host.CrashLoop {
+		return ReasonSandboxCrashLoop
+	}
+	return reasonCodeFromMessage(host.LastError)
 }
 
 func applyPluginHostSummary(host *pluginHostProcess, artifactID string, summary PluginHostRuntimeSummary, policy PluginHostCrashPolicy) {
@@ -1611,7 +1659,7 @@ func (m *Manager) promotionTargetArtifactChecks(plugin PromotionPlugin, artifact
 			Severity: GateSeverityBlocking,
 			Message:  "sandbox-process runtime is disabled by plugin service mode",
 			PluginID: plugin.PluginID,
-			Details:  map[string]any{"reason_code": "sandbox_service_mode_inactive", "service_mode": m.serviceMode},
+			Details:  map[string]any{"reason_code": ReasonSandboxServiceModeInactive, "service_mode": m.serviceMode},
 		})
 		return checks
 	}
@@ -1632,7 +1680,7 @@ func (m *Manager) promotionTargetArtifactChecks(plugin PromotionPlugin, artifact
 			Severity: GateSeverityBlocking,
 			Message:  "sandbox-process external dependencies must declare runtime capability network.egress",
 			PluginID: plugin.PluginID,
-			Details:  map[string]any{"dependencies": missing, "required_capability": "network.egress"},
+			Details:  map[string]any{"reason_code": ReasonSandboxExternalCapabilityMissing, "dependencies": missing, "required_capability": "network.egress"},
 		})
 	}
 	if unsupported := unsupportedSandboxRequiredCapabilities(m.sandboxPolicy, caps); len(unsupported) > 0 {
@@ -1641,7 +1689,7 @@ func (m *Manager) promotionTargetArtifactChecks(plugin PromotionPlugin, artifact
 			Severity: GateSeverityBlocking,
 			Message:  "runtime required capabilities cannot be enforced by this gateway: " + strings.Join(unsupported, ","),
 			PluginID: plugin.PluginID,
-			Details:  map[string]any{"runtime_type": artifact.RuntimeType, "capabilities": unsupported},
+			Details:  map[string]any{"reason_code": ReasonSandboxCapabilityBlock, "runtime_type": artifact.RuntimeType, "capabilities": unsupported},
 		})
 	}
 	return checks

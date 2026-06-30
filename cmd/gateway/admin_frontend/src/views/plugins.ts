@@ -213,6 +213,7 @@ export function renderPluginDetail(plugin: PluginView | null = selectedPlugin())
           <dt>${escapeHTML(ui("Minecraft"))}</dt><dd>${escapeHTML(formatJSON(plugin.minecraft))}</dd>
         </dl>
       </section>
+      ${sandboxRuntimeDetailPanel(plugin)}
       <section class="panel">
         <h3>${escapeHTML(ui("Governance"))}</h3>
         ${governancePanel(plugin, canWrite)}
@@ -339,7 +340,7 @@ function renderPluginServicePanel(): void {
         <div class="status-grid dense">
           ${detailStat(ui("Desired mode"), service.desired_mode)}
           ${detailStat(ui("Active mode"), service.active_mode)}
-          ${detailStat(ui("Effective data plane"), service.data_plane_mode || service.active_mode)}
+          ${detailStat(ui("Effective data plane"), pluginServiceEffectiveDataPlane(service))}
           ${detailStat(ui("Adapter"), service.implemented_adapter ? ui("implemented") : ui("not implemented"))}
           ${detailStat(ui("Desired maturity"), formatValue(service.desired_maturity || ""))}
           ${detailStat(ui("Desired support"), serviceModeSupportSummary(desiredMode))}
@@ -351,6 +352,7 @@ function renderPluginServicePanel(): void {
         ${pluginServiceStateAlerts(service, desiredMode)}
         ${service.unsupported_reason ? `<div class="alert inline-alert">${escapeHTML(localizeMessage(service.unsupported_reason))}</div>` : ""}
         ${service.last_error && service.last_error !== service.unsupported_reason ? `<div class="alert inline-alert">${escapeHTML(localizeMessage(service.last_error))}</div>` : ""}
+        ${sandboxEnvironmentPanel(state.pluginService?.sandbox_environment)}
         ${serviceModeAvailability(modes)}
         ${extensionPointAvailability(pluginExtensionPoints())}
         ${runtimeAdapterAvailability(state.pluginService?.runtime_adapters || [])}
@@ -422,7 +424,7 @@ function serviceModeFeature(modeName: string, modes: PluginServiceModeFeature[])
 }
 
 function pluginServiceSummary(service: NonNullable<PluginServiceStatus["service"]>): string {
-  const dataPlane = service.data_plane_mode || service.active_mode || "unknown";
+  const dataPlane = pluginServiceEffectiveDataPlane(service);
   return `${ui("Effective data plane")} ${dataPlane} · ${ui("Active mode")} ${service.active_mode} · ${ui("Desired mode")} ${service.desired_mode}`;
 }
 
@@ -443,6 +445,15 @@ function crashPolicySummary(service: NonNullable<PluginServiceStatus["service"]>
   return `${service.crash_policy?.max_crashes || 1} / ${service.crash_policy?.window_seconds || 300}s · ${ui("Backoff")} ${service.crash_policy?.backoff_seconds || 30}s`;
 }
 
+function pluginServiceEffectiveDataPlane(service: NonNullable<PluginServiceStatus["service"]>): string {
+  const dataPlane = service.data_plane_mode || service.active_mode || "unknown";
+  const env = state.pluginService?.sandbox_environment;
+  if (dataPlane === "sandbox-process" && env && (!env.gate_enabled || !env.self_check_ok || !env.data_plane_eligible)) {
+    return ui("blocked");
+  }
+  return dataPlane;
+}
+
 function serviceModeSupportSummary(mode: PluginServiceModeFeature | null): string {
   if (!mode) {
     return ui("unknown");
@@ -457,7 +468,11 @@ function serviceModeSupportSummary(mode: PluginServiceModeFeature | null): strin
 
 function pluginServiceStateAlerts(service: NonNullable<PluginServiceStatus["service"]>, desiredMode: PluginServiceModeFeature | null): string {
   const alerts: string[] = [];
-  const dataPlane = service.data_plane_mode || service.active_mode;
+  const rawDataPlane = service.data_plane_mode || service.active_mode;
+  const dataPlane = pluginServiceEffectiveDataPlane(service);
+  if (rawDataPlane === "sandbox-process" && dataPlane === ui("blocked")) {
+    alerts.push(ui("Sandbox data plane is blocked by the runtime gate or environment self-check."));
+  }
   if (dataPlane && dataPlane !== service.desired_mode) {
     alerts.push(`${ui("Current data plane remains")} ${dataPlane}; ${ui("desired mode is")} ${service.desired_mode}.`);
     alerts.push(ui("future desired only until the service mode is applied; current data plane is unchanged."));
@@ -466,6 +481,45 @@ function pluginServiceStateAlerts(service: NonNullable<PluginServiceStatus["serv
     alerts.push(`${ui("Future desired mode only; current data plane is unchanged.")} ${localizeMessage(desiredMode.unsupported_reason)}`);
   }
   return alerts.map((item) => `<div class="alert inline-alert">${escapeHTML(item)}</div>`).join("");
+}
+
+function sandboxEnvironmentPanel(env: PluginServiceStatus["sandbox_environment"]): string {
+  if (!env) {
+    return "";
+  }
+  return `
+    <section class="subsection">
+      <h4>${escapeHTML(ui("Sandbox environment"))}</h4>
+      <div class="status-grid dense">
+        ${detailStat(ui("Runtime gate"), yesNo(Boolean(env.gate_enabled)))}
+        ${detailStat(ui("Self-check"), yesNo(Boolean(env.self_check_ok)))}
+        ${detailStat(ui("Data-plane eligible"), yesNo(Boolean(env.data_plane_eligible)))}
+        ${detailStat(ui("Profile"), env.policy_profile || "")}
+        ${detailStat(ui("Reason code"), env.reason_code || "")}
+      </div>
+      ${env.reason ? `<div class="alert inline-alert">${escapeHTML(localizeMessage(env.reason))}</div>` : ""}
+      ${sandboxEnforcementFactsTable(env.enforcement_facts || [])}
+    </section>
+  `;
+}
+
+function sandboxEnforcementFactsTable(facts: NonNullable<PluginServiceStatus["sandbox_environment"]>["enforcement_facts"]): string {
+  if (!facts || facts.length === 0) {
+    return "";
+  }
+  return `<table class="mini-table">
+    <thead><tr><th>${escapeHTML(ui("Category"))}</th><th>${escapeHTML(ui("Key"))}</th><th>${escapeHTML(ui("Required"))}</th><th>${escapeHTML(ui("Enforced"))}</th><th>${escapeHTML(ui("Method"))}</th><th>${escapeHTML(ui("Reason"))}</th></tr></thead>
+    <tbody>${facts.map((fact) => `
+      <tr>
+        <td>${escapeHTML(formatValue(fact.category))}</td>
+        <td>${escapeHTML(fact.key)}</td>
+        <td>${badge(yesNo(fact.required), !fact.required)}</td>
+        <td>${badge(yesNo(fact.enforced), !fact.enforced)}</td>
+        <td>${escapeHTML(fact.method || "")}</td>
+        <td>${escapeHTML(localizeMessage(fact.unsupported_reason || ""))}</td>
+      </tr>
+    `).join("")}</tbody>
+  </table>`;
 }
 
 function serviceModeOptionLabel(mode: PluginServiceModeFeature): string {
@@ -1457,6 +1511,64 @@ function runtimeLastError(plugin: PluginView): string {
 
 function runtimeManifest(plugin: PluginView): Record<string, unknown> {
   return objectValue(plugin.manifest?.runtime) || {};
+}
+
+function sandboxRuntimeDetailPanel(plugin: PluginView): string {
+  const summary = plugin.runtime_summary || {};
+  const runtimeType = String(summary.runtime_type || plugin.runtime_type || "");
+  if (runtimeType !== "sandbox-process" && !summary.runtime_instance_id && !summary.control_socket) {
+    return "";
+  }
+  return `
+    <section class="panel">
+      <h3>${escapeHTML(ui("Sandbox runtime"))}</h3>
+      <div class="status-grid dense">
+        ${detailStat(ui("Runtime type"), runtimeType)}
+        ${detailStat(ui("Runtime instance"), summary.runtime_instance_id || "")}
+        ${detailStat("PID", summary.pid || "")}
+        ${detailStat(ui("Control socket"), summary.control_socket || "")}
+        ${detailStat("cgroup", summary.cgroup || "")}
+        ${detailStat(ui("Network namespace"), summary.network_namespace || "")}
+        ${detailStat(ui("Active calls"), summary.active_calls || 0)}
+        ${detailStat(ui("Active streams"), summary.active_streams || 0)}
+        ${detailStat(ui("Reason code"), summary.reason_code || "")}
+      </div>
+      ${summary.last_error ? `<div class="alert inline-alert">${escapeHTML(localizeMessage(String(summary.last_error)))}</div>` : ""}
+      <dl class="kv compact">
+        <dt>${escapeHTML(ui("Namespace"))}</dt><dd>${badge(yesNo(Boolean(summary.namespace_enforced)), !summary.namespace_enforced)}</dd>
+        <dt>${escapeHTML(ui("Filesystem"))}</dt><dd>${badge(yesNo(Boolean(summary.filesystem_enforced)), !summary.filesystem_enforced)}</dd>
+        <dt>${escapeHTML(ui("Network"))}</dt><dd>${badge(yesNo(Boolean(summary.network_enforced)), !summary.network_enforced)}</dd>
+        <dt>${escapeHTML(ui("Environment"))}</dt><dd>${badge(yesNo(Boolean(summary.env_enforced)), !summary.env_enforced)}</dd>
+        <dt>${escapeHTML(ui("CPU/memory"))}</dt><dd>${badge(yesNo(Boolean(summary.cpu_memory_enforced)), !summary.cpu_memory_enforced)}</dd>
+        <dt>${escapeHTML(ui("Process"))}</dt><dd>${badge(yesNo(Boolean(summary.process_enforced)), !summary.process_enforced)}</dd>
+        <dt>${escapeHTML(ui("Cleanup"))}</dt><dd>${badge(yesNo(Boolean(summary.cleanup_enforced)), !summary.cleanup_enforced)}</dd>
+        <dt>${escapeHTML(ui("Secret RPC"))}</dt><dd>${badge(yesNo(Boolean(summary.secret_rpc)), !summary.secret_rpc)}</dd>
+      </dl>
+      ${sandboxSummaryFactsTable(summary)}
+    </section>
+  `;
+}
+
+function sandboxSummaryFactsTable(summary: Record<string, unknown>): string {
+  const facts = arrayValue(summary.enforcement_facts)
+    .map(objectValue)
+    .filter((fact): fact is Record<string, unknown> => Boolean(fact));
+  if (facts.length === 0) {
+    return "";
+  }
+  return `<table class="mini-table">
+    <thead><tr><th>${escapeHTML(ui("Category"))}</th><th>${escapeHTML(ui("Key"))}</th><th>${escapeHTML(ui("Required"))}</th><th>${escapeHTML(ui("Enforced"))}</th><th>${escapeHTML(ui("Method"))}</th><th>${escapeHTML(ui("Reason"))}</th></tr></thead>
+    <tbody>${facts.map((fact) => `
+      <tr>
+        <td>${escapeHTML(formatValue(String(fact.category || "")))}</td>
+        <td>${escapeHTML(String(fact.key || ""))}</td>
+        <td>${badge(yesNo(Boolean(fact.required)), !fact.required)}</td>
+        <td>${badge(yesNo(Boolean(fact.enforced)), !fact.enforced)}</td>
+        <td>${escapeHTML(String(fact.method || ""))}</td>
+        <td>${escapeHTML(localizeMessage(String(fact.unsupported_reason || "")))}</td>
+      </tr>
+    `).join("")}</tbody>
+  </table>`;
 }
 
 function objectValue(value: unknown): Record<string, unknown> | null {

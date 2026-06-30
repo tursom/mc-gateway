@@ -449,6 +449,7 @@ type SandboxSecretResponse struct {
 	Scope           string `json:"scope,omitempty"`
 	RedactionHandle string `json:"redaction_handle,omitempty"`
 	ErrorCode       string `json:"error_code,omitempty"`
+	ReasonCode      string `json:"reason_code,omitempty"`
 	Error           string `json:"error,omitempty"`
 }
 
@@ -479,8 +480,10 @@ type SandboxExternalResponse struct {
 type SandboxDiagnosticSummary struct {
 	PluginID              string                   `json:"plugin_id"`
 	ArtifactID            string                   `json:"artifact_id"`
+	RuntimeInstanceID     string                   `json:"runtime_instance_id,omitempty"`
 	PID                   int                      `json:"pid,omitempty"`
 	State                 string                   `json:"state"`
+	ReasonCode            string                   `json:"reason_code,omitempty"`
 	NamespaceEnforced     bool                     `json:"namespace_enforced"`
 	ControlRPC            bool                     `json:"control_rpc"`
 	FilesystemEnforced    bool                     `json:"filesystem_enforced"`
@@ -492,10 +495,14 @@ type SandboxDiagnosticSummary struct {
 	SecretRPC             bool                     `json:"secret_rpc"`
 	CrashLoop             bool                     `json:"crash_loop"`
 	CrashCount            int                      `json:"crash_count"`
+	ActiveCalls           int64                    `json:"active_calls"`
+	ActiveStreams         int64                    `json:"active_streams"`
 	LastError             string                   `json:"last_error,omitempty"`
 	SecretHandles         []string                 `json:"secret_handles,omitempty"`
 	EnvKeys               []string                 `json:"env_keys,omitempty"`
 	ControlSocket         string                   `json:"control_socket,omitempty"`
+	Cgroup                string                   `json:"cgroup,omitempty"`
+	NetworkNamespace      string                   `json:"network_namespace,omitempty"`
 	UnsupportedReason     string                   `json:"unsupported_reason,omitempty"`
 	EnforcementAttributes map[string]string        `json:"enforcement_attributes,omitempty"`
 	EnforcementFacts      []SandboxEnforcementFact `json:"enforcement_facts,omitempty"`
@@ -960,6 +967,7 @@ type RuntimeFeature struct {
 	Maturity          string `json:"maturity"`
 	DataPlane         bool   `json:"data_plane"`
 	RequiresRestart   bool   `json:"requires_restart"`
+	ReasonCode        string `json:"reason_code,omitempty"`
 	UnsupportedReason string `json:"unsupported_reason,omitempty"`
 	Entry             string `json:"entry,omitempty"`
 }
@@ -970,6 +978,7 @@ type PluginServiceModeFeature struct {
 	Maturity          string `json:"maturity"`
 	DataPlane         bool   `json:"data_plane"`
 	RequiresRestart   bool   `json:"requires_restart"`
+	ReasonCode        string `json:"reason_code,omitempty"`
 	UnsupportedReason string `json:"unsupported_reason,omitempty"`
 }
 
@@ -994,6 +1003,7 @@ type PluginServiceState struct {
 	RestartRequired    bool                  `json:"restart_required"`
 	LiveMigration      string                `json:"live_migration"`
 	CrashPolicy        PluginHostCrashPolicy `json:"crash_policy"`
+	ReasonCode         string                `json:"reason_code,omitempty"`
 	UnsupportedReason  string                `json:"unsupported_reason,omitempty"`
 	LastError          string                `json:"last_error"`
 	UpdatedBy          string                `json:"updated_by"`
@@ -1007,12 +1017,23 @@ type PluginHostCrashPolicy struct {
 }
 
 type PluginServiceStatus struct {
-	Service         PluginServiceState            `json:"service"`
-	Modes           []PluginServiceModeFeature    `json:"service_modes"`
-	RuntimeTypes    []RuntimeFeature              `json:"runtime_types"`
-	RuntimeAdapters []RuntimeAdapterFactoryStatus `json:"runtime_adapters"`
-	Hosts           []PluginHostRuntimeSummary    `json:"hosts"`
-	Nodes           []PluginNodeState             `json:"nodes"`
+	Service            PluginServiceState            `json:"service"`
+	Modes              []PluginServiceModeFeature    `json:"service_modes"`
+	RuntimeTypes       []RuntimeFeature              `json:"runtime_types"`
+	RuntimeAdapters    []RuntimeAdapterFactoryStatus `json:"runtime_adapters"`
+	SandboxEnvironment SandboxEnvironmentStatus      `json:"sandbox_environment"`
+	Hosts              []PluginHostRuntimeSummary    `json:"hosts"`
+	Nodes              []PluginNodeState             `json:"nodes"`
+}
+
+type SandboxEnvironmentStatus struct {
+	GateEnabled       bool                     `json:"gate_enabled"`
+	SelfCheckOK       bool                     `json:"self_check_ok"`
+	DataPlaneEligible bool                     `json:"data_plane_eligible"`
+	PolicyProfile     string                   `json:"policy_profile,omitempty"`
+	ReasonCode        string                   `json:"reason_code,omitempty"`
+	Reason            string                   `json:"reason,omitempty"`
+	EnforcementFacts  []SandboxEnforcementFact `json:"enforcement_facts,omitempty"`
 }
 
 type PluginNodeState struct {
@@ -1072,6 +1093,7 @@ type PluginHostRuntimeSummary struct {
 	DrainMode    string `json:"drain_mode"`
 	CrashLoop    bool   `json:"crash_loop"`
 	CrashCount   int    `json:"crash_count"`
+	ReasonCode   string `json:"reason_code,omitempty"`
 	LastError    string `json:"last_error"`
 	StartedAt    int64  `json:"started_at"`
 	DrainingAt   int64  `json:"draining_at"`
@@ -1497,6 +1519,7 @@ type OperationsSnapshot struct {
 	GC                   []GCCandidate               `json:"gc,omitempty"`
 	EventQueue           EventQueueSummary           `json:"event_queue"`
 	Diagnostics          []DiagnosticPackageSummary  `json:"diagnostics,omitempty"`
+	SandboxRuntimes      []SandboxDiagnosticSummary  `json:"sandbox_runtimes,omitempty"`
 }
 
 type BuildMetricSummary struct {

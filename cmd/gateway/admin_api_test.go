@@ -208,6 +208,13 @@ func TestAdminPluginServiceStatusReportsReservedModes(t *testing.T) {
 		service["restart_required"] != false {
 		t.Fatalf("default plugin service = %#v, want implemented in-process data plane", service)
 	}
+	sandboxEnv := status["sandbox_environment"].(map[string]any)
+	if sandboxEnv["gate_enabled"] != false ||
+		sandboxEnv["self_check_ok"] != false ||
+		sandboxEnv["data_plane_eligible"] != false ||
+		sandboxEnv["reason_code"] != pluginmanager.ReasonSandboxFutureGateClosed {
+		t.Fatalf("sandbox environment = %#v, want gate-closed non-data-plane self-check status", sandboxEnv)
+	}
 	crashPolicy := service["crash_policy"].(map[string]any)
 	if int(crashPolicy["backoff_seconds"].(float64)) != int(pluginmanager.DefaultPluginHostCrashBackoffSeconds) ||
 		int(crashPolicy["max_crashes"].(float64)) != int(pluginmanager.DefaultPluginHostCrashMaxCrashes) ||
@@ -402,6 +409,18 @@ func TestAdminPluginRuntimePanelStaticContract(t *testing.T) {
 		"Adapter",
 		"Crash policy",
 		"Restart",
+		"Sandbox environment",
+		"Runtime gate",
+		"Self-check",
+		"Data-plane eligible",
+		"Reason code",
+		"Sandbox runtime",
+		"Runtime instance",
+		"Control socket",
+		"Network namespace",
+		"Active calls",
+		"Active streams",
+		"Secret RPC",
 		"desired pending",
 		"Current data plane remains",
 		"admin.auth.provider/v1",

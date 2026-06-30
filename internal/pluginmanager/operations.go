@@ -1460,6 +1460,10 @@ func (o *Operations) DiagnosticPackage(ctx context.Context, plugin PluginRecord,
 		body["wasm_runtime"] = diagnosticSafeValue(wasmSummary)
 		sections = append(sections, "wasm_runtime")
 	}
+	if sandboxSummary := diagnosticSandboxSummary(plugin, artifact, manifest); sandboxSummary != nil {
+		body["sandbox_runtime"] = diagnosticSafeValue(sandboxSummary)
+		sections = append(sections, "sandbox_runtime")
+	}
 	data, err := json.MarshalIndent(body, "", "  ")
 	if err != nil {
 		return nil, DiagnosticPackageSummary{}, err
@@ -1477,6 +1481,60 @@ func (o *Operations) DiagnosticPackage(ctx context.Context, plugin PluginRecord,
 		return nil, DiagnosticPackageSummary{}, err
 	}
 	return data, summary, nil
+}
+
+func diagnosticSandboxSummary(plugin PluginRecord, artifact ArtifactRecord, manifest Manifest) map[string]any {
+	if artifact.RuntimeType != RuntimeSandbox && manifest.Runtime.Type != RuntimeSandbox {
+		return nil
+	}
+	runtimeSummary := jsonMapFromJSONString(plugin.RuntimeSummaryJSON)
+	return map[string]any{
+		"manifest_summary": map[string]any{
+			"id":                         manifest.ID,
+			"name":                       manifest.Name,
+			"version":                    manifest.Version,
+			"runtime_type":               firstNonEmpty(manifest.Runtime.Type, artifact.RuntimeType),
+			"runtime_entry":              manifest.Runtime.Entry,
+			"protocol":                   manifest.Runtime.Protocol,
+			"abi_version":                manifest.Runtime.ABIVersion,
+			"os":                         manifest.Runtime.OS,
+			"arch":                       manifest.Runtime.Arch,
+			"supported_extension_points": wasmManifestExtensionKeys(manifest),
+			"limits": map[string]any{
+				"handler_timeout_ms": manifest.RuntimeLimits.HandlerTimeoutMS,
+				"memory_bytes":       manifest.RuntimeLimits.MemoryBytes,
+			},
+		},
+		"runtime_status": map[string]any{
+			"runtime_instance_id": runtimeSummary["runtime_instance_id"],
+			"state":               runtimeSummary["runtime_state"],
+			"reason_code":         runtimeSummary["reason_code"],
+			"pid":                 runtimeSummary["pid"],
+			"control_socket":      runtimeSummary["control_socket"],
+			"cgroup":              runtimeSummary["cgroup"],
+			"network_namespace":   runtimeSummary["network_namespace"],
+			"active_calls":        runtimeSummary["active_calls"],
+			"active_streams":      runtimeSummary["active_streams"],
+			"last_error":          runtimeSummary["last_error"],
+		},
+		"enforcement_status": map[string]any{
+			"namespace_enforced":  runtimeSummary["namespace_enforced"],
+			"filesystem_enforced": runtimeSummary["filesystem_enforced"],
+			"network_enforced":    runtimeSummary["network_enforced"],
+			"env_enforced":        runtimeSummary["env_enforced"],
+			"cpu_memory_enforced": runtimeSummary["cpu_memory_enforced"],
+			"process_enforced":    runtimeSummary["process_enforced"],
+			"cleanup_enforced":    runtimeSummary["cleanup_enforced"],
+			"secret_rpc":          runtimeSummary["secret_rpc"],
+			"facts":               runtimeSummary["enforcement_facts"],
+			"attributes":          runtimeSummary["enforcement_attributes"],
+		},
+		"stdout_stderr": map[string]any{
+			"stdout_summary": jsonMapFromAny(runtimeSummary["enforcement_attributes"])["stdout_summary"],
+			"stderr_summary": jsonMapFromAny(runtimeSummary["enforcement_attributes"])["stderr_summary"],
+			"redacted":       true,
+		},
+	}
 }
 
 func diagnosticWASMSummary(plugin PluginRecord, artifact ArtifactRecord, manifest Manifest) map[string]any {
@@ -1777,6 +1835,9 @@ func diagnosticRedactValue(value any, key string) any {
 		}
 		return out
 	case string:
+		if isDiagnosticMachineCodeName(key) {
+			return limitString(typed, 128)
+		}
 		if isEndpointName(key) {
 			return redactSensitive(redactEndpoint(typed))
 		}
@@ -1789,6 +1850,11 @@ func diagnosticRedactValue(value any, key string) any {
 func isEndpointName(name string) bool {
 	lower := strings.ToLower(name)
 	return lower == "endpoint" || lower == "url" || strings.Contains(lower, "uri")
+}
+
+func isDiagnosticMachineCodeName(name string) bool {
+	lower := strings.ToLower(name)
+	return lower == "reason_code" || lower == "error_code"
 }
 
 func isDiagnosticSensitiveName(name string) bool {
@@ -1965,6 +2031,7 @@ func (o *Operations) GCCandidates(ctx context.Context, pluginID string) ([]GCCan
 		})
 		return nil
 	})
+	candidates = append(candidates, o.sandboxRuntimeGCCandidates(pluginID)...)
 	if pluginID != "" {
 		if candidate, ok, err := o.repo.EventRetentionOverflow(ctx, pluginID, DefaultEventRecentLimit); err != nil {
 			return nil, err
@@ -1983,6 +2050,94 @@ func (o *Operations) GCCandidates(ctx context.Context, pluginID string) ([]GCCan
 		}
 	}
 	return candidates, nil
+}
+
+func (o *Operations) sandboxRuntimeGCCandidates(pluginID string) []GCCandidate {
+	runtimeRoot := o.runtimeRoot()
+	var candidates []GCCandidate
+	_ = filepath.WalkDir(runtimeRoot, func(filePath string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if candidate, ok := sandboxRuntimeGCCandidate(filePath, d, runtimeRoot, pluginID); ok {
+			candidates = append(candidates, candidate)
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+		}
+		return nil
+	})
+	for _, entry := range readDirEntries(os.TempDir()) {
+		filePath := filepath.Join(os.TempDir(), entry.Name())
+		if candidate, ok := sandboxRuntimeGCCandidate(filePath, entry, runtimeRoot, pluginID); ok {
+			candidates = append(candidates, candidate)
+		}
+	}
+	return candidates
+}
+
+func readDirEntries(root string) []os.DirEntry {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+	return entries
+}
+
+func sandboxRuntimeGCCandidate(filePath string, d os.DirEntry, runtimeRoot, pluginID string) (GCCandidate, bool) {
+	name := d.Name()
+	if !strings.HasPrefix(name, "mc-gateway-sandbox-") && !strings.HasPrefix(name, "sandbox-cgroup-") {
+		return GCCandidate{}, false
+	}
+	if !d.IsDir() && !strings.HasSuffix(name, ".sock") && !strings.HasSuffix(name, ".cgroup") {
+		return GCCandidate{}, false
+	}
+	info, err := d.Info()
+	if err != nil {
+		return GCCandidate{}, false
+	}
+	pid := sandboxGCPluginID(filePath, runtimeRoot)
+	if pluginID != "" && pid != pluginID {
+		return GCCandidate{}, false
+	}
+	kind := "sandbox_runtime_temp_dir"
+	category := "runtime"
+	reason := "stale sandbox runtime temp dir"
+	if strings.HasSuffix(name, ".sock") {
+		kind = "sandbox_stale_socket"
+		category = "socket"
+		reason = "stale sandbox control socket"
+	} else if strings.HasPrefix(name, "sandbox-cgroup-") || strings.HasSuffix(name, ".cgroup") {
+		kind = "sandbox_stale_cgroup"
+		category = "cgroup"
+		reason = "stale sandbox cgroup marker"
+	}
+	size := info.Size()
+	if d.IsDir() {
+		size = dirSize(filePath)
+	}
+	return GCCandidate{
+		Kind:          kind,
+		Category:      category,
+		ID:            filePath,
+		PluginID:      pid,
+		Path:          filePath,
+		Protected:     false,
+		Reason:        reason,
+		RetentionRule: "sandbox runtime leftovers are removable after process exit or failed startup",
+		SizeBytes:     size,
+		CreatedAt:     info.ModTime().Unix(),
+	}, true
+}
+
+func sandboxGCPluginID(filePath, runtimeRoot string) string {
+	if rel, err := filepath.Rel(runtimeRoot, filePath); err == nil && !strings.HasPrefix(rel, "..") {
+		parts := strings.Split(rel, string(filepath.Separator))
+		if len(parts) > 1 {
+			return parts[0]
+		}
+	}
+	return ""
 }
 
 func (o *Operations) retentionRuleCandidates(pluginID string) []GCCandidate {
@@ -2053,6 +2208,9 @@ func (o *Operations) RunGC(ctx context.Context, actor, pluginID string, dryRun b
 			removed = append(removed, candidate)
 		case "plugin_file_orphan":
 			_ = os.Remove(candidate.Path)
+			removed = append(removed, candidate)
+		case "sandbox_runtime_temp_dir", "sandbox_stale_socket", "sandbox_stale_cgroup":
+			_ = os.RemoveAll(candidate.Path)
 			removed = append(removed, candidate)
 		case "diagnostic_package":
 			id, err := strconv.ParseInt(candidate.ID, 10, 64)

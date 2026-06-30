@@ -945,7 +945,7 @@ func (m *Manager) Load(ctx context.Context, actor, pluginID string) (PluginRecor
 	}
 	loaded, err := m.loadLocked(ctx, pluginRecord)
 	if err != nil {
-		_ = m.repo.RecordOperation(ctx, pluginID, pluginRecord.DesiredArtifactID, "load", "failed", actor, err.Error(), nil)
+		_ = m.repo.RecordOperation(ctx, pluginID, pluginRecord.DesiredArtifactID, "load", "failed", actor, err.Error(), map[string]any{"reason_code": reasonCodeFromError(err)})
 		return PluginRecord{}, err
 	}
 	_ = m.repo.RecordOperation(ctx, pluginID, loaded.artifact.ID, "load", "succeeded", actor, "plugin loaded", nil)
@@ -967,10 +967,14 @@ func (m *Manager) Enable(ctx context.Context, actor, pluginID string) (PluginRec
 	}
 	decision, err := m.EvaluateReleaseGate(ctx, pluginID, pluginRecord.DesiredArtifactID, GovernanceActionEnable, m.currentPolicyProfile(), pluginRecord.ConfigJSON)
 	if err != nil {
-		_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginID, pluginRecord.DesiredGeneration, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"governance": decision}, nil)
+		artifact, _ := m.repo.Artifact(ctx, pluginRecord.DesiredArtifactID)
+		summary := runtimeFailureSummary(artifact, err)
+		summary["governance"] = decision
+		_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginID, pluginRecord.DesiredGeneration, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), summary, nil)
 		m.recordPluginNodeRuntimeState(ctx, pluginID)
 		_ = m.repo.RecordOperation(ctx, pluginID, pluginRecord.DesiredArtifactID, "enable_gate", "failed", actor, err.Error(), map[string]any{
-			"decision": decision,
+			"decision":    decision,
+			"reason_code": reasonCodeFromError(err),
 		})
 		return PluginRecord{}, err
 	}
@@ -982,7 +986,7 @@ func (m *Manager) Enable(ctx context.Context, actor, pluginID string) (PluginRec
 	// 三类内存状态不会被并发读到半更新结果。
 	loaded, err := m.loadLocked(ctx, pluginRecord)
 	if err != nil {
-		_ = m.repo.RecordOperation(ctx, pluginID, pluginRecord.DesiredArtifactID, "enable", "failed", actor, err.Error(), nil)
+		_ = m.repo.RecordOperation(ctx, pluginID, pluginRecord.DesiredArtifactID, "enable", "failed", actor, err.Error(), map[string]any{"reason_code": reasonCodeFromError(err)})
 		return PluginRecord{}, err
 	}
 	if len(loaded.handlers) == 0 && loaded.extensions.empty() {
@@ -1188,16 +1192,20 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 		// 单个插件失败不阻断其他插件收敛；失败会记录到 runtime_state 和操作日志。
 		decision, err := m.EvaluateReleaseGate(ctx, pluginRecord.ID, pluginRecord.DesiredArtifactID, GovernanceActionEnable, m.currentPolicyProfile(), pluginRecord.ConfigJSON)
 		if err != nil {
-			_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginRecord.ID, pluginRecord.DesiredGeneration, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"governance": decision}, nil)
+			artifact, _ := m.repo.Artifact(ctx, pluginRecord.DesiredArtifactID)
+			summary := runtimeFailureSummary(artifact, err)
+			summary["governance"] = decision
+			_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginRecord.ID, pluginRecord.DesiredGeneration, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), summary, nil)
 			m.recordPluginNodeRuntimeStateLocked(ctx, pluginRecord.ID)
-			_ = m.repo.RecordOperation(ctx, pluginRecord.ID, pluginRecord.DesiredArtifactID, "reconcile_gate", "failed", "system", err.Error(), map[string]any{"decision": decision})
+			_ = m.repo.RecordOperation(ctx, pluginRecord.ID, pluginRecord.DesiredArtifactID, "reconcile_gate", "failed", "system", err.Error(), map[string]any{"decision": decision, "reason_code": reasonCodeFromError(err)})
 			continue
 		}
 		loaded, err := m.loadLocked(ctx, pluginRecord)
 		if err != nil {
-			_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginRecord.ID, pluginRecord.DesiredGeneration, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
+			artifact, _ := m.repo.Artifact(ctx, pluginRecord.DesiredArtifactID)
+			_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginRecord.ID, pluginRecord.DesiredGeneration, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), runtimeFailureSummary(artifact, err), nil)
 			m.recordPluginNodeRuntimeStateLocked(ctx, pluginRecord.ID)
-			_ = m.repo.RecordOperation(ctx, pluginRecord.ID, pluginRecord.DesiredArtifactID, "reconcile", "failed", "system", err.Error(), nil)
+			_ = m.repo.RecordOperation(ctx, pluginRecord.ID, pluginRecord.DesiredArtifactID, "reconcile", "failed", "system", err.Error(), map[string]any{"reason_code": reasonCodeFromError(err)})
 			continue
 		}
 		if len(loaded.handlers) == 0 && loaded.extensions.empty() {
@@ -1754,8 +1762,89 @@ func (m *Manager) OperationsSnapshot(ctx context.Context, pluginID string) (Oper
 	gc, _ := m.operations.GCCandidates(ctx, pluginID)
 	snapshot := m.operations.Snapshot(ctx, pluginID, handlers, builds, gc)
 	snapshot.CustomMetrics = append(snapshot.CustomMetrics, m.wasmRuntimeMetricSummaries(ctx, pluginID)...)
+	for _, summary := range m.liveSandboxRuntimeSummaries(pluginID) {
+		snapshot.SandboxRuntimes = append(snapshot.SandboxRuntimes, summary)
+	}
+	sort.Slice(snapshot.SandboxRuntimes, func(i, j int) bool {
+		return snapshot.SandboxRuntimes[i].PluginID < snapshot.SandboxRuntimes[j].PluginID
+	})
 	snapshot.Exporters = m.operations.ExportSnapshot(ctx, snapshot)
 	return snapshot, nil
+}
+
+func (m *Manager) liveSandboxRuntimeSummaries(pluginID string) map[string]SandboxDiagnosticSummary {
+	m.mu.Lock()
+	out := make(map[string]SandboxDiagnosticSummary)
+	var crashed []SandboxDiagnosticSummary
+	for id, loaded := range m.loaded {
+		if pluginID != "" && id != pluginID {
+			continue
+		}
+		if loaded == nil || loaded.artifact.RuntimeType != RuntimeSandbox {
+			continue
+		}
+		process := sandboxHostedPluginFromInstance(loaded.instance).process
+		if process == nil {
+			continue
+		}
+		summary := process.Diagnostics()
+		out[id] = summary
+		if summary.CrashLoop || summary.State == RuntimeFailed {
+			crashed = append(crashed, summary)
+		}
+	}
+	m.mu.Unlock()
+	for _, summary := range crashed {
+		m.quarantineSandboxProcess(context.Background(), summary)
+	}
+	return out
+}
+
+func (m *Manager) quarantineSandboxProcess(ctx context.Context, summary SandboxDiagnosticSummary) {
+	if summary.PluginID == "" {
+		return
+	}
+	message := strings.TrimSpace(summary.LastError)
+	if message == "" {
+		message = "sandbox-process crash loop"
+	}
+	reasonCode := summary.ReasonCode
+	if reasonCode == "" {
+		reasonCode = ReasonSandboxCrashLoop
+	}
+
+	m.mu.Lock()
+	loaded := m.loaded[summary.PluginID]
+	if loaded == nil || loaded.artifact.RuntimeType != RuntimeSandbox {
+		m.mu.Unlock()
+		return
+	}
+	activeArtifactID := loaded.artifact.ID
+	loadedArtifactID := loaded.artifact.ID
+	appliedGeneration := loaded.record.DesiredGeneration
+	m.removeFromDispatchLocked(summary.PluginID)
+	m.removeExtensionsLocked(summary.PluginID)
+	m.markDrainingLocked(summary.PluginID)
+	m.operations.StopPlugin(summary.PluginID)
+	delete(m.loaded, summary.PluginID)
+	m.mu.Unlock()
+
+	runtimeSummary := sandboxDiagnosticSummaryMap(summary)
+	runtimeSummary["quarantine"] = true
+	runtimeSummary["reason_code"] = reasonCode
+	_ = m.repo.MarkRuntime(ctx, summary.PluginID, RuntimeFailed, activeArtifactID, loadedArtifactID, appliedGeneration, message, runtimeSummary, nil)
+	_ = m.repo.SetPluginServiceError(ctx, message)
+	m.recordPluginNodeRuntimeState(ctx, summary.PluginID)
+	_ = m.repo.RecordOperation(ctx, summary.PluginID, activeArtifactID, "sandbox_crash_loop_quarantine", "failed", "system", message, map[string]any{
+		"reason_code":         reasonCode,
+		"runtime_instance_id": summary.RuntimeInstanceID,
+		"pid":                 summary.PID,
+		"crash_loop":          summary.CrashLoop,
+		"crash_count":         summary.CrashCount,
+		"active_streams":      summary.ActiveStreams,
+		"active_calls":        summary.ActiveCalls,
+		"quarantine":          true,
+	})
 }
 
 func (m *Manager) wasmRuntimeMetricSummaries(ctx context.Context, pluginID string) []CustomMetricSummary {
@@ -2030,6 +2119,11 @@ func (m *Manager) DiagnosticPackage(ctx context.Context, actor, pluginID string)
 			plugin.RuntimeSummaryJSON = string(data)
 		}
 	}
+	if liveSummary := m.liveSandboxRuntimeSummaries(pluginID)[pluginID]; liveSummary.PluginID != "" {
+		if data, err := json.Marshal(sandboxDiagnosticSummaryMap(liveSummary)); err == nil {
+			plugin.RuntimeSummaryJSON = string(data)
+		}
+	}
 	plan := m.DispatchPlan(ctx)
 	var handlers []DispatchHandlerSummary
 	for _, handler := range plan.Handlers {
@@ -2248,21 +2342,21 @@ func (m *Manager) loadLocked(ctx context.Context, pluginRecord PluginRecord) (*l
 		return nil, err
 	}
 	if err := m.validateArtifactGate(artifact); err != nil {
-		_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginRecord.ID, pluginRecord.DesiredGeneration, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
+		_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginRecord.ID, pluginRecord.DesiredGeneration, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), runtimeFailureSummary(artifact, err), nil)
 		m.recordPluginNodeRuntimeStateLocked(ctx, pluginRecord.ID)
 		return nil, err
 	}
 
 	var manifest Manifest
 	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err != nil {
-		_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginRecord.ID, pluginRecord.DesiredGeneration, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
+		_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginRecord.ID, pluginRecord.DesiredGeneration, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), runtimeFailureSummary(artifact, err), nil)
 		m.recordPluginNodeRuntimeStateLocked(ctx, pluginRecord.ID)
 		return nil, err
 	}
 	gateway := NewGateway(pluginRecord.ID, m.handleConn, m.wg, m.operations.ForPlugin(pluginRecord.ID, artifact.ID, manifest))
 	runtimeInstance, err := m.startRuntimeInstance(ctx, artifact, pluginRecord, gateway)
 	if err != nil {
-		_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginRecord.ID, pluginRecord.DesiredGeneration, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
+		_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginRecord.ID, pluginRecord.DesiredGeneration, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), runtimeFailureSummary(artifact, err), nil)
 		m.recordPluginNodeRuntimeStateLocked(ctx, pluginRecord.ID)
 		return nil, err
 	}
@@ -2337,6 +2431,19 @@ func (m *Manager) startRuntimeInstance(ctx context.Context, artifact ArtifactRec
 		Plugin:          instance,
 		StartedAt:       time.Now().Unix(),
 	}, nil
+}
+
+func runtimeFailureSummary(artifact ArtifactRecord, err error) map[string]any {
+	message := ""
+	if err != nil {
+		message = err.Error()
+	}
+	return map[string]any{
+		"runtime_type": artifact.RuntimeType,
+		"artifact_id":  artifact.ID,
+		"error":        redactSensitive(message),
+		"reason_code":  reasonCodeFromError(err),
+	}
 }
 
 func runtimePreparedFor(artifact ArtifactRecord, pluginRecord PluginRecord, serviceMode string) RuntimePrepared {
@@ -2631,6 +2738,14 @@ func (m *Manager) loadedRuntimeSummary(loaded *loadedPlugin) map[string]any {
 	if wasmPlugin, ok := loaded.instance.(*wasmHostedPlugin); ok && wasmPlugin != nil {
 		for key, value := range wasmPlugin.diagnosticsSummary() {
 			summary[key] = value
+		}
+	}
+	if loaded.artifact.RuntimeType == RuntimeSandbox {
+		process := sandboxHostedPluginFromInstance(loaded.instance).process
+		if process != nil {
+			for key, value := range sandboxDiagnosticSummaryMap(process.Diagnostics()) {
+				summary[key] = value
+			}
 		}
 	}
 	return summary
