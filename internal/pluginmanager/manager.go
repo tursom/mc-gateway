@@ -778,7 +778,15 @@ func (m *Manager) DryRunConfig(ctx context.Context, pluginID, artifactID, config
 		result.Error = err.Error()
 		return result, err
 	}
-	if dryRunner, ok := m.adapter.(ConfigDryRunAdapter); ok {
+	dryRunAdapter := m.adapter
+	if m.adapterManaged {
+		dryRunAdapter, _ = RuntimeAdapterFactory{}.AdapterFor(m.serviceMode, artifact.RuntimeType)
+		if typed, ok := dryRunAdapter.(WASMAdapter); ok {
+			typed.Runner = m.wasmRunner
+			dryRunAdapter = typed
+		}
+	}
+	if dryRunner, ok := dryRunAdapter.(ConfigDryRunAdapter); ok {
 		// 运行时 dry-run 会实例化插件但不调用 Init，避免注册钩子或启动后台任务。
 		if err := dryRunner.DryRunConfig(ctx, artifact, pluginRecord); err != nil {
 			message := redactSensitiveConfigText(err.Error(), configJSON, sensitivePaths)

@@ -30,15 +30,35 @@ type WASMInvocation struct {
 	MemoryBytes int
 }
 
+type WASMDispatchInvocation struct {
+	ArtifactID     string
+	PluginID       string
+	Module         []byte
+	Manifest       Manifest
+	ExtensionPoint string
+	Request        WASMABIRequest
+	Timeout        time.Duration
+	MemoryBytes    int
+	MaxOutputBytes int
+}
+
 type WASMAdapter struct {
 	Runner *WASMRunner
 	Mode   string
 }
 
 type wasmHostedPlugin struct {
-	runner   *WASMRunner
-	manifest Manifest
-	artifact ArtifactRecord
+	runner     *WASMRunner
+	manifest   Manifest
+	artifact   ArtifactRecord
+	pluginID   string
+	module     []byte
+	configJSON json.RawMessage
+	mu         sync.Mutex
+	lastError  string
+	lastPoint  string
+	lastAt     int64
+	lastOK     bool
 }
 
 func (r *WASMRunner) Validate(ctx context.Context, manifest Manifest, behavior string) error {
@@ -112,6 +132,110 @@ func (r *WASMRunner) Invoke(ctx context.Context, invocation WASMInvocation) erro
 		return newWASMABIError(wasmABIErrorBadOutput, "", fmt.Sprintf("wasm validation returned non-zero result %d", results[0]))
 	}
 	return nil
+}
+
+func (r *WASMRunner) Dispatch(ctx context.Context, invocation WASMDispatchInvocation) (WASMABIResponse, error) {
+	if r == nil {
+		r = NewWASMRunner()
+	}
+	point := invocation.ExtensionPoint
+	if err := validateWASMExtensionPoints(invocation.Manifest); err != nil {
+		return WASMABIResponse{}, err
+	}
+	if err := validateWASMManifestABI(invocation.Manifest); err != nil {
+		return WASMABIResponse{}, err
+	}
+	if len(invocation.Module) == 0 {
+		return WASMABIResponse{}, errors.New("wasm module is empty")
+	}
+	fnName, ok := WASMABIExportForExtension(point)
+	if !ok {
+		return WASMABIResponse{}, newWASMABIError(wasmABIErrorSchemaInvalid, point, fmt.Sprintf("unsupported extension_point %q", point))
+	}
+	invocation.Request.PluginID = firstNonEmpty(invocation.Request.PluginID, invocation.PluginID, invocation.Manifest.ID)
+	invocation.Request.ArtifactID = firstNonEmpty(invocation.Request.ArtifactID, invocation.ArtifactID)
+	invocation.Request.ExtensionPoint = point
+	reqBytes, err := EncodeWASMABIRequest(invocation.Request)
+	if err != nil {
+		return WASMABIResponse{}, err
+	}
+	timeout := invocation.Timeout
+	if timeout <= 0 {
+		timeout = wasmTimeout(invocation.Manifest)
+	}
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	runtimeConfig := wazero.NewRuntimeConfig().
+		WithCloseOnContextDone(true).
+		WithMemoryLimitPages(wasmMemoryLimitPages(invocation.MemoryBytes))
+	runtime := wazero.NewRuntimeWithConfig(callCtx, runtimeConfig)
+	defer runtime.Close(context.Background())
+
+	compiled, err := r.compile(callCtx, runtime, WASMInvocation{
+		ArtifactID:  invocation.ArtifactID,
+		Module:      invocation.Module,
+		Manifest:    invocation.Manifest,
+		Function:    fnName,
+		Timeout:     timeout,
+		MemoryBytes: invocation.MemoryBytes,
+	})
+	if err != nil {
+		return WASMABIResponse{}, err
+	}
+	if err := validateWASMCompiledABI(compiled, invocation.Manifest); err != nil {
+		return WASMABIResponse{}, err
+	}
+	if err := instantiateWASMHostImports(callCtx, runtime); err != nil {
+		return WASMABIResponse{}, err
+	}
+	moduleConfig := wazero.NewModuleConfig().
+		WithName("mc-gateway-plugin-wasm").
+		WithStartFunctions()
+	module, err := runtime.InstantiateModule(callCtx, compiled, moduleConfig)
+	if err != nil {
+		return WASMABIResponse{}, err
+	}
+	defer module.Close(context.Background())
+	memory := module.Memory()
+	if memory == nil {
+		return WASMABIResponse{}, newWASMABIError(wasmABIErrorABIMismatch, point, "wasm module must export memory for host ABI JSON exchange")
+	}
+	const requestOffset = uint32(0)
+	if !memory.Write(requestOffset, reqBytes) {
+		return WASMABIResponse{}, newWASMABIError(wasmABIErrorOversizedInput, point, "request does not fit wasm memory")
+	}
+	fn := module.ExportedFunction(fnName)
+	if fn == nil {
+		return WASMABIResponse{}, newWASMABIError(wasmABIErrorExportMissing, point, fmt.Sprintf("wasm export %q not found", fnName))
+	}
+	results, err := fn.Call(callCtx, uint64(requestOffset), uint64(len(reqBytes)))
+	if err != nil {
+		return WASMABIResponse{}, mapWASMInvocationError(point, err)
+	}
+	if len(results) != 1 {
+		return WASMABIResponse{}, newWASMABIError(wasmABIErrorABIMismatch, point, fmt.Sprintf("wasm export %q returned %d results", fnName, len(results)))
+	}
+	respPtr, respLen := wasmUnpackPtrLen(results[0])
+	maxOutput := invocation.MaxOutputBytes
+	if maxOutput <= 0 {
+		maxOutput = wasmABIMaxOutputBytes
+	}
+	if respLen == 0 || int(respLen) > maxOutput {
+		return WASMABIResponse{}, newWASMABIError(wasmABIErrorOversizedOutput, point, fmt.Sprintf("response size %d exceeds limit %d", respLen, maxOutput))
+	}
+	respBytes, ok := memory.Read(respPtr, respLen)
+	if !ok {
+		return WASMABIResponse{}, newWASMABIError(wasmABIErrorBadOutput, point, fmt.Sprintf("response memory range ptr=%d len=%d is invalid", respPtr, respLen))
+	}
+	resp, _, err := DecodeWASMABIResponse(point, append([]byte(nil), respBytes...))
+	if err != nil {
+		return WASMABIResponse{}, err
+	}
+	if resp.Error != nil {
+		return resp, newWASMABIError(resp.Error.Code, point, resp.Error.Message)
+	}
+	return resp, nil
 }
 
 func (r *WASMRunner) compile(ctx context.Context, runtime wazero.Runtime, invocation WASMInvocation) (wazero.CompiledModule, error) {
@@ -188,6 +312,65 @@ func wasmMemoryLimitPages(memoryBytes int) uint32 {
 	return uint32(pages)
 }
 
+func wasmArtifactModule(artifact ArtifactRecord) ([]byte, error) {
+	if artifact.FilePath == "" {
+		return nil, errors.New("wasm artifact path is empty")
+	}
+	return os.ReadFile(artifact.FilePath)
+}
+
+func wasmUnpackPtrLen(value uint64) (uint32, uint32) {
+	return uint32(value >> 32), uint32(value)
+}
+
+func wasmManifestHasExtension(manifest Manifest, point string) bool {
+	for _, extension := range manifest.ExtensionPoints {
+		if extension.Key == point {
+			return true
+		}
+	}
+	return false
+}
+
+func wasmConfigJSON(config any) (json.RawMessage, error) {
+	switch typed := config.(type) {
+	case nil:
+		return json.RawMessage(`{}`), nil
+	case json.RawMessage:
+		return json.RawMessage(defaultJSONObject(string(typed))), nil
+	case []byte:
+		return json.RawMessage(defaultJSONObject(string(typed))), nil
+	case string:
+		return json.RawMessage(defaultJSONObject(typed)), nil
+	default:
+		data, err := json.Marshal(typed)
+		if err != nil {
+			return nil, err
+		}
+		return json.RawMessage(defaultJSONObject(string(data))), nil
+	}
+}
+
+func mergeWASMRuntimeDetails(details map[string]any, plugin api.Plugin) map[string]any {
+	wasmPlugin, ok := plugin.(*wasmHostedPlugin)
+	if !ok || wasmPlugin == nil {
+		return details
+	}
+	for key, value := range wasmPlugin.diagnosticsSummary() {
+		details[key] = value
+	}
+	return details
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func (m *Manager) RunWASMValidation(ctx context.Context, pluginID, artifactID, behavior string) error {
 	artifact, manifest, err := m.artifactManifest(ctx, pluginID, artifactID)
 	if err != nil {
@@ -259,7 +442,7 @@ func (a WASMAdapter) Prepare(ctx context.Context, artifact ArtifactRecord, plugi
 	}, nil
 }
 
-func (a WASMAdapter) Start(ctx context.Context, prepared RuntimePrepared, artifact ArtifactRecord, _ PluginRecord, _ *Gateway) (RuntimeInstance, error) {
+func (a WASMAdapter) Start(ctx context.Context, prepared RuntimePrepared, artifact ArtifactRecord, pluginRecord PluginRecord, gateway *Gateway) (RuntimeInstance, error) {
 	var manifest Manifest
 	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err != nil {
 		return RuntimeInstance{}, err
@@ -271,18 +454,39 @@ func (a WASMAdapter) Start(ctx context.Context, prepared RuntimePrepared, artifa
 	if err := validateWASMArtifactABI(ctx, artifact, manifest); err != nil {
 		return RuntimeInstance{}, err
 	}
+	module, err := wasmArtifactModule(artifact)
+	if err != nil {
+		return RuntimeInstance{}, err
+	}
+	configJSON := json.RawMessage(defaultJSONObject(pluginRecord.ConfigJSON))
+	plugin := &wasmHostedPlugin{
+		runner:     runner,
+		manifest:   manifest,
+		artifact:   artifact,
+		pluginID:   pluginRecord.ID,
+		module:     module,
+		configJSON: append(json.RawMessage(nil), configJSON...),
+	}
+	if err := plugin.validateConfig(ctx, configJSON); err != nil {
+		return RuntimeInstance{}, err
+	}
+	if gateway != nil {
+		if err := plugin.Init(gateway); err != nil {
+			return RuntimeInstance{}, err
+		}
+	}
 	return RuntimeInstance{
 		RuntimePrepared: prepared,
-		Plugin:          wasmHostedPlugin{runner: runner, manifest: manifest, artifact: artifact},
+		Plugin:          plugin,
 		StartedAt:       time.Now().Unix(),
 	}, nil
 }
 
-func (a WASMAdapter) HealthCheck(_ context.Context, _ RuntimeInstance) RuntimeHealth {
+func (a WASMAdapter) HealthCheck(_ context.Context, instance RuntimeInstance) RuntimeHealth {
 	return RuntimeHealth{
 		OK:     true,
 		Status: RuntimeEnabled,
-		Details: map[string]any{
+		Details: mergeWASMRuntimeDetails(map[string]any{
 			"host_abi":                wasmHostABIV1,
 			"exports":                 wasmABIExportMap(),
 			"imports":                 wasmABIImportMap(),
@@ -290,12 +494,25 @@ func (a WASMAdapter) HealthCheck(_ context.Context, _ RuntimeInstance) RuntimeHe
 			"default_filesystem":      "none",
 			"default_network":         "none",
 			"low_risk_extension_only": true,
-		},
+		}, instance.Plugin),
 		CheckedAt: time.Now().Unix(),
 	}
 }
 
-func (a WASMAdapter) ReloadConfig(context.Context, RuntimeInstance, string) error { return nil }
+func (a WASMAdapter) ReloadConfig(ctx context.Context, instance RuntimeInstance, configJSON string) error {
+	plugin, ok := instance.Plugin.(*wasmHostedPlugin)
+	if !ok || plugin == nil {
+		return nil
+	}
+	next := json.RawMessage(defaultJSONObject(configJSON))
+	if err := plugin.validateConfig(ctx, next); err != nil {
+		return err
+	}
+	plugin.mu.Lock()
+	plugin.configJSON = append(json.RawMessage(nil), next...)
+	plugin.mu.Unlock()
+	return nil
+}
 
 func (a WASMAdapter) Drain(context.Context, RuntimeInstance) error { return nil }
 
@@ -308,7 +525,7 @@ func (a WASMAdapter) Diagnostics(_ context.Context, instance RuntimeInstance) Ru
 		Runtime:    instance.Runtime,
 		Mode:       instance.Mode,
 		State:      RuntimeEnabled,
-		Details: map[string]any{
+		Details: mergeWASMRuntimeDetails(map[string]any{
 			"host_abi":                   wasmHostABIV1,
 			"exports":                    wasmABIExportMap(),
 			"imports":                    wasmABIImportMap(),
@@ -317,18 +534,204 @@ func (a WASMAdapter) Diagnostics(_ context.Context, instance RuntimeInstance) Ru
 			"memory_limit":               true,
 			"default_filesystem":         "none",
 			"default_network":            "none",
-		},
+		}, instance.Plugin),
 		CreatedAt: time.Now().Unix(),
 	}
 }
 
-func (p wasmHostedPlugin) Init(api.Gateway) error { return nil }
+func (a WASMAdapter) DryRunConfig(ctx context.Context, artifact ArtifactRecord, pluginRecord PluginRecord) error {
+	var manifest Manifest
+	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err != nil {
+		return err
+	}
+	runner := a.Runner
+	if runner == nil {
+		runner = NewWASMRunner()
+	}
+	if err := validateWASMArtifactABI(ctx, artifact, manifest); err != nil {
+		return err
+	}
+	module, err := wasmArtifactModule(artifact)
+	if err != nil {
+		return err
+	}
+	plugin := &wasmHostedPlugin{
+		runner:   runner,
+		manifest: manifest,
+		artifact: artifact,
+		pluginID: pluginRecord.ID,
+		module:   module,
+	}
+	return plugin.validateConfig(ctx, json.RawMessage(defaultJSONObject(pluginRecord.ConfigJSON)))
+}
 
-func (p wasmHostedPlugin) Destroy() error { return nil }
+func (p *wasmHostedPlugin) Init(gateway api.Gateway) error {
+	for _, point := range p.manifest.ExtensionPoints {
+		switch point.Key {
+		case ExtensionRuleEvaluate:
+			if err := api.RegisterHookHandler(
+				gateway,
+				api.HookRuleEvaluate,
+				func(api.RuleEvaluateRequest) bool { return true },
+				p.evaluateRule,
+			); err != nil {
+				return err
+			}
+		case ExtensionRouteResolve:
+			if err := api.RegisterHookHandler(
+				gateway,
+				api.HookRouteResolve,
+				func(api.RouteResolveRequest) bool { return true },
+				p.resolveRoute,
+			); err != nil {
+				return err
+			}
+		case ExtensionConfigValidate:
+		default:
+			return fmt.Errorf("wasm extension point %q is not supported by contained validation", point.Key)
+		}
+	}
+	return nil
+}
 
-func (p wasmHostedPlugin) NewConfigObj() any { return struct{}{} }
+func (p *wasmHostedPlugin) Destroy() error { return nil }
 
-func (p wasmHostedPlugin) ReloadConfig(any) error { return nil }
+func (p *wasmHostedPlugin) NewConfigObj() any { return json.RawMessage(`{}`) }
+
+func (p *wasmHostedPlugin) ReloadConfig(config any) error {
+	configJSON, err := wasmConfigJSON(config)
+	if err != nil {
+		return err
+	}
+	if err := p.validateConfig(context.Background(), configJSON); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	p.configJSON = append(json.RawMessage(nil), configJSON...)
+	p.mu.Unlock()
+	return nil
+}
+
+func (p *wasmHostedPlugin) validateConfig(ctx context.Context, configJSON json.RawMessage) error {
+	if p == nil || !wasmManifestHasExtension(p.manifest, ExtensionConfigValidate) {
+		return nil
+	}
+	resp, err := p.dispatch(ctx, ExtensionConfigValidate, WASMABIRequest{
+		Config: append(json.RawMessage(nil), configJSON...),
+	})
+	if err != nil {
+		return err
+	}
+	if resp.Valid == nil || !*resp.Valid {
+		reason := resp.Reason
+		if reason == "" {
+			reason = "wasm config validation failed"
+		}
+		err := fmt.Errorf("wasm config validation failed: %s", reason)
+		p.recordDispatch(ExtensionConfigValidate, err)
+		return err
+	}
+	return nil
+}
+
+func (p *wasmHostedPlugin) evaluateRule(req api.RuleEvaluateRequest) (api.RuleEvaluateDecision, error) {
+	contextJSON, err := json.Marshal(req)
+	if err != nil {
+		return api.RuleEvaluateDecision{}, err
+	}
+	resp, err := p.dispatch(req.Context, ExtensionRuleEvaluate, WASMABIRequest{
+		RuleContext: contextJSON,
+	})
+	if err != nil {
+		return api.RuleEvaluateDecision{}, err
+	}
+	decision := api.RuleEvaluateDecision{
+		Allow:      resp.Decision == "allow",
+		Deny:       resp.Decision == "deny",
+		Reject:     resp.Decision == "deny",
+		Reason:     resp.Reason,
+		ProviderID: p.pluginID,
+	}
+	if decision.Reason == "" {
+		decision.Reason = "wasm rule decision"
+	}
+	return decision, nil
+}
+
+func (p *wasmHostedPlugin) resolveRoute(req api.RouteResolveRequest) (api.RouteDecision, error) {
+	contextJSON, err := json.Marshal(req)
+	if err != nil {
+		return api.RouteDecision{}, err
+	}
+	resp, err := p.dispatch(req.Context, ExtensionRouteResolve, WASMABIRequest{
+		RouteContext: contextJSON,
+		Host:         req.Host,
+		Source:       req.SourceAddr,
+	})
+	if err != nil {
+		return api.RouteDecision{}, api.ErrPass
+	}
+	switch resp.Decision {
+	case "use_default":
+		return api.RouteDecision{Action: api.RouteDecisionPass, ProviderID: p.pluginID, Reason: firstNonEmpty(resp.Reason, "wasm route pass")}, nil
+	case "override":
+		return api.RouteDecision{Action: api.RouteDecisionOverride, Upstream: resp.Route, Host: req.Host, ProviderID: p.pluginID, Reason: firstNonEmpty(resp.Reason, "wasm route override")}, nil
+	case "reject":
+		return api.RouteDecision{Action: api.RouteDecisionReject, Host: req.Host, ProviderID: p.pluginID, Reason: firstNonEmpty(resp.Reason, "wasm route reject")}, nil
+	default:
+		return api.RouteDecision{}, api.ErrPass
+	}
+}
+
+func (p *wasmHostedPlugin) dispatch(ctx context.Context, point string, req WASMABIRequest) (WASMABIResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	resp, err := p.runner.Dispatch(ctx, WASMDispatchInvocation{
+		ArtifactID:     p.artifact.ID,
+		PluginID:       p.pluginID,
+		Module:         p.module,
+		Manifest:       p.manifest,
+		ExtensionPoint: point,
+		Request:        req,
+		Timeout:        wasmTimeout(p.manifest),
+		MemoryBytes:    p.manifest.RuntimeLimits.MemoryBytes,
+		MaxOutputBytes: wasmABIMaxOutputBytes,
+	})
+	p.recordDispatch(point, err)
+	return resp, err
+}
+
+func (p *wasmHostedPlugin) recordDispatch(point string, err error) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lastPoint = point
+	p.lastAt = time.Now().Unix()
+	if err != nil {
+		p.lastOK = false
+		p.lastError = err.Error()
+		return
+	}
+	p.lastOK = true
+	p.lastError = ""
+}
+
+func (p *wasmHostedPlugin) diagnosticsSummary() map[string]any {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return map[string]any{
+		"last_extension_point": p.lastPoint,
+		"last_error":           p.lastError,
+		"last_dispatch_at":     p.lastAt,
+		"last_dispatch_ok":     p.lastOK,
+	}
+}
 
 func wasmABIExportMap() map[string]string {
 	return map[string]string{
