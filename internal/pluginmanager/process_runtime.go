@@ -49,13 +49,7 @@ func (a GoPluginProcessAdapter) Prepare(ctx context.Context, artifact ArtifactRe
 	if err := a.ValidateArtifact(ctx, artifact); err != nil {
 		return RuntimePrepared{}, err
 	}
-	return RuntimePrepared{
-		PluginID:   pluginRecord.ID,
-		ArtifactID: artifact.ID,
-		Runtime:    artifact.RuntimeType,
-		Mode:       PluginServiceModeGoPluginProcess,
-		PreparedAt: time.Now().Unix(),
-	}, nil
+	return runtimePreparedFor(artifact, pluginRecord, PluginServiceModeGoPluginProcess), nil
 }
 
 func (a GoPluginProcessAdapter) Start(ctx context.Context, prepared RuntimePrepared, artifact ArtifactRecord, pluginRecord PluginRecord, gateway *Gateway) (RuntimeInstance, error) {

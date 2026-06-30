@@ -296,22 +296,49 @@ ORDER BY priority ASC, id ASC`)
 }
 
 func (r Repository) MarkRuntime(ctx context.Context, pluginID, runtimeState, activeArtifactID, loadedArtifactID string, appliedGeneration int64, lastError string, runtimeSummary, dispatchSummary any) error {
+	_, err := r.markRuntime(ctx, pluginID, runtimeState, activeArtifactID, loadedArtifactID, appliedGeneration, lastError, runtimeSummary, dispatchSummary, 0)
+	return err
+}
+
+func (r Repository) MarkRuntimeIfDesiredGeneration(ctx context.Context, pluginID string, desiredGeneration int64, runtimeState, activeArtifactID, loadedArtifactID string, appliedGeneration int64, lastError string, runtimeSummary, dispatchSummary any) (bool, error) {
+	if desiredGeneration <= 0 {
+		if err := r.MarkRuntime(ctx, pluginID, runtimeState, activeArtifactID, loadedArtifactID, appliedGeneration, lastError, runtimeSummary, dispatchSummary); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	result, err := r.markRuntime(ctx, pluginID, runtimeState, activeArtifactID, loadedArtifactID, appliedGeneration, lastError, runtimeSummary, dispatchSummary, desiredGeneration)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
+}
+
+func (r Repository) markRuntime(ctx context.Context, pluginID, runtimeState, activeArtifactID, loadedArtifactID string, appliedGeneration int64, lastError string, runtimeSummary, dispatchSummary any, desiredGeneration int64) (sql.Result, error) {
 	now := r.now().Unix()
 	runtimeJSON, err := marshalDefaultObject(runtimeSummary)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	dispatchJSON, err := marshalDefaultObject(dispatchSummary)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	_, err = r.db.ExecContext(ctx, `
+	query := `
 UPDATE plugins
 SET runtime_state = ?, active_artifact_id = ?, loaded_artifact_id = ?, applied_generation = ?,
     last_error = ?, runtime_summary_json = ?, dispatch_summary_json = ?, updated_at = ?
-WHERE id = ?`,
-		runtimeState, activeArtifactID, loadedArtifactID, appliedGeneration, lastError, runtimeJSON, dispatchJSON, now, pluginID)
-	return err
+WHERE id = ?`
+	args := []any{runtimeState, activeArtifactID, loadedArtifactID, appliedGeneration, lastError, runtimeJSON, dispatchJSON, now, pluginID}
+	if desiredGeneration > 0 {
+		query += ` AND desired_generation = ?`
+		args = append(args, desiredGeneration)
+	}
+	return r.db.ExecContext(ctx, query, args...)
 }
 
 func (r Repository) PluginServiceState(ctx context.Context) (PluginServiceState, error) {

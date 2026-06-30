@@ -3,6 +3,7 @@ package pluginmanager
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -305,6 +306,180 @@ func TestSandboxManagerDispatchInvokesFakeControlPeer(t *testing.T) {
 	}
 	if got := peer.invokeCount(ExtensionRouteResolve); got != beforeDisable {
 		t.Fatalf("route invoke count after disable = %d, want unchanged %d", got, beforeDisable)
+	}
+}
+
+func TestSandboxRestartRecoveryRestoresEnabledPluginsByPriority(t *testing.T) {
+	registrations := []SandboxHandlerRegistration{
+		{ExtensionPoint: ExtensionRouteResolve, HandlerID: "route-main", FailPolicy: api.FailPolicyOpen, TimeoutMS: 1000, SchemaVersion: 1},
+	}
+	db := openPluginManagerTestDB(t)
+	root := t.TempDir()
+	first := newSandboxDispatchManagerWithDBForTest(t, db, root, &fakeSandboxControlPeer{}, registrations)
+	failedArtifact := uploadSandboxDispatchArtifactForTest(t, first, "sandbox-recover-failed", registrations)
+	firstArtifact := uploadSandboxDispatchArtifactForTest(t, first, "sandbox-recover-a", registrations)
+	secondArtifact := uploadSandboxDispatchArtifactForTest(t, first, "sandbox-recover-b", registrations)
+	ctx := context.Background()
+	if _, err := first.SetDesired(ctx, "admin", failedArtifact.PluginID, failedArtifact.ID, DesiredEnabled, `{}`, 5); err != nil {
+		t.Fatalf("SetDesired(failed) error = %v", err)
+	}
+	if _, err := first.SetDesired(ctx, "admin", secondArtifact.PluginID, secondArtifact.ID, DesiredEnabled, `{}`, 20); err != nil {
+		t.Fatalf("SetDesired(second) error = %v", err)
+	}
+	if _, err := first.SetDesired(ctx, "admin", firstArtifact.PluginID, firstArtifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired(first) error = %v", err)
+	}
+
+	recoveryPeer := &fakeSandboxControlPeer{startErrs: map[string]error{failedArtifact.PluginID: errors.New("fake sandbox start failed")}}
+	second := newSandboxDispatchManagerWithDBForTest(t, db, root, recoveryPeer, registrations)
+	if err := second.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	gotOrder := strings.Join(recoveryPeer.startOrder(), ",")
+	wantOrder := strings.Join([]string{failedArtifact.PluginID, firstArtifact.PluginID, secondArtifact.PluginID}, ",")
+	if gotOrder != wantOrder {
+		t.Fatalf("sandbox recovery start order = %s, want %s", gotOrder, wantOrder)
+	}
+	failed, err := second.Plugin(ctx, failedArtifact.PluginID)
+	if err != nil {
+		t.Fatalf("Plugin(failed) error = %v", err)
+	}
+	if failed.RuntimeState != RuntimeFailed || !strings.Contains(failed.LastError, "fake sandbox start failed") {
+		t.Fatalf("failed plugin state = %+v, want failed start recorded", failed)
+	}
+	for _, artifact := range []ArtifactRecord{firstArtifact, secondArtifact} {
+		plugin, err := second.Plugin(ctx, artifact.PluginID)
+		if err != nil {
+			t.Fatalf("Plugin(%s) error = %v", artifact.PluginID, err)
+		}
+		if plugin.RuntimeState != RuntimeEnabled || plugin.ActiveArtifactID != artifact.ID {
+			t.Fatalf("recovered plugin = %+v, want enabled artifact %s", plugin, artifact.ID)
+		}
+	}
+}
+
+func TestSandboxOldGenerationRuntimeUpdateCannotOverwriteCurrentStatus(t *testing.T) {
+	registrations := []SandboxHandlerRegistration{
+		{ExtensionPoint: ExtensionRouteResolve, HandlerID: "route-main", FailPolicy: api.FailPolicyOpen, TimeoutMS: 1000, SchemaVersion: 1},
+	}
+	manager := newSandboxDispatchManagerForTest(t, &fakeSandboxControlPeer{}, registrations)
+	artifact := uploadSandboxDispatchArtifactForTest(t, manager, "sandbox-generation-fence", registrations)
+	ctx := context.Background()
+	first, err := manager.SetDesired(ctx, "admin", artifact.PluginID, artifact.ID, DesiredDisabled, `{"version":1}`, 10)
+	if err != nil {
+		t.Fatalf("SetDesired(first) error = %v", err)
+	}
+	second, err := manager.SetDesired(ctx, "admin", artifact.PluginID, artifact.ID, DesiredDisabled, `{"version":2}`, 10)
+	if err != nil {
+		t.Fatalf("SetDesired(second) error = %v", err)
+	}
+	updated, err := manager.repo.MarkRuntimeIfDesiredGeneration(ctx, artifact.PluginID, first.DesiredGeneration, RuntimeFailed, artifact.ID, artifact.ID, first.DesiredGeneration, "old generation failed late", map[string]any{"old_generation": true}, nil)
+	if err != nil {
+		t.Fatalf("MarkRuntimeIfDesiredGeneration(old) error = %v", err)
+	}
+	if updated {
+		t.Fatal("old generation runtime update unexpectedly matched current desired generation")
+	}
+	plugin, err := manager.Plugin(ctx, artifact.PluginID)
+	if err != nil {
+		t.Fatalf("Plugin() error = %v", err)
+	}
+	if plugin.DesiredGeneration != second.DesiredGeneration || plugin.RuntimeState == RuntimeFailed || plugin.LastError != "" {
+		t.Fatalf("plugin after old generation callback = %+v, want generation %d without failed overwrite", plugin, second.DesiredGeneration)
+	}
+}
+
+func TestSandboxReloadFailureKeepsCurrentRuntimeConfig(t *testing.T) {
+	registrations := []SandboxHandlerRegistration{
+		{ExtensionPoint: ExtensionConfigValidate, HandlerID: "config-main", FailPolicy: api.FailPolicyClose, TimeoutMS: 1000, SchemaVersion: 1},
+		{ExtensionPoint: ExtensionRouteResolve, HandlerID: "route-main", FailPolicy: api.FailPolicyOpen, TimeoutMS: 1000, SchemaVersion: 1},
+	}
+	peer := &fakeSandboxControlPeer{}
+	manager := newSandboxDispatchManagerForTest(t, peer, registrations)
+	artifact := uploadSandboxDispatchArtifactForTest(t, manager, "sandbox-reload-failure", registrations)
+	ctx := context.Background()
+	if _, err := manager.SetDesired(ctx, "admin", artifact.PluginID, artifact.ID, DesiredEnabled, `{"version":"active"}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	if _, err := manager.Enable(ctx, "admin", artifact.PluginID); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	before, err := manager.Plugin(ctx, artifact.PluginID)
+	if err != nil {
+		t.Fatalf("Plugin(before) error = %v", err)
+	}
+	summary := jsonMapFromJSONString(before.RuntimeSummaryJSON)
+	if metadataString(summary["runtime_plugin_id"]) != artifact.PluginID ||
+		metadataString(summary["runtime_artifact_id"]) != artifact.ID ||
+		metadataString(summary["runtime_instance_id"]) == "" ||
+		metadataString(summary["config_hash"]) != stableHashJSONRaw(`{"version":"active"}`) ||
+		metadataString(summary["runtime_limits_hash"]) == "" ||
+		metadataString(summary["capability_hash"]) == "" {
+		t.Fatalf("runtime summary = %+v, want sandbox instance binding hashes", summary)
+	}
+	loaded := manager.loaded[artifact.PluginID]
+	if loaded == nil {
+		t.Fatal("loaded sandbox plugin missing")
+	}
+	process := sandboxHostedPluginFromInstance(loaded.instance).process
+	if process == nil {
+		t.Fatal("loaded sandbox process missing")
+	}
+	oldConfig := process.ConfigJSON
+	peer.failNextReload()
+	next := before
+	next.ConfigJSON = `{"version":"rejected-live"}`
+	if err := manager.reloadLoadedRuntime(ctx, "admin", next, "test_reload_failure"); err == nil || !strings.Contains(err.Error(), "reload rejected") {
+		t.Fatalf("reloadLoadedRuntime() error = %v, want reload rejection", err)
+	}
+	if process.ConfigJSON != oldConfig {
+		t.Fatalf("sandbox process config = %s, want unchanged %s after reload failure", process.ConfigJSON, oldConfig)
+	}
+	after, err := manager.Plugin(ctx, artifact.PluginID)
+	if err != nil {
+		t.Fatalf("Plugin(after) error = %v", err)
+	}
+	if after.ActiveArtifactID != before.ActiveArtifactID || after.AppliedGeneration != before.AppliedGeneration || after.RuntimeState != before.RuntimeState {
+		t.Fatalf("plugin after reload failure = %+v, want active runtime unchanged from %+v", after, before)
+	}
+}
+
+func TestSandboxRollbackRerunsCurrentCapabilityGate(t *testing.T) {
+	registrations := []SandboxHandlerRegistration{
+		{ExtensionPoint: ExtensionRouteResolve, HandlerID: "route-main", FailPolicy: api.FailPolicyOpen, TimeoutMS: 1000, SchemaVersion: 1},
+	}
+	manager := newSandboxDispatchManagerForTest(t, &fakeSandboxControlPeer{}, registrations)
+	pluginID := "sandbox-rollback-capability"
+	oldArtifact := uploadTestArtifactWithManifestBytes(t, manager, pluginID, []byte("old sandbox rollback bytes"), func(manifest *Manifest) {
+		manifest.Runtime.Type = RuntimeSandbox
+		manifest.ExtensionPoints = []ExtensionPoint{{Type: "hook", Key: ExtensionRouteResolve}}
+		manifest.Capabilities = json.RawMessage(`{"extension_points":["route.resolve/v1"],"runtime":{"required_capabilities":["network.egress"]}}`)
+		manifest.RuntimeLimits.HandlerTimeoutMS = 1000
+	})
+	newArtifact := uploadTestArtifactWithManifestBytes(t, manager, pluginID, []byte("new sandbox rollback bytes"), func(manifest *Manifest) {
+		manifest.Runtime.Type = RuntimeSandbox
+		manifest.ExtensionPoints = []ExtensionPoint{{Type: "hook", Key: ExtensionRouteResolve}}
+		manifest.Capabilities = json.RawMessage(`{"extension_points":["route.resolve/v1"]}`)
+		manifest.RuntimeLimits.HandlerTimeoutMS = 1000
+	})
+	ctx := context.Background()
+	if _, err := manager.SetDesired(ctx, "admin", pluginID, oldArtifact.ID, DesiredDisabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired(old) error = %v", err)
+	}
+	current, err := manager.SetDesired(ctx, "admin", pluginID, newArtifact.ID, DesiredDisabled, `{}`, 10)
+	if err != nil {
+		t.Fatalf("SetDesired(new) error = %v", err)
+	}
+	manager.sandboxPolicy = normalizeSandboxPolicy(SandboxPolicy{CPUSeconds: 1, MemoryBytes: 8 * 1024 * 1024})
+	if _, err := manager.RollbackArtifact(ctx, "admin", pluginID, oldArtifact.ID); err == nil || !strings.Contains(err.Error(), "network.egress") {
+		t.Fatalf("RollbackArtifact() error = %v, want current capability gate block", err)
+	}
+	after, err := manager.Plugin(ctx, pluginID)
+	if err != nil {
+		t.Fatalf("Plugin(after rollback failure) error = %v", err)
+	}
+	if after.DesiredArtifactID != current.DesiredArtifactID || after.DesiredGeneration != current.DesiredGeneration {
+		t.Fatalf("plugin after blocked rollback = %+v, want desired artifact/generation unchanged from %+v", after, current)
 	}
 }
 
@@ -847,10 +1022,13 @@ func uploadSandboxStreamArtifactForTest(t *testing.T, manager *Manager, pluginID
 }
 
 type fakeSandboxControlPeer struct {
-	mu       sync.Mutex
-	mode     string
-	calls    []SandboxInvokeRequest
-	commands []string
+	mu             sync.Mutex
+	mode           string
+	calls          []SandboxInvokeRequest
+	commands       []string
+	starts         []string
+	reloadFailures int
+	startErrs      map[string]error
 }
 
 func (p *fakeSandboxControlPeer) invoke(ctx context.Context, _ string, req SandboxControlRequest) (SandboxControlResponse, error) {
@@ -874,6 +1052,18 @@ func (p *fakeSandboxControlPeer) invoke(ctx context.Context, _ string, req Sandb
 		OK:                true,
 	}
 	if req.Command == sandboxControlCommandReloadConfig {
+		p.mu.Lock()
+		failReload := p.reloadFailures > 0
+		if failReload {
+			p.reloadFailures--
+		}
+		p.mu.Unlock()
+		if failReload {
+			return setSandboxControlError(resp, sandboxControlErrorSchemaInvalid, "reload rejected by fake sandbox"), nil
+		}
+		return resp, nil
+	}
+	if req.Command == sandboxControlCommandDrain {
 		return resp, nil
 	}
 	if req.Command != sandboxControlCommandInvoke {
@@ -954,20 +1144,53 @@ func (p *fakeSandboxControlPeer) commandCount(command string) int {
 	return count
 }
 
+func (p *fakeSandboxControlPeer) recordStart(pluginID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.starts = append(p.starts, pluginID)
+}
+
+func (p *fakeSandboxControlPeer) startOrder() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.starts...)
+}
+
+func (p *fakeSandboxControlPeer) failNextReload() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.reloadFailures++
+}
+
 func newSandboxDispatchManagerForTest(t *testing.T, peer *fakeSandboxControlPeer, registrations []SandboxHandlerRegistration) *Manager {
+	t.Helper()
+	return newSandboxDispatchManagerWithDBForTest(t, openPluginManagerTestDB(t), t.TempDir(), peer, registrations)
+}
+
+func newSandboxDispatchManagerWithDBForTest(t *testing.T, db *sql.DB, artifactRoot string, peer *fakeSandboxControlPeer, registrations []SandboxHandlerRegistration) *Manager {
 	t.Helper()
 	policy := SandboxPolicy{CPUSeconds: 1, MemoryBytes: 8 * 1024 * 1024, ExternalIsolation: true}
 	manager := New(Options{
-		DB:                 openPluginManagerTestDB(t),
-		ArtifactRoot:       t.TempDir(),
+		DB:                 db,
+		ArtifactRoot:       artifactRoot,
 		FutureRuntimeGates: FutureRuntimeGates{SandboxProcess: true},
 		SandboxSelfCheck:   func(SandboxPolicy) error { return nil },
 		SandboxPolicy:      policy,
 	})
+	if _, err := manager.SetPluginServiceDesired(context.Background(), "admin", PluginServiceModeSandboxProcess); err != nil {
+		t.Fatalf("SetPluginServiceDesired(sandbox) error = %v", err)
+	}
+	if err := manager.ApplyPluginServiceMode(context.Background()); err != nil {
+		t.Fatalf("ApplyPluginServiceMode(sandbox) error = %v", err)
+	}
 	manager.adapter = SandboxProcessAdapter{
 		Policy:    policy,
 		SelfCheck: func(SandboxPolicy) error { return nil },
 		startProcess: func(_ context.Context, _ SandboxSupervisor, pluginID, artifactID, _ string, generation int64, configJSON string, _ SandboxSecretResolver) (*SandboxProcess, error) {
+			peer.recordStart(pluginID)
+			if peer.startErrs != nil && peer.startErrs[pluginID] != nil {
+				return nil, peer.startErrs[pluginID]
+			}
 			process := newSandboxControlProcessForTest(pluginID, artifactID, generation, configJSON)
 			process.SocketPath = "fake-sandbox-control.sock"
 			process.Registrations = append([]SandboxHandlerRegistration(nil), registrations...)

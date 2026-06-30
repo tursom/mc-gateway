@@ -967,7 +967,7 @@ func (m *Manager) Enable(ctx context.Context, actor, pluginID string) (PluginRec
 	}
 	decision, err := m.EvaluateReleaseGate(ctx, pluginID, pluginRecord.DesiredArtifactID, GovernanceActionEnable, m.currentPolicyProfile(), pluginRecord.ConfigJSON)
 	if err != nil {
-		_ = m.repo.MarkRuntime(ctx, pluginID, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"governance": decision}, nil)
+		_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginID, pluginRecord.DesiredGeneration, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"governance": decision}, nil)
 		m.recordPluginNodeRuntimeState(ctx, pluginID)
 		_ = m.repo.RecordOperation(ctx, pluginID, pluginRecord.DesiredArtifactID, "enable_gate", "failed", actor, err.Error(), map[string]any{
 			"decision": decision,
@@ -987,7 +987,7 @@ func (m *Manager) Enable(ctx context.Context, actor, pluginID string) (PluginRec
 	}
 	if len(loaded.handlers) == 0 && loaded.extensions.empty() {
 		err := fmt.Errorf("plugin %q did not register any supported extension point", pluginID)
-		_ = m.repo.MarkRuntime(ctx, pluginID, RuntimeFailed, "", loaded.artifact.ID, pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
+		_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginID, pluginRecord.DesiredGeneration, RuntimeFailed, "", loaded.artifact.ID, pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
 		m.recordPluginNodeRuntimeStateLocked(ctx, pluginID)
 		_ = m.repo.RecordOperation(ctx, pluginID, pluginRecord.DesiredArtifactID, "enable", "failed", actor, err.Error(), nil)
 		return PluginRecord{}, err
@@ -1064,7 +1064,7 @@ func (m *Manager) Disable(ctx context.Context, actor, pluginID string) (PluginRe
 		runtimeState = RuntimeDraining
 	}
 	delete(m.loaded, pluginID)
-	if err := m.repo.MarkRuntime(ctx, pluginID, runtimeState, "", "", pluginRecord.DesiredGeneration, "", map[string]any{
+	if _, err := m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginID, pluginRecord.DesiredGeneration, runtimeState, "", "", pluginRecord.DesiredGeneration, "", map[string]any{
 		"active_proxy_connections": m.activeProxyCountLocked(pluginID),
 	}, nil); err != nil {
 		return PluginRecord{}, err
@@ -1114,7 +1114,7 @@ func (m *Manager) stopRuntimeInstance(ctx context.Context, loaded *loadedPlugin)
 			errs = append(errs, err)
 		}
 	}
-	if lifecycle, ok := m.adapter.(RuntimeAdapterLifecycle); ok {
+	if lifecycle, ok := m.runtimeAdapterForArtifact(loaded.artifact).(RuntimeAdapterLifecycle); ok {
 		if err := lifecycle.Stop(ctx, loaded.runtime); err != nil {
 			errs = append(errs, err)
 		}
@@ -1126,7 +1126,7 @@ func (m *Manager) stopRuntimeInstance(ctx context.Context, loaded *loadedPlugin)
 }
 
 func (m *Manager) drainRuntimeInstance(ctx context.Context, loaded *loadedPlugin) []error {
-	if lifecycle, ok := m.adapter.(RuntimeAdapterLifecycle); ok {
+	if lifecycle, ok := m.runtimeAdapterForArtifact(loaded.artifact).(RuntimeAdapterLifecycle); ok {
 		if err := lifecycle.Drain(ctx, loaded.runtime); err != nil {
 			return []error{err}
 		}
@@ -1188,21 +1188,21 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 		// 单个插件失败不阻断其他插件收敛；失败会记录到 runtime_state 和操作日志。
 		decision, err := m.EvaluateReleaseGate(ctx, pluginRecord.ID, pluginRecord.DesiredArtifactID, GovernanceActionEnable, m.currentPolicyProfile(), pluginRecord.ConfigJSON)
 		if err != nil {
-			_ = m.repo.MarkRuntime(ctx, pluginRecord.ID, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"governance": decision}, nil)
+			_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginRecord.ID, pluginRecord.DesiredGeneration, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"governance": decision}, nil)
 			m.recordPluginNodeRuntimeStateLocked(ctx, pluginRecord.ID)
 			_ = m.repo.RecordOperation(ctx, pluginRecord.ID, pluginRecord.DesiredArtifactID, "reconcile_gate", "failed", "system", err.Error(), map[string]any{"decision": decision})
 			continue
 		}
 		loaded, err := m.loadLocked(ctx, pluginRecord)
 		if err != nil {
-			_ = m.repo.MarkRuntime(ctx, pluginRecord.ID, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
+			_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginRecord.ID, pluginRecord.DesiredGeneration, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
 			m.recordPluginNodeRuntimeStateLocked(ctx, pluginRecord.ID)
 			_ = m.repo.RecordOperation(ctx, pluginRecord.ID, pluginRecord.DesiredArtifactID, "reconcile", "failed", "system", err.Error(), nil)
 			continue
 		}
 		if len(loaded.handlers) == 0 && loaded.extensions.empty() {
 			err := fmt.Errorf("plugin %q did not register any supported extension point", pluginRecord.ID)
-			_ = m.repo.MarkRuntime(ctx, pluginRecord.ID, RuntimeFailed, "", loaded.artifact.ID, pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
+			_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginRecord.ID, pluginRecord.DesiredGeneration, RuntimeFailed, "", loaded.artifact.ID, pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
 			m.recordPluginNodeRuntimeStateLocked(ctx, pluginRecord.ID)
 			_ = m.repo.RecordOperation(ctx, pluginRecord.ID, pluginRecord.DesiredArtifactID, "reconcile", "failed", "system", err.Error(), nil)
 			continue
@@ -2248,21 +2248,21 @@ func (m *Manager) loadLocked(ctx context.Context, pluginRecord PluginRecord) (*l
 		return nil, err
 	}
 	if err := m.validateArtifactGate(artifact); err != nil {
-		_ = m.repo.MarkRuntime(ctx, pluginRecord.ID, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
+		_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginRecord.ID, pluginRecord.DesiredGeneration, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
 		m.recordPluginNodeRuntimeStateLocked(ctx, pluginRecord.ID)
 		return nil, err
 	}
 
 	var manifest Manifest
 	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err != nil {
-		_ = m.repo.MarkRuntime(ctx, pluginRecord.ID, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
+		_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginRecord.ID, pluginRecord.DesiredGeneration, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
 		m.recordPluginNodeRuntimeStateLocked(ctx, pluginRecord.ID)
 		return nil, err
 	}
 	gateway := NewGateway(pluginRecord.ID, m.handleConn, m.wg, m.operations.ForPlugin(pluginRecord.ID, artifact.ID, manifest))
 	runtimeInstance, err := m.startRuntimeInstance(ctx, artifact, pluginRecord, gateway)
 	if err != nil {
-		_ = m.repo.MarkRuntime(ctx, pluginRecord.ID, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
+		_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginRecord.ID, pluginRecord.DesiredGeneration, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
 		m.recordPluginNodeRuntimeStateLocked(ctx, pluginRecord.ID)
 		return nil, err
 	}
@@ -2283,8 +2283,14 @@ func (m *Manager) loadLocked(ctx context.Context, pluginRecord PluginRecord) (*l
 		wasmPlugin.onRepeatedTrapQuarantine = m.handleWASMRepeatedTrapQuarantine
 	}
 	m.loaded[pluginRecord.ID] = loaded
-	if err := m.repo.MarkRuntime(ctx, pluginRecord.ID, RuntimeLoaded, "", artifact.ID, pluginRecord.AppliedGeneration, "", m.loadedRuntimeSummary(loaded), loaded.dispatchSummaries()); err != nil {
+	updated, err := m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginRecord.ID, pluginRecord.DesiredGeneration, RuntimeLoaded, "", artifact.ID, pluginRecord.AppliedGeneration, "", m.loadedRuntimeSummary(loaded), loaded.dispatchSummaries())
+	if err != nil {
 		return nil, err
+	}
+	if !updated {
+		delete(m.loaded, pluginRecord.ID)
+		_ = m.stopRuntimeInstance(ctx, loaded)
+		return nil, errors.New("runtime desired generation changed before load completed")
 	}
 	m.recordPluginNodeRuntimeStateLocked(ctx, pluginRecord.ID)
 	m.operations.StartTasks(pluginRecord.ID)
@@ -2327,16 +2333,28 @@ func (m *Manager) startRuntimeInstance(ctx context.Context, artifact ArtifactRec
 		return RuntimeInstance{}, errors.New("runtime adapter returned nil plugin instance")
 	}
 	return RuntimeInstance{
-		RuntimePrepared: RuntimePrepared{
-			PluginID:   pluginRecord.ID,
-			ArtifactID: artifact.ID,
-			Runtime:    artifact.RuntimeType,
-			Mode:       m.serviceMode,
-			PreparedAt: time.Now().Unix(),
-		},
-		Plugin:    instance,
-		StartedAt: time.Now().Unix(),
+		RuntimePrepared: runtimePreparedFor(artifact, pluginRecord, m.serviceMode),
+		Plugin:          instance,
+		StartedAt:       time.Now().Unix(),
 	}, nil
+}
+
+func runtimePreparedFor(artifact ArtifactRecord, pluginRecord PluginRecord, serviceMode string) RuntimePrepared {
+	prepared := RuntimePrepared{
+		PluginID:          pluginRecord.ID,
+		ArtifactID:        artifact.ID,
+		DesiredGeneration: pluginRecord.DesiredGeneration,
+		ConfigHash:        stableHashJSONRaw(defaultJSONObject(pluginRecord.ConfigJSON)),
+		Runtime:           artifact.RuntimeType,
+		Mode:              serviceMode,
+		PreparedAt:        time.Now().Unix(),
+	}
+	var manifest Manifest
+	if json.Unmarshal([]byte(artifact.MetadataJSON), &manifest) == nil {
+		prepared.RuntimeLimitsHash = stableHash(manifest.RuntimeLimits)
+		prepared.CapabilityHash = stableHashJSONRaw(defaultJSONObject(string(manifest.Capabilities)))
+	}
+	return prepared
 }
 
 func (m *Manager) runtimeAdapterForArtifact(artifact ArtifactRecord) RuntimeAdapter {
@@ -2493,6 +2511,14 @@ func (m *Manager) reloadLoadedRuntime(ctx context.Context, actor string, plugin 
 	adapter := m.runtimeAdapterForArtifact(loaded.artifact)
 	lifecycle, ok := adapter.(RuntimeAdapterLifecycle)
 	metadata := runtimeReloadMetadata(loaded, plugin, reason)
+	current, currentErr := m.repo.Plugin(ctx, plugin.ID)
+	if currentErr == nil && (current.DesiredGeneration != plugin.DesiredGeneration || current.DesiredArtifactID != plugin.DesiredArtifactID) {
+		metadata["stale_runtime_generation"] = true
+		metadata["current_generation"] = current.DesiredGeneration
+		m.mu.Unlock()
+		_ = m.repo.RecordOperation(ctx, plugin.ID, plugin.DesiredArtifactID, "reload", "skipped", actor, "stale runtime generation skipped", metadata)
+		return nil
+	}
 	if !ok {
 		m.mu.Unlock()
 		_ = m.repo.RecordOperation(ctx, plugin.ID, loaded.artifact.ID, "reload", "skipped", actor, "runtime adapter does not support reload", metadata)
@@ -2515,8 +2541,8 @@ func (m *Manager) reloadLoadedRuntime(ctx context.Context, actor string, plugin 
 	if loaded.runtime.HostProcess != nil {
 		summary["plugin_host"] = m.hostSummary(loaded.record.ID)
 	}
-	err := m.repo.MarkRuntime(ctx, plugin.ID, RuntimeEnabled, loaded.artifact.ID, loaded.artifact.ID, plugin.DesiredGeneration, "", summary, loaded.dispatchSummaries())
-	if err == nil {
+	updated, err := m.repo.MarkRuntimeIfDesiredGeneration(ctx, plugin.ID, plugin.DesiredGeneration, RuntimeEnabled, loaded.artifact.ID, loaded.artifact.ID, plugin.DesiredGeneration, "", summary, loaded.dispatchSummaries())
+	if err == nil && updated {
 		m.recordPluginNodeRuntimeStateLocked(ctx, plugin.ID)
 	}
 	m.mu.Unlock()
@@ -2524,6 +2550,11 @@ func (m *Manager) reloadLoadedRuntime(ctx context.Context, actor string, plugin 
 		metadata["last_error"] = redactSensitive(err.Error())
 		_ = m.repo.RecordOperation(ctx, plugin.ID, loaded.artifact.ID, "reload", "failed", actor, "runtime reload state update failed", metadata)
 		return err
+	}
+	if !updated {
+		metadata["stale_runtime_generation"] = true
+		_ = m.repo.RecordOperation(ctx, plugin.ID, loaded.artifact.ID, "reload", "skipped", actor, "stale runtime generation skipped", metadata)
+		return nil
 	}
 	metadata["applied_generation"] = plugin.DesiredGeneration
 	_ = m.repo.RecordOperation(ctx, plugin.ID, loaded.artifact.ID, "reload", "succeeded", actor, "runtime config reloaded", metadata)
@@ -2558,8 +2589,12 @@ func (m *Manager) markEnabled(ctx context.Context, loaded *loadedPlugin) error {
 	m.markHostStarted(loaded.record.ID, loaded.artifact.ID, loaded.runtime.HostProcess)
 	summary := m.loadedRuntimeSummary(loaded)
 	summary["plugin_host"] = m.hostSummary(loaded.record.ID)
-	if err := m.repo.MarkRuntime(ctx, loaded.record.ID, RuntimeEnabled, loaded.artifact.ID, loaded.artifact.ID, loaded.record.DesiredGeneration, "", summary, loaded.dispatchSummaries()); err != nil {
+	updated, err := m.repo.MarkRuntimeIfDesiredGeneration(ctx, loaded.record.ID, loaded.record.DesiredGeneration, RuntimeEnabled, loaded.artifact.ID, loaded.artifact.ID, loaded.record.DesiredGeneration, "", summary, loaded.dispatchSummaries())
+	if err != nil {
 		return err
+	}
+	if !updated {
+		return errors.New("runtime desired generation changed before enable completed")
 	}
 	m.recordPluginNodeRuntimeStateLocked(ctx, loaded.record.ID)
 	return nil
@@ -2571,6 +2606,27 @@ func (m *Manager) loadedRuntimeSummary(loaded *loadedPlugin) map[string]any {
 		"extension_count": loaded.extensions.count(),
 		"service_mode":    m.serviceMode,
 		"runtime_type":    loaded.artifact.RuntimeType,
+	}
+	if loaded.runtime.PluginID != "" {
+		summary["runtime_plugin_id"] = loaded.runtime.PluginID
+	}
+	if loaded.runtime.ArtifactID != "" {
+		summary["runtime_artifact_id"] = loaded.runtime.ArtifactID
+	}
+	if loaded.runtime.RuntimeInstanceID != "" {
+		summary["runtime_instance_id"] = loaded.runtime.RuntimeInstanceID
+	}
+	if loaded.runtime.DesiredGeneration != 0 {
+		summary["desired_generation"] = loaded.runtime.DesiredGeneration
+	}
+	if loaded.runtime.ConfigHash != "" {
+		summary["config_hash"] = loaded.runtime.ConfigHash
+	}
+	if loaded.runtime.RuntimeLimitsHash != "" {
+		summary["runtime_limits_hash"] = loaded.runtime.RuntimeLimitsHash
+	}
+	if loaded.runtime.CapabilityHash != "" {
+		summary["capability_hash"] = loaded.runtime.CapabilityHash
 	}
 	if wasmPlugin, ok := loaded.instance.(*wasmHostedPlugin); ok && wasmPlugin != nil {
 		for key, value := range wasmPlugin.diagnosticsSummary() {

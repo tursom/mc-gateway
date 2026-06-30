@@ -671,13 +671,31 @@ func (a SandboxProcessAdapter) Prepare(ctx context.Context, artifact ArtifactRec
 	if err := a.ValidateArtifact(ctx, artifact); err != nil {
 		return RuntimePrepared{}, err
 	}
-	return RuntimePrepared{
-		PluginID:   pluginRecord.ID,
-		ArtifactID: artifact.ID,
-		Runtime:    artifact.RuntimeType,
-		Mode:       PluginServiceModeSandboxProcess,
-		PreparedAt: time.Now().Unix(),
-	}, nil
+	if pluginRecord.ID != "" && artifact.PluginID != "" && pluginRecord.ID != artifact.PluginID {
+		return RuntimePrepared{}, errors.New("artifact plugin_id does not match")
+	}
+	if pluginRecord.DesiredArtifactID != "" && pluginRecord.DesiredArtifactID != artifact.ID {
+		return RuntimePrepared{}, errors.New("desired artifact_id does not match")
+	}
+	var manifest Manifest
+	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err != nil {
+		return RuntimePrepared{}, fmt.Errorf("decode sandbox manifest: %w", err)
+	}
+	if err := validateSandboxArtifactMetadata(artifact, manifest); err != nil {
+		return RuntimePrepared{}, err
+	}
+	caps := requiredRuntimeCapabilities(artifact)
+	if missing := sandboxExternalDependencyCapabilityMissing(manifest, caps); len(missing) > 0 {
+		return RuntimePrepared{}, fmt.Errorf("sandbox-process external dependencies require runtime capability network.egress: %s", strings.Join(missing, ","))
+	}
+	policy := a.Supervisor.Policy
+	if sandboxPolicyEmpty(policy) {
+		policy = a.Policy
+	}
+	if unsupported := unsupportedSandboxRequiredCapabilities(policy, caps); len(unsupported) > 0 {
+		return RuntimePrepared{}, fmt.Errorf("sandbox-process cannot enforce required capabilities: %s", strings.Join(unsupported, ","))
+	}
+	return runtimePreparedFor(artifact, pluginRecord, PluginServiceModeSandboxProcess), nil
 }
 
 func (a SandboxProcessAdapter) Start(ctx context.Context, prepared RuntimePrepared, artifact ArtifactRecord, pluginRecord PluginRecord, gateway *Gateway) (RuntimeInstance, error) {
@@ -711,6 +729,7 @@ func (a SandboxProcessAdapter) Start(ctx context.Context, prepared RuntimePrepar
 		_ = process.Stop(ctx)
 		return RuntimeInstance{}, err
 	}
+	prepared.RuntimeInstanceID = process.RuntimeInstanceID
 	return RuntimeInstance{
 		RuntimePrepared: prepared,
 		Plugin:          plugin,

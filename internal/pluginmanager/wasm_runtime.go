@@ -649,13 +649,7 @@ func (a WASMAdapter) Prepare(ctx context.Context, artifact ArtifactRecord, plugi
 	if mode == "" {
 		mode = PluginServiceModeInProcess
 	}
-	return RuntimePrepared{
-		PluginID:   pluginRecord.ID,
-		ArtifactID: artifact.ID,
-		Runtime:    artifact.RuntimeType,
-		Mode:       mode,
-		PreparedAt: time.Now().Unix(),
-	}, nil
+	return runtimePreparedFor(artifact, pluginRecord, mode), nil
 }
 
 func (a WASMAdapter) Start(ctx context.Context, prepared RuntimePrepared, artifact ArtifactRecord, pluginRecord PluginRecord, gateway *Gateway) (RuntimeInstance, error) {

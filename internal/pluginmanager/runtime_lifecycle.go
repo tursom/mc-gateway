@@ -12,11 +12,16 @@ import (
 )
 
 type RuntimePrepared struct {
-	PluginID   string
-	ArtifactID string
-	Runtime    string
-	Mode       string
-	PreparedAt int64
+	PluginID          string
+	ArtifactID        string
+	RuntimeInstanceID string
+	DesiredGeneration int64
+	ConfigHash        string
+	RuntimeLimitsHash string
+	CapabilityHash    string
+	Runtime           string
+	Mode              string
+	PreparedAt        int64
 }
 
 type RuntimeInstance struct {
@@ -290,13 +295,7 @@ func (a GoPluginAdapter) Prepare(ctx context.Context, artifact ArtifactRecord, p
 	if err := a.ValidateArtifact(ctx, artifact); err != nil {
 		return RuntimePrepared{}, err
 	}
-	return RuntimePrepared{
-		PluginID:   pluginRecord.ID,
-		ArtifactID: artifact.ID,
-		Runtime:    artifact.RuntimeType,
-		Mode:       PluginServiceModeInProcess,
-		PreparedAt: time.Now().Unix(),
-	}, nil
+	return runtimePreparedFor(artifact, pluginRecord, PluginServiceModeInProcess), nil
 }
 
 func (a GoPluginAdapter) Start(ctx context.Context, prepared RuntimePrepared, artifact ArtifactRecord, pluginRecord PluginRecord, gateway *Gateway) (RuntimeInstance, error) {
