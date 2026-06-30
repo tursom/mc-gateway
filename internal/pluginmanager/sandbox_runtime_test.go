@@ -160,7 +160,8 @@ func TestSandboxProcessAdapterStartRequiresControlStartup(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			adapter := SandboxProcessAdapter{
-				Policy: SandboxPolicy{CPUSeconds: 1, MemoryBytes: 8 * 1024 * 1024},
+				Policy:    SandboxPolicy{CPUSeconds: 1, MemoryBytes: 8 * 1024 * 1024, ExternalIsolation: true},
+				SelfCheck: func(SandboxPolicy) error { return nil },
 				startProcess: func(ctx context.Context, supervisor SandboxSupervisor, pluginID, artifactID, executable string, generation int64, configJSON string, resolver SandboxSecretResolver) (*SandboxProcess, error) {
 					process, cleanup, err := startSandboxControlProcessForTest(t, ctx, pluginID, artifactID, generation, configJSON)
 					if err != nil {
@@ -777,7 +778,7 @@ func enableSandboxStreamProxyForTest(t *testing.T, pluginID string, peer *fakeSa
 	if timeoutMS == 0 {
 		timeoutMS = 1000
 	}
-	policy := SandboxPolicy{CPUSeconds: 1, MemoryBytes: 8 * 1024 * 1024}
+	policy := SandboxPolicy{CPUSeconds: 1, MemoryBytes: 8 * 1024 * 1024, ExternalIsolation: true}
 	manager := New(Options{
 		DB:                 openPluginManagerTestDB(t),
 		ArtifactRoot:       t.TempDir(),
@@ -796,7 +797,8 @@ func enableSandboxStreamProxyForTest(t *testing.T, pluginID string, peer *fakeSa
 		},
 	}
 	manager.adapter = SandboxProcessAdapter{
-		Policy: policy,
+		Policy:    policy,
+		SelfCheck: func(SandboxPolicy) error { return nil },
 		startProcess: func(_ context.Context, _ SandboxSupervisor, pluginID, artifactID, _ string, generation int64, configJSON string, _ SandboxSecretResolver) (*SandboxProcess, error) {
 			process := newSandboxControlProcessForTest(pluginID, artifactID, generation, configJSON)
 			process.SocketPath = "fake-sandbox-stream-control.sock"
@@ -954,7 +956,7 @@ func (p *fakeSandboxControlPeer) commandCount(command string) int {
 
 func newSandboxDispatchManagerForTest(t *testing.T, peer *fakeSandboxControlPeer, registrations []SandboxHandlerRegistration) *Manager {
 	t.Helper()
-	policy := SandboxPolicy{CPUSeconds: 1, MemoryBytes: 8 * 1024 * 1024}
+	policy := SandboxPolicy{CPUSeconds: 1, MemoryBytes: 8 * 1024 * 1024, ExternalIsolation: true}
 	manager := New(Options{
 		DB:                 openPluginManagerTestDB(t),
 		ArtifactRoot:       t.TempDir(),
@@ -963,7 +965,8 @@ func newSandboxDispatchManagerForTest(t *testing.T, peer *fakeSandboxControlPeer
 		SandboxPolicy:      policy,
 	})
 	manager.adapter = SandboxProcessAdapter{
-		Policy: policy,
+		Policy:    policy,
+		SelfCheck: func(SandboxPolicy) error { return nil },
 		startProcess: func(_ context.Context, _ SandboxSupervisor, pluginID, artifactID, _ string, generation int64, configJSON string, _ SandboxSecretResolver) (*SandboxProcess, error) {
 			process := newSandboxControlProcessForTest(pluginID, artifactID, generation, configJSON)
 			process.SocketPath = "fake-sandbox-control.sock"

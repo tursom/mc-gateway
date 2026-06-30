@@ -2397,8 +2397,12 @@ func (m *Manager) validateArtifactGate(artifact ArtifactRecord) error {
 		if _, message := m.validateSandboxServiceModeApply(); message != "" {
 			return errors.New(message)
 		}
-		if caps := requiredRuntimeCapabilities(artifact); len(caps) > 0 {
-			return fmt.Errorf("sandbox-process cannot enforce required capabilities: %s", strings.Join(caps, ","))
+		caps := requiredRuntimeCapabilities(artifact)
+		if missing := sandboxExternalDependencyCapabilityMissing(manifest, caps); len(missing) > 0 {
+			return fmt.Errorf("sandbox-process external dependencies require runtime capability network.egress: %s", strings.Join(missing, ","))
+		}
+		if unsupported := unsupportedSandboxRequiredCapabilities(m.sandboxPolicy, caps); len(unsupported) > 0 {
+			return fmt.Errorf("sandbox-process cannot enforce required capabilities: %s", strings.Join(unsupported, ","))
 		}
 		return nil
 	}
@@ -2885,11 +2889,62 @@ func requiredRuntimeCapabilities(artifact ArtifactRecord) []string {
 
 func runtimeRequiredCapabilitiesUnsupported(runtimeType string) bool {
 	switch runtimeType {
-	case RuntimeSandbox, RuntimeWASM:
+	case RuntimeWASM:
 		return true
 	default:
 		return false
 	}
+}
+
+func unsupportedSandboxRequiredCapabilities(policy SandboxPolicy, capabilities []string) []string {
+	policy = normalizeSandboxPolicy(policy)
+	var unsupported []string
+	for _, capability := range uniqueSortedStrings(capabilities) {
+		switch strings.ToLower(strings.TrimSpace(capability)) {
+		case "", "filesystem.read", "filesystem.write", "network.none", "env", "secret.handle", "cpu.memory":
+			continue
+		case "process.restricted":
+			if sandboxFactsAllRequiredEnforced(
+				sandboxEnforcementFacts(policy),
+				"process",
+				"no_new_privs",
+				"capabilities_dropped",
+				"seccomp",
+				"fork_exec_policy",
+			) {
+				continue
+			}
+		}
+		unsupported = append(unsupported, capability)
+	}
+	return uniqueSortedStrings(unsupported)
+}
+
+func sandboxExternalDependencyCapabilityMissing(manifest Manifest, capabilities []string) []string {
+	if len(manifest.ExternalDeps) == 0 || stringSliceContainsValue(capabilities, "network.egress") {
+		return nil
+	}
+	missing := make([]string, 0, len(manifest.ExternalDeps))
+	for _, dep := range manifest.ExternalDeps {
+		name := strings.TrimSpace(dep.Name)
+		if name == "" {
+			name = dep.Endpoint
+		}
+		if name != "" {
+			missing = append(missing, name)
+		}
+	}
+	return uniqueSortedStrings(missing)
+}
+
+func stringSliceContainsValue(values []string, want string) bool {
+	want = strings.ToLower(strings.TrimSpace(want))
+	for _, value := range values {
+		if strings.ToLower(strings.TrimSpace(value)) == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *upstreamHandler) invoke(req api.UpstreamConnectRequest) (conn net.Conn, err error) {

@@ -418,12 +418,14 @@ type FutureRuntimeGates struct {
 }
 
 type SandboxPolicy struct {
-	FilesystemRoots []string          `json:"filesystem_roots,omitempty"`
-	NetworkEnabled  bool              `json:"network_enabled"`
-	Env             map[string]string `json:"env,omitempty"`
-	CPUSeconds      int64             `json:"cpu_seconds,omitempty"`
-	MemoryBytes     int64             `json:"memory_bytes,omitempty"`
-	SecretHandles   []string          `json:"secret_handles,omitempty"`
+	FilesystemRoots   []string          `json:"filesystem_roots,omitempty"`
+	NetworkEnabled    bool              `json:"network_enabled"`
+	Env               map[string]string `json:"env,omitempty"`
+	CPUSeconds        int64             `json:"cpu_seconds,omitempty"`
+	MemoryBytes       int64             `json:"memory_bytes,omitempty"`
+	FileQuotaBytes    int64             `json:"file_quota_bytes,omitempty"`
+	SecretHandles     []string          `json:"secret_handles,omitempty"`
+	ExternalIsolation bool              `json:"external_isolation,omitempty"`
 }
 
 type SandboxSecretRequest struct {
@@ -438,24 +440,38 @@ type SandboxSecretResponse struct {
 }
 
 type SandboxDiagnosticSummary struct {
-	PluginID              string            `json:"plugin_id"`
-	ArtifactID            string            `json:"artifact_id"`
-	PID                   int               `json:"pid,omitempty"`
-	State                 string            `json:"state"`
-	ControlRPC            bool              `json:"control_rpc"`
-	FilesystemEnforced    bool              `json:"filesystem_enforced"`
-	NetworkEnforced       bool              `json:"network_enforced"`
-	EnvEnforced           bool              `json:"env_enforced"`
-	CPUMemoryEnforced     bool              `json:"cpu_memory_enforced"`
-	SecretRPC             bool              `json:"secret_rpc"`
-	CrashLoop             bool              `json:"crash_loop"`
-	CrashCount            int               `json:"crash_count"`
-	LastError             string            `json:"last_error,omitempty"`
-	SecretHandles         []string          `json:"secret_handles,omitempty"`
-	EnvKeys               []string          `json:"env_keys,omitempty"`
-	ControlSocket         string            `json:"control_socket,omitempty"`
-	UnsupportedReason     string            `json:"unsupported_reason,omitempty"`
-	EnforcementAttributes map[string]string `json:"enforcement_attributes,omitempty"`
+	PluginID              string                   `json:"plugin_id"`
+	ArtifactID            string                   `json:"artifact_id"`
+	PID                   int                      `json:"pid,omitempty"`
+	State                 string                   `json:"state"`
+	NamespaceEnforced     bool                     `json:"namespace_enforced"`
+	ControlRPC            bool                     `json:"control_rpc"`
+	FilesystemEnforced    bool                     `json:"filesystem_enforced"`
+	NetworkEnforced       bool                     `json:"network_enforced"`
+	EnvEnforced           bool                     `json:"env_enforced"`
+	CPUMemoryEnforced     bool                     `json:"cpu_memory_enforced"`
+	ProcessEnforced       bool                     `json:"process_enforced"`
+	CleanupEnforced       bool                     `json:"cleanup_enforced"`
+	SecretRPC             bool                     `json:"secret_rpc"`
+	CrashLoop             bool                     `json:"crash_loop"`
+	CrashCount            int                      `json:"crash_count"`
+	LastError             string                   `json:"last_error,omitempty"`
+	SecretHandles         []string                 `json:"secret_handles,omitempty"`
+	EnvKeys               []string                 `json:"env_keys,omitempty"`
+	ControlSocket         string                   `json:"control_socket,omitempty"`
+	UnsupportedReason     string                   `json:"unsupported_reason,omitempty"`
+	EnforcementAttributes map[string]string        `json:"enforcement_attributes,omitempty"`
+	EnforcementFacts      []SandboxEnforcementFact `json:"enforcement_facts,omitempty"`
+}
+
+type SandboxEnforcementFact struct {
+	Category          string            `json:"category"`
+	Key               string            `json:"key"`
+	Required          bool              `json:"required"`
+	Enforced          bool              `json:"enforced"`
+	Method            string            `json:"method,omitempty"`
+	UnsupportedReason string            `json:"unsupported_reason,omitempty"`
+	Details           map[string]string `json:"details,omitempty"`
 }
 
 type MinecraftCapability struct {

@@ -54,12 +54,15 @@ const (
 	sandboxControlErrorSecretUnavailable = "secret_unavailable"
 	sandboxControlErrorBadResponse       = "bad_response"
 	sandboxControlErrorProcessExited     = "process_exited"
+	sandboxDefaultWritableRuntimeDir     = "/tmp"
+	sandboxControlRuntimeDir             = "/run"
 )
 
 type SandboxProcessAdapter struct {
 	Supervisor SandboxSupervisor
 	Policy     SandboxPolicy
 	Secrets    SandboxSecretResolver
+	SelfCheck  SandboxEnvironmentSelfCheck
 
 	startProcess sandboxProcessStarter
 }
@@ -69,6 +72,7 @@ type SandboxSupervisor struct {
 	ArgsPrefix     []string
 	Policy         SandboxPolicy
 	StartupTimeout time.Duration
+	SelfCheck      SandboxEnvironmentSelfCheck
 }
 
 type SandboxProcess struct {
@@ -90,6 +94,7 @@ type SandboxProcess struct {
 	cmd      *exec.Cmd
 	listener net.Listener
 	done     chan struct{}
+	release  func()
 
 	startupMu        sync.Mutex
 	startupDone      chan struct{}
@@ -318,13 +323,14 @@ func normalizeSandboxPolicy(policy SandboxPolicy) SandboxPolicy {
 	if policy.MemoryBytes <= 0 {
 		policy.MemoryBytes = 64 * 1024 * 1024
 	}
+	if policy.FileQuotaBytes <= 0 {
+		policy.FileQuotaBytes = DefaultPluginFileQuota
+	}
 	if policy.Env == nil {
 		policy.Env = map[string]string{}
 	}
-	policy.FilesystemRoots = append([]string(nil), policy.FilesystemRoots...)
-	sort.Strings(policy.FilesystemRoots)
-	policy.SecretHandles = append([]string(nil), policy.SecretHandles...)
-	sort.Strings(policy.SecretHandles)
+	policy.FilesystemRoots = normalizeSandboxControlStringList(policy.FilesystemRoots)
+	policy.SecretHandles = normalizeSandboxControlStringList(policy.SecretHandles)
 	return policy
 }
 
@@ -334,16 +340,23 @@ func sandboxPolicyEmpty(policy SandboxPolicy) bool {
 		len(policy.Env) == 0 &&
 		policy.CPUSeconds == 0 &&
 		policy.MemoryBytes == 0 &&
-		len(policy.SecretHandles) == 0
+		policy.FileQuotaBytes == 0 &&
+		len(policy.SecretHandles) == 0 &&
+		!policy.ExternalIsolation
 }
 
 func validateSandboxPolicyEnforceable(policy SandboxPolicy) error {
 	if policy.NetworkEnabled {
 		return errors.New("sandbox-process network access cannot be enabled until network policy enforcement is available")
 	}
+	for _, root := range policy.FilesystemRoots {
+		if _, err := sandboxFilesystemRootRel(root); err != nil {
+			return err
+		}
+	}
 	for key := range policy.Env {
 		lower := strings.ToLower(strings.TrimSpace(key))
-		if strings.Contains(lower, "secret") || strings.Contains(lower, "token") {
+		if sandboxSensitiveName(lower) {
 			return fmt.Errorf("sandbox-process env key %q looks like secret material; use secret RPC handles instead", key)
 		}
 	}
@@ -361,7 +374,188 @@ func defaultSandboxEnvironmentSelfCheck(policy SandboxPolicy) error {
 	if err := validateSandboxPolicyEnforceable(policy); err != nil {
 		return err
 	}
-	return validateSandboxEnforcementSupported()
+	return validateSandboxEnforcementSupported(policy)
+}
+
+func sandboxEnvironmentSelfCheck(selfCheck SandboxEnvironmentSelfCheck, policy SandboxPolicy) error {
+	if selfCheck == nil {
+		selfCheck = defaultSandboxEnvironmentSelfCheck
+	}
+	return selfCheck(normalizeSandboxPolicy(policy))
+}
+
+type sandboxEnforcementReport struct {
+	Facts []SandboxEnforcementFact `json:"facts"`
+}
+
+func (r sandboxEnforcementReport) requiredFailures() []SandboxEnforcementFact {
+	failures := make([]SandboxEnforcementFact, 0)
+	for _, fact := range r.Facts {
+		if fact.Required && !fact.Enforced {
+			failures = append(failures, fact)
+		}
+	}
+	return failures
+}
+
+func (r sandboxEnforcementReport) err() error {
+	failures := r.requiredFailures()
+	if len(failures) == 0 {
+		return nil
+	}
+	parts := make([]string, 0, len(failures))
+	for _, fact := range failures {
+		reason := fact.UnsupportedReason
+		if reason == "" {
+			reason = "not enforced"
+		}
+		parts = append(parts, fact.Category+"."+fact.Key+"="+reason)
+	}
+	sort.Strings(parts)
+	return fmt.Errorf("sandbox-process required enforcement unavailable: %s", strings.Join(parts, "; "))
+}
+
+func sandboxEnforcementFacts(policy SandboxPolicy) []SandboxEnforcementFact {
+	policy = normalizeSandboxPolicy(policy)
+	filesystemMethod, filesystemEnforced, filesystemReason := sandboxFilesystemEnforcementFact(policy)
+	facts := []SandboxEnforcementFact{
+		{
+			Category:          "filesystem",
+			Key:               "readonly_root",
+			Required:          true,
+			Enforced:          filesystemEnforced,
+			Method:            filesystemMethod,
+			UnsupportedReason: filesystemReason,
+		},
+		{
+			Category:          "filesystem",
+			Key:               "artifact_readonly_staging",
+			Required:          true,
+			Enforced:          filesystemEnforced,
+			Method:            sandboxEnforcementMethod(filesystemMethod, "copied-runtime-entry-mode-0555"),
+			UnsupportedReason: filesystemReason,
+		},
+		{
+			Category:          "filesystem",
+			Key:               "runtime_writable_volume",
+			Required:          true,
+			Enforced:          filesystemEnforced,
+			Method:            sandboxEnforcementMethod(filesystemMethod, "writable-runtime-dir"),
+			UnsupportedReason: filesystemReason,
+			Details:           map[string]string{"path": sandboxDefaultWritableRuntimeDir},
+		},
+		{
+			Category:          "filesystem",
+			Key:               "path_allowlist",
+			Required:          true,
+			Enforced:          filesystemEnforced,
+			Method:            sandboxEnforcementMethod(filesystemMethod, "explicit-writable-roots-only"),
+			UnsupportedReason: filesystemReason,
+			Details:           map[string]string{"roots": strings.Join(policy.FilesystemRoots, ",")},
+		},
+		{
+			Category: "filesystem",
+			Key:      "quota",
+			Required: false,
+			Enforced: policy.FileQuotaBytes > 0,
+			Method:   "rlimit_fsize_per_file",
+			Details:  map[string]string{"bytes": fmt.Sprintf("%d", policy.FileQuotaBytes)},
+		},
+		{
+			Category: "network",
+			Key:      "no_host_network",
+			Required: true,
+			Enforced: !policy.NetworkEnabled,
+			Method:   "linux-network-namespace-without-host-network",
+		},
+		{
+			Category: "network",
+			Key:      "egress_policy",
+			Required: true,
+			Enforced: !policy.NetworkEnabled,
+			Method:   "default-deny-no-egress-proxy",
+			UnsupportedReason: func() string {
+				if policy.NetworkEnabled {
+					return "egress proxy/firewall/sidecar enforcement is not configured"
+				}
+				return ""
+			}(),
+		},
+		{
+			Category: "environment",
+			Key:      "allowlist_no_secret_env",
+			Required: true,
+			Enforced: true,
+			Method:   "explicit-env-map-secret-token-filter",
+		},
+		{
+			Category: "resource",
+			Key:      "cpu_memory",
+			Required: true,
+			Enforced: policy.CPUSeconds > 0 && policy.MemoryBytes > 0,
+			Method:   "rlimit_cpu_rlimit_as",
+			Details: map[string]string{
+				"cpu_seconds":  fmt.Sprintf("%d", policy.CPUSeconds),
+				"memory_bytes": fmt.Sprintf("%d", policy.MemoryBytes),
+			},
+		},
+		{
+			Category: "secret",
+			Key:      "handle_rpc",
+			Required: true,
+			Enforced: true,
+			Method:   "version-only-control-rpc",
+		},
+	}
+	facts = append(facts, sandboxPlatformEnforcementFacts(policy)...)
+	return facts
+}
+
+func sandboxEnforcementReportForPolicy(policy SandboxPolicy) sandboxEnforcementReport {
+	return sandboxEnforcementReport{Facts: sandboxEnforcementFacts(policy)}
+}
+
+func sandboxEnforcementMethod(parts ...string) string {
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return strings.Join(out, "+")
+}
+
+func sandboxFactsAllRequiredEnforced(facts []SandboxEnforcementFact, category string, keys ...string) bool {
+	wanted := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		wanted[key] = false
+	}
+	for _, fact := range facts {
+		if fact.Category != category {
+			continue
+		}
+		if _, ok := wanted[fact.Key]; !ok {
+			continue
+		}
+		wanted[fact.Key] = fact.Enforced
+	}
+	for _, enforced := range wanted {
+		if !enforced {
+			return false
+		}
+	}
+	return true
+}
+
+func sandboxSensitiveName(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	for _, marker := range []string{"secret", "token", "password", "credential", "authorization"} {
+		if strings.Contains(name, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func ValidateSandboxProcessProtocol(protocol string) error {
@@ -447,7 +641,7 @@ func (a SandboxProcessAdapter) ValidateArtifact(_ context.Context, artifact Arti
 	if err := validateSandboxPolicyEnforceable(policy); err != nil {
 		return err
 	}
-	return validateSandboxEnforcementSupported()
+	return sandboxEnvironmentSelfCheck(a.SelfCheck, policy)
 }
 
 func (a SandboxProcessAdapter) Prepare(ctx context.Context, artifact ArtifactRecord, pluginRecord PluginRecord) (RuntimePrepared, error) {
@@ -468,8 +662,14 @@ func (a SandboxProcessAdapter) Start(ctx context.Context, prepared RuntimePrepar
 	if sandboxPolicyEmpty(supervisor.Policy) {
 		supervisor.Policy = a.Policy
 	}
+	if supervisor.SelfCheck == nil {
+		supervisor.SelfCheck = a.SelfCheck
+	}
 	supervisor.Policy = normalizeSandboxPolicy(supervisor.Policy)
 	if err := validateSandboxPolicyEnforceable(supervisor.Policy); err != nil {
+		return RuntimeInstance{}, err
+	}
+	if err := sandboxEnvironmentSelfCheck(supervisor.SelfCheck, supervisor.Policy); err != nil {
 		return RuntimeInstance{}, err
 	}
 	startProcess := a.startProcess
@@ -590,9 +790,6 @@ func (a SandboxProcessAdapter) Diagnostics(_ context.Context, instance RuntimeIn
 }
 
 func (s SandboxSupervisor) Start(ctx context.Context, pluginID, artifactID, executable string, generation int64, configJSON string, resolver SandboxSecretResolver) (*SandboxProcess, error) {
-	if err := validateSandboxEnforcementSupported(); err != nil {
-		return nil, err
-	}
 	executable = strings.TrimSpace(executable)
 	if executable == "" {
 		executable = s.Executable
@@ -602,6 +799,9 @@ func (s SandboxSupervisor) Start(ctx context.Context, pluginID, artifactID, exec
 	}
 	policy := normalizeSandboxPolicy(s.Policy)
 	if err := validateSandboxPolicyEnforceable(policy); err != nil {
+		return nil, err
+	}
+	if err := sandboxEnvironmentSelfCheck(s.SelfCheck, policy); err != nil {
 		return nil, err
 	}
 	rootDir, err := prepareSandboxRoot(executable, policy)
@@ -618,29 +818,36 @@ func (s SandboxSupervisor) Start(ctx context.Context, pluginID, artifactID, exec
 		_ = os.RemoveAll(rootDir)
 		return nil, err
 	}
+	if err := finalizeSandboxRoot(rootDir, policy, socketPath); err != nil {
+		_ = listener.Close()
+		_ = os.RemoveAll(rootDir)
+		return nil, err
+	}
 	runtimeInstanceID := newSandboxRuntimeInstanceID()
 	args := append([]string{}, s.ArgsPrefix...)
 	cmd := exec.CommandContext(ctx, "/plugin", args...)
 	cmd.Env = sandboxProcessEnv(policy, pluginID, artifactID, runtimeInstanceID, generation)
-	configureSandboxCommand(cmd, rootDir)
+	configureSandboxCommand(cmd, rootDir, policy)
 	cmd.Dir = "/"
 	if policy.CPUSeconds > 0 {
 		cmd.Cancel = func() error {
 			if cmd.Process != nil {
-				return cmd.Process.Kill()
+				return killSandboxProcessTree(cmd.Process.Pid)
 			}
 			return nil
 		}
 	}
-	if err := cmd.Start(); err != nil {
+	release, err := startSandboxCommand(cmd)
+	if err != nil {
 		_ = listener.Close()
 		_ = os.RemoveAll(rootDir)
 		return nil, err
 	}
 	if err := applySandboxRLimits(cmd.Process.Pid, policy); err != nil {
 		_ = listener.Close()
-		_ = cmd.Process.Kill()
+		_ = killSandboxProcessTree(cmd.Process.Pid)
 		_ = cmd.Wait()
+		release()
 		_ = os.RemoveAll(rootDir)
 		return nil, err
 	}
@@ -658,11 +865,13 @@ func (s SandboxSupervisor) Start(ctx context.Context, pluginID, artifactID, exec
 		ConfigJSON:        configJSON,
 		cmd:               cmd,
 		done:              make(chan struct{}),
+		release:           release,
 		startupDone:       make(chan struct{}),
 	}
 	if err := process.startControlRPC(ctx, listener, resolver); err != nil {
 		_ = process.Kill()
 		_ = cmd.Wait()
+		release()
 		_ = os.RemoveAll(rootDir)
 		return nil, err
 	}
@@ -689,7 +898,7 @@ func prepareSandboxRoot(executable string, policy SandboxPolicy) (string, error)
 		_ = os.RemoveAll(rootDir)
 		return "", err
 	}
-	if err := os.Chmod(filepath.Join(rootDir, "plugin"), 0755); err != nil {
+	if err := os.Chmod(filepath.Join(rootDir, "plugin"), 0555); err != nil {
 		_ = os.RemoveAll(rootDir)
 		return "", err
 	}
@@ -703,10 +912,10 @@ func prepareSandboxRoot(executable string, policy SandboxPolicy) (string, error)
 		if strings.TrimSpace(root) == "" {
 			continue
 		}
-		clean := strings.TrimPrefix(filepath.Clean(root), string(filepath.Separator))
-		if clean == "." || strings.HasPrefix(clean, "..") {
+		clean, err := sandboxFilesystemRootRel(root)
+		if err != nil {
 			_ = os.RemoveAll(rootDir)
-			return "", fmt.Errorf("sandbox filesystem root %q escapes sandbox root", root)
+			return "", err
 		}
 		if err := os.MkdirAll(filepath.Join(rootDir, clean), 0700); err != nil {
 			_ = os.RemoveAll(rootDir)
@@ -714,6 +923,88 @@ func prepareSandboxRoot(executable string, policy SandboxPolicy) (string, error)
 		}
 	}
 	return rootDir, nil
+}
+
+func finalizeSandboxRoot(rootDir string, policy SandboxPolicy, socketPath string) error {
+	if strings.TrimSpace(rootDir) == "" {
+		return errors.New("sandbox root is required")
+	}
+	writable := map[string]bool{
+		filepath.Clean(filepath.Join(rootDir, strings.TrimPrefix(sandboxDefaultWritableRuntimeDir, "/"))): true,
+	}
+	for _, root := range policy.FilesystemRoots {
+		if strings.TrimSpace(root) == "" {
+			continue
+		}
+		clean, err := sandboxFilesystemRootRel(root)
+		if err != nil {
+			return err
+		}
+		writable[filepath.Clean(filepath.Join(rootDir, clean))] = true
+	}
+	if err := filepath.WalkDir(rootDir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		switch {
+		case info.Mode().IsRegular():
+			if filepath.Clean(path) == filepath.Join(rootDir, "plugin") {
+				return os.Chmod(path, 0555)
+			}
+		case info.IsDir():
+			if writable[filepath.Clean(path)] {
+				return chmodSandboxWritable(path)
+			}
+			return os.Chmod(path, 0555)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if strings.TrimSpace(socketPath) != "" {
+		if err := os.Chmod(socketPath, 0666); err != nil {
+			return err
+		}
+		if err := chownSandboxWritable(socketPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func chmodSandboxWritable(path string) error {
+	if err := os.Chmod(path, 0700); err != nil {
+		return err
+	}
+	return chownSandboxWritable(path)
+}
+
+func sandboxFilesystemRootRel(root string) (string, error) {
+	trimmed := strings.TrimSpace(root)
+	if trimmed == "" {
+		return "", errors.New("sandbox filesystem root cannot be empty")
+	}
+	clean := filepath.Clean(trimmed)
+	clean = strings.TrimPrefix(clean, string(filepath.Separator))
+	switch {
+	case clean == "", clean == ".":
+		return "", fmt.Errorf("sandbox filesystem root %q must not be the sandbox root", root)
+	case strings.HasPrefix(clean, ".."):
+		return "", fmt.Errorf("sandbox filesystem root %q escapes sandbox root", root)
+	}
+	first := clean
+	if idx := strings.IndexRune(clean, filepath.Separator); idx >= 0 {
+		first = clean[:idx]
+	}
+	switch first {
+	case "plugin", strings.TrimPrefix(sandboxControlRuntimeDir, "/"):
+		return "", fmt.Errorf("sandbox filesystem root %q targets reserved sandbox path %q", root, first)
+	}
+	return clean, nil
 }
 
 func sandboxControlSocketPath(rootDir string) (string, error) {
@@ -753,7 +1044,7 @@ func sandboxProcessEnv(policy SandboxPolicy, pluginID, artifactID, runtimeInstan
 	}
 	out = append(out, fmt.Sprintf("MC_GATEWAY_GENERATION=%d", generation))
 	for _, key := range keys {
-		if strings.Contains(strings.ToLower(key), "secret") || strings.Contains(strings.ToLower(key), "token") {
+		if sandboxSensitiveName(key) {
 			continue
 		}
 		out = append(out, key+"="+policy.Env[key])
@@ -1425,16 +1716,16 @@ func (p *SandboxProcess) Stop(ctx context.Context) error {
 	if p.cmd == nil || p.cmd.Process == nil {
 		return nil
 	}
-	_ = p.cmd.Process.Signal(os.Interrupt)
+	_ = signalSandboxProcessTree(p.cmd.Process.Pid, os.Interrupt)
 	select {
 	case <-p.done:
 		return nil
 	case <-ctx.Done():
-		_ = p.cmd.Process.Kill()
+		_ = killSandboxProcessTree(p.cmd.Process.Pid)
 		<-p.done
 		return ctx.Err()
 	case <-time.After(time.Second):
-		_ = p.cmd.Process.Kill()
+		_ = killSandboxProcessTree(p.cmd.Process.Pid)
 		<-p.done
 		return nil
 	}
@@ -1447,11 +1738,14 @@ func (p *SandboxProcess) Kill() error {
 	if p.listener != nil {
 		_ = p.listener.Close()
 	}
-	return p.cmd.Process.Kill()
+	return killSandboxProcessTree(p.cmd.Process.Pid)
 }
 
 func (p *SandboxProcess) wait() {
 	err := p.cmd.Wait()
+	if p.release != nil {
+		p.release()
+	}
 	if p.listener != nil {
 		_ = p.listener.Close()
 	}
@@ -1499,16 +1793,20 @@ func (p *SandboxProcess) Diagnostics() SandboxDiagnosticSummary {
 	if protocol == "" {
 		protocol = sandboxProcessProtocol
 	}
+	facts := sandboxEnforcementFacts(policy)
 	return SandboxDiagnosticSummary{
 		PluginID:           p.PluginID,
 		ArtifactID:         p.ArtifactID,
 		PID:                p.PID,
 		State:              state,
+		NamespaceEnforced:  sandboxFactsAllRequiredEnforced(facts, "namespace", "mount", "network", "pid", "uts", "ipc", "user"),
 		ControlRPC:         true,
-		FilesystemEnforced: true,
-		NetworkEnforced:    !policy.NetworkEnabled,
-		EnvEnforced:        true,
-		CPUMemoryEnforced:  true,
+		FilesystemEnforced: sandboxFactsAllRequiredEnforced(facts, "filesystem", "readonly_root", "artifact_readonly_staging", "runtime_writable_volume", "path_allowlist"),
+		NetworkEnforced:    sandboxFactsAllRequiredEnforced(facts, "network", "no_host_network", "egress_policy"),
+		EnvEnforced:        sandboxFactsAllRequiredEnforced(facts, "environment", "allowlist_no_secret_env"),
+		CPUMemoryEnforced:  sandboxFactsAllRequiredEnforced(facts, "resource", "cpu_memory"),
+		ProcessEnforced:    sandboxFactsAllRequiredEnforced(facts, "process", "no_new_privs", "capabilities_dropped", "seccomp", "fork_exec_policy"),
+		CleanupEnforced:    sandboxFactsAllRequiredEnforced(facts, "cleanup", "process_tree", "orphan"),
 		SecretRPC:          true,
 		CrashLoop:          p.crashLoop,
 		CrashCount:         p.crashCount,
@@ -1517,14 +1815,17 @@ func (p *SandboxProcess) Diagnostics() SandboxDiagnosticSummary {
 		EnvKeys:            envKeys,
 		ControlSocket:      "unix:///run/control.sock",
 		UnsupportedReason:  unsupportedSandboxRuntimeReason(startupErrorCode),
+		EnforcementFacts:   facts,
 		EnforcementAttributes: map[string]string{
 			"control_channel": sandboxControlChannelUnix,
 			"protocol":        protocol,
 			"stream_protocol": StreamProxyProtocolV1,
-			"filesystem":      "chroot-staged-root-with-explicit-roots",
-			"network":         "newnet-without-host-network-by-default",
+			"filesystem":      "readonly-chroot-staged-root-with-explicit-writable-roots",
+			"network":         "newnet-default-deny-no-host-network",
 			"environment":     "explicit-allowlist-no-secret-env",
 			"cpu_memory":      "process-rlimit-policy",
+			"process":         "pid-user-namespace-no-new-privs-capability-drop-external-seccomp-required",
+			"cleanup":         "pid-namespace-process-group-kill-pdeathsig",
 			"secret_delivery": "handle-rpc-version-only",
 		},
 	}
@@ -1538,8 +1839,7 @@ func unsupportedSandboxRuntimeReason(code string) string {
 }
 
 func redactSandboxControlEnvKey(key string) string {
-	lower := strings.ToLower(key)
-	if strings.Contains(lower, "secret") || strings.Contains(lower, "token") || strings.Contains(lower, "password") {
+	if sandboxSensitiveName(key) {
 		return "[redacted]"
 	}
 	return key
@@ -1551,11 +1851,14 @@ func sandboxDiagnosticsDetails(summary SandboxDiagnosticSummary) map[string]any 
 		"control_channel":        sandboxControlChannelUnix,
 		"stream_protocol":        StreamProxyProtocolV1,
 		"pid":                    summary.PID,
+		"namespace_enforced":     summary.NamespaceEnforced,
 		"control_rpc":            summary.ControlRPC,
 		"filesystem_enforced":    summary.FilesystemEnforced,
 		"network_enforced":       summary.NetworkEnforced,
 		"env_enforced":           summary.EnvEnforced,
 		"cpu_memory_enforced":    summary.CPUMemoryEnforced,
+		"process_enforced":       summary.ProcessEnforced,
+		"cleanup_enforced":       summary.CleanupEnforced,
 		"secret_rpc":             summary.SecretRPC,
 		"crash_loop":             summary.CrashLoop,
 		"crash_count":            summary.CrashCount,
@@ -1565,6 +1868,7 @@ func sandboxDiagnosticsDetails(summary SandboxDiagnosticSummary) map[string]any 
 		"env_keys":               append([]string(nil), summary.EnvKeys...),
 		"control_socket":         summary.ControlSocket,
 		"enforcement_attributes": summary.EnforcementAttributes,
+		"enforcement_facts":      append([]SandboxEnforcementFact(nil), summary.EnforcementFacts...),
 	}
 }
 

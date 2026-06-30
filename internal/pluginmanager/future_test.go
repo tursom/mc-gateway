@@ -101,6 +101,40 @@ func TestSandboxFeatureFactsGateStates(t *testing.T) {
 	}
 }
 
+func TestSandboxAdapterFactoryCarriesPolicyAndSelfCheck(t *testing.T) {
+	called := false
+	policy := SandboxPolicy{CPUSeconds: 7, MemoryBytes: 32 * 1024 * 1024, ExternalIsolation: true}
+	selfCheck := func(got SandboxPolicy) error {
+		called = true
+		if got.CPUSeconds != policy.CPUSeconds || got.MemoryBytes != policy.MemoryBytes || !got.ExternalIsolation {
+			return fmt.Errorf("self-check policy = %+v, want configured policy", got)
+		}
+		return nil
+	}
+	adapter, status := RuntimeAdapterFactory{Facts: RuntimeFeatureFactsOptions{
+		FutureRuntimeGates: FutureRuntimeGates{SandboxProcess: true},
+		SandboxPolicy:      policy,
+		SandboxSelfCheck:   selfCheck,
+	}}.AdapterFor(PluginServiceModeSandboxProcess, RuntimeSandbox)
+	if !status.DataPlane || !status.Lifecycle {
+		t.Fatalf("adapter status = %+v, want sandbox data-plane lifecycle", status)
+	}
+	sandboxAdapter, ok := adapter.(SandboxProcessAdapter)
+	if !ok {
+		t.Fatalf("adapter = %T, want SandboxProcessAdapter", adapter)
+	}
+	if !sandboxAdapter.Policy.ExternalIsolation || sandboxAdapter.Policy.CPUSeconds != policy.CPUSeconds {
+		t.Fatalf("sandbox adapter policy = %+v, want configured policy", sandboxAdapter.Policy)
+	}
+	called = false
+	if err := sandboxAdapter.ValidateArtifact(context.Background(), ArtifactRecord{RuntimeType: RuntimeSandbox, ArtifactType: ArtifactTypeBinary}); err != nil {
+		t.Fatalf("ValidateArtifact() error = %v", err)
+	}
+	if !called {
+		t.Fatal("ValidateArtifact() did not call configured sandbox self-check")
+	}
+}
+
 func TestSandboxApplyFailurePreservesActiveDataPlane(t *testing.T) {
 	manager := New(Options{
 		DB:           openPluginManagerTestDB(t),
@@ -714,6 +748,50 @@ func TestSandboxRequiredCapabilityBlocksEnable(t *testing.T) {
 	}
 }
 
+func TestSandboxRequiredCapabilityMatrixAndExternalDeps(t *testing.T) {
+	manager := New(Options{
+		DB:                 openPluginManagerTestDB(t),
+		ArtifactRoot:       t.TempDir(),
+		FutureRuntimeGates: FutureRuntimeGates{SandboxProcess: true},
+		SandboxPolicy:      SandboxPolicy{ExternalIsolation: true},
+		SandboxSelfCheck:   func(SandboxPolicy) error { return nil },
+	})
+	if _, err := manager.SetPluginServiceDesired(context.Background(), "admin", PluginServiceModeSandboxProcess); err != nil {
+		t.Fatalf("SetPluginServiceDesired() error = %v", err)
+	}
+	if err := manager.ApplyPluginServiceMode(context.Background()); err != nil {
+		t.Fatalf("ApplyPluginServiceMode() error = %v", err)
+	}
+
+	supported := uploadTestArtifactWithManifest(t, manager, "sandbox-supported-capabilities", func(manifest *Manifest) {
+		manifest.Runtime.Type = RuntimeSandbox
+		manifest.Capabilities = json.RawMessage(`{"runtime":{"required_capabilities":["filesystem.read","filesystem.write","network.none","env","secret.handle","cpu.memory","process.restricted"]}}`)
+	})
+	preflight := manager.preflightChecks(context.Background(), PluginRecord{ID: supported.PluginID, ConfigJSON: `{}`}, supported, mustManifestFromArtifact(t, supported), PolicyProfileDev, GovernanceActionEnable, `{}`)
+	if preflightCheckCodes(preflight.Checks)["capability_enforcement_unavailable"] {
+		t.Fatalf("preflight = %+v, want supported sandbox capabilities to pass enforcement matrix", preflight)
+	}
+
+	egress := uploadTestArtifactWithManifest(t, manager, "sandbox-egress-blocked", func(manifest *Manifest) {
+		manifest.Runtime.Type = RuntimeSandbox
+		manifest.Capabilities = json.RawMessage(`{"runtime":{"required_capabilities":["network.egress"]}}`)
+	})
+	preflight = manager.preflightChecks(context.Background(), PluginRecord{ID: egress.PluginID, ConfigJSON: `{}`}, egress, mustManifestFromArtifact(t, egress), PolicyProfileDev, GovernanceActionEnable, `{}`)
+	if preflight.OK || !preflightCheckCodes(preflight.Checks)["capability_enforcement_unavailable"] {
+		t.Fatalf("preflight = %+v, want network.egress blocked until egress proxy/firewall is implemented", preflight)
+	}
+
+	missingEgress := uploadTestArtifactWithManifest(t, manager, "sandbox-external-missing-egress", func(manifest *Manifest) {
+		manifest.Runtime.Type = RuntimeSandbox
+		manifest.ExternalDeps = []ExternalSpec{{Name: "profile-api", Endpoint: "https://profile.example", Required: true}}
+		manifest.Capabilities = json.RawMessage(`{}`)
+	})
+	preflight = manager.preflightChecks(context.Background(), PluginRecord{ID: missingEgress.PluginID, ConfigJSON: `{}`}, missingEgress, mustManifestFromArtifact(t, missingEgress), PolicyProfileDev, GovernanceActionEnable, `{}`)
+	if preflight.OK || !preflightCheckCodes(preflight.Checks)["sandbox_external_dependency_capability_missing"] {
+		t.Fatalf("preflight = %+v, want external dependency to require network.egress declaration", preflight)
+	}
+}
+
 func TestSandboxPolicyDiagnosticsAndSecretHandle(t *testing.T) {
 	manager := newManagerForTest(t, &fakeAdapter{})
 	artifact := uploadTestArtifactWithManifest(t, manager, "sandbox-secret", func(manifest *Manifest) {
@@ -746,15 +824,19 @@ func TestSandboxPolicyDiagnosticsAndSecretHandle(t *testing.T) {
 		PID:               1234,
 		StartedAt:         time.Now().Unix(),
 		Policy: SandboxPolicy{
-			Env:           map[string]string{"SAFE": "1", "API_SECRET": "must-not-enter-env"},
-			SecretHandles: []string{"api_token"},
-			CPUSeconds:    1,
-			MemoryBytes:   8 * 1024 * 1024,
+			Env:               map[string]string{"SAFE": "1", "API_SECRET": "must-not-enter-env"},
+			SecretHandles:     []string{"api_token"},
+			CPUSeconds:        1,
+			MemoryBytes:       8 * 1024 * 1024,
+			ExternalIsolation: true,
 		},
 	}
 	diag := process.Diagnostics()
 	if !diag.ControlRPC || !diag.FilesystemEnforced || !diag.NetworkEnforced || !diag.EnvEnforced || !diag.CPUMemoryEnforced || !diag.SecretRPC {
 		t.Fatalf("Diagnostics() = %+v, want all sandbox enforcement flags", diag)
+	}
+	if len(diag.EnforcementFacts) == 0 || diag.EnforcementAttributes["cpu_memory"] != "process-rlimit-policy" {
+		t.Fatalf("Diagnostics() = %+v, want machine-readable enforcement facts and actual rlimit method", diag)
 	}
 	env := sandboxEnv(process.Policy)
 	joined := strings.Join(env, "\n")
@@ -799,6 +881,24 @@ func TestSandboxFilesystemStagingRejectsEscapes(t *testing.T) {
 	if info, err := os.Stat(filepath.Join(root, "data", "cache")); err != nil || !info.IsDir() {
 		t.Fatalf("sandbox filesystem root not staged: info=%+v err=%v", info, err)
 	}
+	if err := finalizeSandboxRoot(root, SandboxPolicy{FilesystemRoots: []string{"/data/cache"}}, ""); err != nil {
+		t.Fatalf("finalizeSandboxRoot() error = %v", err)
+	}
+	for path, wantMode := range map[string]os.FileMode{
+		root:                                 0555,
+		filepath.Join(root, "plugin"):        0555,
+		filepath.Join(root, "run"):           0555,
+		filepath.Join(root, "data"):          0555,
+		filepath.Join(root, "data", "cache"): 0700,
+	} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("Stat(%s) error = %v", path, err)
+		}
+		if info.Mode().Perm() != wantMode {
+			t.Fatalf("mode(%s) = %v, want %v", path, info.Mode().Perm(), wantMode)
+		}
+	}
 	if _, err := prepareSandboxRoot(executable, SandboxPolicy{FilesystemRoots: []string{"../host"}}); err == nil {
 		t.Fatal("prepareSandboxRoot(escape) error = nil, want escape rejected")
 	}
@@ -829,6 +929,16 @@ func TestSandboxPolicyBlocksUnenforceableControls(t *testing.T) {
 			name:   "missing memory",
 			policy: SandboxPolicy{CPUSeconds: 1},
 			want:   "memory limit must be positive",
+		},
+		{
+			name:   "root writable path",
+			policy: SandboxPolicy{FilesystemRoots: []string{"/"}, CPUSeconds: 1, MemoryBytes: 8 * 1024 * 1024},
+			want:   "must not be the sandbox root",
+		},
+		{
+			name:   "reserved run path",
+			policy: SandboxPolicy{FilesystemRoots: []string{"/run/cache"}, CPUSeconds: 1, MemoryBytes: 8 * 1024 * 1024},
+			want:   "reserved sandbox path",
 		},
 	}
 	for _, tt := range tests {

@@ -179,7 +179,7 @@ func (factory RuntimeAdapterFactory) AdapterFor(serviceMode, runtimeType string)
 			status.DataPlane = modeFeature.DataPlane && runtimeFeature.DataPlane
 			status.Lifecycle = status.DataPlane
 			status.UnsupportedReason = firstRuntimeUnsupportedReason(modeFeature.UnsupportedReason, runtimeFeature.UnsupportedReason)
-			return SandboxProcessAdapter{}, completeStatus()
+			return SandboxProcessAdapter{Policy: facts.SandboxPolicy, SelfCheck: facts.SandboxSelfCheck}, completeStatus()
 		case RuntimeWASM:
 			status.Adapter = "wazero"
 			status.ControlChannel = "wazero-host-abi"
