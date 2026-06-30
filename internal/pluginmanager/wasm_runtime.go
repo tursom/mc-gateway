@@ -16,8 +16,6 @@ import (
 	"github.com/tursom/mc-gateway/plugin/api"
 )
 
-const wasmHostABIV1 = "mc-gateway.wasm.host/v1"
-
 type WASMRunner struct {
 	mu       sync.Mutex
 	compiled map[string][]byte
@@ -48,7 +46,7 @@ func (r *WASMRunner) Validate(ctx context.Context, manifest Manifest, behavior s
 		ArtifactID:  manifest.ID + ":" + behavior,
 		Module:      wasmFixtureModule(behavior),
 		Manifest:    manifest,
-		Function:    "validate",
+		Function:    wasmDefaultExport(manifest),
 		Timeout:     wasmTimeout(manifest),
 		MemoryBytes: manifest.RuntimeLimits.MemoryBytes,
 	})
@@ -59,6 +57,9 @@ func (r *WASMRunner) Invoke(ctx context.Context, invocation WASMInvocation) erro
 		r = NewWASMRunner()
 	}
 	if err := validateWASMExtensionPoints(invocation.Manifest); err != nil {
+		return err
+	}
+	if err := validateWASMManifestABI(invocation.Manifest); err != nil {
 		return err
 	}
 	if len(invocation.Module) == 0 {
@@ -81,6 +82,12 @@ func (r *WASMRunner) Invoke(ctx context.Context, invocation WASMInvocation) erro
 	if err != nil {
 		return err
 	}
+	if err := validateWASMCompiledABI(compiled, invocation.Manifest); err != nil {
+		return err
+	}
+	if err := instantiateWASMHostImports(callCtx, runtime); err != nil {
+		return err
+	}
 	moduleConfig := wazero.NewModuleConfig().
 		WithName("mc-gateway-plugin-wasm").
 		WithStartFunctions()
@@ -91,18 +98,18 @@ func (r *WASMRunner) Invoke(ctx context.Context, invocation WASMInvocation) erro
 	defer module.Close(context.Background())
 	fnName := invocation.Function
 	if fnName == "" {
-		fnName = "validate"
+		fnName = wasmDefaultExport(invocation.Manifest)
 	}
 	fn := module.ExportedFunction(fnName)
 	if fn == nil {
-		return fmt.Errorf("wasm export %q not found", fnName)
+		return newWASMABIError(wasmABIErrorExportMissing, "", fmt.Sprintf("wasm export %q not found", fnName))
 	}
-	results, err := fn.Call(callCtx)
+	results, err := fn.Call(callCtx, 0, 0)
 	if err != nil {
-		return err
+		return mapWASMInvocationError("", err)
 	}
 	if len(results) > 0 && results[0] != 0 {
-		return fmt.Errorf("wasm validation returned non-zero result %d", results[0])
+		return newWASMABIError(wasmABIErrorBadOutput, "", fmt.Sprintf("wasm validation returned non-zero result %d", results[0]))
 	}
 	return nil
 }
@@ -139,6 +146,24 @@ func validateWASMExtensionPoints(manifest Manifest) error {
 		}
 	}
 	return nil
+}
+
+func validateWASMArtifactABI(ctx context.Context, artifact ArtifactRecord, manifest Manifest) error {
+	if err := validateWASMManifestABI(manifest); err != nil {
+		return err
+	}
+	if artifact.FilePath == "" {
+		return nil
+	}
+	module, err := os.ReadFile(artifact.FilePath)
+	if err != nil {
+		return err
+	}
+	return validateWASMModuleABI(ctx, module, manifest, artifactSizeMemoryLimit(artifact, manifest))
+}
+
+func artifactSizeMemoryLimit(_ ArtifactRecord, manifest Manifest) int {
+	return manifest.RuntimeLimits.MemoryBytes
 }
 
 func wasmTimeout(manifest Manifest) time.Duration {
@@ -185,7 +210,7 @@ func (m *Manager) RunWASMValidation(ctx context.Context, pluginID, artifactID, b
 		ArtifactID:  artifact.ID + ":" + behavior,
 		Module:      module,
 		Manifest:    manifest,
-		Function:    "validate",
+		Function:    wasmDefaultExport(manifest),
 		Timeout:     wasmTimeout(manifest),
 		MemoryBytes: manifest.RuntimeLimits.MemoryBytes,
 	})
@@ -203,7 +228,7 @@ func (a WASMAdapter) Load(ctx context.Context, artifact ArtifactRecord, pluginRe
 	return instance.Plugin, nil
 }
 
-func (a WASMAdapter) ValidateArtifact(_ context.Context, artifact ArtifactRecord) error {
+func (a WASMAdapter) ValidateArtifact(ctx context.Context, artifact ArtifactRecord) error {
 	if artifact.RuntimeType != RuntimeWASM {
 		return fmt.Errorf("wasm adapter does not support runtime %q", artifact.RuntimeType)
 	}
@@ -211,7 +236,10 @@ func (a WASMAdapter) ValidateArtifact(_ context.Context, artifact ArtifactRecord
 	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err != nil {
 		return err
 	}
-	return validateWASMExtensionPoints(manifest)
+	if err := validateWASMExtensionPoints(manifest); err != nil {
+		return err
+	}
+	return validateWASMArtifactABI(ctx, artifact, manifest)
 }
 
 func (a WASMAdapter) Prepare(ctx context.Context, artifact ArtifactRecord, pluginRecord PluginRecord) (RuntimePrepared, error) {
@@ -236,22 +264,11 @@ func (a WASMAdapter) Start(ctx context.Context, prepared RuntimePrepared, artifa
 	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err != nil {
 		return RuntimeInstance{}, err
 	}
-	module, err := os.ReadFile(artifact.FilePath)
-	if err != nil {
-		return RuntimeInstance{}, err
-	}
 	runner := a.Runner
 	if runner == nil {
 		runner = NewWASMRunner()
 	}
-	if err := runner.Invoke(ctx, WASMInvocation{
-		ArtifactID:  artifact.ID,
-		Module:      module,
-		Manifest:    manifest,
-		Function:    "validate",
-		Timeout:     wasmTimeout(manifest),
-		MemoryBytes: manifest.RuntimeLimits.MemoryBytes,
-	}); err != nil {
+	if err := validateWASMArtifactABI(ctx, artifact, manifest); err != nil {
 		return RuntimeInstance{}, err
 	}
 	return RuntimeInstance{
@@ -267,6 +284,8 @@ func (a WASMAdapter) HealthCheck(_ context.Context, _ RuntimeInstance) RuntimeHe
 		Status: RuntimeEnabled,
 		Details: map[string]any{
 			"host_abi":                wasmHostABIV1,
+			"exports":                 wasmABIExportMap(),
+			"imports":                 wasmABIImportMap(),
 			"module_cache":            true,
 			"default_filesystem":      "none",
 			"default_network":         "none",
@@ -291,6 +310,8 @@ func (a WASMAdapter) Diagnostics(_ context.Context, instance RuntimeInstance) Ru
 		State:      RuntimeEnabled,
 		Details: map[string]any{
 			"host_abi":                   wasmHostABIV1,
+			"exports":                    wasmABIExportMap(),
+			"imports":                    wasmABIImportMap(),
 			"module_cache":               true,
 			"fuel_equivalent_time_limit": true,
 			"memory_limit":               true,
@@ -309,6 +330,21 @@ func (p wasmHostedPlugin) NewConfigObj() any { return struct{}{} }
 
 func (p wasmHostedPlugin) ReloadConfig(any) error { return nil }
 
+func wasmABIExportMap() map[string]string {
+	return map[string]string{
+		ExtensionConfigValidate: wasmExportConfigValidateV1,
+		ExtensionRuleEvaluate:   wasmExportRuleEvaluateV1,
+		ExtensionRouteResolve:   wasmExportRouteResolveV1,
+	}
+}
+
+func wasmABIImportMap() map[string]string {
+	return map[string]string{
+		wasmHostImportModule + "." + wasmHostImportLog:    "log(level_i32, message_ptr_i32, message_len_i32) -> status_i32",
+		wasmHostImportModule + "." + wasmHostImportMetric: "metric(name_ptr_i32, name_len_i32, labels_ptr_i32, labels_len_i32, value_f64) -> status_i32",
+	}
+}
+
 func wasmFixtureModule(behavior string) []byte {
 	switch behavior {
 	case "timeout":
@@ -323,33 +359,56 @@ func wasmFixtureModule(behavior string) []byte {
 }
 
 var (
-	wasmOKModule = []byte{
-		0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-		0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
-		0x03, 0x02, 0x01, 0x00,
-		0x07, 0x0c, 0x01, 0x08, 0x76, 0x61, 0x6c, 0x69, 0x64, 0x61, 0x74, 0x65, 0x00, 0x00,
-		0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
-	}
-	wasmTrapModule = []byte{
-		0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-		0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
-		0x03, 0x02, 0x01, 0x00,
-		0x07, 0x0c, 0x01, 0x08, 0x76, 0x61, 0x6c, 0x69, 0x64, 0x61, 0x74, 0x65, 0x00, 0x00,
-		0x0a, 0x05, 0x01, 0x03, 0x00, 0x00, 0x0b,
-	}
-	wasmLoopModule = []byte{
-		0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-		0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
-		0x03, 0x02, 0x01, 0x00,
-		0x07, 0x0c, 0x01, 0x08, 0x76, 0x61, 0x6c, 0x69, 0x64, 0x61, 0x74, 0x65, 0x00, 0x00,
-		0x0a, 0x08, 0x01, 0x06, 0x00, 0x03, 0x40, 0x0c, 0x00, 0x0b, 0x0b,
-	}
-	wasmMemoryGrowModule = []byte{
-		0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-		0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f,
-		0x03, 0x02, 0x01, 0x00,
-		0x05, 0x03, 0x01, 0x00, 0x01,
-		0x07, 0x0c, 0x01, 0x08, 0x76, 0x61, 0x6c, 0x69, 0x64, 0x61, 0x74, 0x65, 0x00, 0x00,
-		0x0a, 0x08, 0x01, 0x06, 0x00, 0x41, 0x02, 0x40, 0x00, 0x0b,
-	}
+	wasmOKModule         = wasmABIExportModule([]byte{0x00, 0x42, 0x00, 0x0b}, false)
+	wasmTrapModule       = wasmABIExportModule([]byte{0x00, 0x00, 0x0b}, false)
+	wasmLoopModule       = wasmABIExportModule([]byte{0x00, 0x03, 0x40, 0x0c, 0x00, 0x0b, 0x0b}, false)
+	wasmMemoryGrowModule = wasmABIExportModule([]byte{0x00, 0x41, 0x02, 0x40, 0x00, 0xad, 0x0b}, true)
 )
+
+func wasmABIExportModule(functionBody []byte, memory bool) []byte {
+	module := []byte{0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00}
+	module = append(module, wasmSection(1, []byte{0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7e})...)
+	module = append(module, wasmSection(3, []byte{0x01, 0x00})...)
+	if memory {
+		module = append(module, wasmSection(5, []byte{0x01, 0x01, 0x00, 0x01})...)
+	}
+	module = append(module, wasmSection(7, wasmABIExportSection())...)
+	body := appendU32LEB(nil, uint32(len(functionBody)))
+	body = append(body, functionBody...)
+	code := appendU32LEB(nil, 1)
+	code = append(code, body...)
+	module = append(module, wasmSection(10, code)...)
+	return module
+}
+
+func wasmABIExportSection() []byte {
+	exports := []string{wasmExportConfigValidateV1, wasmExportRuleEvaluateV1, wasmExportRouteResolveV1}
+	payload := appendU32LEB(nil, uint32(len(exports)))
+	for _, name := range exports {
+		payload = appendU32LEB(payload, uint32(len(name)))
+		payload = append(payload, name...)
+		payload = append(payload, 0x00, 0x00)
+	}
+	return payload
+}
+
+func wasmSection(id byte, payload []byte) []byte {
+	section := []byte{id}
+	section = appendU32LEB(section, uint32(len(payload)))
+	section = append(section, payload...)
+	return section
+}
+
+func appendU32LEB(out []byte, value uint32) []byte {
+	for {
+		b := byte(value & 0x7f)
+		value >>= 7
+		if value != 0 {
+			b |= 0x80
+		}
+		out = append(out, b)
+		if value == 0 {
+			return out
+		}
+	}
+}

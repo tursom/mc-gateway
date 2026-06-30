@@ -433,10 +433,16 @@ func pluginFeatureFacts() map[string]any {
 			"future_runtime_gate":          false,
 			"runtime_adapter":              true,
 			"host_abi":                     true,
-			"module_cache":                 true,
-			"fuel_time_memory_limits":      true,
-			"default_no_file_network":      true,
-			"data_plane":                   true,
+			"host_abi_version":             pluginmanager.WASMHostABIVersion(),
+			"exports": map[string]string{
+				pluginmanager.ExtensionConfigValidate: "mcgw_config_validate_v1",
+				pluginmanager.ExtensionRuleEvaluate:   "mcgw_rule_evaluate_v1",
+				pluginmanager.ExtensionRouteResolve:   "mcgw_route_resolve_v1",
+			},
+			"module_cache":            true,
+			"fuel_time_memory_limits": true,
+			"default_no_file_network": true,
+			"data_plane":              true,
 		},
 		"conformance": map[string]any{
 			"stable_json":                              true,
@@ -2990,6 +2996,7 @@ func manifestSchemaForCLI() map[string]any {
 			"schema_version":   map[string]any{"const": pluginmanager.SchemaVersion},
 			"artifact_type":    map[string]any{"enum": []string{pluginmanager.ArtifactTypeBinary, pluginmanager.ArtifactTypeSource}},
 			"runtime.type":     map[string]any{"enum": runtimeTypeKeysForCLI()},
+			"runtime.abi":      map[string]any{"enum": []string{pluginmanager.WASMHostABIVersion()}},
 			"extension_points": map[string]any{"type": "array", "items": supportedExtensionPointKeysForCLI()},
 			"config_schema":    map[string]any{"type": "object"},
 			"background_tasks": map[string]any{
@@ -4543,6 +4550,11 @@ func manifestExplanation(key string) (map[string]any, bool) {
 			"required": true,
 			"default":  pluginmanager.RuntimeEntry,
 			"summary":  "Path of the runtime entry inside a binary .mcgp package.",
+		},
+		"runtime.abi": {
+			"key":     "runtime.abi",
+			"values":  []string{pluginmanager.WASMHostABIVersion()},
+			"summary": "WASM host ABI version required when runtime.type is wasm.",
 		},
 		"runtime.entry_symbol": {
 			"key":     "runtime.entry_symbol",

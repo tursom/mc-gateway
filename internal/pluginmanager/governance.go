@@ -873,6 +873,18 @@ func (m *Manager) preflightChecks(ctx context.Context, plugin PluginRecord, arti
 				Message:  err.Error(),
 			})
 		}
+		if err := validateWASMArtifactABI(ctx, artifact, manifest); err != nil {
+			result.Checks = append(result.Checks, PreflightCheck{
+				Code:     "wasm_abi_invalid",
+				Severity: GateSeverityBlocking,
+				Message:  err.Error(),
+				Details: map[string]any{
+					"host_abi": wasmHostABIV1,
+					"exports":  wasmABIExportMap(),
+					"imports":  wasmABIImportMap(),
+				},
+			})
+		}
 	}
 	if caps := requiredRuntimeCapabilities(artifact); runtimeRequiredCapabilitiesUnsupported(artifact.RuntimeType) && len(caps) > 0 {
 		result.Checks = append(result.Checks, PreflightCheck{

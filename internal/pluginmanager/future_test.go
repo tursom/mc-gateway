@@ -201,7 +201,7 @@ func TestRuntimeAdapterFactoryProcessModeSupportsProcessDataPlane(t *testing.T) 
 		PluginID:     "wasm-low-risk",
 		ArtifactType: ArtifactTypeBinary,
 		RuntimeType:  RuntimeWASM,
-		MetadataJSON: `{"schema_version":"mc-gateway.plugin/v1","id":"wasm-low-risk","name":"WASM Low Risk","version":"0.1.0","artifact_type":"binary","runtime":{"type":"wasm","entry":"plugin.wasm"},"api_version":"plugin-api/v1","extension_points":[{"type":"provider","key":"route.resolve/v1"}],"capabilities":{}}`,
+		MetadataJSON: `{"schema_version":"mc-gateway.plugin/v1","id":"wasm-low-risk","name":"WASM Low Risk","version":"0.1.0","artifact_type":"binary","runtime":{"type":"wasm","entry":"plugin.wasm","abi":"mc-gateway.wasm.host/v1"},"api_version":"plugin-api/v1","extension_points":[{"type":"provider","key":"route.resolve/v1"}],"capabilities":{}}`,
 	}
 	prepared, err := lifecycle.Prepare(context.Background(), artifact, PluginRecord{ID: artifact.PluginID})
 	if err != nil {
@@ -700,9 +700,10 @@ func TestSandboxPolicyBlocksUnenforceableControls(t *testing.T) {
 
 func TestWASMRequiredCapabilityBlocksEnable(t *testing.T) {
 	manager := newManagerForTest(t, &fakeAdapter{initOnly: true})
-	artifact := uploadTestArtifactWithManifest(t, manager, "wasm-capability-plugin", func(manifest *Manifest) {
+	artifact := uploadTestArtifactWithManifestBytes(t, manager, "wasm-capability-plugin", wasmOKModule, func(manifest *Manifest) {
 		manifest.Runtime.Type = RuntimeWASM
 		manifest.Runtime.Entry = RuntimeWASMEntry
+		manifest.Runtime.ABI = wasmHostABIV1
 		manifest.ExtensionPoints = []ExtensionPoint{{Type: "rule", Key: ExtensionRuleEvaluate}}
 		manifest.Capabilities = json.RawMessage(`{"runtime":{"required_capabilities":["network.egress","secret.env"]}}`)
 	})
@@ -732,9 +733,10 @@ func TestWASMRequiredCapabilityBlocksEnable(t *testing.T) {
 
 func TestWASMValidationContainment(t *testing.T) {
 	manager := newManagerForTest(t, &fakeAdapter{})
-	artifact := uploadTestArtifactWithManifest(t, manager, "wasm-plugin", func(manifest *Manifest) {
+	artifact := uploadTestArtifactWithManifestBytes(t, manager, "wasm-plugin", wasmOKModule, func(manifest *Manifest) {
 		manifest.Runtime.Type = RuntimeWASM
 		manifest.Runtime.Entry = RuntimeWASMEntry
+		manifest.Runtime.ABI = wasmHostABIV1
 		manifest.RuntimeLimits.HandlerTimeoutMS = 10
 		manifest.ExtensionPoints = []ExtensionPoint{{Type: "rule", Key: ExtensionRuleEvaluate}, {Type: "validator", Key: ExtensionConfigValidate}}
 	})
@@ -755,9 +757,10 @@ func TestWASMValidationContainment(t *testing.T) {
 
 func TestWASMValidationRejectsUnsupportedExtensionPoint(t *testing.T) {
 	manager := newManagerForTest(t, &fakeAdapter{})
-	artifact := uploadTestArtifactWithManifest(t, manager, "wasm-upstream", func(manifest *Manifest) {
+	artifact := uploadTestArtifactWithManifestBytes(t, manager, "wasm-upstream", wasmOKModule, func(manifest *Manifest) {
 		manifest.Runtime.Type = RuntimeWASM
 		manifest.Runtime.Entry = RuntimeWASMEntry
+		manifest.Runtime.ABI = wasmHostABIV1
 		manifest.ExtensionPoints = []ExtensionPoint{{Type: "hook", Key: ExtensionUpstreamConnect}}
 	})
 	err := manager.RunWASMValidation(context.Background(), "wasm-upstream", artifact.ID, "ok")

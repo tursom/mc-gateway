@@ -955,6 +955,8 @@ func validateManifest(manifest Manifest) error {
 		return fmt.Errorf("unsupported runtime.entry %q", manifest.Runtime.Entry)
 	case manifest.ArtifactType == ArtifactTypeBinary && manifest.Runtime.Type == RuntimeWASM && manifest.Runtime.Entry != RuntimeWASMEntry:
 		return fmt.Errorf("unsupported runtime.entry %q", manifest.Runtime.Entry)
+	case manifest.Runtime.Type == RuntimeWASM && manifest.Runtime.ABI != wasmHostABIV1:
+		return fmt.Errorf("unsupported runtime.abi %q", manifest.Runtime.ABI)
 	case manifest.ArtifactType == ArtifactTypeSource && rawSourceBuildEntry(manifest) == "":
 		return errors.New("build.entry is required for source artifacts")
 	case manifest.APIVersion != APIVersion:

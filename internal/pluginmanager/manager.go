@@ -2120,6 +2120,9 @@ func (m *Manager) validateArtifactGate(artifact ArtifactRecord) error {
 		if err := validateWASMExtensionPoints(manifest); err != nil {
 			return err
 		}
+		if err := validateWASMArtifactABI(context.Background(), artifact, manifest); err != nil {
+			return err
+		}
 		return nil
 	}
 	if artifact.GoVersion != runtime.Version() {

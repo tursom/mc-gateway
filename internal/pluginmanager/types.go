@@ -225,6 +225,7 @@ type Manifest struct {
 type RuntimeManifest struct {
 	Type        string `json:"type"`
 	Entry       string `json:"entry"`
+	ABI         string `json:"abi,omitempty"`
 	BuildEntry  string `json:"build_entry"`
 	EntrySymbol string `json:"entry_symbol"`
 }

@@ -147,6 +147,32 @@ func TestArtifactStoreMergesProvenanceMetadata(t *testing.T) {
 	}
 }
 
+func TestArtifactStoreRejectsWASMMissingOrMismatchedRuntimeABI(t *testing.T) {
+	tests := []struct {
+		name string
+		abi  string
+	}{
+		{name: "missing runtime abi"},
+		{name: "mismatched runtime abi", abi: "mc-gateway.wasm.host/v0"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewArtifactStore(t.TempDir())
+			_, err := store.ValidateAndStore(ArtifactUpload{
+				SourcePath: writeTestMCGP(t, map[string][]byte{
+					"manifest.json":  testWASMManifestBytes(t, "wasm-abi-plugin", tt.abi),
+					RuntimeWASMEntry: wasmOKModule,
+				}),
+				FileName: "wasm-abi-plugin.mcgp",
+				Actor:    "admin",
+			})
+			if err == nil || !strings.Contains(err.Error(), "unsupported runtime.abi") {
+				t.Fatalf("ValidateAndStore(%s) error = %v, want unsupported runtime.abi", tt.name, err)
+			}
+		})
+	}
+}
+
 func TestArtifactStoreRejectsUnsafePackage(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -197,6 +223,35 @@ func TestArtifactStoreRejectsUnsafePackage(t *testing.T) {
 			}
 		})
 	}
+}
+
+func testWASMManifestBytes(t *testing.T, pluginID, abi string) []byte {
+	t.Helper()
+	manifest := Manifest{
+		SchemaVersion: SchemaVersion,
+		ID:            pluginID,
+		Name:          "WASM Test Plugin",
+		Version:       "0.1.0",
+		ArtifactType:  ArtifactTypeBinary,
+		Runtime: RuntimeManifest{
+			Type:  RuntimeWASM,
+			Entry: RuntimeWASMEntry,
+			ABI:   abi,
+		},
+		APIVersion: APIVersion,
+		ExtensionPoints: []ExtensionPoint{{
+			Type: "rule",
+			Key:  ExtensionRuleEvaluate,
+		}},
+		Capabilities:  json.RawMessage(`{"extension_points":["rule.evaluate/v1"]}`),
+		ConfigSchema:  json.RawMessage(`{"type":"object"}`),
+		RuntimeLimits: RuntimeLimits{HandlerTimeoutMS: 3000},
+	}
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("Marshal wasm manifest error = %v", err)
+	}
+	return data
 }
 
 func TestArtifactStoreRejectsSourceShellScripts(t *testing.T) {
