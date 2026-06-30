@@ -9,13 +9,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
-
-	"golang.org/x/sys/unix"
 
 	"github.com/tursom/mc-gateway/plugin/api"
 )
@@ -273,8 +269,7 @@ func (s SandboxSupervisor) Start(ctx context.Context, pluginID, artifactID, exec
 	args := append([]string{}, s.ArgsPrefix...)
 	cmd := exec.CommandContext(ctx, "/plugin", args...)
 	cmd.Env = sandboxEnv(policy)
-	cmd.SysProcAttr = sandboxSysProcAttr()
-	cmd.SysProcAttr.Chroot = rootDir
+	configureSandboxCommand(cmd, rootDir)
 	cmd.Dir = "/"
 	if policy.CPUSeconds > 0 {
 		cmd.Cancel = func() error {
@@ -362,39 +357,6 @@ func sandboxControlSocketPath(rootDir string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(runDir, "control.sock"), nil
-}
-
-func applySandboxRLimits(pid int, policy SandboxPolicy) error {
-	if pid <= 0 {
-		return errors.New("sandbox pid is required")
-	}
-	if policy.MemoryBytes > 0 {
-		limit := &unix.Rlimit{Cur: uint64(policy.MemoryBytes), Max: uint64(policy.MemoryBytes)}
-		if err := unix.Prlimit(pid, unix.RLIMIT_AS, limit, nil); err != nil {
-			return fmt.Errorf("apply sandbox memory limit: %w", err)
-		}
-	}
-	if policy.CPUSeconds > 0 {
-		limit := &unix.Rlimit{Cur: uint64(policy.CPUSeconds), Max: uint64(policy.CPUSeconds)}
-		if err := unix.Prlimit(pid, unix.RLIMIT_CPU, limit, nil); err != nil {
-			return fmt.Errorf("apply sandbox cpu limit: %w", err)
-		}
-	}
-	return nil
-}
-
-func validateSandboxEnforcementSupported() error {
-	if runtime.GOOS != "linux" {
-		return fmt.Errorf("sandbox-process enforcement requires linux namespaces, got %s", runtime.GOOS)
-	}
-	return nil
-}
-
-func sandboxSysProcAttr() *syscall.SysProcAttr {
-	return &syscall.SysProcAttr{
-		Setsid:     true,
-		Cloneflags: syscall.CLONE_NEWNS | syscall.CLONE_NEWNET | syscall.CLONE_NEWIPC | syscall.CLONE_NEWUTS,
-	}
 }
 
 func sandboxEnv(policy SandboxPolicy) []string {
