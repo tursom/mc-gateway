@@ -83,6 +83,21 @@ func TestWASMABIExportMappingAndModuleValidation(t *testing.T) {
 	}
 }
 
+func TestWASMLowRiskExtensionWhitelist(t *testing.T) {
+	manifest := wasmTestManifest([]ExtensionPoint{
+		{Type: "validator", Key: ExtensionConfigValidate},
+		{Type: "rule", Key: ExtensionRuleEvaluate},
+		{Type: "provider", Key: ExtensionRouteResolve},
+	})
+	if err := validateWASMExtensionPoints(manifest); err != nil {
+		t.Fatalf("validateWASMExtensionPoints(low-risk) error = %v", err)
+	}
+	manifest.ExtensionPoints = append(manifest.ExtensionPoints, ExtensionPoint{Type: "hook", Key: ExtensionStatusPing})
+	if err := validateWASMExtensionPoints(manifest); err == nil || !strings.Contains(err.Error(), "not supported") || !strings.Contains(err.Error(), ExtensionConfigValidate) {
+		t.Fatalf("validateWASMExtensionPoints(high-risk) error = %v, want unsupported with whitelist", err)
+	}
+}
+
 func TestWASMABIValidationRejectsDeniedHostImport(t *testing.T) {
 	manifest := wasmTestManifest([]ExtensionPoint{{Type: "rule", Key: ExtensionRuleEvaluate}})
 	tests := []struct {

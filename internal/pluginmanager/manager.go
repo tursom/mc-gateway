@@ -1561,6 +1561,15 @@ func (m *Manager) UpsertSecret(ctx context.Context, actor, pluginID, artifactID,
 	if secret.HotReload {
 		plugin, err := m.repo.Plugin(ctx, pluginID)
 		if err != nil {
+			if errors.Is(err, ErrPluginNotFound) {
+				_ = m.repo.RecordOperation(ctx, pluginID, artifactID, "reload", "skipped", actor, "secret hot reload skipped because plugin desired state is not configured", map[string]any{
+					"reload_reason":   "secret_rotation",
+					"secret_ref":      "plugin://" + pluginID + "/" + name,
+					"active_changed":  false,
+					"current_version": secret.CurrentVersion,
+				})
+				return secret, nil
+			}
 			_ = m.repo.RecordOperation(ctx, pluginID, artifactID, "reload", "failed", actor, err.Error(), map[string]any{
 				"reload_reason":   "secret_rotation",
 				"secret_ref":      "plugin://" + pluginID + "/" + name,
@@ -2276,6 +2285,16 @@ func (m *Manager) runtimeAdapterForArtifact(artifact ArtifactRecord) RuntimeAdap
 	if m.adapterManaged {
 		adapter, _ = RuntimeAdapterFactory{}.AdapterFor(m.serviceMode, artifact.RuntimeType)
 		switch typed := adapter.(type) {
+		case GoPluginProcessAdapter:
+			switch configured := m.adapter.(type) {
+			case GoPluginProcessAdapter:
+				typed.Supervisor = configured.Supervisor
+			case *GoPluginProcessAdapter:
+				if configured != nil {
+					typed.Supervisor = configured.Supervisor
+				}
+			}
+			adapter = typed
 		case SandboxProcessAdapter:
 			typed.Policy = m.sandboxPolicy
 			typed.Secrets = m

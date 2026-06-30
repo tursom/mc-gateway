@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -38,6 +39,67 @@ func TestWASMDispatchRuleEvaluateUsesWASM(t *testing.T) {
 	}
 	if !result.Handled || result.PluginID != "wasm-rule" || !result.Decision.Deny || result.Decision.Allow || result.Decision.Reason != "blocked by wasm" {
 		t.Fatalf("EvaluateRule() = %+v, want wasm deny decision", result)
+	}
+}
+
+func TestWASMDispatchRuleEvaluateAllowDenyAndError(t *testing.T) {
+	_, _, plugin := startWASMLifecyclePlugin(t, "wasm-rule-matrix", `{}`)
+	tests := []struct {
+		name      string
+		resp      WASMABIResponse
+		err       error
+		wantAllow bool
+		wantDeny  bool
+		wantErr   string
+	}{
+		{
+			name: "allow",
+			resp: WASMABIResponse{
+				ExtensionPoint: ExtensionRuleEvaluate,
+				OK:             true,
+				Decision:       "allow",
+				Reason:         "allow from wasm",
+			},
+			wantAllow: true,
+		},
+		{
+			name: "deny",
+			resp: WASMABIResponse{
+				ExtensionPoint: ExtensionRuleEvaluate,
+				OK:             true,
+				Decision:       "deny",
+				Reason:         "deny from wasm",
+			},
+			wantDeny: true,
+		},
+		{
+			name:    "error",
+			err:     newWASMABIError(wasmABIErrorTrap, ExtensionRuleEvaluate, "rule trap"),
+			wantErr: wasmABIErrorTrap,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plugin.dispatchHook = func(_ context.Context, _ wasmRuntimeSnapshot, point string, _ WASMABIRequest) (WASMABIResponse, error, bool) {
+				if point != ExtensionRuleEvaluate {
+					return WASMABIResponse{}, nil, false
+				}
+				return tt.resp, tt.err, true
+			}
+			decision, err := plugin.evaluateRule(api.RuleEvaluateRequest{Action: "join", Context: context.Background()})
+			if tt.wantErr != "" {
+				if got := wasmABIErrorCode(err); got != tt.wantErr {
+					t.Fatalf("evaluateRule() error = %v code=%q, want %s", err, got, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("evaluateRule() error = %v", err)
+			}
+			if decision.Allow != tt.wantAllow || decision.Deny != tt.wantDeny || decision.Reject != tt.wantDeny || decision.ProviderID != "wasm-rule-matrix" {
+				t.Fatalf("evaluateRule() = %+v, want allow=%v deny=%v provider", decision, tt.wantAllow, tt.wantDeny)
+			}
+		})
 	}
 }
 
@@ -77,6 +139,123 @@ func TestWASMDispatchRouteResolveUsesWASMAndDisableRemoves(t *testing.T) {
 	}
 }
 
+func TestWASMDispatchRouteResolveFallbackRejectAndError(t *testing.T) {
+	manager := newManagerForTestWithBuildersProfile(t, nil, nil, PolicyProfileDev)
+	module := wasmStaticResponseModule(t, wasmExportRouteResolveV1, WASMABIResponse{
+		ExtensionPoint: ExtensionRouteResolve,
+		OK:             true,
+		Decision:       "use_default",
+	})
+	artifact := uploadWASMDispatchArtifact(t, manager, "wasm-route-matrix", module, []ExtensionPoint{{Type: "provider", Key: ExtensionRouteResolve}})
+	adapter := WASMAdapter{Runner: NewWASMRunner(), Mode: PluginServiceModeInProcess}
+	prepared, err := adapter.Prepare(context.Background(), artifact, PluginRecord{ID: "wasm-route-matrix"})
+	if err != nil {
+		t.Fatalf("Prepare(wasm-route-matrix) error = %v", err)
+	}
+	instance, err := adapter.Start(context.Background(), prepared, artifact, PluginRecord{ID: "wasm-route-matrix", ConfigJSON: `{}`}, nil)
+	if err != nil {
+		t.Fatalf("Start(wasm-route-matrix) error = %v", err)
+	}
+	plugin := instance.Plugin.(*wasmHostedPlugin)
+	tests := []struct {
+		name       string
+		resp       WASMABIResponse
+		err        error
+		wantAction string
+		wantErr    error
+	}{
+		{
+			name: "fallback",
+			resp: WASMABIResponse{
+				ExtensionPoint: ExtensionRouteResolve,
+				OK:             true,
+				Decision:       "use_default",
+				Reason:         "default route",
+			},
+			wantAction: api.RouteDecisionPass,
+		},
+		{
+			name: "reject",
+			resp: WASMABIResponse{
+				ExtensionPoint: ExtensionRouteResolve,
+				OK:             true,
+				Decision:       "reject",
+				Reason:         "reject route",
+			},
+			wantAction: api.RouteDecisionReject,
+		},
+		{
+			name:    "error",
+			err:     newWASMABIError(wasmABIErrorTrap, ExtensionRouteResolve, "route trap"),
+			wantErr: api.ErrPass,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plugin.dispatchHook = func(_ context.Context, _ wasmRuntimeSnapshot, point string, _ WASMABIRequest) (WASMABIResponse, error, bool) {
+				if point != ExtensionRouteResolve {
+					return WASMABIResponse{}, nil, false
+				}
+				return tt.resp, tt.err, true
+			}
+			decision, err := plugin.resolveRoute(api.RouteResolveRequest{Host: "play.example", Context: context.Background()})
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("resolveRoute() error = %v, want %v", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveRoute() error = %v", err)
+			}
+			if decision.Action != tt.wantAction || decision.ProviderID != "wasm-route-matrix" {
+				t.Fatalf("resolveRoute() = %+v, want action %s provider", decision, tt.wantAction)
+			}
+		})
+	}
+}
+
+func TestWASMDispatchFailureContainmentAllowsNextCall(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		counterKey string
+	}{
+		{name: "timeout", err: newWASMABIError(wasmABIErrorTimeout, ExtensionRuleEvaluate, "deadline"), counterKey: "timeout_count"},
+		{name: "trap", err: newWASMABIError(wasmABIErrorTrap, ExtensionRuleEvaluate, "trap"), counterKey: "trap_count"},
+		{name: "memory exceeded", err: newWASMABIError(wasmABIErrorMemoryExceeded, ExtensionRuleEvaluate, "memory limit exceeded"), counterKey: "memory_error_count"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, plugin := startWASMLifecyclePlugin(t, "wasm-containment-"+strings.ReplaceAll(tt.name, " ", "-"), `{}`)
+			plugin.dispatchHook = func(_ context.Context, _ wasmRuntimeSnapshot, point string, _ WASMABIRequest) (WASMABIResponse, error, bool) {
+				if point != ExtensionRuleEvaluate {
+					return WASMABIResponse{}, nil, false
+				}
+				return WASMABIResponse{}, tt.err, true
+			}
+			if _, err := plugin.evaluateRule(api.RuleEvaluateRequest{Action: "join", Context: context.Background()}); wasmABIErrorCode(err) != wasmABIErrorCode(tt.err) {
+				t.Fatalf("evaluateRule(first) error = %v code=%q, want %s", err, wasmABIErrorCode(err), wasmABIErrorCode(tt.err))
+			}
+
+			plugin.dispatchHook = func(_ context.Context, _ wasmRuntimeSnapshot, point string, _ WASMABIRequest) (WASMABIResponse, error, bool) {
+				if point != ExtensionRuleEvaluate {
+					return WASMABIResponse{}, nil, false
+				}
+				return WASMABIResponse{ExtensionPoint: ExtensionRuleEvaluate, OK: true, Decision: "allow"}, nil, true
+			}
+			decision, err := plugin.evaluateRule(api.RuleEvaluateRequest{Action: "join", Context: context.Background()})
+			if err != nil || !decision.Allow {
+				t.Fatalf("evaluateRule(next) = %+v err=%v, want successful allow after %s", decision, err, tt.name)
+			}
+			summary := plugin.diagnosticsSummary()
+			if summary[tt.counterKey] != int64(1) || summary["last_dispatch_ok"] != true || summary["last_error"] != "" {
+				t.Fatalf("diagnostics after recovery = %+v, want %s=1 and last success", summary, tt.counterKey)
+			}
+		})
+	}
+}
+
 func TestWASMDispatchConfigValidateBlocksBadConfig(t *testing.T) {
 	manager := newManagerForTestWithBuildersProfile(t, nil, nil, PolicyProfileDev)
 	valid := false
@@ -97,6 +276,24 @@ func TestWASMDispatchConfigValidateBlocksBadConfig(t *testing.T) {
 	}
 	if _, err := manager.Enable(context.Background(), "admin", "wasm-config"); err == nil || !strings.Contains(err.Error(), "bad config from wasm") {
 		t.Fatalf("Enable(wasm-config) error = %v, want blocking validation error", err)
+	}
+}
+
+func TestWASMDispatchConfigValidateAcceptsGoodConfig(t *testing.T) {
+	manager := newManagerForTestWithBuildersProfile(t, nil, nil, PolicyProfileDev)
+	valid := true
+	module := wasmStaticResponseModule(t, wasmExportConfigValidateV1, WASMABIResponse{
+		ExtensionPoint: ExtensionConfigValidate,
+		OK:             true,
+		Valid:          &valid,
+	})
+	artifact := uploadWASMDispatchArtifact(t, manager, "wasm-config-ok", module, []ExtensionPoint{{Type: "validator", Key: ExtensionConfigValidate}})
+
+	if result, err := manager.DryRunConfig(context.Background(), "wasm-config-ok", artifact.ID, `{"enabled":true}`); err != nil || !result.OK {
+		t.Fatalf("DryRunConfig(good wasm config) = %+v err=%v, want ok", result, err)
+	}
+	if _, err := manager.SetDesired(context.Background(), "admin", "wasm-config-ok", artifact.ID, DesiredEnabled, `{"enabled":true}`, 10); err != nil {
+		t.Fatalf("SetDesired(wasm-config-ok) error = %v", err)
 	}
 }
 
@@ -157,6 +354,32 @@ func TestWASMPrepareRejectsInvalidLimits(t *testing.T) {
 	}
 }
 
+func TestWASMDispatchOutputLimitRejectsOversizedResponse(t *testing.T) {
+	manifest := wasmTestManifest([]ExtensionPoint{{Type: "rule", Key: ExtensionRuleEvaluate}})
+	manifest.RuntimeLimits.HandlerTimeoutMS = 100
+	manifest.RuntimeLimits.MemoryBytes = 64 * 1024
+	module := wasmStaticResponseModule(t, wasmExportRuleEvaluateV1, WASMABIResponse{
+		ExtensionPoint: ExtensionRuleEvaluate,
+		OK:             true,
+		Decision:       "allow",
+		Reason:         strings.Repeat("x", 64),
+	})
+	_, err := NewWASMRunner().Dispatch(context.Background(), WASMDispatchInvocation{
+		ArtifactID:     "wasm-output-limit",
+		PluginID:       "wasm-output-limit",
+		Module:         module,
+		Manifest:       manifest,
+		ExtensionPoint: ExtensionRuleEvaluate,
+		Request:        WASMABIRequest{RuleContext: json.RawMessage(`{"action":"join"}`)},
+		Timeout:        100 * time.Millisecond,
+		MemoryBytes:    64 * 1024,
+		MaxOutputBytes: 32,
+	})
+	if got := wasmABIErrorCode(err); got != wasmABIErrorOversizedOutput {
+		t.Fatalf("Dispatch(output limit) error = %v code=%q, want %s", err, got, wasmABIErrorOversizedOutput)
+	}
+}
+
 func TestWASMReloadConfigDoesNotPolluteInFlightDispatch(t *testing.T) {
 	adapter, instance, plugin := startWASMLifecyclePlugin(t, "wasm-reload", `{"version":"old"}`)
 	entered := make(chan WASMABIRequest, 1)
@@ -207,6 +430,45 @@ func TestWASMReloadConfigDoesNotPolluteInFlightDispatch(t *testing.T) {
 	}
 	if got := <-nextReq; string(got.Config) != `{"version":"new"}` {
 		t.Fatalf("post-reload config = %s, want new snapshot", got.Config)
+	}
+}
+
+func TestWASMRollbackConfigSnapshotRestoresPreviousArtifactAndConfig(t *testing.T) {
+	manager := newManagerForTestWithBuildersProfile(t, nil, nil, PolicyProfileDev)
+	oldArtifact := uploadWASMDispatchArtifact(t, manager, "wasm-rollback", wasmStaticResponseModule(t, wasmExportRuleEvaluateV1, WASMABIResponse{
+		ExtensionPoint: ExtensionRuleEvaluate,
+		OK:             true,
+		Decision:       "allow",
+		Reason:         "old",
+	}), []ExtensionPoint{{Type: "rule", Key: ExtensionRuleEvaluate}})
+	newArtifact := uploadWASMDispatchArtifact(t, manager, "wasm-rollback", wasmStaticResponseModule(t, wasmExportRuleEvaluateV1, WASMABIResponse{
+		ExtensionPoint: ExtensionRuleEvaluate,
+		OK:             true,
+		Decision:       "deny",
+		Reason:         "new",
+	}), []ExtensionPoint{{Type: "rule", Key: ExtensionRuleEvaluate}})
+	if _, err := manager.SetDesired(context.Background(), "admin", "wasm-rollback", oldArtifact.ID, DesiredEnabled, `{"version":"old"}`, 10); err != nil {
+		t.Fatalf("SetDesired(old wasm) error = %v", err)
+	}
+	if _, err := manager.SetDesired(context.Background(), "admin", "wasm-rollback", newArtifact.ID, DesiredEnabled, `{"version":"new"}`, 20); err != nil {
+		t.Fatalf("SetDesired(new wasm) error = %v", err)
+	}
+	snapshots, err := manager.ListConfigSnapshots(context.Background(), "wasm-rollback")
+	if err != nil {
+		t.Fatalf("ListConfigSnapshots(wasm-rollback) error = %v", err)
+	}
+	if len(snapshots) != 1 {
+		t.Fatalf("snapshots = %d, want 1", len(snapshots))
+	}
+	rolledBack, err := manager.RollbackConfigSnapshot(context.Background(), "admin", snapshots[0].ID, true)
+	if err != nil {
+		t.Fatalf("RollbackConfigSnapshot(wasm full desired) error = %v", err)
+	}
+	if rolledBack.DesiredArtifactID != oldArtifact.ID ||
+		rolledBack.ConfigJSON != `{"version":"old"}` ||
+		rolledBack.DesiredState != DesiredEnabled ||
+		rolledBack.Priority != 10 {
+		t.Fatalf("rolled back wasm plugin = %+v, want old artifact/config/state/priority", rolledBack)
 	}
 }
 
