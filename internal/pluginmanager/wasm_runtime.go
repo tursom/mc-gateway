@@ -23,7 +23,32 @@ const (
 	wasmMaxHandlerTimeoutMS = int(DefaultHandlerTimeout / time.Millisecond)
 	wasmMinMemoryBytes      = 64 * 1024
 	wasmMaxMemoryBytes      = 64 * 1024 * 1024
+
+	wasmRecentFailureLimit      = 10
+	wasmTrapQuarantineThreshold = 3
 )
+
+var wasmDurationBucketUpperMS = []int64{1, 5, 10, 50, 100, 500, 1000, 3000}
+
+type wasmRuntimeFailure struct {
+	At             int64  `json:"at"`
+	ExtensionPoint string `json:"extension_point,omitempty"`
+	ErrorCode      string `json:"error_code,omitempty"`
+	Message        string `json:"message"`
+	Quarantine     bool   `json:"quarantine,omitempty"`
+}
+
+type wasmRuntimeQuarantine struct {
+	PluginID       string         `json:"plugin_id"`
+	ArtifactID     string         `json:"artifact_id"`
+	Reason         string         `json:"reason"`
+	ExtensionPoint string         `json:"extension_point,omitempty"`
+	LastError      string         `json:"last_error,omitempty"`
+	TrapCount      int64          `json:"trap_count"`
+	Threshold      int64          `json:"threshold"`
+	At             int64          `json:"at"`
+	RuntimeSummary map[string]any `json:"runtime_summary,omitempty"`
+}
 
 type WASMRunner struct {
 	mu       sync.Mutex
@@ -57,29 +82,40 @@ type WASMAdapter struct {
 }
 
 type wasmHostedPlugin struct {
-	runner             *WASMRunner
-	manifest           Manifest
-	artifact           ArtifactRecord
-	pluginID           string
-	module             []byte
-	configJSON         json.RawMessage
-	moduleHash         string
-	moduleCacheStatus  string
-	artifactGeneration int64
-	state              string
-	startedAt          int64
-	drainingAt         int64
-	stoppedAt          int64
-	dispatchHook       func(context.Context, wasmRuntimeSnapshot, string, WASMABIRequest) (WASMABIResponse, error, bool)
-	mu                 sync.Mutex
-	activeCalls        int
-	trapCount          int64
-	timeoutCount       int64
-	memoryErrorCount   int64
-	lastError          string
-	lastPoint          string
-	lastAt             int64
-	lastOK             bool
+	runner                   *WASMRunner
+	manifest                 Manifest
+	artifact                 ArtifactRecord
+	pluginID                 string
+	module                   []byte
+	configJSON               json.RawMessage
+	moduleHash               string
+	moduleCacheStatus        string
+	artifactGeneration       int64
+	state                    string
+	startedAt                int64
+	drainingAt               int64
+	stoppedAt                int64
+	dispatchHook             func(context.Context, wasmRuntimeSnapshot, string, WASMABIRequest) (WASMABIResponse, error, bool)
+	mu                       sync.Mutex
+	activeCalls              int
+	callCount                int64
+	durationCount            int64
+	durationSumMS            int64
+	durationMaxMS            int64
+	durationBuckets          [9]int64
+	trapCount                int64
+	timeoutCount             int64
+	memoryErrorCount         int64
+	consecutiveTraps         int64
+	recentFailures           []wasmRuntimeFailure
+	quarantined              bool
+	quarantineAt             int64
+	quarantineReason         string
+	lastError                string
+	lastPoint                string
+	lastAt                   int64
+	lastOK                   bool
+	onRepeatedTrapQuarantine func(context.Context, wasmRuntimeQuarantine)
 }
 
 type wasmRuntimeSnapshot struct {
@@ -911,6 +947,7 @@ func (p *wasmHostedPlugin) dispatch(ctx context.Context, point string, req WASMA
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	start := time.Now()
 	snapshot, finish, err := p.beginDispatch(point)
 	if err != nil {
 		p.recordDispatch(point, err)
@@ -923,7 +960,7 @@ func (p *wasmHostedPlugin) dispatch(ctx context.Context, point string, req WASMA
 	if snapshot.dispatchHook != nil {
 		resp, hookErr, handled := snapshot.dispatchHook(ctx, snapshot, point, req)
 		if handled {
-			p.recordDispatch(point, hookErr)
+			p.recordDispatchWithContext(ctx, point, hookErr, req.Config, time.Since(start))
 			return resp, hookErr
 		}
 	}
@@ -938,7 +975,7 @@ func (p *wasmHostedPlugin) dispatch(ctx context.Context, point string, req WASMA
 		MemoryBytes:    snapshot.manifest.RuntimeLimits.MemoryBytes,
 		MaxOutputBytes: wasmABIMaxOutputBytes,
 	})
-	p.recordDispatch(point, err)
+	p.recordDispatchWithContext(ctx, point, err, req.Config, time.Since(start))
 	return resp, err
 }
 
@@ -1052,29 +1089,92 @@ func (p *wasmHostedPlugin) lifecycleState() string {
 	return p.state
 }
 
-func (p *wasmHostedPlugin) recordDispatch(point string, err error) {
+func (p *wasmHostedPlugin) recordDispatch(point string, err error, durations ...time.Duration) {
+	p.recordDispatchWithContext(context.Background(), point, err, nil, durations...)
+}
+
+func (p *wasmHostedPlugin) recordDispatchWithContext(ctx context.Context, point string, err error, configJSON json.RawMessage, durations ...time.Duration) {
 	if p == nil {
 		return
 	}
+	var quarantine wasmRuntimeQuarantine
+	var callback func(context.Context, wasmRuntimeQuarantine)
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	now := time.Now().Unix()
 	p.lastPoint = point
-	p.lastAt = time.Now().Unix()
+	p.lastAt = now
+	if len(durations) > 0 && durations[0] >= 0 {
+		durationMS := durations[0].Milliseconds()
+		if durationMS < 0 {
+			durationMS = 0
+		}
+		p.callCount++
+		p.durationCount++
+		p.durationSumMS += durationMS
+		if durationMS > p.durationMaxMS {
+			p.durationMaxMS = durationMS
+		}
+		p.durationBuckets[wasmDurationBucketIndex(durationMS)]++
+	}
 	if err != nil {
 		p.lastOK = false
-		p.lastError = err.Error()
-		switch wasmABIErrorCode(err) {
+		message := p.redactRuntimeError(err.Error(), configJSON)
+		code := wasmABIErrorCode(err)
+		p.lastError = message
+		switch code {
 		case wasmABIErrorTrap:
 			p.trapCount++
+			p.consecutiveTraps++
 		case wasmABIErrorTimeout:
 			p.timeoutCount++
+			p.consecutiveTraps = 0
 		case wasmABIErrorMemoryExceeded:
 			p.memoryErrorCount++
+			p.consecutiveTraps = 0
+		default:
+			p.consecutiveTraps = 0
+		}
+		failure := wasmRuntimeFailure{
+			At:             now,
+			ExtensionPoint: point,
+			ErrorCode:      code,
+			Message:        message,
+		}
+		if code == wasmABIErrorTrap && p.consecutiveTraps >= wasmTrapQuarantineThreshold && !p.quarantined {
+			p.quarantined = true
+			p.quarantineAt = now
+			p.quarantineReason = fmt.Sprintf("wasm repeated trap quarantine after %d consecutive traps", p.consecutiveTraps)
+			p.state = RuntimeDraining
+			failure.Quarantine = true
+			quarantine = wasmRuntimeQuarantine{
+				PluginID:       p.pluginID,
+				ArtifactID:     p.artifact.ID,
+				Reason:         p.quarantineReason,
+				ExtensionPoint: point,
+				LastError:      message,
+				TrapCount:      p.trapCount,
+				Threshold:      wasmTrapQuarantineThreshold,
+				At:             now,
+			}
+			callback = p.onRepeatedTrapQuarantine
+		}
+		p.appendRecentFailureLocked(failure)
+		if callback != nil {
+			quarantine.RuntimeSummary = p.diagnosticsSummaryLocked()
+		}
+		p.mu.Unlock()
+		if callback != nil {
+			if ctx == nil {
+				ctx = context.Background()
+			}
+			callback(ctx, quarantine)
 		}
 		return
 	}
 	p.lastOK = true
 	p.lastError = ""
+	p.consecutiveTraps = 0
+	p.mu.Unlock()
 }
 
 func (p *wasmHostedPlugin) diagnosticsSummary() map[string]any {
@@ -1083,18 +1183,33 @@ func (p *wasmHostedPlugin) diagnosticsSummary() map[string]any {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.diagnosticsSummaryLocked()
+}
+
+func (p *wasmHostedPlugin) diagnosticsSummaryLocked() map[string]any {
 	return map[string]any{
 		"state":                  firstNonEmpty(p.state, RuntimeEnabled),
+		"runtime_type":           RuntimeWASM,
 		"host_abi":               wasmHostABIV1,
+		"runtime_abi":            p.manifest.Runtime.ABI,
 		"module_hash":            p.moduleHash,
 		"module_cache_status":    p.moduleCacheStatus,
 		"artifact_generation":    p.artifactGeneration,
+		"call_count":             p.callCount,
+		"duration_count":         p.durationCount,
+		"duration_sum_ms":        p.durationSumMS,
+		"duration_max_ms":        p.durationMaxMS,
+		"duration_histogram_ms":  wasmDurationHistogram(p.durationBuckets),
 		"handler_timeout_ms":     p.manifest.RuntimeLimits.HandlerTimeoutMS,
 		"memory_bytes":           p.manifest.RuntimeLimits.MemoryBytes,
 		"active_calls":           p.activeCalls,
 		"trap_count":             p.trapCount,
 		"timeout_count":          p.timeoutCount,
 		"memory_error_count":     p.memoryErrorCount,
+		"consecutive_trap_count": p.consecutiveTraps,
+		"quarantined":            p.quarantined,
+		"quarantine_at":          p.quarantineAt,
+		"quarantine_reason":      p.quarantineReason,
 		"started_at":             p.startedAt,
 		"draining_at":            p.drainingAt,
 		"stopped_at":             p.stoppedAt,
@@ -1105,8 +1220,52 @@ func (p *wasmHostedPlugin) diagnosticsSummary() map[string]any {
 		"runtime_module_loaded":  len(p.module) > 0,
 		"runtime_runner_loaded":  p.runner != nil,
 		"supported_extensions":   wasmManifestExtensionKeys(p.manifest),
+		"limits": map[string]any{
+			"handler_timeout_ms": p.manifest.RuntimeLimits.HandlerTimeoutMS,
+			"memory_bytes":       p.manifest.RuntimeLimits.MemoryBytes,
+			"max_output_bytes":   wasmABIMaxOutputBytes,
+			"max_input_bytes":    wasmABIMaxInputBytes,
+		},
+		"recent_failures":        append([]wasmRuntimeFailure(nil), p.recentFailures...),
 		"low_risk_extension_set": true,
 	}
+}
+
+func (p *wasmHostedPlugin) appendRecentFailureLocked(failure wasmRuntimeFailure) {
+	if failure.Message == "" {
+		return
+	}
+	if len(p.recentFailures) >= wasmRecentFailureLimit {
+		copy(p.recentFailures, p.recentFailures[1:])
+		p.recentFailures = p.recentFailures[:len(p.recentFailures)-1]
+	}
+	p.recentFailures = append(p.recentFailures, failure)
+}
+
+func (p *wasmHostedPlugin) redactRuntimeError(message string, configJSON json.RawMessage) string {
+	if len(configJSON) > 0 {
+		paths := sensitiveConfigPaths(p.manifest.ConfigSchema, string(configJSON))
+		message = redactSensitiveConfigText(message, string(configJSON), paths)
+	}
+	return redactSensitive(message)
+}
+
+func wasmDurationBucketIndex(durationMS int64) int {
+	for i, upper := range wasmDurationBucketUpperMS {
+		if durationMS <= upper {
+			return i
+		}
+	}
+	return len(wasmDurationBucketUpperMS)
+}
+
+func wasmDurationHistogram(buckets [9]int64) map[string]int64 {
+	out := make(map[string]int64, len(wasmDurationBucketUpperMS)+1)
+	for i, upper := range wasmDurationBucketUpperMS {
+		out[fmt.Sprintf("le_%d", upper)] = buckets[i]
+	}
+	out["+Inf"] = buckets[len(wasmDurationBucketUpperMS)]
+	return out
 }
 
 func wasmManifestExtensionKeys(manifest Manifest) []string {

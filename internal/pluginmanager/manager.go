@@ -427,7 +427,8 @@ func (m *Manager) EnsureOfficialPlugins(ctx context.Context, actor string) error
 func (m *Manager) UploadArtifact(ctx context.Context, upload ArtifactUpload) (ArtifactRecord, error) {
 	artifact, err := m.store.ValidateAndStore(upload)
 	if err != nil {
-		_ = m.repo.RecordOperation(ctx, "", "", "artifact_upload", "failed", upload.Actor, err.Error(), nil)
+		audit := m.store.uploadFailureAuditDetails(upload, err)
+		_ = m.repo.RecordOperation(ctx, audit.pluginID, audit.artifactID, "artifact_upload", "failed", upload.Actor, err.Error(), audit.metadata)
 		return ArtifactRecord{}, err
 	}
 	if artifact.ArtifactType == ArtifactTypeSource {
@@ -686,9 +687,16 @@ func (m *Manager) SetDesired(ctx context.Context, actor, pluginID, artifactID, d
 	if desiredState != DesiredDeleted {
 		// 任何非删除状态都先做配置 dry-run，避免把无法加载的配置写成新的期望状态。
 		if _, err := m.DryRunConfig(ctx, pluginID, artifactID, configJSON); err != nil {
-			_ = m.repo.RecordOperation(ctx, pluginID, artifactID, "config_dry_run", "failed", actor, err.Error(), map[string]any{
+			metadata := map[string]any{
 				"active_changed": false,
-			})
+			}
+			for key, value := range m.wasmValidationFailureMetadata(ctx, artifactID, err) {
+				metadata[key] = value
+			}
+			_ = m.repo.RecordOperation(ctx, pluginID, artifactID, "config_dry_run", "failed", actor, err.Error(), metadata)
+			if metadata["runtime_type"] == RuntimeWASM {
+				_ = m.repo.RecordOperation(ctx, pluginID, artifactID, "wasm_validation", "failed", actor, err.Error(), metadata)
+			}
 			return PluginRecord{}, err
 		}
 	}
@@ -726,6 +734,14 @@ func (m *Manager) SetDesired(ctx context.Context, actor, pluginID, artifactID, d
 		metadata["partial_failure"] = rollout.PartialFailure
 	}
 	_ = m.repo.RecordOperation(ctx, pluginID, artifactID, "cluster_desired_apply", "succeeded", actor, "desired generation queued for automatic cluster apply", metadata)
+	if desiredState == DesiredEnabled {
+		if err := m.reloadLoadedRuntime(ctx, actor, pluginRecord, "config_update"); err != nil {
+			return PluginRecord{}, err
+		}
+		if refreshed, err := m.repo.Plugin(ctx, pluginID); err == nil {
+			pluginRecord = refreshed
+		}
+	}
 	return pluginRecord, nil
 }
 
@@ -843,11 +859,15 @@ func (m *Manager) RollbackArtifact(ctx context.Context, actor, pluginID, artifac
 		})
 		return PluginRecord{}, err
 	}
-	_ = m.repo.RecordOperation(ctx, pluginID, artifactID, "artifact_rollback", "succeeded", actor, "artifact rollback desired state updated", map[string]any{
+	rollbackMetadata := map[string]any{
 		"desired_generation":  plugin.DesiredGeneration,
 		"active_changed":      false,
 		"governance_decision": decision,
-	})
+	}
+	for key, value := range m.wasmArtifactMetadata(ctx, artifactID) {
+		rollbackMetadata[key] = value
+	}
+	_ = m.repo.RecordOperation(ctx, pluginID, artifactID, "artifact_rollback", "succeeded", actor, "artifact rollback desired state updated", rollbackMetadata)
 	return plugin, nil
 }
 
@@ -895,13 +915,17 @@ func (m *Manager) RollbackConfigSnapshot(ctx context.Context, actor string, snap
 		})
 		return PluginRecord{}, err
 	}
-	_ = m.repo.RecordOperation(ctx, snapshot.PluginID, artifactID, "config_rollback", "succeeded", actor, "config snapshot rollback desired state updated", map[string]any{
+	rollbackMetadata := map[string]any{
 		"snapshot_id":         snapshot.ID,
 		"full_desired":        fullDesired,
 		"desired_generation":  next.DesiredGeneration,
 		"active_changed":      false,
 		"governance_decision": decision,
-	})
+	}
+	for key, value := range m.wasmArtifactMetadata(ctx, artifactID) {
+		rollbackMetadata[key] = value
+	}
+	_ = m.repo.RecordOperation(ctx, snapshot.PluginID, artifactID, "config_rollback", "succeeded", actor, "config snapshot rollback desired state updated", rollbackMetadata)
 	return next, nil
 }
 
@@ -979,11 +1003,15 @@ func (m *Manager) Enable(ctx context.Context, actor, pluginID string) (PluginRec
 	m.publish(next)
 	m.publishExtensionsLocked(extensions)
 	_ = m.repo.UpdateArtifactStatus(ctx, loaded.artifact.ID, ArtifactStatusLoaded, "")
-	_ = m.repo.RecordOperation(ctx, pluginID, loaded.artifact.ID, "enable", "succeeded", actor, "plugin enabled", map[string]any{
+	enableMetadata := map[string]any{
 		"desired_generation":  loaded.record.DesiredGeneration,
 		"handler_count":       len(loaded.handlers),
 		"governance_decision": decision,
-	})
+	}
+	for key, value := range wasmLifecycleMetadata(loaded) {
+		enableMetadata[key] = value
+	}
+	_ = m.repo.RecordOperation(ctx, pluginID, loaded.artifact.ID, "enable", "succeeded", actor, "plugin enabled", enableMetadata)
 	return m.repo.Plugin(ctx, pluginID)
 }
 
@@ -1008,7 +1036,11 @@ func (m *Manager) Disable(ctx context.Context, actor, pluginID string) (PluginRe
 	m.markDrainingLocked(pluginID)
 	m.markHostDraining(pluginID)
 	m.operations.StopPlugin(pluginID)
+	disableMetadata := map[string]any{}
 	if loaded := m.loaded[pluginID]; loaded != nil {
+		for key, value := range wasmLifecycleMetadata(loaded) {
+			disableMetadata[key] = value
+		}
 		var errs []error
 		if m.shouldDeferProcessHostStop(pluginID, loaded) {
 			errs = m.drainRuntimeInstance(ctx, loaded)
@@ -1031,7 +1063,10 @@ func (m *Manager) Disable(ctx context.Context, actor, pluginID string) (PluginRe
 		return PluginRecord{}, err
 	}
 	m.recordPluginNodeRuntimeStateLocked(ctx, pluginID)
-	_ = m.repo.RecordOperation(ctx, pluginID, pluginRecord.DesiredArtifactID, "disable", "succeeded", actor, "plugin disabled", nil)
+	if len(disableMetadata) == 0 {
+		disableMetadata = nil
+	}
+	_ = m.repo.RecordOperation(ctx, pluginID, pluginRecord.DesiredArtifactID, "disable", "succeeded", actor, "plugin disabled", disableMetadata)
 	return m.repo.Plugin(ctx, pluginID)
 }
 
@@ -1425,6 +1460,50 @@ func (m *Manager) quarantinePluginLocked(pluginID string) {
 	m.operations.StopPlugin(pluginID)
 }
 
+func (m *Manager) handleWASMRepeatedTrapQuarantine(ctx context.Context, event wasmRuntimeQuarantine) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	loaded := m.loaded[event.PluginID]
+	if loaded == nil || loaded.artifact.ID != event.ArtifactID || loaded.artifact.RuntimeType != RuntimeWASM {
+		_ = m.repo.RecordOperation(ctx, event.PluginID, event.ArtifactID, "wasm_repeated_trap_quarantine", "warning", "system", event.Reason, map[string]any{
+			"runtime_type":    RuntimeWASM,
+			"trap_count":      event.TrapCount,
+			"trap_threshold":  event.Threshold,
+			"extension_point": event.ExtensionPoint,
+			"stale_runtime":   true,
+		})
+		return
+	}
+	m.quarantinePluginLocked(event.PluginID)
+	plugin, err := m.repo.Plugin(ctx, event.PluginID)
+	if err != nil {
+		return
+	}
+	summary := event.RuntimeSummary
+	if summary == nil {
+		summary = m.loadedRuntimeSummary(loaded)
+	}
+	summary["quarantine"] = true
+	summary["quarantine_reason"] = event.Reason
+	summary["trap_threshold"] = event.Threshold
+	summary["last_error"] = event.LastError
+	_ = m.repo.MarkRuntime(ctx, event.PluginID, RuntimeDraining, loaded.artifact.ID, loaded.artifact.ID, plugin.AppliedGeneration, event.Reason, summary, loaded.dispatchSummaries())
+	m.recordPluginNodeRuntimeStateLocked(ctx, event.PluginID)
+	_ = m.repo.RecordOperation(ctx, event.PluginID, event.ArtifactID, "wasm_repeated_trap_quarantine", "warning", "system", event.Reason, map[string]any{
+		"runtime_type":    RuntimeWASM,
+		"runtime_abi":     summary["runtime_abi"],
+		"module_hash":     summary["module_hash"],
+		"trap_count":      event.TrapCount,
+		"trap_threshold":  event.Threshold,
+		"extension_point": event.ExtensionPoint,
+		"last_error":      event.LastError,
+		"quarantine":      true,
+	})
+}
+
 func (m *Manager) UpsertSecret(ctx context.Context, actor, pluginID, artifactID, name, value string, reloadRequired, hotReload bool) (SecretRecord, error) {
 	if artifactID == "" {
 		plugin, err := m.repo.Plugin(ctx, pluginID)
@@ -1479,6 +1558,21 @@ func (m *Manager) UpsertSecret(ctx context.Context, actor, pluginID, artifactID,
 		"reload_required":  secret.ReloadRequired,
 		"hot_reload":       secret.HotReload,
 	})
+	if secret.HotReload {
+		plugin, err := m.repo.Plugin(ctx, pluginID)
+		if err != nil {
+			_ = m.repo.RecordOperation(ctx, pluginID, artifactID, "reload", "failed", actor, err.Error(), map[string]any{
+				"reload_reason":   "secret_rotation",
+				"secret_ref":      "plugin://" + pluginID + "/" + name,
+				"active_changed":  false,
+				"current_version": secret.CurrentVersion,
+			})
+			return SecretRecord{}, err
+		}
+		if err := m.reloadLoadedRuntime(ctx, actor, plugin, "secret_rotation"); err != nil {
+			return SecretRecord{}, err
+		}
+	}
 	return secret, nil
 }
 
@@ -1624,8 +1718,97 @@ func (m *Manager) OperationsSnapshot(ctx context.Context, pluginID string) (Oper
 	}
 	gc, _ := m.operations.GCCandidates(ctx, pluginID)
 	snapshot := m.operations.Snapshot(ctx, pluginID, handlers, builds, gc)
+	snapshot.CustomMetrics = append(snapshot.CustomMetrics, m.wasmRuntimeMetricSummaries(ctx, pluginID)...)
 	snapshot.Exporters = m.operations.ExportSnapshot(ctx, snapshot)
 	return snapshot, nil
+}
+
+func (m *Manager) wasmRuntimeMetricSummaries(ctx context.Context, pluginID string) []CustomMetricSummary {
+	summaries := m.liveWASMRuntimeSummaries(pluginID)
+	if pluginID != "" {
+		if _, ok := summaries[pluginID]; !ok {
+			if plugin, err := m.repo.Plugin(ctx, pluginID); err == nil {
+				if summary := jsonMapFromJSONString(plugin.RuntimeSummaryJSON); summary != nil && summary["runtime_type"] == RuntimeWASM {
+					summaries[pluginID] = summary
+				}
+			}
+		}
+	}
+	var metrics []CustomMetricSummary
+	for id, summary := range summaries {
+		metrics = append(metrics,
+			wasmRuntimeMetricSummary(id, "wasm.call_count", summary["call_count"]),
+			wasmRuntimeMetricSummary(id, "wasm.duration_count", summary["duration_count"]),
+			wasmRuntimeMetricSummary(id, "wasm.duration_sum_ms", summary["duration_sum_ms"]),
+			wasmRuntimeMetricSummary(id, "wasm.duration_max_ms", summary["duration_max_ms"]),
+			wasmRuntimeMetricSummary(id, "wasm.timeout_count", summary["timeout_count"]),
+			wasmRuntimeMetricSummary(id, "wasm.trap_count", summary["trap_count"]),
+			wasmRuntimeMetricSummary(id, "wasm.memory_exceeded_count", summary["memory_error_count"]),
+			wasmRuntimeMetricSummary(id, "wasm.active_calls", summary["active_calls"]),
+		)
+	}
+	sort.Slice(metrics, func(i, j int) bool {
+		if metrics[i].PluginID == metrics[j].PluginID {
+			return metrics[i].Name < metrics[j].Name
+		}
+		return metrics[i].PluginID < metrics[j].PluginID
+	})
+	return metrics
+}
+
+func (m *Manager) liveWASMRuntimeSummaries(pluginID string) map[string]map[string]any {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]map[string]any)
+	for id, loaded := range m.loaded {
+		if pluginID != "" && id != pluginID {
+			continue
+		}
+		if loaded == nil || loaded.artifact.RuntimeType != RuntimeWASM {
+			continue
+		}
+		wasmPlugin, ok := loaded.instance.(*wasmHostedPlugin)
+		if !ok || wasmPlugin == nil {
+			continue
+		}
+		out[id] = wasmPlugin.diagnosticsSummary()
+	}
+	return out
+}
+
+func wasmRuntimeMetricSummary(pluginID, name string, value any) CustomMetricSummary {
+	n := numericMetricValue(value)
+	return CustomMetricSummary{
+		PluginID:   pluginID,
+		Name:       name,
+		Type:       "gauge",
+		Count:      uint64(n),
+		LastValue:  float64(n),
+		Labels:     map[string]string{"runtime": RuntimeWASM},
+		LastSeenAt: time.Now().Unix(),
+	}
+}
+
+func numericMetricValue(value any) int64 {
+	switch typed := value.(type) {
+	case int:
+		return int64(typed)
+	case int64:
+		return typed
+	case uint64:
+		const maxInt64 = uint64(1<<63 - 1)
+		if typed > maxInt64 {
+			return int64(maxInt64)
+		}
+		return int64(typed)
+	case float64:
+		return int64(typed)
+	case json.Number:
+		n, _ := typed.Int64()
+		return n
+	default:
+		return 0
+	}
 }
 
 func (m *Manager) HealthCheckExternalDependency(ctx context.Context, actor, pluginID, dependency string) (ExternalDependencyHealthCheck, error) {
@@ -1802,6 +1985,11 @@ func (m *Manager) DiagnosticPackage(ctx context.Context, actor, pluginID string)
 	}
 	var manifest Manifest
 	_ = json.Unmarshal([]byte(artifact.MetadataJSON), &manifest)
+	if liveSummary := m.liveWASMRuntimeSummaries(pluginID)[pluginID]; liveSummary != nil {
+		if data, err := json.Marshal(liveSummary); err == nil {
+			plugin.RuntimeSummaryJSON = string(data)
+		}
+	}
 	plan := m.DispatchPlan(ctx)
 	var handlers []DispatchHandlerSummary
 	for _, handler := range plan.Handlers {
@@ -1811,7 +1999,7 @@ func (m *Manager) DiagnosticPackage(ctx context.Context, actor, pluginID string)
 	}
 	builds, _ := m.repo.ListBuilds(ctx, pluginID)
 	gc, _ := m.operations.GCCandidates(ctx, pluginID)
-	data, summary, err := m.operations.DiagnosticPackage(ctx, plugin, manifest, handlers, builds, gc)
+	data, summary, err := m.operations.DiagnosticPackage(ctx, plugin, artifact, manifest, handlers, builds, gc)
 	if err != nil {
 		_ = m.repo.RecordOperation(ctx, pluginID, artifact.ID, "diagnostic_package", "failed", actor, err.Error(), nil)
 		return nil, DiagnosticPackageSummary{}, err
@@ -2023,12 +2211,11 @@ func (m *Manager) loadLocked(ctx context.Context, pluginRecord PluginRecord) (*l
 		handlers:   handlers,
 		extensions: extensions,
 	}
+	if wasmPlugin, ok := instance.(*wasmHostedPlugin); ok && wasmPlugin != nil {
+		wasmPlugin.onRepeatedTrapQuarantine = m.handleWASMRepeatedTrapQuarantine
+	}
 	m.loaded[pluginRecord.ID] = loaded
-	if err := m.repo.MarkRuntime(ctx, pluginRecord.ID, RuntimeLoaded, "", artifact.ID, pluginRecord.AppliedGeneration, "", map[string]any{
-		"handler_count":   len(handlers),
-		"extension_count": extensions.count(),
-		"service_mode":    m.serviceMode,
-	}, loaded.dispatchSummaries()); err != nil {
+	if err := m.repo.MarkRuntime(ctx, pluginRecord.ID, RuntimeLoaded, "", artifact.ID, pluginRecord.AppliedGeneration, "", m.loadedRuntimeSummary(loaded), loaded.dispatchSummaries()); err != nil {
 		return nil, err
 	}
 	m.recordPluginNodeRuntimeStateLocked(ctx, pluginRecord.ID)
@@ -2049,19 +2236,7 @@ func (m *Manager) startRuntimeInstance(ctx context.Context, artifact ArtifactRec
 		}
 		m.hostMu.Unlock()
 	}
-	adapter := m.adapter
-	if m.adapterManaged {
-		adapter, _ = RuntimeAdapterFactory{}.AdapterFor(m.serviceMode, artifact.RuntimeType)
-		switch typed := adapter.(type) {
-		case SandboxProcessAdapter:
-			typed.Policy = m.sandboxPolicy
-			typed.Secrets = m
-			adapter = typed
-		case WASMAdapter:
-			typed.Runner = m.wasmRunner
-			adapter = typed
-		}
-	}
+	adapter := m.runtimeAdapterForArtifact(artifact)
 	if lifecycle, ok := adapter.(RuntimeAdapterLifecycle); ok {
 		prepared, err := lifecycle.Prepare(ctx, artifact, pluginRecord)
 		if err != nil {
@@ -2094,6 +2269,23 @@ func (m *Manager) startRuntimeInstance(ctx context.Context, artifact ArtifactRec
 		Plugin:    instance,
 		StartedAt: time.Now().Unix(),
 	}, nil
+}
+
+func (m *Manager) runtimeAdapterForArtifact(artifact ArtifactRecord) RuntimeAdapter {
+	adapter := m.adapter
+	if m.adapterManaged {
+		adapter, _ = RuntimeAdapterFactory{}.AdapterFor(m.serviceMode, artifact.RuntimeType)
+		switch typed := adapter.(type) {
+		case SandboxProcessAdapter:
+			typed.Policy = m.sandboxPolicy
+			typed.Secrets = m
+			adapter = typed
+		case WASMAdapter:
+			typed.Runner = m.wasmRunner
+			adapter = typed
+		}
+	}
+	return adapter
 }
 
 // validateArtifactGate 确认制品能被当前网关进程加载。Go plugin 对 Go 版本和
@@ -2173,19 +2365,182 @@ func (m *Manager) restartRequired(pluginID, artifactID string) bool {
 	return loaded != nil && loaded.artifact.ID != artifactID
 }
 
+func (m *Manager) reloadLoadedRuntime(ctx context.Context, actor string, plugin PluginRecord, reason string) error {
+	if plugin.ID == "" || plugin.DesiredArtifactID == "" {
+		return nil
+	}
+	m.mu.Lock()
+	loaded := m.loaded[plugin.ID]
+	if loaded == nil || loaded.artifact.ID != plugin.DesiredArtifactID {
+		metadata := map[string]any{
+			"reload_reason":      reason,
+			"runtime_loaded":     loaded != nil,
+			"desired_generation": plugin.DesiredGeneration,
+			"active_changed":     false,
+		}
+		if loaded != nil {
+			metadata["loaded_artifact_id"] = loaded.artifact.ID
+		}
+		m.mu.Unlock()
+		for key, value := range m.wasmArtifactMetadata(ctx, plugin.DesiredArtifactID) {
+			metadata[key] = value
+		}
+		_ = m.repo.RecordOperation(ctx, plugin.ID, plugin.DesiredArtifactID, "reload", "skipped", actor, "runtime reload skipped", metadata)
+		return nil
+	}
+	adapter := m.runtimeAdapterForArtifact(loaded.artifact)
+	lifecycle, ok := adapter.(RuntimeAdapterLifecycle)
+	metadata := runtimeReloadMetadata(loaded, plugin, reason)
+	if !ok {
+		m.mu.Unlock()
+		_ = m.repo.RecordOperation(ctx, plugin.ID, loaded.artifact.ID, "reload", "skipped", actor, "runtime adapter does not support reload", metadata)
+		return nil
+	}
+	if err := lifecycle.ReloadConfig(ctx, loaded.runtime, plugin.ConfigJSON); err != nil {
+		message := reloadErrorMessage(loaded.artifact, plugin.ConfigJSON, err)
+		metadata["last_error"] = message
+		m.mu.Unlock()
+		_ = m.repo.RecordOperation(ctx, plugin.ID, loaded.artifact.ID, "reload", "failed", actor, message, metadata)
+		return err
+	}
+	loaded.record = plugin
+	if wasmPlugin, ok := loaded.instance.(*wasmHostedPlugin); ok && wasmPlugin != nil {
+		wasmPlugin.mu.Lock()
+		wasmPlugin.artifactGeneration = plugin.DesiredGeneration
+		wasmPlugin.mu.Unlock()
+	}
+	summary := m.loadedRuntimeSummary(loaded)
+	if loaded.runtime.HostProcess != nil {
+		summary["plugin_host"] = m.hostSummary(loaded.record.ID)
+	}
+	err := m.repo.MarkRuntime(ctx, plugin.ID, RuntimeEnabled, loaded.artifact.ID, loaded.artifact.ID, plugin.DesiredGeneration, "", summary, loaded.dispatchSummaries())
+	if err == nil {
+		m.recordPluginNodeRuntimeStateLocked(ctx, plugin.ID)
+	}
+	m.mu.Unlock()
+	if err != nil {
+		metadata["last_error"] = redactSensitive(err.Error())
+		_ = m.repo.RecordOperation(ctx, plugin.ID, loaded.artifact.ID, "reload", "failed", actor, "runtime reload state update failed", metadata)
+		return err
+	}
+	metadata["applied_generation"] = plugin.DesiredGeneration
+	_ = m.repo.RecordOperation(ctx, plugin.ID, loaded.artifact.ID, "reload", "succeeded", actor, "runtime config reloaded", metadata)
+	return nil
+}
+
+func runtimeReloadMetadata(loaded *loadedPlugin, plugin PluginRecord, reason string) map[string]any {
+	metadata := map[string]any{
+		"reload_reason":      reason,
+		"desired_generation": plugin.DesiredGeneration,
+		"active_changed":     true,
+		"handler_count":      len(loaded.handlers),
+		"extension_count":    loaded.extensions.count(),
+	}
+	for key, value := range wasmLifecycleMetadata(loaded) {
+		metadata[key] = value
+	}
+	return metadata
+}
+
+func reloadErrorMessage(artifact ArtifactRecord, configJSON string, err error) string {
+	message := err.Error()
+	var manifest Manifest
+	if json.Unmarshal([]byte(artifact.MetadataJSON), &manifest) == nil {
+		message = redactSensitiveConfigText(message, configJSON, sensitiveConfigPaths(manifest.ConfigSchema, configJSON))
+	}
+	return redactSensitive(message)
+}
+
 func (m *Manager) markEnabled(ctx context.Context, loaded *loadedPlugin) error {
 	m.operations.StartTasks(loaded.record.ID)
 	m.markHostStarted(loaded.record.ID, loaded.artifact.ID, loaded.runtime.HostProcess)
-	if err := m.repo.MarkRuntime(ctx, loaded.record.ID, RuntimeEnabled, loaded.artifact.ID, loaded.artifact.ID, loaded.record.DesiredGeneration, "", map[string]any{
-		"handler_count":   len(loaded.handlers),
-		"extension_count": loaded.extensions.count(),
-		"service_mode":    m.serviceMode,
-		"plugin_host":     m.hostSummary(loaded.record.ID),
-	}, loaded.dispatchSummaries()); err != nil {
+	summary := m.loadedRuntimeSummary(loaded)
+	summary["plugin_host"] = m.hostSummary(loaded.record.ID)
+	if err := m.repo.MarkRuntime(ctx, loaded.record.ID, RuntimeEnabled, loaded.artifact.ID, loaded.artifact.ID, loaded.record.DesiredGeneration, "", summary, loaded.dispatchSummaries()); err != nil {
 		return err
 	}
 	m.recordPluginNodeRuntimeStateLocked(ctx, loaded.record.ID)
 	return nil
+}
+
+func (m *Manager) loadedRuntimeSummary(loaded *loadedPlugin) map[string]any {
+	summary := map[string]any{
+		"handler_count":   len(loaded.handlers),
+		"extension_count": loaded.extensions.count(),
+		"service_mode":    m.serviceMode,
+		"runtime_type":    loaded.artifact.RuntimeType,
+	}
+	if wasmPlugin, ok := loaded.instance.(*wasmHostedPlugin); ok && wasmPlugin != nil {
+		for key, value := range wasmPlugin.diagnosticsSummary() {
+			summary[key] = value
+		}
+	}
+	return summary
+}
+
+func wasmLifecycleMetadata(loaded *loadedPlugin) map[string]any {
+	if loaded == nil || loaded.artifact.RuntimeType != RuntimeWASM {
+		return nil
+	}
+	metadata := map[string]any{
+		"runtime_type": RuntimeWASM,
+	}
+	if wasmPlugin, ok := loaded.instance.(*wasmHostedPlugin); ok && wasmPlugin != nil {
+		summary := wasmPlugin.diagnosticsSummary()
+		for _, key := range []string{
+			"runtime_abi", "host_abi", "module_hash", "module_cache_status",
+			"handler_timeout_ms", "memory_bytes", "supported_extensions",
+			"call_count", "trap_count", "timeout_count", "memory_error_count",
+			"active_calls", "quarantined", "quarantine_reason",
+			"last_extension_point", "last_error", "limits",
+		} {
+			if value, ok := summary[key]; ok {
+				metadata[key] = value
+			}
+		}
+	}
+	return metadata
+}
+
+func (m *Manager) wasmArtifactMetadata(ctx context.Context, artifactID string) map[string]any {
+	artifact, err := m.repo.Artifact(ctx, artifactID)
+	if err != nil || artifact.RuntimeType != RuntimeWASM {
+		return nil
+	}
+	var manifest Manifest
+	_ = json.Unmarshal([]byte(artifact.MetadataJSON), &manifest)
+	metadata := map[string]any{
+		"runtime_type": RuntimeWASM,
+		"runtime_abi":  manifest.Runtime.ABI,
+		"module_hash":  artifact.SHA256,
+	}
+	if artifactMetadata := jsonMapFromJSONString(artifact.MetadataJSON); artifactMetadata != nil {
+		if wasmMetadata := jsonMapFromAny(artifactMetadata["wasm"]); wasmMetadata != nil {
+			if moduleHash := diagnosticStringFromAny(wasmMetadata["module_sha256"]); moduleHash != "" {
+				metadata["module_hash"] = moduleHash
+			}
+		}
+	}
+	if len(manifest.ExtensionPoints) > 0 {
+		metadata["supported_extensions"] = wasmManifestExtensionKeys(manifest)
+	}
+	return metadata
+}
+
+func (m *Manager) wasmValidationFailureMetadata(ctx context.Context, artifactID string, err error) map[string]any {
+	metadata := m.wasmArtifactMetadata(ctx, artifactID)
+	if len(metadata) == 0 {
+		return nil
+	}
+	code := wasmABIErrorCode(err)
+	metadata["validation_failure"] = true
+	if code != "" {
+		metadata["wasm_error_code"] = code
+	}
+	if code == wasmABIErrorABIMismatch || strings.Contains(strings.ToLower(err.Error()), "abi") {
+		metadata["abi_mismatch"] = true
+	}
+	return metadata
 }
 
 func (m *Manager) recordPluginNodeRuntimeState(ctx context.Context, pluginID string) {

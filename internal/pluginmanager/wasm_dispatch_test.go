@@ -1,6 +1,7 @@
 package pluginmanager
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"strings"
@@ -299,6 +300,208 @@ func TestWASMStopReleasesRuntimeAndDiagnosticsReflectStopped(t *testing.T) {
 	}
 }
 
+func TestWASMOperationsDiagnosticsMetricsAuditAndRedaction(t *testing.T) {
+	manager := newManagerForTestWithBuildersProfile(t, nil, nil, PolicyProfileDev)
+	module := wasmStaticResponseModule(t, wasmExportRuleEvaluateV1, WASMABIResponse{
+		ExtensionPoint: ExtensionRuleEvaluate,
+		OK:             true,
+		Decision:       "allow",
+	})
+	artifact := uploadTestArtifactWithManifestBytes(t, manager, "wasm-observe", module, func(manifest *Manifest) {
+		manifest.Runtime.Type = RuntimeWASM
+		manifest.Runtime.Entry = RuntimeWASMEntry
+		manifest.Runtime.ABI = wasmHostABIV1
+		manifest.RuntimeLimits.HandlerTimeoutMS = 100
+		manifest.RuntimeLimits.MemoryBytes = 64 * 1024
+		manifest.ExtensionPoints = []ExtensionPoint{{Type: "rule", Key: ExtensionRuleEvaluate}}
+		manifest.Capabilities = json.RawMessage(`{}`)
+		manifest.ConfigSchema = json.RawMessage(`{"type":"object","properties":{"token":{"type":"string","sensitive":true}}}`)
+	})
+	if _, err := manager.SetDesired(context.Background(), "admin", "wasm-observe", artifact.ID, DesiredEnabled, `{"token":"plain-secret"}`, 10); err != nil {
+		t.Fatalf("SetDesired(wasm-observe) error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", "wasm-observe"); err != nil {
+		t.Fatalf("Enable(wasm-observe) error = %v", err)
+	}
+	manager.mu.Lock()
+	plugin := manager.loaded["wasm-observe"].instance.(*wasmHostedPlugin)
+	plugin.dispatchHook = func(_ context.Context, _ wasmRuntimeSnapshot, point string, _ WASMABIRequest) (WASMABIResponse, error, bool) {
+		return WASMABIResponse{}, newWASMABIError(wasmABIErrorTrap, point, "trap saw plain-secret"), true
+	}
+	manager.mu.Unlock()
+
+	_, _ = manager.EvaluateRule(context.Background(), api.RuleEvaluateRequest{Action: "join", Context: context.Background()})
+	snapshot, err := manager.OperationsSnapshot(context.Background(), "wasm-observe")
+	if err != nil {
+		t.Fatalf("OperationsSnapshot(wasm-observe) error = %v", err)
+	}
+	if !hasCustomMetric(snapshot.CustomMetrics, "wasm.call_count") ||
+		!hasCustomMetric(snapshot.CustomMetrics, "wasm.duration_sum_ms") ||
+		!hasCustomMetric(snapshot.CustomMetrics, "wasm.trap_count") ||
+		!hasCustomMetric(snapshot.CustomMetrics, "wasm.active_calls") {
+		t.Fatalf("custom metrics = %+v, want wasm runtime metrics", snapshot.CustomMetrics)
+	}
+	data, summary, err := manager.DiagnosticPackage(context.Background(), "admin", "wasm-observe")
+	if err != nil {
+		t.Fatalf("DiagnosticPackage(wasm-observe) error = %v", err)
+	}
+	if !containsString(summary.Sections, "wasm_runtime") {
+		t.Fatalf("diagnostic sections = %+v, want wasm_runtime", summary.Sections)
+	}
+	if bytes.Contains(data, []byte("plain-secret")) {
+		t.Fatalf("diagnostic leaked config secret: %s", data)
+	}
+	if !bytes.Contains(data, []byte(`"wasm_runtime"`)) ||
+		!bytes.Contains(data, []byte(`"recent_failures"`)) ||
+		!bytes.Contains(data, []byte("[REDACTED]")) {
+		t.Fatalf("diagnostic missing wasm runtime redacted failure: %s", data)
+	}
+	ops, err := manager.repo.ListOperations(context.Background(), "wasm-observe", 20)
+	if err != nil {
+		t.Fatalf("ListOperations(wasm-observe) error = %v", err)
+	}
+	if !hasOperation(ops, "enable", "succeeded") {
+		t.Fatalf("operations = %+v, want enable audit event", ops)
+	}
+}
+
+func TestWASMReloadAuditIncludesRuntimeMetadata(t *testing.T) {
+	manager := newManagerForTestWithBuildersProfile(t, nil, nil, PolicyProfileDev)
+	module := wasmStaticResponseModule(t, wasmExportRuleEvaluateV1, WASMABIResponse{
+		ExtensionPoint: ExtensionRuleEvaluate,
+		OK:             true,
+		Decision:       "allow",
+	})
+	artifact := uploadWASMDispatchArtifact(t, manager, "wasm-reload-audit", module, []ExtensionPoint{{Type: "rule", Key: ExtensionRuleEvaluate}})
+	if _, err := manager.SetDesired(context.Background(), "admin", "wasm-reload-audit", artifact.ID, DesiredEnabled, `{"version":"old"}`, 10); err != nil {
+		t.Fatalf("SetDesired(initial) error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", "wasm-reload-audit"); err != nil {
+		t.Fatalf("Enable(wasm-reload-audit) error = %v", err)
+	}
+	updated, err := manager.SetDesired(context.Background(), "admin", "wasm-reload-audit", artifact.ID, DesiredEnabled, `{"version":"new"}`, 10)
+	if err != nil {
+		t.Fatalf("SetDesired(reload) error = %v", err)
+	}
+	if updated.AppliedGeneration != updated.DesiredGeneration {
+		t.Fatalf("plugin generation after reload = applied %d desired %d, want synced", updated.AppliedGeneration, updated.DesiredGeneration)
+	}
+	ops, err := manager.repo.ListOperations(context.Background(), "wasm-reload-audit", 20)
+	if err != nil {
+		t.Fatalf("ListOperations(wasm-reload-audit) error = %v", err)
+	}
+	record, ok := findOperation(ops, "reload", "succeeded")
+	if !ok {
+		t.Fatalf("operations = %+v, want reload succeeded audit", ops)
+	}
+	metadata := jsonMap(record.MetadataJSON)
+	if metadata["runtime_type"] != RuntimeWASM ||
+		metadata["runtime_abi"] != wasmHostABIV1 ||
+		metadata["host_abi"] != wasmHostABIV1 ||
+		metadata["module_hash"] == "" ||
+		metadata["reload_reason"] != "config_update" ||
+		metadata["active_changed"] != true {
+		t.Fatalf("reload metadata = %+v, want wasm ABI/module reload summary", metadata)
+	}
+	if _, ok := metadata["last_error"]; !ok {
+		t.Fatalf("reload metadata = %+v, want last_error field", metadata)
+	}
+	if limits := jsonMapFromAny(metadata["limits"]); limits == nil || limits["memory_bytes"] == nil || limits["handler_timeout_ms"] == nil {
+		t.Fatalf("reload limits metadata = %+v", metadata["limits"])
+	}
+	extensions, ok := metadata["supported_extensions"].([]any)
+	if !ok || len(extensions) == 0 || extensions[0] != ExtensionRuleEvaluate {
+		t.Fatalf("reload supported_extensions = %#v, want rule extension", metadata["supported_extensions"])
+	}
+}
+
+func TestWASMABIMismatchUploadFailureAuditIncludesRuntimeMetadata(t *testing.T) {
+	manager := newManagerForTestWithBuildersProfile(t, nil, nil, PolicyProfileDev)
+	packagePath := writeTestMCGP(t, map[string][]byte{
+		"manifest.json":  testWASMManifestBytes(t, "wasm-abi-upload", "mc-gateway.wasm.host/v0"),
+		RuntimeWASMEntry: wasmOKModule,
+	})
+	_, err := manager.UploadArtifact(context.Background(), ArtifactUpload{
+		SourcePath: packagePath,
+		FileName:   "wasm-abi-upload.mcgp",
+		Actor:      "admin",
+	})
+	if err == nil || !strings.Contains(err.Error(), "runtime.abi") {
+		t.Fatalf("UploadArtifact(abi mismatch) error = %v, want runtime.abi rejection", err)
+	}
+	ops, err := manager.repo.ListOperations(context.Background(), "wasm-abi-upload", 10)
+	if err != nil {
+		t.Fatalf("ListOperations(wasm-abi-upload) error = %v", err)
+	}
+	record, ok := findOperation(ops, "artifact_upload", "failed")
+	if !ok {
+		t.Fatalf("operations = %+v, want artifact_upload failed audit", ops)
+	}
+	moduleHash := wasmModuleHash(wasmOKModule)
+	if record.PluginID != "wasm-abi-upload" || record.ArtifactID != moduleHash {
+		t.Fatalf("operation identity = plugin %q artifact %q, want parsed plugin and module hash %s", record.PluginID, record.ArtifactID, moduleHash)
+	}
+	metadata := jsonMap(record.MetadataJSON)
+	if metadata["runtime_type"] != RuntimeWASM ||
+		metadata["runtime_abi"] != "mc-gateway.wasm.host/v0" ||
+		metadata["host_abi"] != wasmHostABIV1 ||
+		metadata["abi_mismatch"] != true ||
+		metadata["module_sha256"] != moduleHash ||
+		metadata["module_hash"] != moduleHash ||
+		metadata["entry"] != RuntimeWASMEntry ||
+		metadata["plugin_id"] != "wasm-abi-upload" ||
+		metadata["version"] != "0.1.0" ||
+		metadata["package_sha256"] == "" {
+		t.Fatalf("artifact_upload metadata = %+v, want wasm ABI mismatch package/module summary", metadata)
+	}
+	if limits := jsonMapFromAny(metadata["limits"]); limits == nil || limits["memory_bytes"] == nil || limits["handler_timeout_ms"] == nil {
+		t.Fatalf("artifact_upload limits metadata = %+v", metadata["limits"])
+	}
+}
+
+func TestWASMRepeatedTrapTriggersQuarantineAudit(t *testing.T) {
+	manager := newManagerForTestWithBuildersProfile(t, nil, nil, PolicyProfileDev)
+	module := wasmStaticResponseModule(t, wasmExportRuleEvaluateV1, WASMABIResponse{
+		ExtensionPoint: ExtensionRuleEvaluate,
+		OK:             true,
+		Decision:       "allow",
+	})
+	artifact := uploadWASMDispatchArtifact(t, manager, "wasm-quarantine", module, []ExtensionPoint{{Type: "rule", Key: ExtensionRuleEvaluate}})
+	if _, err := manager.SetDesired(context.Background(), "admin", "wasm-quarantine", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired(wasm-quarantine) error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", "wasm-quarantine"); err != nil {
+		t.Fatalf("Enable(wasm-quarantine) error = %v", err)
+	}
+	manager.mu.Lock()
+	plugin := manager.loaded["wasm-quarantine"].instance.(*wasmHostedPlugin)
+	plugin.dispatchHook = func(_ context.Context, _ wasmRuntimeSnapshot, point string, _ WASMABIRequest) (WASMABIResponse, error, bool) {
+		return WASMABIResponse{}, newWASMABIError(wasmABIErrorTrap, point, "trap"), true
+	}
+	manager.mu.Unlock()
+
+	for i := 0; i < wasmTrapQuarantineThreshold; i++ {
+		_, _ = manager.EvaluateRule(context.Background(), api.RuleEvaluateRequest{Action: "join", Context: context.Background()})
+	}
+	record, err := manager.Plugin(context.Background(), "wasm-quarantine")
+	if err != nil {
+		t.Fatalf("Plugin(wasm-quarantine) error = %v", err)
+	}
+	if record.RuntimeState != RuntimeDraining || !strings.Contains(record.LastError, "repeated trap quarantine") {
+		t.Fatalf("plugin after traps = %+v, want draining quarantine", record)
+	}
+	if dispatchHasRulePlugin(manager, "wasm-quarantine") {
+		t.Fatalf("rule dispatch still contains wasm-quarantine after quarantine")
+	}
+	ops, err := manager.repo.ListOperations(context.Background(), "wasm-quarantine", 20)
+	if err != nil {
+		t.Fatalf("ListOperations(wasm-quarantine) error = %v", err)
+	}
+	if !hasOperation(ops, "wasm_repeated_trap_quarantine", "warning") {
+		t.Fatalf("operations = %+v, want repeated trap quarantine audit", ops)
+	}
+}
+
 func uploadWASMDispatchArtifact(t *testing.T, manager *Manager, pluginID string, module []byte, points []ExtensionPoint) ArtifactRecord {
 	t.Helper()
 	return uploadTestArtifactWithManifestBytes(t, manager, pluginID, module, func(manifest *Manifest) {
@@ -357,6 +560,38 @@ func dispatchHasRoutePlugin(manager *Manager, pluginID string) bool {
 		}
 	}
 	return false
+}
+
+func dispatchHasRulePlugin(manager *Manager, pluginID string) bool {
+	for _, handler := range manager.extensionState().rules {
+		if handler.pluginID == pluginID {
+			return true
+		}
+	}
+	return false
+}
+
+func hasCustomMetric(metrics []CustomMetricSummary, name string) bool {
+	for _, metric := range metrics {
+		if metric.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func hasOperation(records []OperationRecord, operation, status string) bool {
+	_, ok := findOperation(records, operation, status)
+	return ok
+}
+
+func findOperation(records []OperationRecord, operation, status string) (OperationRecord, bool) {
+	for _, record := range records {
+		if record.Operation == operation && record.Status == status {
+			return record, true
+		}
+	}
+	return OperationRecord{}, false
 }
 
 func wasmStaticResponseModule(t *testing.T, exportName string, response WASMABIResponse) []byte {

@@ -47,6 +47,12 @@ type ArtifactUpload struct {
 	Actor      string
 }
 
+type artifactUploadAuditDetails struct {
+	pluginID   string
+	artifactID string
+	metadata   map[string]any
+}
+
 func NewArtifactStore(root string) ArtifactStore {
 	return ArtifactStore{
 		Root:               root,
@@ -524,6 +530,107 @@ func runtimeArtifactMetadata(manifest Manifest, pluginBytes []byte, packageSHA s
 			"memory_bytes":       manifest.RuntimeLimits.MemoryBytes,
 		},
 	}
+}
+
+func (s ArtifactStore) uploadFailureAuditDetails(upload ArtifactUpload, cause error) artifactUploadAuditDetails {
+	if !isWASMABIMismatch(cause) || strings.TrimSpace(upload.SourcePath) == "" {
+		return artifactUploadAuditDetails{}
+	}
+	packageSHA, _ := fileSHA256(upload.SourcePath)
+	reader, err := zip.OpenReader(upload.SourcePath)
+	if err != nil {
+		return artifactUploadAuditDetails{}
+	}
+	defer reader.Close()
+	entries := make(map[string]*zip.File, len(reader.File))
+	for _, file := range reader.File {
+		if file.FileInfo().IsDir() {
+			continue
+		}
+		clean, err := cleanZipName(file.Name)
+		if err != nil {
+			continue
+		}
+		if _, exists := entries[clean]; !exists {
+			entries[clean] = file
+		}
+	}
+	manifestFile := entries["manifest.json"]
+	if manifestFile == nil {
+		return artifactUploadAuditDetails{}
+	}
+	maxManifestBytes := s.MaxManifestBytes
+	if maxManifestBytes <= 0 {
+		maxManifestBytes = DefaultManifestMaxBytes
+	}
+	manifestBytes, err := readZipFile(manifestFile, maxManifestBytes)
+	if err != nil {
+		return artifactUploadAuditDetails{}
+	}
+	var manifest Manifest
+	if err := json.Unmarshal(manifestBytes, &manifest); err != nil || manifest.Runtime.Type != RuntimeWASM {
+		return artifactUploadAuditDetails{}
+	}
+	entry := manifest.Runtime.Entry
+	if entry == "" {
+		entry = RuntimeWASMEntry
+	}
+	metadata := map[string]any{
+		"runtime_type": RuntimeWASM,
+		"runtime_abi":  manifest.Runtime.ABI,
+		"host_abi":     wasmHostABIV1,
+		"abi_mismatch": true,
+		"entry":        entry,
+		"plugin_id":    manifest.ID,
+		"version":      manifest.Version,
+		"limits": map[string]any{
+			"handler_timeout_ms": manifest.RuntimeLimits.HandlerTimeoutMS,
+			"memory_bytes":       manifest.RuntimeLimits.MemoryBytes,
+		},
+		"supported_extensions": wasmManifestExtensionKeys(manifest),
+	}
+	if code := wasmABIErrorCode(cause); code != "" {
+		metadata["wasm_error_code"] = code
+	} else {
+		metadata["wasm_error_code"] = wasmABIErrorABIMismatch
+	}
+	if packageSHA != "" {
+		metadata["package_sha256"] = packageSHA
+	}
+	details := artifactUploadAuditDetails{
+		pluginID: manifest.ID,
+		metadata: metadata,
+	}
+	if moduleFile := entries[entry]; moduleFile != nil {
+		maxPackageBytes := s.MaxPackageBytes
+		if maxPackageBytes <= 0 {
+			maxPackageBytes = DefaultPackageMaxBytes
+		}
+		if moduleBytes, err := readZipFile(moduleFile, maxPackageBytes); err == nil {
+			moduleSHA := wasmModuleHash(moduleBytes)
+			metadata["module_sha256"] = moduleSHA
+			metadata["module_hash"] = moduleSHA
+			metadata["artifact_sha256"] = moduleSHA
+			details.artifactID = moduleSHA
+			if required, err := wasmRequiredExports(manifest); err == nil {
+				metadata["required_exports"] = required
+			}
+		}
+	}
+	return details
+}
+
+func isWASMABIMismatch(err error) bool {
+	if err == nil {
+		return false
+	}
+	if wasmABIErrorCode(err) == wasmABIErrorABIMismatch {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "abi_mismatch") ||
+		strings.Contains(message, "runtime.abi") ||
+		(strings.Contains(message, "abi") && strings.Contains(message, "does not match"))
 }
 
 func artifactProvenanceFromEntries(entries map[string]*zip.File, maxBytes int64) (map[string]any, error) {

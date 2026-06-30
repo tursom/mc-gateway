@@ -1432,7 +1432,7 @@ func (o *Operations) CancelTask(pluginID, taskID string) (BackgroundTaskSummary,
 
 // DiagnosticPackage 生成可下载的插件诊断包。输出前会统一脱敏，避免把密钥、
 // token 或完整协议载荷写入可共享文件。
-func (o *Operations) DiagnosticPackage(ctx context.Context, plugin PluginRecord, manifest Manifest, handlers []DispatchHandlerSummary, builds []BuildRecord, gc []GCCandidate) ([]byte, DiagnosticPackageSummary, error) {
+func (o *Operations) DiagnosticPackage(ctx context.Context, plugin PluginRecord, artifact ArtifactRecord, manifest Manifest, handlers []DispatchHandlerSummary, builds []BuildRecord, gc []GCCandidate) ([]byte, DiagnosticPackageSummary, error) {
 	snapshot := o.Snapshot(ctx, plugin.ID, handlers, builds, gc)
 	operations, _ := o.repo.ListOperations(ctx, plugin.ID, 50)
 	body := map[string]any{
@@ -1452,6 +1452,14 @@ func (o *Operations) DiagnosticPackage(ctx context.Context, plugin PluginRecord,
 			"secret", "token", "password", "session response", "full packet payload",
 		},
 	}
+	sections := []string{
+		"plugin", "plugin_state", "manifest", "dispatch_summary", "recent_errors",
+		"trace_summary", "event_summary", "metric_summary", "operations", "recent_operations", "runbook",
+	}
+	if wasmSummary := diagnosticWASMSummary(plugin, artifact, manifest); wasmSummary != nil {
+		body["wasm_runtime"] = diagnosticSafeValue(wasmSummary)
+		sections = append(sections, "wasm_runtime")
+	}
 	data, err := json.MarshalIndent(body, "", "  ")
 	if err != nil {
 		return nil, DiagnosticPackageSummary{}, err
@@ -1464,14 +1472,90 @@ func (o *Operations) DiagnosticPackage(ctx context.Context, plugin PluginRecord,
 	if err := os.WriteFile(file, data, 0600); err != nil {
 		return nil, DiagnosticPackageSummary{}, err
 	}
-	summary, err := o.repo.SaveDiagnostic(ctx, plugin.ID, file, int64(len(data)), []string{
-		"plugin", "plugin_state", "manifest", "dispatch_summary", "recent_errors",
-		"trace_summary", "event_summary", "metric_summary", "operations", "recent_operations", "runbook",
-	})
+	summary, err := o.repo.SaveDiagnostic(ctx, plugin.ID, file, int64(len(data)), sections)
 	if err != nil {
 		return nil, DiagnosticPackageSummary{}, err
 	}
 	return data, summary, nil
+}
+
+func diagnosticWASMSummary(plugin PluginRecord, artifact ArtifactRecord, manifest Manifest) map[string]any {
+	if artifact.RuntimeType != RuntimeWASM && manifest.Runtime.Type != RuntimeWASM {
+		return nil
+	}
+	runtimeSummary := jsonMapFromJSONString(plugin.RuntimeSummaryJSON)
+	artifactMetadata := jsonMapFromJSONString(artifact.MetadataJSON)
+	wasmMetadata := jsonMapFromAny(artifactMetadata["wasm"])
+	requiredExports, _ := wasmRequiredExports(manifest)
+	moduleHash := diagnosticStringFromAny(runtimeSummary["module_hash"])
+	if moduleHash == "" {
+		moduleHash = diagnosticStringFromAny(wasmMetadata["module_sha256"])
+	}
+	if moduleHash == "" {
+		moduleHash = artifact.SHA256
+	}
+	return map[string]any{
+		"manifest_summary": map[string]any{
+			"id":                         manifest.ID,
+			"name":                       manifest.Name,
+			"version":                    manifest.Version,
+			"runtime_type":               firstNonEmpty(manifest.Runtime.Type, artifact.RuntimeType),
+			"runtime_entry":              manifest.Runtime.Entry,
+			"supported_extension_points": wasmManifestExtensionKeys(manifest),
+			"limits": map[string]any{
+				"handler_timeout_ms": manifest.RuntimeLimits.HandlerTimeoutMS,
+				"memory_bytes":       manifest.RuntimeLimits.MemoryBytes,
+				"max_input_bytes":    wasmABIMaxInputBytes,
+				"max_output_bytes":   wasmABIMaxOutputBytes,
+			},
+		},
+		"abi_summary": map[string]any{
+			"host_abi":                   wasmHostABIV1,
+			"manifest_abi":               manifest.Runtime.ABI,
+			"required_exports":           requiredExports,
+			"host_imports":               wasmABIImportMap(),
+			"low_risk_extension_only":    true,
+			"supported_extension_points": []string{ExtensionConfigValidate, ExtensionRouteResolve, ExtensionRuleEvaluate},
+		},
+		"module_hash":         moduleHash,
+		"module_cache_status": runtimeSummary["module_cache_status"],
+		"artifact_id":         artifact.ID,
+		"package_sha256":      artifact.PackageSHA256,
+		"metrics": map[string]any{
+			"call_count":            runtimeSummary["call_count"],
+			"duration_count":        runtimeSummary["duration_count"],
+			"duration_sum_ms":       runtimeSummary["duration_sum_ms"],
+			"duration_max_ms":       runtimeSummary["duration_max_ms"],
+			"duration_histogram_ms": runtimeSummary["duration_histogram_ms"],
+			"active_calls":          runtimeSummary["active_calls"],
+			"trap_count":            runtimeSummary["trap_count"],
+			"timeout_count":         runtimeSummary["timeout_count"],
+			"memory_error_count":    runtimeSummary["memory_error_count"],
+		},
+		"quarantine": map[string]any{
+			"quarantined":       runtimeSummary["quarantined"],
+			"quarantine_at":     runtimeSummary["quarantine_at"],
+			"quarantine_reason": runtimeSummary["quarantine_reason"],
+			"trap_threshold":    wasmTrapQuarantineThreshold,
+		},
+		"recent_failures": runtimeSummary["recent_failures"],
+	}
+}
+
+func jsonMapFromJSONString(raw string) map[string]any {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var out map[string]any
+	if json.Unmarshal([]byte(defaultJSONObject(raw)), &out) != nil {
+		return nil
+	}
+	return out
+}
+
+func diagnosticStringFromAny(value any) string {
+	text, _ := value.(string)
+	return text
 }
 
 func diagnosticPluginState(plugin PluginRecord) map[string]any {

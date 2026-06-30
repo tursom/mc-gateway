@@ -201,8 +201,12 @@ export function renderPluginDetail(plugin: PluginView | null = selectedPlugin())
         <h3>${escapeHTML(ui("Manifest"))}</h3>
         <dl class="kv">
           <dt>${escapeHTML(ui("Artifact"))}</dt><dd>${artifactMaturityBadge(plugin.artifact_type)} ${escapeHTML(formatValue(plugin.artifact_type || ""))}</dd>
-          <dt>${escapeHTML(ui("Runtime"))}</dt><dd>${escapeHTML(plugin.runtime_type || "")}</dd>
+          <dt>${escapeHTML(ui("Runtime type"))}</dt><dd>${escapeHTML(plugin.runtime_type || "")}</dd>
           <dt>${escapeHTML(ui("Runtime maturity"))}</dt><dd>${runtimeMaturityBadge(plugin.runtime_type)}</dd>
+          <dt>${escapeHTML(ui("ABI"))}</dt><dd>${escapeHTML(runtimeABI(plugin))}</dd>
+          <dt>${escapeHTML(ui("Limits"))}</dt><dd>${escapeHTML(runtimeLimits(plugin))}</dd>
+          <dt>${escapeHTML(ui("Supported extensions"))}</dt><dd>${escapeHTML(runtimeSupportedExtensions(plugin))}</dd>
+          <dt>${escapeHTML(ui("Last error"))}</dt><dd>${escapeHTML(localizeMessage(runtimeLastError(plugin)))}</dd>
           <dt>${escapeHTML(ui("Extensions"))}</dt><dd>${escapeHTML((plugin.extension_points || []).join(", "))}</dd>
           <dt>${escapeHTML(ui("Scope"))}</dt><dd>${escapeHTML(formatJSON(plugin.scope))}</dd>
           <dt>${escapeHTML(ui("Rollout"))}</dt><dd>${escapeHTML(formatJSON(plugin.rollout))}</dd>
@@ -1418,6 +1422,49 @@ function proxyConnectionList(connections: PluginProxyConnection[]): string {
 function secretChip(secret: PluginSecret): string {
   const reload = secret.reload_required ? ui("reload required") : ui("hot reload");
   return `<span class="chip">${escapeHTML(secret.name)} v${escapeHTML(secret.current_version)} · ${escapeHTML(ui("prev"))} ${escapeHTML(secret.previous_version)} · ${escapeHTML(reload)}</span>`;
+}
+
+function runtimeABI(plugin: PluginView): string {
+  const summary = plugin.runtime_summary || {};
+  const manifestRuntime = runtimeManifest(plugin);
+  return String(summary.runtime_abi || summary.host_abi || manifestRuntime.abi || "");
+}
+
+function runtimeLimits(plugin: PluginView): string {
+  const summary = plugin.runtime_summary || {};
+  const limits = objectValue(summary.limits) || objectValue(plugin.manifest?.runtime_limits);
+  const timeout = summary.handler_timeout_ms || limits?.handler_timeout_ms;
+  const memory = summary.memory_bytes || limits?.memory_bytes;
+  if (timeout || memory) {
+    return [`${timeout || ""}ms`, memory ? `${memory} bytes` : ""].filter(Boolean).join(" / ");
+  }
+  return limits ? formatJSON(limits) : "";
+}
+
+function runtimeSupportedExtensions(plugin: PluginView): string {
+  const summary = plugin.runtime_summary || {};
+  const supported = arrayValue(summary.supported_extensions);
+  if (supported.length > 0) {
+    return supported.map(String).join(", ");
+  }
+  return (plugin.extension_points || []).join(", ");
+}
+
+function runtimeLastError(plugin: PluginView): string {
+  const summary = plugin.runtime_summary || {};
+  return String(summary.last_error || plugin.last_error || "");
+}
+
+function runtimeManifest(plugin: PluginView): Record<string, unknown> {
+  return objectValue(plugin.manifest?.runtime) || {};
+}
+
+function objectValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+}
+
+function arrayValue(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
 }
 
 function detailStat(label: string, value: unknown): string {
