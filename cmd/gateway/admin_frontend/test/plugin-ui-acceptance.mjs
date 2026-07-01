@@ -70,14 +70,15 @@ state.language = "zh";
 state.pluginFeatures = {
   schema_version: "mc-gateway.plugin/v1",
   api_version: "plugin-api/v1",
-	  runtime_types: [
-	    { type: "go-plugin", implemented: true, maturity: "implemented", data_plane: true, requires_restart: false },
-	    { type: "wasm", implemented: true, maturity: "partial", data_plane: true, requires_restart: false, unsupported_reason: "wasm runtime only supports low-risk extension points; protocol-proxy, network, file, and high-risk extension points are not supported" },
-	  ],
-	  service_modes: [
-	    { mode: "in-process", implemented: true, maturity: "implemented", data_plane: true, requires_restart: false },
-	    { mode: "sandbox-process", implemented: false, maturity: "reserved", data_plane: false, requires_restart: true, unsupported_reason: "sandbox-process service mode is reserved; current data-plane modes are in-process and go-plugin-process" },
-	  ],
+  runtime_types: [
+    { type: "go-plugin", implemented: true, maturity: "implemented", data_plane: true, requires_restart: false },
+    { type: "sandbox-process", implemented: true, maturity: "partial", data_plane: true, requires_restart: true, reason_code: "sandbox_data_plane_partial", unsupported_reason: "sandbox-process data-plane is partial; selected request/response extension points and upstream.connect/v1 protocol-proxy use sandbox stream.proxy/v1 relay with drain-only lifecycle; broader isolation and governance hardening remain incomplete" },
+    { type: "wasm", implemented: true, maturity: "partial", data_plane: true, requires_restart: false, unsupported_reason: "wasm runtime only supports low-risk extension points; protocol-proxy, network, file, and high-risk extension points are not supported" },
+  ],
+  service_modes: [
+    { mode: "in-process", implemented: true, maturity: "implemented", data_plane: true, requires_restart: false },
+    { mode: "sandbox-process", implemented: true, maturity: "partial", data_plane: true, requires_restart: true, reason_code: "sandbox_data_plane_partial", unsupported_reason: "sandbox-process data-plane is partial; selected request/response extension points and upstream.connect/v1 protocol-proxy use sandbox stream.proxy/v1 relay with drain-only lifecycle; broader isolation and governance hardening remain incomplete" },
+  ],
   runtime_adapters: [],
   extension_points: [
     { key: "admin.auth.provider/v1", type: "provider", implemented: false, maturity: "reserved", data_plane: false, requires_restart: false, unsupported_reason: "reserved auth provider" },
@@ -90,10 +91,9 @@ state.pluginService = {
     active_mode: "in-process",
     data_plane_mode: "in-process",
     implemented_adapter: true,
-	    desired_maturity: "reserved",
-	    active_maturity: "implemented",
-	    restart_required: true,
-	    unsupported_reason: "sandbox-process service mode is reserved; current data-plane modes are in-process and go-plugin-process",
+    desired_maturity: "partial",
+    active_maturity: "implemented",
+    restart_required: true,
     crash_policy: { backoff_seconds: 30, max_crashes: 1, window_seconds: 300 },
     live_migration: "drain-only",
   },
@@ -101,14 +101,14 @@ state.pluginService = {
   runtime_types: state.pluginFeatures.runtime_types,
   runtime_adapters: [],
   sandbox_environment: {
-    gate_enabled: false,
-    self_check_ok: false,
-    data_plane_eligible: false,
+    gate_enabled: true,
+    self_check_ok: true,
+    data_plane_eligible: true,
     policy_profile: "prod",
-    reason_code: "sandbox_future_gate_closed",
-    reason: "sandbox-process service mode is disabled by future runtime gate",
+    reason_code: "sandbox_data_plane_partial",
+    reason: "sandbox-process data-plane is partial; selected request/response extension points and upstream.connect/v1 protocol-proxy use sandbox stream.proxy/v1 relay with drain-only lifecycle; broader isolation and governance hardening remain incomplete",
     enforcement_facts: [
-      { category: "namespace", key: "network", required: true, enforced: false, method: "netns", unsupported_reason: "future runtime gate closed" },
+      { category: "namespace", key: "network", required: true, enforced: true, method: "netns" },
     ],
   },
   hosts: [],
@@ -213,9 +213,10 @@ const detailHTML = element("pluginDetail").innerHTML;
 for (const expected of [
   "插件服务",
   "期望成熟度",
-  "在服务模式应用前仅作为未来期望",
   "当前数据面保持为 in-process",
-  "sandbox-process 服务模式已预留",
+  "部分实现",
+  "数据面",
+  "需要重启",
   "构建期埋点",
   "预留认证提供方",
   "admin.auth.provider/v1",
@@ -271,7 +272,7 @@ for (const untranslated of [
 
 assert.equal(ui("No builds"), "暂无构建");
 assert.equal(t("action"), "动作");
-assert.doesNotMatch(serviceHTML, /sandbox-process[^<]*(active|current data plane)/i, "future runtime must not read as the active data plane");
+assert.doesNotMatch(serviceHTML, /sandbox-process[^<]*(active|current data plane)/i, "pending sandbox mode must not read as the active data plane");
 
 const sandboxPlugin = {
   ...plugin,

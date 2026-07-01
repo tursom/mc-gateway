@@ -196,6 +196,7 @@ const localizedMessages: Partial<Record<Language, Record<string, string>>> = {
     "route deleted": "路由已删除",
     "route saved": "路由已保存",
     "ingress.service/v1 is reserved; schema and governance checks exist but gateway-managed listener data-plane is not enabled": "ingress.service/v1 已预留；schema 和治理检查存在，但网关托管监听数据面尚未启用",
+    "sandbox-process data-plane is partial; selected request/response extension points and upstream.connect/v1 protocol-proxy use sandbox stream.proxy/v1 relay with drain-only lifecycle; broader isolation and governance hardening remain incomplete": "sandbox-process 数据面部分可用；已支持选定请求/响应扩展点，upstream.connect/v1 protocol-proxy 通过 sandbox stream.proxy/v1 relay 和 drain-only 生命周期承载，完整隔离和治理仍需继续加固",
     "sandbox-process enforcement is implemented but disabled unless future runtime gates enable sandbox_process": "sandbox-process 强制隔离已实现，但在未来运行时开关启用 sandbox_process 前保持禁用",
     "sandbox-process runtime requires sandbox-process service mode": "sandbox-process 运行时需要 sandbox-process 服务模式",
     "sandbox-process runtime is reserved; current gateway releases do not expose a sandbox data-plane": "sandbox-process 运行时已预留；当前网关版本不开放 sandbox 数据面",

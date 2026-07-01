@@ -1,6 +1,6 @@
 # 运行时和未来能力
 
-本文说明不同 runtime、service mode 和 future-gated 能力的开发边界。它们已经出现在 `plugin features` 中，但 maturity 不同，不能都当作生产可用主路径。
+本文说明不同 runtime、service mode 和 future-gated 能力的开发边界。它们已经出现在 `plugin features` 中，但 maturity 不同，不能都当作同等完整的生产主路径。
 
 ## Runtime 类型
 
@@ -8,10 +8,10 @@
 | --- | --- | --- |
 | `go-plugin` | implemented | 当前主路径，进程内加载 `plugin.so` |
 | `builtin` | partial | 仅限 gateway-owned official plugin，不是第三方包路径 |
-| `sandbox-process` | partial/future-gated | enforcement 已建模，但需要 future gate；不能默认启用 |
+| `sandbox-process` | partial | 独立进程 sandbox 数据面已可用于受支持扩展点；需要 conformance 和 sandbox policy 通过 |
 | `wasm` | partial/future-gated | wazero runtime 已建模，用于低风险 validation 类扩展；需要 future gate |
 
-当前第三方插件开发应以 `go-plugin` 为主。其它 runtime 文档只能表达开发边界和 future gate，不应承诺无条件生产可用。
+当前第三方插件开发仍应优先选择 `go-plugin`。需要强隔离、跨语言或可回收进程边界时，可以选择 `sandbox-process`，但必须覆盖 sandbox conformance、capability enforcement 和部署侧隔离策略。
 
 ## Service Mode
 
@@ -19,7 +19,7 @@
 | --- | --- | --- |
 | `in-process` | implemented | gateway 进程内加载 Go plugin |
 | `go-plugin-process` | partial | 子进程 plugin-host，支持部分 upstream/protocol-proxy drain-only 能力 |
-| `sandbox-process` | partial/future-gated | 未来隔离进程和 WASM 承载模式 |
+| `sandbox-process` | partial | 独立 sandbox 进程承载模式；切换需要 apply/restart 语义 |
 
 `go-plugin` in-process 能直接返回 `net.Conn`。跨进程、sandbox 和 WASM 不能复用这个内存内 `net.Conn` 语义，需要 stream relay 或新 ABI。
 
@@ -85,7 +85,7 @@ go run ./cmd/gateway plugin runtime apply
 
 ## Sandbox Process
 
-Sandbox 是未来隔离 runtime，当前由 future gate 控制。
+Sandbox 是独立进程隔离 runtime，当前状态是 partial data-plane。默认产品事实会把 `sandbox-process` 标记为可用；部署方仍可用 `MC_GATEWAY_FUTURE_RUNTIME_SANDBOX_PROCESS=0` 显式关闭。若自定义 `MC_GATEWAY_SANDBOX_POLICY_JSON`，必须保证 policy 能通过环境自检，否则 Admin/CLI 会显示 blocked 而不是 active data-plane。
 
 已建模能力：
 
@@ -95,6 +95,9 @@ Sandbox 是未来隔离 runtime，当前由 future gate 控制。
 - secret RPC。
 - crash loop policy。
 - diagnostic summary。
+- route/rule/config request-response dispatch。
+- protocol-proxy stream relay。
+- conformance fixture release gate。
 
 开发边界：
 
@@ -116,7 +119,7 @@ capabilities:
       - network:egress
 ```
 
-当前不能把它写成默认生产 runtime。
+当前只能把它作为 partial runtime 使用：受支持 extension point 可以进入数据面，未覆盖的 capability、缺失 fixture 或环境自检失败仍会阻断 prod enable。
 
 ## WASM
 

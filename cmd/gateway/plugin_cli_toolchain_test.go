@@ -763,9 +763,10 @@ func TestPluginFeaturesAndManifestCommands(t *testing.T) {
 		t.Fatalf("wasm feature = %+v, want partial low-risk data-plane runtime", wasm)
 	}
 	sandboxRuntime := findRuntimeFeature(features.RuntimeTypes, pluginmanager.RuntimeSandbox)
-	if sandboxRuntime.Implemented || sandboxRuntime.Maturity != pluginmanager.FeatureMaturityReserved || sandboxRuntime.DataPlane ||
-		!strings.Contains(sandboxRuntime.UnsupportedReason, "sandbox data-plane") {
-		t.Fatalf("sandbox runtime feature = %+v, want reserved non-data-plane runtime", sandboxRuntime)
+	if !sandboxRuntime.Implemented || sandboxRuntime.Maturity != pluginmanager.FeatureMaturityPartial || !sandboxRuntime.DataPlane ||
+		sandboxRuntime.ReasonCode != "sandbox_data_plane_partial" ||
+		!strings.Contains(sandboxRuntime.UnsupportedReason, "stream.proxy/v1 relay") {
+		t.Fatalf("sandbox runtime feature = %+v, want partial sandbox data-plane runtime", sandboxRuntime)
 	}
 	inProcess := findCLIServiceModeFeature(features.ServiceModes, pluginmanager.PluginServiceModeInProcess)
 	if !inProcess.Implemented || inProcess.Maturity != pluginmanager.FeatureMaturityImplemented || !inProcess.DataPlane || inProcess.RequiresRestart {
@@ -776,9 +777,10 @@ func TestPluginFeaturesAndManifestCommands(t *testing.T) {
 		t.Fatalf("go-plugin-process feature = %+v, want partial process data plane", processMode)
 	}
 	sandboxMode := findCLIServiceModeFeature(features.ServiceModes, pluginmanager.PluginServiceModeSandboxProcess)
-	if sandboxMode.Implemented || sandboxMode.Maturity != pluginmanager.FeatureMaturityReserved || sandboxMode.DataPlane ||
-		!strings.Contains(sandboxMode.UnsupportedReason, "current data-plane modes") {
-		t.Fatalf("sandbox service mode = %+v, want reserved non-data-plane service mode", sandboxMode)
+	if !sandboxMode.Implemented || sandboxMode.Maturity != pluginmanager.FeatureMaturityPartial || !sandboxMode.DataPlane ||
+		sandboxMode.ReasonCode != "sandbox_data_plane_partial" ||
+		!strings.Contains(sandboxMode.UnsupportedReason, "stream.proxy/v1 relay") {
+		t.Fatalf("sandbox service mode = %+v, want partial sandbox data-plane service mode", sandboxMode)
 	}
 	inProcessAdapter := findRuntimeAdapterStatus(features.RuntimeAdapters, pluginmanager.PluginServiceModeInProcess, pluginmanager.RuntimeGoPlugin)
 	if !inProcessAdapter.Implemented || inProcessAdapter.Maturity != pluginmanager.FeatureMaturityImplemented || !inProcessAdapter.DataPlane || !inProcessAdapter.Lifecycle || inProcessAdapter.Adapter != "go-plugin-in-process" {
@@ -1008,8 +1010,8 @@ func TestPluginFeaturesAndManifestCommands(t *testing.T) {
 		features.Ingress.DataPlane {
 		t.Fatalf("ingress feature = %+v, want reserved listener lifecycle without current data plane", features.Ingress)
 	}
-	if !features.Sandbox.RuntimeTypeReserved ||
-		!features.Sandbox.ServiceModeReserved ||
+	if features.Sandbox.RuntimeTypeReserved ||
+		features.Sandbox.ServiceModeReserved ||
 		!features.Sandbox.RequiredCapabilityGate ||
 		!features.Sandbox.FutureRuntimeGate ||
 		!features.Sandbox.Supervisor ||
@@ -1021,8 +1023,8 @@ func TestPluginFeaturesAndManifestCommands(t *testing.T) {
 		!features.Sandbox.SecretRPC ||
 		features.Sandbox.CrashLoopPolicyDataPlane ||
 		!features.Sandbox.DiagnosticSummary ||
-		features.Sandbox.DataPlane {
-		t.Fatalf("sandbox feature = %+v, want reserved sandbox controls without current data plane", features.Sandbox)
+		!features.Sandbox.DataPlane {
+		t.Fatalf("sandbox feature = %+v, want partial sandbox data plane with controls", features.Sandbox)
 	}
 	if features.WASM.RuntimeTypeReserved ||
 		!features.WASM.ContainedValidation ||
@@ -1105,6 +1107,42 @@ func TestPluginFeatureFactsSandboxGateStates(t *testing.T) {
 		SandboxSelfCheck:   func(pluginmanager.SandboxPolicy) error { return nil },
 	})
 	assertSandboxFeatureState(t, facts, pluginmanager.FeatureMaturityPartial, true, "partial")
+}
+
+func TestPluginRuntimeFeatureFactsEnvDefaultsSandboxProduction(t *testing.T) {
+	options, err := pluginRuntimeFeatureFactsOptionsFromEnv(func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("pluginRuntimeFeatureFactsOptionsFromEnv(default) error = %v", err)
+	}
+	if !options.FutureRuntimeGates.SandboxProcess || !options.SandboxPolicy.ExternalIsolation {
+		t.Fatalf("default runtime facts = %+v, want sandbox gate enabled with external isolation policy", options)
+	}
+
+	options, err = pluginRuntimeFeatureFactsOptionsFromEnv(func(name string) string {
+		if name == envFutureRuntimeSandboxProcess {
+			return "0"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("pluginRuntimeFeatureFactsOptionsFromEnv(off) error = %v", err)
+	}
+	if options.FutureRuntimeGates.SandboxProcess || options.SandboxPolicy.ExternalIsolation {
+		t.Fatalf("disabled runtime facts = %+v, want explicit gate off without default sandbox policy", options)
+	}
+
+	options, err = pluginRuntimeFeatureFactsOptionsFromEnv(func(name string) string {
+		if name == envSandboxPolicyJSON {
+			return `{"external_isolation":false}`
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("pluginRuntimeFeatureFactsOptionsFromEnv(policy override) error = %v", err)
+	}
+	if !options.FutureRuntimeGates.SandboxProcess || options.SandboxPolicy.ExternalIsolation {
+		t.Fatalf("overridden runtime facts = %+v, want default gate with explicit policy override preserved", options)
+	}
 }
 
 func assertSandboxFeatureState(t *testing.T, facts map[string]any, wantMaturity string, wantDataPlane bool, wantReason string) {

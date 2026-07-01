@@ -6,26 +6,25 @@
 
 ## 背景
 
-当前 `sandbox-process` 已经有一部分运行时底座：`SandboxProcessAdapter`、supervisor、control RPC、filesystem staging、network namespace 默认隔离、env allowlist、CPU/memory rlimit、secret handle RPC 和 diagnostics summary。它的安全策略已经偏向 fail-closed：无法强制的网络访问、疑似 secret/token 环境变量、缺失 CPU/memory 限制都会阻断。
+当前 `sandbox-process` 已经形成 partial data-plane：`SandboxProcessAdapter`、supervisor、control RPC、filesystem staging、network namespace 默认隔离、env allowlist、CPU/memory rlimit、secret handle RPC、diagnostics summary、request/response dispatch、stream relay、治理准入、观测和 conformance release gate 均已接入。它的安全策略偏向 fail-closed：无法强制的网络访问、疑似 secret/token 环境变量、缺失 CPU/memory 限制、缺失 sandbox conformance fixture 都会阻断。
 
-但它仍不是生产数据面运行时。`plugin features` 事实源把 `runtime.type=sandbox-process` 和 `service_mode=sandbox-process` 表达为 `reserved`、`data_plane=false`。当前代码也仍会阻断启用或回落到 `in-process`，避免 Admin、CLI 或 API 把模型底座误读成完整 runtime。
+`plugin features` 事实源现在把 `runtime.type=sandbox-process` 和 `service_mode=sandbox-process` 表达为 `partial`、`data_plane=true`。它仍不是“完整无限制 runtime”：只对明确支持并通过 conformance 的 extension point 开放；部署方显式关闭 future gate、环境自检失败、policy 无法强制或 governance/conformance 失败时，Admin、CLI 和 API 仍会展示 blocked/non-active data-plane，并保留回落到 `in-process` 的安全边界。
 
 本文目标是把“sandbox-process 完全可用”拆成可实施、可验收、可回滚的工作项。这里的“完全可用”指：对明确支持的 extension point，sandbox 插件可以通过 Admin/CLI 上传、校验、准入、启用、调用、观测、reload、drain、disable、rollback 和故障隔离的完整生产闭环。
 
 ## 当前事实
 
-主要事实源和缺口如下：
+主要事实源和剩余边界如下：
 
-- `internal/pluginmanager/features.go`：`RuntimeSandbox` 和 `PluginServiceModeSandboxProcess` 仍是 `reserved`、`data_plane=false`。
-- `internal/pluginmanager/future.go`：`ApplyPluginServiceMode` 会因为 sandbox service mode 未实现数据面而回落到 `in-process`；future gate 只作为额外保护，不是完整启用路径。
-- `internal/pluginmanager/runtime_lifecycle.go`：`RuntimeAdapterFactory` 已有 `sandbox-process + sandbox-process` adapter 组合，但状态仍是 reserved/non-data-plane。
-- `internal/pluginmanager/sandbox_runtime.go`：已有进程启动、chroot staging、namespace、rlimit、control RPC、secret handle 和 diagnostics，但 `sandboxHostedPlugin.Init/ReloadConfig/Destroy` 仍是 no-op，没有真实注册 hook/provider/subscriber。
-- `internal/pluginmanager/manager.go`：`validateArtifactGate` 对 sandbox service mode 和 future gate 做阻断；`requiredRuntimeCapabilities` 对 sandbox required capability 仍按无法强制处理。
-- `internal/pluginmanager/types.go`：`SandboxSecretResponse` 当前只返回授权状态和 version，不返回短期 secret value。
-- `cmd/gateway/plugin_cli_toolchain.go`：CLI build/test adapter 对 `sandbox-process` 仍返回 reserved。
-- `docs/plugin-roadmap-remaining-work/m08-stream-sandbox-wasm-ingress.md`：当前阶段结论明确为“可验证但默认不暴露 sandbox/WASM/ingress 数据面”。
+- `internal/pluginmanager/features.go`：`RuntimeSandbox` 和 `PluginServiceModeSandboxProcess` 默认是 `partial`、`data_plane=true`；显式 gate-off 或 self-check 失败时会降为不可用状态。
+- `internal/pluginmanager/future.go`：`ApplyPluginServiceMode` 支持 sandbox active/data-plane mode；失败时保留旧 active data-plane。
+- `internal/pluginmanager/runtime_lifecycle.go`：`RuntimeAdapterFactory` 的 `sandbox-process + sandbox-process` adapter 已返回 partial data-plane lifecycle。
+- `internal/pluginmanager/sandbox_runtime.go`：进程启动、chroot staging、namespace、rlimit、control RPC、secret handle、diagnostics、hook/provider/subscriber 注册和 stream relay 已接入。
+- `internal/pluginmanager/manager.go`：sandbox service mode、artifact metadata、capability、governance、rollback 和 promotion gate 均走 fail-closed。
+- `cmd/gateway/plugin_cli_toolchain.go`：CLI 支持 sandbox validate/test/package/preflight/conformance，并要求 strict fixture coverage。
+- `plugin/sandboxsdk` 与 `examples/plugins/sandbox-*`：提供 route resolver、rule policy、stream proxy 的可运行样例和 conformance fixture。
 
-这些事实必须先保持一致。任何实现步骤都不能只改 UI 文案或 feature facts 来宣称可用。
+这些事实必须保持一致。任何后续能力提升都不能只改 UI 文案或 feature facts 来宣称可用。
 
 ## 目标状态
 
@@ -522,7 +521,7 @@ go run ./cmd/gateway plugin test examples/plugins/<sandbox-example> --profile co
 
 ## Feature facts 提升条件
 
-只有同时满足以下条件，才能把 `sandbox-process` 从 reserved 提升：
+`sandbox-process` 已按以下条件从 reserved 提升为 partial data-plane；后续若要提升为 implemented，仍需重新审视这些条件和更广泛 extension coverage：
 
 1. `ApplyPluginServiceMode` 能进入 sandbox active mode，并在失败时可回退。
 2. 至少一个 request/response extension point 通过真实 sandbox RPC 数据面。

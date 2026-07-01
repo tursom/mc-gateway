@@ -401,11 +401,11 @@ function pluginServiceModes(): PluginServiceModeFeature[] {
   if (modes.length) {
     return modes;
   }
-	  return [
-	    { mode: "in-process", implemented: true, maturity: "implemented", data_plane: true, requires_restart: false },
-	    { mode: "go-plugin-process", implemented: true, maturity: "partial", data_plane: true, requires_restart: true, unsupported_reason: "go-plugin-process supports upstream.connect/v1 dialer mode and protocol-proxy drain-only with persisted crash policy and per-node crash isolation; fd-live migration, sandbox enforcement, full isolation, and non-Linux process-table orphan discovery are not implemented" },
-	    { mode: "sandbox-process", implemented: false, maturity: "reserved", data_plane: false, requires_restart: true, unsupported_reason: "sandbox-process service mode is reserved; current data-plane modes are in-process and go-plugin-process" },
-	  ];
+  return [
+    { mode: "in-process", implemented: true, maturity: "implemented", data_plane: true, requires_restart: false },
+    { mode: "go-plugin-process", implemented: true, maturity: "partial", data_plane: true, requires_restart: true, unsupported_reason: "go-plugin-process supports upstream.connect/v1 dialer mode and protocol-proxy drain-only with persisted crash policy and per-node crash isolation; fd-live migration, sandbox enforcement, full isolation, and non-Linux process-table orphan discovery are not implemented" },
+    { mode: "sandbox-process", implemented: true, maturity: "partial", data_plane: true, requires_restart: true, reason_code: "sandbox_data_plane_partial", unsupported_reason: "sandbox-process data-plane is partial; selected request/response extension points and upstream.connect/v1 protocol-proxy use sandbox stream.proxy/v1 relay with drain-only lifecycle; broader isolation and governance hardening remain incomplete" },
+  ];
 }
 
 function pluginExtensionPoints(): PluginExtensionPointFeature[] {

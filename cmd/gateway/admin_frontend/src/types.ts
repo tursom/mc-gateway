@@ -212,6 +212,7 @@ export interface PluginServiceModeFeature {
   requires_restart: boolean;
   host_protocol?: string;
   control_channel?: string;
+  reason_code?: string;
   unsupported_reason?: string;
 }
 

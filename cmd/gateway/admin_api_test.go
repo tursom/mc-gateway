@@ -191,7 +191,7 @@ func TestAdminServiceUpdateMarksRestartRequired(t *testing.T) {
 	}
 }
 
-func TestAdminPluginServiceStatusReportsReservedModes(t *testing.T) {
+func TestAdminPluginServiceStatusReportsSandboxDataPlane(t *testing.T) {
 	handler := newAdminTestHandlerWithAdmin(t)
 	token := adminTestLogin(t, handler, "admin", "secret")
 
@@ -209,11 +209,11 @@ func TestAdminPluginServiceStatusReportsReservedModes(t *testing.T) {
 		t.Fatalf("default plugin service = %#v, want implemented in-process data plane", service)
 	}
 	sandboxEnv := status["sandbox_environment"].(map[string]any)
-	if sandboxEnv["gate_enabled"] != false ||
-		sandboxEnv["self_check_ok"] != false ||
-		sandboxEnv["data_plane_eligible"] != false ||
-		sandboxEnv["reason_code"] != pluginmanager.ReasonSandboxFutureGateClosed {
-		t.Fatalf("sandbox environment = %#v, want gate-closed non-data-plane self-check status", sandboxEnv)
+	if sandboxEnv["gate_enabled"] != true ||
+		sandboxEnv["self_check_ok"] != true ||
+		sandboxEnv["data_plane_eligible"] != true ||
+		sandboxEnv["reason_code"] != "sandbox_data_plane_partial" {
+		t.Fatalf("sandbox environment = %#v, want enabled sandbox data-plane self-check status", sandboxEnv)
 	}
 	crashPolicy := service["crash_policy"].(map[string]any)
 	if int(crashPolicy["backoff_seconds"].(float64)) != int(pluginmanager.DefaultPluginHostCrashBackoffSeconds) ||
@@ -239,11 +239,12 @@ func TestAdminPluginServiceStatusReportsReservedModes(t *testing.T) {
 		t.Fatalf("go-plugin-process adapter = %#v, want partial process data plane", processAdapter)
 	}
 	sandboxMode := findAdminServiceModeFeature(t, status["service_modes"].([]any), pluginmanager.PluginServiceModeSandboxProcess)
-	if sandboxMode["implemented"] != false ||
-		sandboxMode["data_plane"] != false ||
-		sandboxMode["maturity"] != pluginmanager.FeatureMaturityReserved ||
-		!strings.Contains(sandboxMode["unsupported_reason"].(string), "current data-plane modes") {
-		t.Fatalf("sandbox service mode = %#v, want reserved non-data-plane mode", sandboxMode)
+	if sandboxMode["implemented"] != true ||
+		sandboxMode["data_plane"] != true ||
+		sandboxMode["maturity"] != pluginmanager.FeatureMaturityPartial ||
+		sandboxMode["reason_code"] != "sandbox_data_plane_partial" ||
+		!strings.Contains(sandboxMode["unsupported_reason"].(string), "stream.proxy/v1 relay") {
+		t.Fatalf("sandbox service mode = %#v, want partial sandbox data-plane mode", sandboxMode)
 	}
 	wasmSandboxAdapter := findAdminRuntimeAdapterStatus(t, status["runtime_adapters"].([]any), pluginmanager.PluginServiceModeSandboxProcess, pluginmanager.RuntimeWASM)
 	expectedWASMAdapter := findPluginRuntimeAdapterStatus(pluginmanager.RuntimeAdapterFactoryStatuses(), pluginmanager.PluginServiceModeSandboxProcess, pluginmanager.RuntimeWASM)
@@ -359,11 +360,12 @@ func TestAdminPluginFeaturesExposeSharedFactSource(t *testing.T) {
 		t.Fatalf("wasm feature = %#v, want partial low-risk data-plane runtime", wasm)
 	}
 	sandboxRuntime := findAdminRuntimeFeature(t, runtimeTypes, pluginmanager.RuntimeSandbox)
-	if sandboxRuntime["implemented"] != false ||
-		sandboxRuntime["maturity"] != pluginmanager.FeatureMaturityReserved ||
-		sandboxRuntime["data_plane"] != false ||
-		!strings.Contains(sandboxRuntime["unsupported_reason"].(string), "sandbox data-plane") {
-		t.Fatalf("sandbox runtime = %#v, want reserved non-data-plane runtime", sandboxRuntime)
+	if sandboxRuntime["implemented"] != true ||
+		sandboxRuntime["maturity"] != pluginmanager.FeatureMaturityPartial ||
+		sandboxRuntime["data_plane"] != true ||
+		sandboxRuntime["reason_code"] != "sandbox_data_plane_partial" ||
+		!strings.Contains(sandboxRuntime["unsupported_reason"].(string), "stream.proxy/v1 relay") {
+		t.Fatalf("sandbox runtime = %#v, want partial sandbox data-plane runtime", sandboxRuntime)
 	}
 	extensionPoints := features["extension_points"].([]any)
 	if len(extensionPoints) != len(pluginmanager.ExtensionPointFeatures()) {

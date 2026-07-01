@@ -15,7 +15,7 @@ const (
 
 func pluginRuntimeFeatureFactsOptionsFromEnv(getenv func(string) string) (pluginmanager.RuntimeFeatureFactsOptions, error) {
 	var gates pluginmanager.FutureRuntimeGates
-	sandboxEnabled, err := parsePluginFeatureBoolEnv(getenv(envFutureRuntimeSandboxProcess), false, envFutureRuntimeSandboxProcess)
+	sandboxEnabled, err := parsePluginFeatureBoolEnv(getenv(envFutureRuntimeSandboxProcess), true, envFutureRuntimeSandboxProcess)
 	if err != nil {
 		return pluginmanager.RuntimeFeatureFactsOptions{}, err
 	}
@@ -26,6 +26,8 @@ func pluginRuntimeFeatureFactsOptionsFromEnv(getenv func(string) string) (plugin
 		if err := json.Unmarshal([]byte(raw), &sandboxPolicy); err != nil {
 			return pluginmanager.RuntimeFeatureFactsOptions{}, fmt.Errorf("%s must be a sandbox policy JSON object: %w", envSandboxPolicyJSON, err)
 		}
+	} else if sandboxEnabled {
+		sandboxPolicy.ExternalIsolation = true
 	}
 	return pluginmanager.RuntimeFeatureFactsOptions{
 		FutureRuntimeGates: gates,
