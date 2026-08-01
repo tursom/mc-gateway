@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -233,4 +234,29 @@ func waitGatewayTestUpstream(t testing.TB, done <-chan gatewayTestUpstreamResult
 		t.Fatal("timed out waiting for upstream server")
 		return nil
 	}
+}
+
+func readGatewayTestPacketOnce(reader io.Reader, conn net.Conn, packetLen int, isTransportTimeout func(error) bool) gatewayTestUpstreamResult {
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		return gatewayTestUpstreamResult{err: err}
+	}
+	packet := make([]byte, packetLen)
+	if _, err := io.ReadFull(reader, packet); err != nil {
+		return gatewayTestUpstreamResult{err: err}
+	}
+
+	if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+		return gatewayTestUpstreamResult{err: err}
+	}
+	extra := make([]byte, 1)
+	n, err := reader.Read(extra)
+	if n > 0 || err == nil {
+		return gatewayTestUpstreamResult{err: errors.New("upstream received duplicate initial packet data")}
+	}
+	var netErr net.Error
+	transportTimedOut := isTransportTimeout != nil && isTransportTimeout(err)
+	if !errors.Is(err, io.EOF) && (!errors.As(err, &netErr) || !netErr.Timeout()) && !transportTimedOut {
+		return gatewayTestUpstreamResult{err: err}
+	}
+	return gatewayTestUpstreamResult{packet: packet}
 }
