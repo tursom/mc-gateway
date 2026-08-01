@@ -3,11 +3,11 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
-	"sync"
 
 	"github.com/rs/zerolog/log"
 	"github.com/tursom/mc-gateway/internal/tcphttpmux"
@@ -49,19 +49,18 @@ func tcpWebPortReuseEnabled() bool {
 		normalizedTCPPort() == normalizedWebSocketPort()
 }
 
-func runTcpWebPortReuse(wg *sync.WaitGroup) {
-	if wg != nil {
-		defer wg.Done()
+func runTcpWebPortReuse(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return nil
 	}
-
 	port := normalizedTCPPort()
 	// 同一个 listener 同时承载 Minecraft TCP 和 Admin HTTP，由 serveTcpWebPortReuse 分流。
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
-		log.Fatal().Err(err).
-			Int("port", port).
-			Msg("Failed to listen on shared TCP/WebSocket port")
+		return fmt.Errorf("listen on shared TCP/WebSocket port %d: %w", port, err)
 	}
+	stop := context.AfterFunc(ctx, func() { _ = listener.Close() })
+	defer stop()
 
 	log.Info().
 		Int("port", port).
@@ -69,10 +68,9 @@ func runTcpWebPortReuse(wg *sync.WaitGroup) {
 		Msg("Listening for shared TCP and Admin connections")
 
 	if err := serveTcpWebPortReuse(listener, newGatewayHTTPHandler(), handleRequest); err != nil && !errors.Is(err, net.ErrClosed) {
-		log.Fatal().Err(err).
-			Int("port", port).
-			Msg("Shared TCP/Admin server stopped")
+		return fmt.Errorf("serve shared TCP/Admin port %d: %w", port, err)
 	}
+	return nil
 }
 
 func serveTcpWebPortReuse(listener net.Listener, handler http.Handler, tcpHandler func(net.Conn)) error {

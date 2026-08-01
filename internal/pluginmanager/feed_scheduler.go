@@ -33,6 +33,9 @@ type ExternalFeedSchedule struct {
 }
 
 func (m *Manager) StartExternalFeedSchedulers(ctx context.Context, advisoryFeeds, vulnerabilityFeeds []ExternalFeedSchedule) error {
+	if m.closing.Load() {
+		return ErrManagerClosed
+	}
 	if len(advisoryFeeds) == 0 && len(vulnerabilityFeeds) == 0 {
 		return nil
 	}
@@ -80,6 +83,12 @@ func (m *Manager) StartExternalFeedSchedulers(ctx context.Context, advisoryFeeds
 }
 
 func (m *Manager) StopExternalFeedSchedulers() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = m.stopExternalFeedSchedulers(ctx)
+}
+
+func (m *Manager) stopExternalFeedSchedulers(ctx context.Context) error {
 	m.feedSchedulerMu.Lock()
 	cancel := m.feedSchedulerCancel
 	done := m.feedSchedulerDone
@@ -87,15 +96,17 @@ func (m *Manager) StopExternalFeedSchedulers() {
 	m.feedSchedulerDone = nil
 	m.feedSchedulerMu.Unlock()
 	if cancel == nil {
-		return
+		return nil
 	}
 	cancel()
 	if done == nil {
-		return
+		return nil
 	}
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 

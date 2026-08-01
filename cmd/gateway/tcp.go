@@ -3,27 +3,27 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
-	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
 )
 
-func runTcp(wg *sync.WaitGroup) {
-	if wg != nil {
-		defer wg.Done()
+func runTcp(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return nil
 	}
-
 	port := normalizedTCPPort()
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
-		log.Fatal().Err(err).
-			Int("port", port).
-			Msg("Failed to listen on port")
+		return fmt.Errorf("listen on TCP port %d: %w", port, err)
 	}
 	defer listener.Close()
+	stop := context.AfterFunc(ctx, func() { _ = listener.Close() })
+	defer stop()
 	log.Info().
 		Int("port", port).
 		Msg("Listening for TCP connections")
@@ -32,6 +32,12 @@ func runTcp(wg *sync.WaitGroup) {
 		// 接受传入的连接
 		conn, err := listener.Accept()
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			if errors.Is(err, net.ErrClosed) {
+				return err
+			}
 			log.Err(err).Msg("Error accepting")
 			continue
 		}

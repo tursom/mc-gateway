@@ -206,6 +206,11 @@ type Manager struct {
 	feedSchedulerMu     sync.Mutex
 	feedSchedulerCancel context.CancelFunc
 	feedSchedulerDone   chan struct{}
+
+	closing   atomic.Bool
+	closeOnce sync.Once
+	closeDone chan struct{}
+	closeErr  error
 }
 
 // loadedPlugin 是内存中的插件实例和它注册的扩展快照。数据库记录说明期望状态，
@@ -689,6 +694,9 @@ func (m *Manager) validateBuildPolicy(req BuildRequest) error {
 // SetDesired 只修改插件的期望状态，不直接改变当前进程已加载的插件。
 // 调用方需要再执行 Enable/Disable/Reconcile 才会推动运行态收敛。
 func (m *Manager) SetDesired(ctx context.Context, actor, pluginID, artifactID, desiredState, configJSON string, priority int) (PluginRecord, error) {
+	if m.closing.Load() {
+		return PluginRecord{}, ErrManagerClosed
+	}
 	if desiredState == "" {
 		desiredState = DesiredDisabled
 	}
@@ -934,6 +942,9 @@ func (m *Manager) RollbackConfigSnapshot(ctx context.Context, actor string, snap
 }
 
 func (m *Manager) Load(ctx context.Context, actor, pluginID string) (PluginRecord, error) {
+	if m.closing.Load() {
+		return PluginRecord{}, ErrManagerClosed
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -955,6 +966,9 @@ func (m *Manager) Load(ctx context.Context, actor, pluginID string) (PluginRecor
 // Enable 将期望状态推进为启用，并把插件处理器发布到连接热路径。
 // 发布前会先通过治理门禁，避免高风险制品绕过评审直接生效。
 func (m *Manager) Enable(ctx context.Context, actor, pluginID string) (PluginRecord, error) {
+	if m.closing.Load() {
+		return PluginRecord{}, ErrManagerClosed
+	}
 	pluginRecord, err := m.repo.Plugin(ctx, pluginID)
 	if err != nil {
 		return PluginRecord{}, err
@@ -1179,6 +1193,9 @@ func (m *Manager) deferSandboxProcessStop(pluginID string, process *SandboxProce
 // Reconcile 根据数据库中的期望启用列表重建内存分发快照，主要用于进程启动
 // 或运行态状态漂移后的自愈。
 func (m *Manager) Reconcile(ctx context.Context) error {
+	if m.closing.Load() {
+		return ErrManagerClosed
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -2320,6 +2337,9 @@ func (m *Manager) stopPendingSandboxProcess(_ string, process *SandboxProcess) {
 // loadLocked 加载或复用插件实例。调用方必须持有 m.mu，确保 loaded 缓存和
 // 运行态标记不会与 Enable/Disable/Reconcile 并发冲突。
 func (m *Manager) loadLocked(ctx context.Context, pluginRecord PluginRecord) (*loadedPlugin, error) {
+	if m.closing.Load() {
+		return nil, ErrManagerClosed
+	}
 	if loaded := m.loaded[pluginRecord.ID]; loaded != nil &&
 		loaded.artifact.ID == pluginRecord.DesiredArtifactID &&
 		loaded.record.DesiredGeneration == pluginRecord.DesiredGeneration {

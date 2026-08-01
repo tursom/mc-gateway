@@ -3,11 +3,11 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -108,17 +108,19 @@ func newWebSocketHandler() http.Handler {
 }
 
 // 启动 WebSocket 服务器
-func runWebSocket(wg *sync.WaitGroup) {
-	if wg != nil {
-		defer wg.Done()
+func runWebSocket(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return nil
 	}
-
 	port := normalizedWebSocketPort()
 	path := normalizedWebSocketPath()
 
 	log.Info().Int("port", port).Str("path", path).Msg("Starting WebSocket server")
 	server := &http.Server{Addr: fmt.Sprintf(":%d", port), Handler: newWebSocketHandler()}
-	if err := server.ListenAndServe(); err != nil {
-		log.Fatal().Err(err).Msg("Failed to start WebSocket server")
+	stop := context.AfterFunc(ctx, func() { _ = server.Close() })
+	defer stop()
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("serve WebSocket port %d: %w", port, err)
 	}
+	return nil
 }

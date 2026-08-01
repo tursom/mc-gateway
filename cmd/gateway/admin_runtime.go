@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"time"
@@ -106,7 +107,7 @@ func initializeGatewayRuntime() error {
 		DB:                        db,
 		ArtifactRoot:              filepath.Join(filepath.Dir(startup.DBPath), "plugins", "artifacts"),
 		HandleConn:                handleRequest,
-		WaitGroup:                 &exitWaitGroup,
+		WaitGroup:                 &pluginExitWaitGroup,
 		IngressReservedListeners:  reservedIngressListeners,
 		RequireConformanceFixture: startup.PluginRequireConformanceFixture,
 		FutureRuntimeGates:        runtimeFacts.FutureRuntimeGates,
@@ -115,16 +116,23 @@ func initializeGatewayRuntime() error {
 	return pluginsManager.Reconcile(ctx)
 }
 
-// closeGatewayRuntime 只关闭当前进程持有的数据库连接；SQLite 文件和插件制品都保留在数据目录中。
-func closeGatewayRuntime() {
+// closeGatewayRuntime 先停止插件运行态，再关闭当前进程持有的数据库连接。
+// SQLite 文件、插件期望状态和插件制品都保留在数据目录中。
+func closeGatewayRuntime(ctx context.Context) error {
+	var errs []error
 	if pluginsManager != nil {
-		pluginsManager.StopExternalFeedSchedulers()
+		if err := pluginsManager.Close(ctx); err != nil {
+			errs = append(errs, err)
+		}
 		pluginsManager = nil
 	}
 	if adminDB != nil {
-		_ = adminDB.Close()
+		if err := adminDB.Close(); err != nil {
+			errs = append(errs, err)
+		}
 		adminDB = nil
 	}
+	return errors.Join(errs...)
 }
 
 func parseStartupConfig(getenv func(string) string) (adminconfig.Config, error) {

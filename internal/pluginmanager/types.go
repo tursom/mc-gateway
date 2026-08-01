@@ -195,6 +195,7 @@ const (
 var (
 	ErrArtifactNotFound = errors.New("plugin artifact not found")
 	ErrPluginNotFound   = errors.New("plugin not found")
+	ErrManagerClosed    = errors.New("plugin manager is closing")
 )
 
 type Manifest struct {

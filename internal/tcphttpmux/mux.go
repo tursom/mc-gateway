@@ -79,6 +79,8 @@ var readBufferPool = sync.Pool{
 // 会先读取少量字节判断协议，再被投递给 http.Server 或 tcpHandler。
 func Serve(listener net.Listener, handler http.Handler, tcpHandler func(net.Conn), opts Options) error {
 	defer listener.Close()
+	var routingWG sync.WaitGroup
+	defer routingWG.Wait()
 
 	// http.Server 仍使用标准库模型，只是它的 listener 是内存通道。
 	// 这样管理端路由、中间件和超时语义都保持为普通 HTTP 服务。
@@ -117,13 +119,29 @@ func Serve(listener net.Listener, handler http.Handler, tcpHandler func(net.Conn
 			opts.SetSocketOptions(conn)
 		}
 		// 每条连接独立分流，避免慢客户端阻塞共享监听器继续 accept。
-		go HandleConn(conn, webListener, tcpHandler, opts)
+		routingWG.Add(1)
+		go func() {
+			handedOff := false
+			handoff := func() {
+				if handedOff {
+					return
+				}
+				handedOff = true
+				routingWG.Done()
+			}
+			defer handoff()
+			handleConn(conn, webListener, tcpHandler, opts, handoff)
+		}()
 	}
 }
 
 // HandleConn 完成单连接分流。它只负责协议识别和投递，认证、路由和转发
 // 仍由 HTTP handler 或 tcpHandler 里的业务层完成。
 func HandleConn(conn net.Conn, webListener *ChanListener, tcpHandler func(net.Conn), opts Options) {
+	handleConn(conn, webListener, tcpHandler, opts, nil)
+}
+
+func handleConn(conn net.Conn, webListener *ChanListener, tcpHandler func(net.Conn), opts Options, handoff func()) {
 	peeked, err := ReadInitialPacket(conn, opts.normalizedInitialPacketTimeout())
 	if err != nil {
 		if opts.OnInitialPacketError != nil {
@@ -150,11 +168,17 @@ func HandleConn(conn net.Conn, webListener *ChanListener, tcpHandler func(net.Co
 			}
 			conn.Close()
 		}
+		if handoff != nil {
+			handoff()
+		}
 		return
 	}
 
 	if opts.OnTCPConnection != nil {
 		opts.OnTCPConnection()
+	}
+	if handoff != nil {
+		handoff()
 	}
 	tcpHandler(replayed)
 }

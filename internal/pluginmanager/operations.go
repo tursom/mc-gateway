@@ -55,6 +55,12 @@ type Operations struct {
 	root   string
 	nodeID string
 
+	lifecycleMu     sync.Mutex
+	lifecycleCtx    context.Context
+	lifecycleCancel context.CancelFunc
+	lifecycleWG     sync.WaitGroup
+	closed          atomic.Bool
+
 	// plugins 保存每个插件的运行时运维上下文，按 manifest 重新配置但保留统计摘要。
 	mu      sync.RWMutex
 	plugins map[string]*PluginOperations
@@ -187,18 +193,71 @@ func NewOperationsWithNodeID(repo Repository, root, nodeID string) *Operations {
 	if strings.TrimSpace(nodeID) == "" {
 		nodeID = defaultOperationsNodeID()
 	}
+	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
 	ops := &Operations{
 		repo:            repo,
 		root:            root,
 		nodeID:          nodeID,
+		lifecycleCtx:    lifecycleCtx,
+		lifecycleCancel: lifecycleCancel,
 		plugins:         make(map[string]*PluginOperations),
 		eventQueue:      make(chan queuedEvent, DefaultEventQueueLimit),
 		subscriberQueue: make(chan queuedEvent, DefaultEventQueueLimit),
 		exporters:       make(map[string]*operationsExporterRuntime),
 	}
-	go ops.consumeEvents()
-	go ops.consumeSubscriberEvents()
+	ops.launch(ops.consumeEvents)
+	ops.launch(ops.consumeSubscriberEvents)
 	return ops
+}
+
+func (o *Operations) launch(run func()) bool {
+	if o == nil || run == nil {
+		return false
+	}
+	o.lifecycleMu.Lock()
+	defer o.lifecycleMu.Unlock()
+	if o.closed.Load() {
+		return false
+	}
+	o.lifecycleWG.Add(1)
+	go func() {
+		defer o.lifecycleWG.Done()
+		run()
+	}()
+	return true
+}
+
+// Close 停止任务、事件消费者和订阅投递，并等待所有受管 goroutine 退出。
+func (o *Operations) Close(ctx context.Context) error {
+	if o == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	o.lifecycleMu.Lock()
+	if o.closed.CompareAndSwap(false, true) {
+		o.lifecycleCancel()
+	}
+	o.lifecycleMu.Unlock()
+
+	o.mu.RLock()
+	plugins := make([]*PluginOperations, 0, len(o.plugins))
+	for _, plugin := range o.plugins {
+		plugins = append(plugins, plugin)
+	}
+	o.mu.RUnlock()
+	for _, plugin := range plugins {
+		plugin.stopTasks()
+	}
+	return waitGroupContext(ctx, &o.lifecycleWG)
+}
+
+func (o *Operations) isClosed() bool {
+	if o == nil {
+		return true
+	}
+	return o.closed.Load()
 }
 
 func defaultOperationsNodeID() string {
@@ -388,7 +447,18 @@ func (o *Operations) StartTasks(pluginID string) {
 }
 
 func (o *Operations) consumeEvents() {
-	for event := range o.eventQueue {
+	for {
+		select {
+		case <-o.lifecycleCtx.Done():
+			return
+		default:
+		}
+		var event queuedEvent
+		select {
+		case <-o.lifecycleCtx.Done():
+			return
+		case event = <-o.eventQueue:
+		}
 		o.queued.Add(1)
 		// 落库使用短超时，避免后台消费者在数据库异常时堆积过久。
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -405,6 +475,10 @@ func (o *Operations) consumeEvents() {
 }
 
 func (o *Operations) queueEvent(event queuedEvent) {
+	if o.isClosed() {
+		o.dropped.Add(1)
+		return
+	}
 	select {
 	case o.eventQueue <- event:
 	default:
@@ -422,6 +496,10 @@ func (o *Operations) queueEvent(event queuedEvent) {
 }
 
 func (o *Operations) queueSubscriberEvent(event queuedEvent) {
+	if o.isClosed() {
+		o.subscriberDropped.Add(1)
+		return
+	}
 	// 已标记 dropped 的事件只进入持久化路径，不再交给订阅者重复处理。
 	o.subscriberMu.RLock()
 	hasSubscribers := len(o.subscribers) > 0
@@ -438,7 +516,18 @@ func (o *Operations) queueSubscriberEvent(event queuedEvent) {
 }
 
 func (o *Operations) consumeSubscriberEvents() {
-	for event := range o.subscriberQueue {
+	for {
+		select {
+		case <-o.lifecycleCtx.Done():
+			return
+		default:
+		}
+		var event queuedEvent
+		select {
+		case <-o.lifecycleCtx.Done():
+			return
+		case event = <-o.subscriberQueue:
+		}
 		o.subscriberMu.RLock()
 		subscribers := append([]*subscriberHandler(nil), o.subscribers...)
 		o.subscriberMu.RUnlock()
@@ -1013,6 +1102,9 @@ func (po *PluginOperations) stopTasks() {
 }
 
 func (po *PluginOperations) startTask(task *taskRuntime) {
+	if po.parent.isClosed() {
+		return
+	}
 	task.mu.Lock()
 	if task.schedulerOn {
 		task.mu.Unlock()
@@ -1024,12 +1116,12 @@ func (po *PluginOperations) startTask(task *taskRuntime) {
 	task.mu.Unlock()
 
 	if runOnStart {
-		go po.runTask(task)
+		po.parent.launch(func() { po.runTask(task) })
 	}
 	if interval <= 0 || task.task.Manual {
 		return
 	}
-	go func() {
+	if !po.parent.launch(func() {
 		for {
 			// 抖动值按任务 ID 确定，避免多个网关实例同一时间集中触发相同任务。
 			delay := interval + deterministicJitter(task.task.Jitter, task.task.ID)
@@ -1041,7 +1133,12 @@ func (po *PluginOperations) startTask(task *taskRuntime) {
 			task.nextRunAt = time.Now().Add(delay).Unix()
 			task.mu.Unlock()
 			timer := time.NewTimer(delay)
-			<-timer.C
+			select {
+			case <-po.parent.lifecycleCtx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
 			task.mu.Lock()
 			on := task.schedulerOn
 			task.mu.Unlock()
@@ -1050,7 +1147,12 @@ func (po *PluginOperations) startTask(task *taskRuntime) {
 			}
 			po.runTask(task)
 		}
-	}()
+	}) {
+		task.mu.Lock()
+		task.schedulerOn = false
+		task.nextRunAt = 0
+		task.mu.Unlock()
+	}
 }
 
 func (po *PluginOperations) runTask(task *taskRuntime) {
@@ -1106,7 +1208,7 @@ func (po *PluginOperations) runTask(task *taskRuntime) {
 		leaseOwned = true
 	}
 
-	runCtx, cancel := context.WithCancel(context.Background())
+	runCtx, cancel := context.WithCancel(po.parent.lifecycleCtx)
 	task.mu.Lock()
 	task.cancel = cancel
 	task.mu.Unlock()
@@ -1286,6 +1388,9 @@ func taskRetryLimit(spec TaskSpec) int {
 // TriggerTask 手动触发后台任务。confirmToken 来自任务摘要，调用方必须显式回传，
 // 用来降低误触发有副作用任务的风险。
 func (po *PluginOperations) TriggerTask(taskID, confirmToken string) (BackgroundTaskSummary, error) {
+	if po.parent.isClosed() {
+		return BackgroundTaskSummary{}, ErrManagerClosed
+	}
 	po.mu.Lock()
 	task := po.tasks[taskID]
 	po.mu.Unlock()
@@ -1298,7 +1403,9 @@ func (po *PluginOperations) TriggerTask(taskID, confirmToken string) (Background
 	if expected == "" || confirmToken != expected {
 		return BackgroundTaskSummary{}, errors.New("confirm_token is required")
 	}
-	go po.runTask(task)
+	if !po.parent.launch(func() { po.runTask(task) }) {
+		return BackgroundTaskSummary{}, ErrManagerClosed
+	}
 	return task.summary(), nil
 }
 

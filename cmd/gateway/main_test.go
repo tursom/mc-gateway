@@ -194,6 +194,7 @@ func TestMapToHostClosesUpstreamWhenInitialWriteFails(t *testing.T) {
 type gatewayTestPluginAdapter struct {
 	handler  api.UpstreamConnectHandler
 	initHook func(*pluginmanager.Gateway) error
+	plugin   api.Plugin
 }
 
 func enableGatewayTestUpstreamPlugin(t *testing.T, pluginID string, handler api.UpstreamConnectHandler) {
@@ -231,6 +232,9 @@ func (a gatewayTestPluginAdapter) Load(_ context.Context, _ pluginmanager.Artifa
 		}
 	} else if err := a.initHook(gateway); err != nil {
 		return nil, err
+	}
+	if a.plugin != nil {
+		return a.plugin, nil
 	}
 	return &gatewayPluginStub{}, nil
 }

@@ -7,47 +7,100 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"os"
+	"os/signal"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/rs/zerolog/log"
 	"github.com/tursom/mc-gateway/internal/pluginmanager"
 	"github.com/tursom/mc-gateway/internal/upstreamtarget"
 	"github.com/tursom/mc-gateway/plugin/api"
 	"github.com/tursom/mc-gateway/protocol"
+	"golang.org/x/sync/errgroup"
 )
 
-var exitWaitGroup sync.WaitGroup
+const gatewayShutdownTimeout = 30 * time.Second
+
+var pluginExitWaitGroup sync.WaitGroup
 
 func main() {
+	os.Exit(runMain())
+}
+
+func runMain() int {
 	// 插件和 plugin-host 子命令复用网关二进制。这里先于运行态配置加载
 	// 处理它们，这样本地构建、清单和 host 握手命令不需要一份可用的网关部署配置。
 	if handled, code := runPluginHostCLI(os.Args[1:]); handled {
-		os.Exit(code)
+		return code
 	}
 	if handled, code := runPluginCLI(os.Args[1:]); handled {
-		os.Exit(code)
+		return code
 	}
 
 	if err := loadConfig(); err != nil {
-		panic(err)
+		log.Err(err).Msg("Failed to initialize gateway runtime")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), gatewayShutdownTimeout)
+		defer cancel()
+		_ = closeGatewayRuntime(shutdownCtx)
+		return 1
 	}
 
 	if err := writePIDFile(); err != nil {
 		log.Err(err).Msg("Failed to write PID file")
 	}
 	defer removePIDFile()
-	defer closeGatewayRuntime()
 
 	go handleLogRotate()
 
-	defer exitWaitGroup.Wait()
+	signalCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	serviceCtx, cancelServices := context.WithCancel(context.Background())
+	serviceErrCh := make(chan error, 1)
+	go func() { serviceErrCh <- runEnabledServices(serviceCtx) }()
 
-	startEnabledServices()
+	var serviceErr error
+	servicesDone := false
+	select {
+	case serviceErr = <-serviceErrCh:
+		servicesDone = true
+		if serviceErr == nil {
+			serviceErr = errors.New("gateway services stopped unexpectedly")
+		}
+	case <-signalCtx.Done():
+	}
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), gatewayShutdownTimeout)
+	cancelServices()
+	if !servicesDone {
+		select {
+		case serviceErr = <-serviceErrCh:
+		case <-shutdownCtx.Done():
+			serviceErr = fmt.Errorf("stop gateway services: %w", shutdownCtx.Err())
+		}
+	}
+	closeErr := closeGatewayRuntime(shutdownCtx)
+	cancelShutdown()
+	if serviceErr != nil {
+		log.Err(serviceErr).Msg("Gateway service stopped unexpectedly")
+	}
+	if closeErr != nil {
+		log.Err(closeErr).Msg("Gateway runtime shutdown failed")
+	}
+	if serviceErr != nil || closeErr != nil {
+		return 1
+	}
+	return 0
 }
 
-func startEnabledServices() {
+func runEnabledServices(ctx context.Context) error {
+	group, serviceCtx := errgroup.WithContext(ctx)
+	startService := func(run func(context.Context) error) {
+		group.Go(func() error { return run(serviceCtx) })
+	}
 	// TCP 和 Admin HTTP 始终通过共享监听器启动。共享监听器按每条连接
 	// 的首包判断它是 HTTP 还是 Minecraft 协议数据，因此不需要额外维护
 	// 一个手动模式开关。
@@ -64,11 +117,7 @@ func startEnabledServices() {
 	if config.WebSocket.Enable && normalizedWebSocketPort() != normalizedTCPPort() {
 		startService(runWebSocket)
 	}
-}
-
-func startService(run func(wg *sync.WaitGroup)) {
-	exitWaitGroup.Add(1)
-	go run(&exitWaitGroup)
+	return group.Wait()
 }
 
 func handleRequest(conn net.Conn) {

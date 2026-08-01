@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -84,6 +85,52 @@ func TestChanListenerAcceptCloseAndDeliver(t *testing.T) {
 	_, err = listener.Accept()
 	if !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("Accept() error = %v, want %v", err, net.ErrClosed)
+	}
+}
+
+func TestServeWaitsForInFlightRoutingBeforeReturning(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	routingStarted := make(chan struct{})
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- Serve(listener, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), func(net.Conn) {}, Options{
+			InitialPacketTimeout: time.Second,
+			SetSocketOptions: func(net.Conn) {
+				close(routingStarted)
+			},
+		})
+	}()
+	client, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("Dial() error = %v", err)
+	}
+	defer client.Close()
+	select {
+	case <-routingStarted:
+	case <-time.After(time.Second):
+		t.Fatal("routing did not start")
+	}
+	if err := listener.Close(); err != nil {
+		t.Fatalf("Close(listener) error = %v", err)
+	}
+	select {
+	case err := <-serveDone:
+		t.Fatalf("Serve() returned before in-flight routing completed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := client.Close(); err != nil {
+		t.Fatalf("Close(client) error = %v", err)
+	}
+	select {
+	case err := <-serveDone:
+		if err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("Serve() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve() did not return after routing completed")
 	}
 }
 

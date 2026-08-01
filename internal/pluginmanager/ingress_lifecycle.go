@@ -149,6 +149,24 @@ func (m *IngressLifecycleManager) Drain(pluginID string) IngressListener {
 	return ingressListenerSnapshot(listener)
 }
 
+func (m *IngressLifecycleManager) Close() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now().Unix()
+	for _, listener := range m.listeners {
+		listener.State = RuntimeDraining
+		listener.Health = "draining"
+		listener.DrainingAt = now
+		if listener.listener != nil {
+			_ = listener.listener.Close()
+			listener.listener = nil
+		}
+	}
+}
+
 func (m *IngressLifecycleManager) ReservedListeners() []IngressReservedListener {
 	if m == nil {
 		return nil
@@ -168,6 +186,9 @@ func (m *Manager) RefreshIngressReservedListeners(listeners []IngressReservedLis
 }
 
 func (m *Manager) StartIngressListener(ctx context.Context, pluginID, artifactID string) (IngressListener, error) {
+	if m.closing.Load() {
+		return IngressListener{}, ErrManagerClosed
+	}
 	if !m.futureGates.IngressEnabled() {
 		return IngressListener{}, errors.New("ingress.service/v1 data plane is disabled by feature gate")
 	}

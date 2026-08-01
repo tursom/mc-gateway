@@ -144,6 +144,9 @@ func (m *Manager) SetPluginServiceCrashPolicy(ctx context.Context, actor string,
 }
 
 func (m *Manager) ApplyPluginServiceMode(ctx context.Context) error {
+	if m.closing.Load() {
+		return ErrManagerClosed
+	}
 	state, err := m.repo.PluginServiceState(ctx)
 	if err != nil {
 		return err

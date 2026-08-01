@@ -11,9 +11,9 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"net"
-	"sync"
 	"time"
 
 	quic "github.com/quic-go/quic-go"
@@ -29,33 +29,38 @@ type (
 	}
 )
 
-func runQuic(wg *sync.WaitGroup) {
-	if wg != nil {
-		defer wg.Done()
+func runQuic(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return nil
 	}
-
 	// QUIC 基于 UDP 监听，端口来自运行态服务配置。
 	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: config.Quic.Port})
 	if err != nil {
-		log.Panic().Err(err).Msg("Failed to listen UDP")
+		return fmt.Errorf("listen on QUIC UDP port %d: %w", config.Quic.Port, err)
 	}
 	defer udpConn.Close()
 
 	tlsConf, err := generateTLSConfig()
 	if err != nil {
-		log.Panic().Err(err).Msg("Failed to generate TLS config")
+		return fmt.Errorf("generate QUIC TLS config: %w", err)
 	}
 
 	// quic-go 的 listener 接收 connection，真正的字节流在 stream 中。
 	ln, err := quic.Listen(udpConn, tlsConf, nil)
 	if err != nil {
-		log.Panic().Err(err).Msg("Failed to listen QUIC")
+		return fmt.Errorf("listen QUIC: %w", err)
 	}
+	defer ln.Close()
+	stop := context.AfterFunc(ctx, func() { _ = ln.Close() })
+	defer stop()
 	log.Info().Int("port", config.Quic.Port).Msg("Listening for QUIC connections")
 
 	for {
-		conn, err := ln.Accept(context.Background())
+		conn, err := ln.Accept(ctx)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			log.Err(err).Msg("Error accepting QUIC connection")
 			continue
 		}

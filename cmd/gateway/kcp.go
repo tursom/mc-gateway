@@ -3,33 +3,35 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
-	"sync"
 
 	"github.com/rs/zerolog/log"
 	"github.com/xtaci/kcp-go"
 )
 
-func runKcp(wg *sync.WaitGroup) {
-	if wg != nil {
-		defer wg.Done()
+func runKcp(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return nil
 	}
-
 	// KCP 监听使用运行态服务配置中的分片参数，和上游拨号保持一致。
 	listener, err := kcp.ListenWithOptions(fmt.Sprintf(":%d", config.Kcp.Port), nil, config.Kcp.DataShards, config.Kcp.ParityShards)
 	if err != nil {
-		log.Fatal().Err(err).
-			Int("port", config.Kcp.Port).
-			Msg("Failed to listen on KCP port")
+		return fmt.Errorf("listen on KCP port %d: %w", config.Kcp.Port, err)
 	}
 	defer listener.Close()
+	stop := context.AfterFunc(ctx, func() { _ = listener.Close() })
+	defer stop()
 
 	log.Info().Int("port", config.Kcp.Port).Msg("KCP server is listening")
 
 	for {
 		conn, err := listener.AcceptKCP()
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
 			log.Err(err).
 				Msg("Failed to accept KCP connection")
 			continue
