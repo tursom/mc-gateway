@@ -4,7 +4,6 @@ go 1.25.0
 
 require (
 	github.com/gorilla/websocket v1.5.3
-	github.com/mitchellh/mapstructure v1.5.0
 	github.com/pelletier/go-toml/v2 v2.4.2
 	github.com/pires/go-proxyproto v0.8.1
 	github.com/quic-go/quic-go v0.52.0

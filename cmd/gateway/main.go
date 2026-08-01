@@ -18,6 +18,8 @@ import (
 	"github.com/tursom/mc-gateway/protocol"
 )
 
+var exitWaitGroup sync.WaitGroup
+
 func main() {
 	// 插件和 plugin-host 子命令复用网关二进制。这里先于运行态配置加载
 	// 处理它们，这样本地构建、清单和 host 握手命令不需要一份可用的网关部署配置。
@@ -231,18 +233,6 @@ func mapToHost(conn net.Conn) net.Conn {
 				return nil
 			}
 			client = result.Conn
-		}
-	}
-
-	if client == nil {
-		ok, err = invokeFirstHookHandler(api.HookUpstream, Handler2[net.Conn, string, bool](conn, host), func(handler func(net.Conn, string) (net.Conn, error)) error {
-			var err error
-			client, err = handler(conn, host)
-			return err
-		})
-		if err != nil {
-			log.Err(err).Msg("Failed to invoke upstream hook")
-			return nil
 		}
 	}
 

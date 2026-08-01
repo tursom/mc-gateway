@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"net"
 	"strings"
@@ -23,29 +22,18 @@ func TestHandleRequestProxiesAndClosesConnections(t *testing.T) {
 
 	packet := gatewayTestPacket("play.example")
 	source := newGatewayTestConn(packet)
-	upstream := newGatewayTestConn([]byte("reply"))
+	upstreamAddress, upstreamDone := startGatewayTestUpstream(t, len(packet), []byte("reply"))
 	setGatewayTestRoutes(map[string]string{
-		"play.example": "backend.example:25565",
+		"play.example": upstreamAddress,
 	})
-
-	registerGatewayUpstreamHook(
-		t,
-		func(net.Conn, string) bool { return true },
-		func(net.Conn, string) (net.Conn, error) {
-			return upstream, nil
-		},
-	)
 
 	handleRequest(source)
 
 	if !source.closed {
 		t.Fatal("source connection was not closed")
 	}
-	if !upstream.closed {
-		t.Fatal("upstream connection was not closed")
-	}
-	if !bytes.Equal(upstream.writeBuf.Bytes(), packet) {
-		t.Fatalf("upstream initial packet = %v, want %v", upstream.writeBuf.Bytes(), packet)
+	if upstreamPacket := waitGatewayTestUpstream(t, upstreamDone); !bytes.Equal(upstreamPacket, packet) {
+		t.Fatalf("upstream initial packet = %v, want %v", upstreamPacket, packet)
 	}
 	if got := source.writeBuf.String(); got != "reply" {
 		t.Fatalf("proxied reply = %q, want reply", got)
@@ -203,8 +191,10 @@ func TestHandleRequestProtocolProxyPanicOnlyFailsCurrentConnection(t *testing.T)
 func TestHandleRequestProtocolProxyDisableSkipsNewConnections(t *testing.T) {
 	defer saveGatewayState(t)()
 
+	packet := gatewayTestPacket("play.example")
+	upstreamAddress, upstreamDone := startGatewayTestUpstream(t, len(packet), nil)
 	setGatewayTestRoutes(map[string]string{
-		"play.example": "backend.example:25565",
+		"play.example": upstreamAddress,
 	})
 	proxyCalls := 0
 	pluginsManager = pluginmanager.New(pluginmanager.Options{
@@ -239,27 +229,24 @@ func TestHandleRequestProtocolProxyDisableSkipsNewConnections(t *testing.T) {
 		t.Fatalf("Disable() error = %v", err)
 	}
 
-	legacyUpstream := newGatewayTestConn(nil)
-	registerGatewayUpstreamHook(
-		t,
-		func(net.Conn, string) bool { return true },
-		func(net.Conn, string) (net.Conn, error) { return legacyUpstream, nil },
-	)
-	second := newGatewayTestConn(gatewayTestPacket("play.example"))
+	second := newGatewayTestConn(packet)
 	handleRequest(second)
 	if proxyCalls != 1 {
 		t.Fatalf("proxy calls after disable = %d, want still 1", proxyCalls)
 	}
-	if legacyUpstream.writeBuf.Len() == 0 {
-		t.Fatal("legacy upstream did not receive second request")
+	if upstreamPacket := waitGatewayTestUpstream(t, upstreamDone); !bytes.Equal(upstreamPacket, packet) {
+		t.Fatalf("native upstream initial packet = %v, want %v", upstreamPacket, packet)
 	}
 }
 
 func TestHandleRequestRouteResolverUsesOverrideAndSQLiteFallback(t *testing.T) {
 	defer saveGatewayState(t)()
 
-	setGatewayTestRoutes(map[string]string{"fallback.example": "fallback-upstream:25565"})
-	var dialed []string
+	overridePacket := gatewayTestPacket("override.example")
+	fallbackPacket := gatewayTestPacket("fallback.example")
+	overrideAddress, overrideDone := startGatewayTestUpstream(t, len(overridePacket), nil)
+	fallbackAddress, fallbackDone := startGatewayTestUpstream(t, len(fallbackPacket), nil)
+	setGatewayTestRoutes(map[string]string{"fallback.example": fallbackAddress})
 	pluginsManager = pluginmanager.New(pluginmanager.Options{
 		DB:           newGatewayTestPluginDB(t),
 		ArtifactRoot: t.TempDir(),
@@ -268,7 +255,7 @@ func TestHandleRequestRouteResolverUsesOverrideAndSQLiteFallback(t *testing.T) {
 				func(api.RouteResolveRequest) bool { return true },
 				func(req api.RouteResolveRequest) (api.RouteDecision, error) {
 					if req.Host == "override.example" {
-						return api.RouteDecision{Action: api.RouteDecisionOverride, Upstream: "override-upstream:25565", CacheTTL: time.Minute}, nil
+						return api.RouteDecision{Action: api.RouteDecisionOverride, Upstream: overrideAddress, CacheTTL: time.Minute}, nil
 					}
 					return api.RouteDecision{Action: api.RouteDecisionPass}, nil
 				})
@@ -284,16 +271,14 @@ func TestHandleRequestRouteResolverUsesOverrideAndSQLiteFallback(t *testing.T) {
 	if _, err := pluginsManager.Enable(context.Background(), "admin", "route-plugin"); err != nil {
 		t.Fatalf("Enable() error = %v", err)
 	}
-	registerGatewayUpstreamHook(t, func(net.Conn, string) bool { return true }, func(_ net.Conn, host string) (net.Conn, error) {
-		dialed = append(dialed, host)
-		return newGatewayTestConn(nil), nil
-	})
+	handleRequest(newGatewayTestConn(overridePacket))
+	handleRequest(newGatewayTestConn(fallbackPacket))
 
-	handleRequest(newGatewayTestConn(gatewayTestPacket("override.example")))
-	handleRequest(newGatewayTestConn(gatewayTestPacket("fallback.example")))
-
-	if len(dialed) != 2 || dialed[0] != "override-upstream:25565" || dialed[1] != "fallback-upstream:25565" {
-		t.Fatalf("dialed = %+v, want override then sqlite fallback", dialed)
+	if got := waitGatewayTestUpstream(t, overrideDone); !bytes.Equal(got, overridePacket) {
+		t.Fatalf("override upstream packet = %v, want %v", got, overridePacket)
+	}
+	if got := waitGatewayTestUpstream(t, fallbackDone); !bytes.Equal(got, fallbackPacket) {
+		t.Fatalf("fallback upstream packet = %v, want %v", got, fallbackPacket)
 	}
 }
 
@@ -340,40 +325,6 @@ func TestHandleRequestRecoversAndClosesConnection(t *testing.T) {
 	if !source.closed {
 		t.Fatal("source connection was not closed after panic")
 	}
-}
-
-func TestGatewayHandleConnStartsRequestGoroutine(t *testing.T) {
-	defer saveGatewayState(t)()
-
-	source := newGatewayTestConn(nil)
-	source.readErr = errors.New("read failed")
-
-	(&Gateway{}).HandleConn(source)
-
-	deadline := time.After(2 * time.Second)
-	ticker := time.NewTicker(time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-deadline:
-			t.Fatal("timed out waiting for HandleConn goroutine")
-		case <-ticker.C:
-			if source.isClosed() {
-				return
-			}
-		}
-	}
-}
-
-func TestGatewayTestOpPanics(t *testing.T) {
-	defer func() {
-		if recover() == nil {
-			t.Fatal("TestOp() did not panic")
-		}
-	}()
-
-	(&Gateway{}).TestOp()
 }
 
 type panicReadGatewayConn struct {

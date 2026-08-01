@@ -5,7 +5,6 @@ package main
 import (
 	"sync"
 
-	"github.com/rs/zerolog/log"
 	"github.com/tursom/mc-gateway/internal/gatewayconfig"
 )
 
@@ -26,15 +25,5 @@ func loadConfig() error {
 		return err
 	}
 
-	loadPlugins()
-
 	return nil
-}
-
-func loadPluginConfig(cfg map[string]any, pluginCfg any) error {
-	log.Info().
-		Any("config", cfg).
-		Msg("Loading plugin config")
-
-	return gatewayconfig.DecodePluginConfig(cfg, pluginCfg)
 }

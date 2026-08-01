@@ -2147,6 +2147,57 @@ func TestManagerEnableDisableAndDispatch(t *testing.T) {
 	}
 }
 
+func TestManagerMapsLegacyUpstreamHookIntoManagedDispatch(t *testing.T) {
+	upstream := newMemoryConn()
+	source := newMemoryConn()
+	var acceptedSource net.Conn
+	var acceptedHost string
+	adapter := &fakeAdapter{
+		initOnly: true,
+		initHook: func(gateway *Gateway) error {
+			return api.RegisterHookHandler(
+				gateway,
+				api.HookUpstream,
+				func(gotSource net.Conn, gotHost string) bool {
+					acceptedSource = gotSource
+					acceptedHost = gotHost
+					return true
+				},
+				func(net.Conn, string) (net.Conn, error) {
+					return upstream, nil
+				},
+			)
+		},
+	}
+	manager := newManagerForTest(t, adapter)
+	artifact := uploadTestArtifact(t, manager, "legacy-plugin")
+	if _, err := manager.SetDesired(context.Background(), "admin", "legacy-plugin", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	if err := manager.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+
+	result, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{
+		Source:   source,
+		Host:     "play.example",
+		Upstream: "backend.example:25565",
+	})
+	if err != nil {
+		t.Fatalf("ConnectUpstream() error = %v", err)
+	}
+	if !result.Handled || result.Conn != upstream {
+		t.Fatalf("ConnectUpstream() = %+v, want legacy managed conn", result)
+	}
+	if acceptedSource != source || acceptedHost != "backend.example:25565" {
+		t.Fatalf("legacy acceptor source/host = %v/%q, want original source/backend.example:25565", acceptedSource, acceptedHost)
+	}
+	plan := manager.DispatchPlan(context.Background())
+	if len(plan.Handlers) != 1 || plan.Handlers[0].HandlerID != "legacy-upstream" {
+		t.Fatalf("dispatch handlers = %+v, want legacy-upstream", plan.Handlers)
+	}
+}
+
 func TestManagerErrPassContinuesToNextHandler(t *testing.T) {
 	adapter := &fakeAdapter{
 		handlers: map[string]api.UpstreamConnectHandler{

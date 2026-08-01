@@ -2,13 +2,14 @@
 
 ## 背景
 
-当前 gateway 已经有插件探索代码：
+当前 gateway 的插件运行时已经收敛为单一管理路径：
 
 - `plugin/api` 定义了插件接口、Gateway 能力和 hook 类型。
-- `cmd/gateway/plugin.go` 使用 Go `plugin.Open` 加载 `.so`，并通过 `Plugin` 符号创建插件实例。
-- 现有 hook 主要覆盖上游连接创建：路由命中后、默认拨号前，插件可以接管 upstream 连接。
+- `internal/pluginmanager` 负责制品加载、实例创建、配置、生命周期和数据面分发；正式 runtime adapter 从已纳管 `.mcgp` 制品中加载 `plugin.so`。
+- SQLite 和 Admin 是插件 desired state、配置和制品的唯一管理入口；旧 `[plugin.*]` TOML loader 已移除。
+- `HookUpstreamConnect` 是正式上游扩展点；已打包旧插件注册的 `HookUpstream` 由 Plugin Manager 映射到同一只读 dispatch snapshot。
 
-这套探索方向可以继续落地，但需要把边界、ABI、管理页操作和生命周期明确下来。本文设计插件系统第一版，目标是让可信插件可以通过管理页上传、加载、启用、禁用和删除，并让开发者可以按稳定的 API/ABI 编写自定义插件。
+本文描述收敛后的插件系统边界、ABI、管理页操作和生命周期。可信插件通过管理页上传、加载、启用、禁用和删除，开发者基于稳定的 API/ABI 编写自定义插件。
 
 本文扩展了管理页设计中的原第一版边界。插件管理属于后续增强能力，不恢复旧的 `config.toml` 配置模型。
 
@@ -7357,19 +7358,18 @@ examples/plugins/mc-status-motd/
 
 阶段实施拆分以 [插件系统阶段实现计划](plugin-implementation-plan.md) 为准。本文保留的是目标设计和能力全集；阶段文档负责定义每个实现阶段的可用边界、任务、验收和回滚策略。
 
-### 从现有探索代码迁移
+### 从探索代码迁移的结果
 
-当前 `plugin/api` 和 `cmd/gateway/plugin.go` 可以作为第一版原型参考，但不能作为最终结构继续扩张。迁移路径：
+并行运行时迁移已经完成，当前约束如下：
 
-1. 保留现有 `api.Plugin`、`Gateway.Hook` 和 `HookUpstream` 作为兼容层，避免示例插件立即失效。
-2. 新增 Plugin Manager，接管插件加载、实例创建、配置解码、生命周期和 runtime state。
-3. 将 `cmd/gateway/plugin.go` 中的全局 `plugins`、`hooks` map 迁移为 Plugin Manager 内部状态。
-4. 将 hook 调用改为从只读 dispatch table snapshot 读取，不在连接路径持有 `pluginLock`。
-5. 将旧 `HookUpstream` 映射到新版 `upstream.connect/v1`，并把散列参数收敛为 `UpstreamConnectRequest`。
-6. 将旧 `config.Plugin` 加载方式标记为开发兼容入口；正式配置来源改为 SQLite/Admin。
-7. 上传、构建、加载、启用、禁用、删除都通过 Admin API 改变 desired state，再由 Plugin Manager 收敛。
-8. 旧 raw `.so` 加载只保留为本地开发能力，生产路径统一 `.mcgp` artifact。
-9. 等示例插件、测试 harness 和 Admin 管理闭环稳定后，移除或降级旧 config 插件入口。
+1. 保留现有 `api.Plugin`、`api.Gateway`、`RegisterHookHandler` 和 `HookUpstream`，避免已打包插件失效。
+2. Plugin Manager 接管插件加载、实例创建、JSON 配置解码、生命周期和 runtime state。
+3. `cmd/gateway/plugin.go` 及其全局 `plugins`、`hooks`、`pluginLock` 已删除，连接路径只读取 Plugin Manager 发布的 dispatch snapshot。
+4. 旧 `HookUpstream` 由 Plugin Manager 映射到 `upstream.connect/v1` 的请求上下文；兼容逻辑不在 gateway 数据面重复实现。
+5. `gatewayconfig.Config.Plugin`、`DecodePluginConfig` 和 `[plugin.*]` TOML loader 已删除，不提供兼容期或迁移告警。
+6. SQLite/Admin 是上传、构建、加载、启用、禁用、配置、删除和回滚的唯一管理入口，Admin API 改变 desired state 后由 Plugin Manager 收敛。
+7. 生产制品统一为 `.mcgp` artifact；正式 runtime adapter 仍使用 `plugin.Open` 加载包内已校验的 `plugin.so`。
+8. managed 插件未接管上游时，gateway 直接进入 TCP、QUIC、KCP 或 HAProxy 原生上游路径。
 
 ### 阶段 1：运行时模型和数据结构
 
@@ -7730,7 +7730,7 @@ examples/plugins/mc-status-motd/
 - CLI 工具覆盖 plugin_data inspect/export/gc，且 data gc 支持 dry-run。
 - Admin API 错误响应有稳定 code，管理页和 CLI 不依赖错误字符串解析。
 - 文档能明确区分第一版能力、预留 extension point 和未来 runtime。
-- 从现有 `cmd/gateway/plugin.go` 原型迁移到 Plugin Manager 的路径清晰，旧 config 插件入口不会成为正式管理路径。
+- 并行的 `cmd/gateway/plugin.go` 运行时和旧 config 插件入口已经移除；SQLite/Admin 和 Plugin Manager 是唯一管理与分发路径。
 - 单实例是第一版主路径；如果进入多实例模式，文档定义了 artifact 分发、构建协调、节点 runtime state 和 partial rollout failure 的语义。
 - 第一版默认同一 plugin ID 只有一个启用实例；未来多实例需要 instance ID、数据隔离和排序规则。
 - 如果实现仓库能力，仓库导入只能生成本地 artifact，不能绕过管理员 review 直接启用。

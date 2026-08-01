@@ -8,44 +8,6 @@ import (
 	"testing"
 )
 
-func TestLoadPluginConfig(t *testing.T) {
-	defer saveGatewayState(t)()
-
-	type pluginConfig struct {
-		Enable bool   `toml:"enable"`
-		Name   string `toml:"name"`
-		Count  int    `toml:"count"`
-	}
-
-	var got pluginConfig
-	err := loadPluginConfig(map[string]any{
-		"enable": true,
-		"name":   "plugin-a",
-		"count":  7,
-	}, &got)
-	if err != nil {
-		t.Fatalf("loadPluginConfig() error = %v", err)
-	}
-
-	want := pluginConfig{Enable: true, Name: "plugin-a", Count: 7}
-	if got != want {
-		t.Fatalf("loadPluginConfig() = %+v, want %+v", got, want)
-	}
-}
-
-func TestLoadPluginConfigReturnsDecodeError(t *testing.T) {
-	defer saveGatewayState(t)()
-
-	type pluginConfig struct {
-		Count int `toml:"count"`
-	}
-
-	var got pluginConfig
-	if err := loadPluginConfig(map[string]any{"count": "not-an-int"}, &got); err == nil {
-		t.Fatal("loadPluginConfig() error = nil, want error")
-	}
-}
-
 func TestParseStartupConfigDefaultsAndEnv(t *testing.T) {
 	cfg, err := parseStartupConfig(func(string) string { return "" })
 	if err != nil {

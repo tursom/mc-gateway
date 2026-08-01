@@ -16,6 +16,7 @@
 - **runtime 仍是重要缺口**，但它不是全部缺口。`go-plugin-process`、sandbox、WASM、跨进程 stream 等属于阶段 8 的未来能力，当前大多是 schema、状态模型或 stub。
 - **当前最需要的 roadmap 不是继续堆功能名**，而是把“已可生产使用”、“可用但需加固”、“模型/预留”、“完全未做”分清楚，并为每个阶段补上验收证据。
 - **阶段 1-7 的完成度不应被阶段 8 绑架**。如果短期目标是让当前插件系统可上线，优先级应该先压实当前 `in-process go-plugin` 主路径、构建/治理/运维/扩展点的验收；如果目标是解决热卸载、进程隔离或跨语言，再进入 runtime 扩展路线。
+- **旧并行运行时已经移除**：插件启动、生命周期和数据面分发统一由 `internal/pluginmanager` 负责，SQLite/Admin 是唯一管理入口；旧 `HookUpstream` ABI 兼容仍由正式管理器承载。
 
 ## 成熟度标记
 
@@ -33,7 +34,7 @@
 | `.mcgp` binary artifact | 已落地 | `ArtifactStore.ValidateAndStore` 校验 zip、manifest、runtime entry；`Manager.UploadArtifact` 保存 artifact。见 `internal/pluginmanager/artifact.go:57-260`、`internal/pluginmanager/manager.go:368-389` | 需要用端到端 fixture 证明上传、load、enable、disable、重启恢复 |
 | `in-process go-plugin` runtime | 已落地 | `RuntimeAdapterLifecycle` 已定义 Validate/Prepare/Start/Health/Reload/Drain/Stop/Diagnostics；`GoPluginAdapter` 通过 lifecycle 路径调用 `plugin.Open()` 和 `Lookup("Plugin")` 实例化插件。见 `internal/pluginmanager/runtime_lifecycle.go`、`internal/pluginmanager/manager.go` | 不能热卸载，插件崩溃仍在主进程边界内，只能靠 recover/timeout 降风险 |
 | desired/runtime state 和 dispatch | 已落地 | `SetDesired`、`Load`、`Enable`、`Disable`、`Delete` 推动状态和只读分发快照。见 `internal/pluginmanager/manager.go:593-930` | 需要持续验证失败不污染旧 dispatch table |
-| `upstream.connect/v1` dialer mode | 已落地 | `ConnectUpstream` 调用 handler，dialer mode 返回插件提供的 `net.Conn`。见 `internal/pluginmanager/manager.go:993-1070` | 需要保持和 legacy hook 的兼容测试 |
+| `upstream.connect/v1` dialer mode | 已落地 | `ConnectUpstream` 调用 handler，dialer mode 返回插件提供的 `net.Conn`；`buildHandlers` 将旧 `HookUpstream` 注册映射为 `legacy-upstream`，并有 manager 回归测试。见 `internal/pluginmanager/manager.go`、`internal/pluginmanager/manager_test.go` | 需要持续保持新旧 hook 的请求字段和错误语义一致 |
 | protocol-proxy mode | 已落地但需加固 | initial data replay、双向 copy、copy-loop panic recovery、active proxy tracking、drain/force close 已有；CLI conformance 的 `conformance.json` 已能声明 protocol-proxy golden scenarios；`protocol/smoke` 和 manager/example 测试已覆盖真实 MC handshake/login/payload backpressure fixture。见 `internal/pluginmanager/manager.go:1073-1105`、`1875-1947`、`1477-1491`、`cmd/gateway/plugin_cli_toolchain.go`、`protocol/smoke` | 仍需要更完整真实 MC smoke fixture、异常路径和跨版本示例验收 |
 | source `.mcgp` 和 builder | 生产边界已落地 | source 上传创建 build；local-process 和 container builder 都能产出 binary artifact，记录 source/artifact sha、module/provenance、Go version、ABI fingerprint；prod governance 会阻断 local-process、warning 缺失 builder digest、浮动 builder image 或未绑定 gateway release/plugin API/Go/platform 的 builder image；external CI assessment 要求顶层签名/SBOM、source/artifact sha、run/builder identity、attestation、release provenance 和 trusted 标记；GC 会保护 queued/running build 的 source package 并可清空 completed build log。见 `internal/pluginmanager/manager.go:441-631`、`internal/pluginmanager/builder.go`、`internal/pluginmanager/future.go`、`internal/pluginmanager/gc.go` | M3 已有 release-pinned builder workflow、external CI 阻断测试和跨环境 source build 验收；后续只剩 M4+ governance/conformance 扩展 |
 | container builder | 生产边界已落地 | `ContainerBuilder.Build()` 通过 `docker run --rm --read-only` 只读挂载 source、独立输出目录和 `/tmp` tmpfs 执行 `go build -mod=readonly -buildmode=plugin`，同时记录 builder image digest；prod governance 会要求浮动 image tag 或未绑定 release/API/Go/platform 的 image 走 warning override；官方 builder image 由 `.github/workflows/plugin-builder-image.yml` 输出 digest-pinned artifact。见 `internal/pluginmanager/builder.go`、`internal/pluginmanager/governance.go`、`.github/workflows/plugin-builder-image.yml` | 真实 Docker 构建保留 opt-in smoke，不作为默认本机验收 |
@@ -133,7 +134,9 @@
 - `plugin.Open(plugin.so)` 加载。
 - `Plugin` symbol 或 manifest `entry_symbol` 查找。
 - `ReloadConfig()`、`Init()`、`Destroy()` 生命周期。
+- SQLite/Admin 唯一管理入口；旧 `[plugin.*]` TOML loader、`Config.Plugin` 和并行 hook dispatch 已移除。
 - `upstream.connect/v1` dialer mode。
+- legacy `HookUpstream` 由正式 Plugin Manager 映射为 managed dialer handler。
 - `upstream.connect/v1` protocol-proxy mode 在进程内通过 `net.Conn` 接管。
 - panic recover、handler timeout、active proxy count、drain 和 force close。
 - `official.rule-policy` builtin 特例，但它不是通用第三方 builtin runtime。

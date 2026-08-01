@@ -3,13 +3,12 @@
 package gatewayconfig
 
 type Config struct {
-	Tcp       ProtocolConfig            `toml:"tcp"`
-	Quic      QuicConfig                `toml:"quic"`
-	Kcp       KcpConfig                 `toml:"kcp"`
-	WebSocket WebSocketConfig           `toml:"websocket"`
-	Log       LogConfig                 `toml:"log"`
-	PidFile   string                    `toml:"pid_file"`
-	Plugin    map[string]map[string]any `toml:"plugin"`
+	Tcp       ProtocolConfig  `toml:"tcp"`
+	Quic      QuicConfig      `toml:"quic"`
+	Kcp       KcpConfig       `toml:"kcp"`
+	WebSocket WebSocketConfig `toml:"websocket"`
+	Log       LogConfig       `toml:"log"`
+	PidFile   string          `toml:"pid_file"`
 }
 
 type ProtocolConfig struct {

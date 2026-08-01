@@ -12,7 +12,6 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
-	"github.com/tursom/mc-gateway/plugin/api"
 )
 
 const benchmarkPayloadSize = 4 << 20
@@ -66,19 +65,14 @@ func BenchmarkTCPForwardCopy(b *testing.B) {
 func BenchmarkMapToHostInitialPacket(b *testing.B) {
 	disableBenchmarkLogs(b)
 
-	const (
-		hostName     = "dev.example"
-		upstreamHost = "benchmark-upstream"
-	)
+	const hostName = "dev.example"
 
-	packet := benchmarkHandshakePacket(hostName)
+	packet := gatewayTestPacket(hostName)
 	source := newBenchmarkConn(benchmarkAddr("client:25565"))
-	upstream := newBenchmarkConn(benchmarkAddr("upstream:25565"))
-	publishRouteSnapshot(map[string]string{hostName: upstreamHost})
+	upstreamAddress, received, closeUpstream := startBenchmarkUpstream(b, len(packet))
+	defer closeUpstream()
+	publishRouteSnapshot(map[string]string{hostName: upstreamAddress})
 	defer publishRouteSnapshot(nil)
-
-	restore := installBenchmarkUpstreamHook(b, hostName, upstreamHost, upstream)
-	defer restore()
 
 	b.SetBytes(int64(len(packet)))
 	b.ReportAllocs()
@@ -86,15 +80,17 @@ func BenchmarkMapToHostInitialPacket(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		source.ResetReader(packet)
-		upstream.ResetWriter()
 
 		client := mapToHost(source)
 		if client == nil {
 			b.Fatal("mapToHost returned nil")
 		}
-		if upstream.Written() != int64(len(packet)) {
-			b.Fatalf("upstream wrote %d bytes, want %d", upstream.Written(), len(packet))
+		_ = client.Close()
+		b.StopTimer()
+		if err := waitBenchmarkUpstream(received); err != nil {
+			b.Fatalf("upstream receive failed: %v", err)
 		}
+		b.StartTimer()
 	}
 }
 
@@ -182,45 +178,41 @@ func benchmarkTCPRead(start <-chan struct{}, conn *net.TCPConn, done chan<- benc
 	done <- benchmarkTCPReadResult{n: n, err: err}
 }
 
-func benchmarkHandshakePacket(host string) []byte {
-	packet := make([]byte, 5+len(host)+2)
-	packet[4] = byte(len(host))
-	copy(packet[5:], host)
-	return packet
-}
-
-func installBenchmarkUpstreamHook(b *testing.B, hostName, upstreamHost string, upstream net.Conn) func() {
+func startBenchmarkUpstream(b *testing.B, packetLen int) (string, <-chan error, func()) {
 	b.Helper()
 
-	previousConfig := config
-	previousHooks := hooks
-
-	pluginLock.Lock()
-	hooks = map[string]map[string]any{
-		"benchmark": {},
-	}
-	pluginLock.Unlock()
-
-	gateway := &Gateway{pluginId: "benchmark"}
-	if err := api.RegisterHookHandler(
-		gateway,
-		api.HookUpstream,
-		func(_ net.Conn, host string) bool {
-			return host == upstreamHost
-		},
-		func(_ net.Conn, _ string) (net.Conn, error) {
-			return upstream, nil
-		},
-	); err != nil {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
 		b.Fatal(err)
 	}
+	received := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+			_, err = io.ReadFull(conn, make([]byte, packetLen))
+			_ = conn.Close()
+			received <- err
+		}
+	}()
 
-	return func() {
-		config = previousConfig
+	return listener.Addr().String(), received, func() {
+		_ = listener.Close()
+		<-done
+	}
+}
 
-		pluginLock.Lock()
-		hooks = previousHooks
-		pluginLock.Unlock()
+func waitBenchmarkUpstream(received <-chan error) error {
+	select {
+	case err := <-received:
+		return err
+	case <-time.After(3 * time.Second):
+		return errors.New("timed out waiting for benchmark upstream")
 	}
 }
 

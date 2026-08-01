@@ -17,7 +17,6 @@ import (
 	"github.com/tursom/mc-gateway/internal/adminsession"
 	"github.com/tursom/mc-gateway/internal/gatewayconfig"
 	"github.com/tursom/mc-gateway/internal/gatewaymetrics"
-	"github.com/tursom/mc-gateway/plugin/api"
 )
 
 func saveGatewayState(t *testing.T) func() {
@@ -34,13 +33,6 @@ func saveGatewayState(t *testing.T) func() {
 	oldAdminSessionManager := adminSessionManager
 	oldRouteSnapshot := routeSnapshot.Clone()
 	oldGatewayMetrics := gatewayMetrics
-
-	pluginLock.Lock()
-	oldPlugins := plugins
-	oldHooks := hooks
-	plugins = make(map[string]api.Plugin)
-	hooks = make(map[string]map[string]any)
-	pluginLock.Unlock()
 
 	config = gatewayconfig.Config{}
 	currentPidFile = ""
@@ -79,11 +71,6 @@ func saveGatewayState(t *testing.T) func() {
 		publishRouteSnapshot(oldRouteSnapshot)
 		gatewayMetrics = oldGatewayMetrics
 		log.Logger = oldLogger
-
-		pluginLock.Lock()
-		plugins = oldPlugins
-		hooks = oldHooks
-		pluginLock.Unlock()
 	}
 }
 
@@ -192,18 +179,58 @@ func (c *gatewayTestConn) SetWriteDeadline(time.Time) error {
 	return nil
 }
 
-func registerGatewayUpstreamHook(
-	t *testing.T,
-	acceptor func(net.Conn, string) bool,
-	handler func(net.Conn, string) (net.Conn, error),
-) {
+type gatewayTestUpstreamResult struct {
+	packet []byte
+	err    error
+}
+
+func startGatewayTestUpstream(t testing.TB, packetLen int, reply []byte) (string, <-chan gatewayTestUpstreamResult) {
 	t.Helper()
 
-	pluginLock.Lock()
-	hooks["test-plugin"] = make(map[string]any)
-	pluginLock.Unlock()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
 
-	if err := api.RegisterHookHandler(&Gateway{pluginId: "test-plugin"}, api.HookUpstream, acceptor, handler); err != nil {
-		t.Fatalf("RegisterHookHandler() error = %v", err)
+	done := make(chan gatewayTestUpstreamResult, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			done <- gatewayTestUpstreamResult{err: err}
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+
+		packet := make([]byte, packetLen)
+		if _, err := io.ReadFull(conn, packet); err != nil {
+			done <- gatewayTestUpstreamResult{err: err}
+			return
+		}
+		if len(reply) > 0 {
+			if _, err := conn.Write(reply); err != nil {
+				done <- gatewayTestUpstreamResult{err: err}
+				return
+			}
+		}
+		done <- gatewayTestUpstreamResult{packet: packet}
+	}()
+
+	return listener.Addr().String(), done
+}
+
+func waitGatewayTestUpstream(t testing.TB, done <-chan gatewayTestUpstreamResult) []byte {
+	t.Helper()
+
+	select {
+	case result := <-done:
+		if result.err != nil {
+			t.Fatalf("upstream server error = %v", result.err)
+		}
+		return result.packet
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for upstream server")
+		return nil
 	}
 }
