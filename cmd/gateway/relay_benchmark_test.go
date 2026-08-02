@@ -62,38 +62,6 @@ func BenchmarkTCPForwardCopy(b *testing.B) {
 	})
 }
 
-func BenchmarkMapToHostInitialPacket(b *testing.B) {
-	disableBenchmarkLogs(b)
-
-	const hostName = "dev.example"
-
-	packet := gatewayTestPacket(hostName)
-	source := newBenchmarkConn(benchmarkAddr("client:25565"))
-	upstreamAddress, received, closeUpstream := startBenchmarkUpstream(b, len(packet))
-	defer closeUpstream()
-	publishRouteSnapshot(map[string]string{hostName: upstreamAddress})
-	defer publishRouteSnapshot(nil)
-
-	b.SetBytes(int64(len(packet)))
-	b.ReportAllocs()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
-		source.ResetReader(packet)
-
-		client := mapToHost(source)
-		if client == nil {
-			b.Fatal("mapToHost returned nil")
-		}
-		_ = client.Close()
-		b.StopTimer()
-		if err := waitBenchmarkUpstream(received); err != nil {
-			b.Fatalf("upstream receive failed: %v", err)
-		}
-		b.StartTimer()
-	}
-}
-
 func benchmarkCopy(b *testing.B, copyFunc func(io.Writer, io.Reader)) {
 	reader := newBenchmarkReader(benchmarkPayloadSize)
 	writer := &benchmarkWriter{}

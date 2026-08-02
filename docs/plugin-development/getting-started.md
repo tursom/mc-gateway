@@ -22,7 +22,7 @@ go run ./cmd/gateway plugin schema export --section manifest
 ```sh
 go run ./cmd/gateway plugin init ./my-plugin \
   --id my-plugin \
-  --template upstream-dialer \
+  --template takeover \
   --module example.com/my-plugin
 ```
 
@@ -30,8 +30,7 @@ go run ./cmd/gateway plugin init ./my-plugin \
 
 | 模板 | runtime | 默认扩展点 | 适用场景 |
 | --- | --- | --- | --- |
-| `upstream-dialer` | `go-plugin` | `upstream.connect/v1` | 改写上游拨号、隧道、代理、服务发现 |
-| `protocol-proxy` | `go-plugin` | `upstream.connect/v1` | 接管完整 Minecraft 字节流，自行实现登录、转发和后续代理 |
+| `takeover` | `go-plugin` | `upstream.connect/v2` | 接管客户端流、检查或替换连接，再选择 Next/Core |
 
 可选参数：
 
@@ -100,8 +99,8 @@ go run ./cmd/gateway plugin disable my-plugin
 
 | 示例 | 目录 | 说明 |
 | --- | --- | --- |
-| Upstream Rewrite | [../../examples/plugins/upstream-rewrite](../../examples/plugins/upstream-rewrite) | `upstream.connect/v1` dialer mode，按 host 改写上游拨号 |
-| MC Auth Proxy | [../../examples/plugins/mc-auth-proxy](../../examples/plugins/mc-auth-proxy) | `upstream.connect/v1` protocol-proxy mode，演示登录流接管、事件和指标 |
+| Upstream Rewrite | [../../examples/plugins/upstream-rewrite](../../examples/plugins/upstream-rewrite) | `route.resolve/v1`，按 host 改写默认路由结果 |
+| MC Auth Proxy | [../../examples/plugins/mc-auth-proxy](../../examples/plugins/mc-auth-proxy) | `upstream.connect/v2` connection takeover mode，演示登录流接管、事件和指标 |
 | Extension Ecosystem | [../../examples/plugins/extension-ecosystem](../../examples/plugins/extension-ecosystem) | route、status、rule、middleware、event、provider 等扩展点 fixture |
 
-推荐从 `upstream-rewrite` 开始修改。只有需要完整 Minecraft 登录、forwarding 或 play 阶段代理时，才转向 protocol-proxy 模式。
+推荐从 `upstream-rewrite` 开始修改。只有需要完整 Minecraft 登录、forwarding 或 play 阶段代理时，才转向 connection takeover 模式。

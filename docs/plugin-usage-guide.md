@@ -13,7 +13,7 @@
 - Go 符号：`Plugin`
 - API 版本：`plugin-api/v1`
 - schema 版本：`mc-gateway.plugin/v1`
-- 主要插件数据面入口：`upstream.connect/v1`
+- 主要插件数据面入口：`upstream.connect/v2`
 
 Go native 插件和网关在同一信任边界内运行。它不是沙箱，不能隔离任意恶意代码。生产环境只应启用可信来源、经过 review 和治理检查的插件。
 
@@ -199,7 +199,7 @@ go run ./cmd/gateway plugin files inspect <plugin-id>
 | `Plugin` 符号缺失 | Go 代码未导出 `func Plugin() api.Plugin`，或 `runtime.entry_symbol` 不匹配 |
 | 兼容性失败 | 检查 Go 版本、GOOS/GOARCH、`api_version`、SDK module 和 ABI |
 | enable 失败但旧插件仍可用 | 这是预期行为；启用失败不能破坏旧 dispatch table |
-| disable 后旧连接仍存在 | protocol-proxy 连接会进入 draining，新连接不再进入插件 |
+| disable 后旧连接仍存在 | connection takeover 连接会进入 draining，新连接不再进入插件 |
 | delete 后内存仍占用 | Go plugin 不能真卸载；重启后彻底释放 |
 | 生产启用被阻断 | 查看 `plugin review status`、`plugin advisory scan`、`plugin vulnerability scan` 和 `plugin verify` |
 
@@ -208,7 +208,7 @@ go run ./cmd/gateway plugin files inspect <plugin-id>
 - 只启用可信插件，并固定 artifact sha256、package sha256、Go 版本和 SDK/API 版本。
 - 上传、启用、禁用、回滚、secret 更新和构建操作都走 Admin/API，让审计日志完整。
 - source 包生产构建使用 container builder，不使用开发机 local-process 结果直接上线。
-- protocol-proxy 插件必须覆盖 malformed packet、timeout、panic、disable/drain、backend unavailable 等失败路径。
+- connection takeover 插件必须覆盖 malformed packet、timeout、panic、disable/drain、backend unavailable 等失败路径。
 - 事件和指标标签保持低基数，不写入玩家名、UUID、token、session response、secret 或 packet payload。
 - 配置变更先 dry-run，再启用；回滚前同样重新执行当前治理门禁。
 - 删除已加载 Go plugin 后安排重启窗口，避免误以为代码已从进程中卸载。

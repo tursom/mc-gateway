@@ -72,12 +72,12 @@ state.pluginFeatures = {
   api_version: "plugin-api/v1",
   runtime_types: [
     { type: "go-plugin", implemented: true, maturity: "implemented", data_plane: true, requires_restart: false },
-    { type: "sandbox-process", implemented: true, maturity: "partial", data_plane: true, requires_restart: true, reason_code: "sandbox_data_plane_partial", unsupported_reason: "sandbox-process data-plane is partial; selected request/response extension points and upstream.connect/v1 protocol-proxy use sandbox stream.proxy/v1 relay with drain-only lifecycle; broader isolation and governance hardening remain incomplete" },
-    { type: "wasm", implemented: true, maturity: "partial", data_plane: true, requires_restart: false, unsupported_reason: "wasm runtime only supports low-risk extension points; protocol-proxy, network, file, and high-risk extension points are not supported" },
+    { type: "sandbox-process", implemented: true, maturity: "partial", data_plane: true, requires_restart: true, reason_code: "sandbox_data_plane_partial", unsupported_reason: "sandbox-process data-plane is partial; selected request/response extension points and upstream.connect/v2 takeover use the sandbox stream relay with drain-only lifecycle; broader isolation and governance hardening remain incomplete" },
+    { type: "wasm", implemented: true, maturity: "partial", data_plane: true, requires_restart: false, unsupported_reason: "wasm runtime only supports low-risk extension points; upstream.connect/v2, network, file, and other high-risk extension points are not supported" },
   ],
   service_modes: [
     { mode: "in-process", implemented: true, maturity: "implemented", data_plane: true, requires_restart: false },
-    { mode: "sandbox-process", implemented: true, maturity: "partial", data_plane: true, requires_restart: true, reason_code: "sandbox_data_plane_partial", unsupported_reason: "sandbox-process data-plane is partial; selected request/response extension points and upstream.connect/v1 protocol-proxy use sandbox stream.proxy/v1 relay with drain-only lifecycle; broader isolation and governance hardening remain incomplete" },
+    { mode: "sandbox-process", implemented: true, maturity: "partial", data_plane: true, requires_restart: true, reason_code: "sandbox_data_plane_partial", unsupported_reason: "sandbox-process data-plane is partial; selected request/response extension points and upstream.connect/v2 takeover use the sandbox stream relay with drain-only lifecycle; broader isolation and governance hardening remain incomplete" },
   ],
   runtime_adapters: [],
   extension_points: [
@@ -106,7 +106,7 @@ state.pluginService = {
     data_plane_eligible: true,
     policy_profile: "prod",
     reason_code: "sandbox_data_plane_partial",
-    reason: "sandbox-process data-plane is partial; selected request/response extension points and upstream.connect/v1 protocol-proxy use sandbox stream.proxy/v1 relay with drain-only lifecycle; broader isolation and governance hardening remain incomplete",
+    reason: "sandbox-process data-plane is partial; selected request/response extension points and upstream.connect/v2 takeover use the sandbox stream relay with drain-only lifecycle; broader isolation and governance hardening remain incomplete",
     enforcement_facts: [
       { category: "namespace", key: "network", required: true, enforced: true, method: "netns" },
     ],
@@ -145,7 +145,7 @@ const plugin = {
   desired_artifact: { id: "artifact-desired-123456", plugin_id: "acceptance-plugin", version: "1.0.0", file_name: "acceptance.mcgp", sha256: "sha", artifact_type: "binary", runtime_type: "go-plugin", status: "loadable" },
   active_artifact: { id: "artifact-active-123456", plugin_id: "acceptance-plugin", version: "1.0.0", file_name: "acceptance.mcgp", sha256: "sha", artifact_type: "binary", runtime_type: "go-plugin", status: "loaded" },
   loaded_artifact: { id: "artifact-active-123456", plugin_id: "acceptance-plugin", version: "1.0.0", file_name: "acceptance.mcgp", sha256: "sha", artifact_type: "binary", runtime_type: "go-plugin", status: "loaded" },
-  extension_points: ["upstream.connect/v1"],
+  extension_points: ["upstream.connect/v2"],
   priority: 10,
   scope: { type: "global" },
   rollout: { mode: "all" },
@@ -165,8 +165,8 @@ const plugin = {
     { id: "artifact-active-123456", plugin_id: "acceptance-plugin", version: "1.0.0", file_name: "acceptance.mcgp", sha256: "sha", artifact_type: "binary", runtime_type: "go-plugin", status: "loaded" },
     { id: "source-123456", plugin_id: "acceptance-plugin", version: "1.0.0", file_name: "acceptance-src.mcgp", sha256: "source", artifact_type: "source", runtime_type: "go-plugin", status: "uploaded" },
   ],
-  active_proxy_connections: 0,
-  proxy_connections: [],
+  active_connection_sessions: 0,
+  connection_sessions: [],
   governance: {
     decision: { ok: true, action: "enable", profile: "prod", risk_level: "low", policy_hash: "policyhash123456", review_required: false, warning_override_used: false, issues: [] },
     policy: { profile: "prod", require_conformance_fixture: true },

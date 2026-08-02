@@ -1,3 +1,5 @@
+> **Archived:** This document records the superseded pre-v2 plugin design. Current behavior is defined by `docs/plugin-development/extension-points.md`.
+
 # 插件系统 Roadmap 优先级审计
 
 本文的目标是给插件系统做完整 roadmap 审计，而不是只判断某一个 runtime 是否完成。runtime 是插件系统的基础能力之一，但完整 roadmap 还包括包格式、构建、Admin 管理闭环、治理门禁、观测运维、扩展生态、仓库分发、供应链、promotion、多实例和灾备。
@@ -12,7 +14,7 @@
 
 之前把 runtime 当成唯一主线是不准确的。更合理的判断是：
 
-- **现有主路径已经相当完整**：`go-plugin + in-process`、`.mcgp` 管理、protocol-proxy、source builder、本地 Admin/CLI、配置/secret/rollback、governance、operations 和部分 extension ecosystem 都已经有真实代码。
+- **现有主路径已经相当完整**：`go-plugin + in-process`、`.mcgp` 管理、connection takeover、source builder、本地 Admin/CLI、配置/secret/rollback、governance、operations 和部分 extension ecosystem 都已经有真实代码。
 - **runtime 仍是重要缺口**，但它不是全部缺口。`go-plugin-process`、sandbox、WASM、跨进程 stream 等属于阶段 8 的未来能力，当前大多是 schema、状态模型或 stub。
 - **当前最需要的 roadmap 不是继续堆功能名**，而是把“已可生产使用”、“可用但需加固”、“模型/预留”、“完全未做”分清楚，并为每个阶段补上验收证据。
 - **阶段 1-7 的完成度不应被阶段 8 绑架**。如果短期目标是让当前插件系统可上线，优先级应该先压实当前 `in-process go-plugin` 主路径、构建/治理/运维/扩展点的验收；如果目标是解决热卸载、进程隔离或跨语言，再进入 runtime 扩展路线。
@@ -34,8 +36,8 @@
 | `.mcgp` binary artifact | 已落地 | `ArtifactStore.ValidateAndStore` 校验 zip、manifest、runtime entry；`Manager.UploadArtifact` 保存 artifact。见 `internal/pluginmanager/artifact.go:57-260`、`internal/pluginmanager/manager.go:368-389` | 需要用端到端 fixture 证明上传、load、enable、disable、重启恢复 |
 | `in-process go-plugin` runtime | 已落地 | `RuntimeAdapterLifecycle` 已定义 Validate/Prepare/Start/Health/Reload/Drain/Stop/Diagnostics；`GoPluginAdapter` 通过 lifecycle 路径调用 `plugin.Open()` 和 `Lookup("Plugin")` 实例化插件。见 `internal/pluginmanager/runtime_lifecycle.go`、`internal/pluginmanager/manager.go` | 不能热卸载，插件崩溃仍在主进程边界内，只能靠 recover/timeout 降风险 |
 | desired/runtime state 和 dispatch | 已落地 | `SetDesired`、`Load`、`Enable`、`Disable`、`Delete` 推动状态和只读分发快照。见 `internal/pluginmanager/manager.go:593-930` | 需要持续验证失败不污染旧 dispatch table |
-| `upstream.connect/v1` dialer mode | 已落地 | `ConnectUpstream` 调用 handler，dialer mode 返回插件提供的 `net.Conn`；`buildHandlers` 将旧 `HookUpstream` 注册映射为 `legacy-upstream`，并有 manager 回归测试。见 `internal/pluginmanager/manager.go`、`internal/pluginmanager/manager_test.go` | 需要持续保持新旧 hook 的请求字段和错误语义一致 |
-| protocol-proxy mode | 已落地但需加固 | initial data replay、双向 copy、copy-loop panic recovery、active proxy tracking、drain/force close 已有；CLI conformance 的 `conformance.json` 已能声明 protocol-proxy golden scenarios；`protocol/smoke` 和 manager/example 测试已覆盖真实 MC handshake/login/payload backpressure fixture。见 `internal/pluginmanager/manager.go:1073-1105`、`1875-1947`、`1477-1491`、`cmd/gateway/plugin_cli_toolchain.go`、`protocol/smoke` | 仍需要更完整真实 MC smoke fixture、异常路径和跨版本示例验收 |
+| `legacy upstream-connect contract` route.resolve/v1 provider | 已落地 | `ConnectUpstream` 调用 handler，route.resolve/v1 provider 返回插件提供的 `net.Conn`；`buildHandlers` 将旧 `HookUpstream` 注册映射为 `legacy-upstream`，并有 manager 回归测试。见 `internal/pluginmanager/manager.go`、`internal/pluginmanager/manager_test.go` | 需要持续保持新旧 hook 的请求字段和错误语义一致 |
+| connection takeover mode | 已落地但需加固 | initial data replay、双向 copy、copy-loop panic recovery、active proxy tracking、drain/force close 已有；CLI conformance 的 `conformance.json` 已能声明 connection takeover golden scenarios；`protocol/smoke` 和 manager/example 测试已覆盖真实 MC handshake/login/payload backpressure fixture。见 `internal/pluginmanager/manager.go:1073-1105`、`1875-1947`、`1477-1491`、`cmd/gateway/plugin_cli_toolchain.go`、`protocol/smoke` | 仍需要更完整真实 MC smoke fixture、异常路径和跨版本示例验收 |
 | source `.mcgp` 和 builder | 生产边界已落地 | source 上传创建 build；local-process 和 container builder 都能产出 binary artifact，记录 source/artifact sha、module/provenance、Go version、ABI fingerprint；prod governance 会阻断 local-process、warning 缺失 builder digest、浮动 builder image 或未绑定 gateway release/plugin API/Go/platform 的 builder image；external CI assessment 要求顶层签名/SBOM、source/artifact sha、run/builder identity、attestation、release provenance 和 trusted 标记；GC 会保护 queued/running build 的 source package 并可清空 completed build log。见 `internal/pluginmanager/manager.go:441-631`、`internal/pluginmanager/builder.go`、`internal/pluginmanager/future.go`、`internal/pluginmanager/gc.go` | M3 已有 release-pinned builder workflow、external CI 阻断测试和跨环境 source build 验收；后续只剩 M4+ governance/conformance 扩展 |
 | container builder | 生产边界已落地 | `ContainerBuilder.Build()` 通过 `docker run --rm --read-only` 只读挂载 source、独立输出目录和 `/tmp` tmpfs 执行 `go build -mod=readonly -buildmode=plugin`，同时记录 builder image digest；prod governance 会要求浮动 image tag 或未绑定 release/API/Go/platform 的 image 走 warning override；官方 builder image 由 `.github/workflows/plugin-builder-image.yml` 输出 digest-pinned artifact。见 `internal/pluginmanager/builder.go`、`internal/pluginmanager/governance.go`、`.github/workflows/plugin-builder-image.yml` | 真实 Docker 构建保留 opt-in smoke，不作为默认本机验收 |
 | Admin UI 管理闭环 | 已落地但需加固 | 插件列表、详情、上传、配置、secret、rollback、governance、operations、plugin-service 面板已有；runtime service mode 面板已分开展示 desired/active/effective data-plane、adapter、desired/active support、restart/pending 状态和 crash policy；governance 面板已展示 policy strict fixture gate。见 `cmd/gateway/admin_frontend/src/views/plugins.ts` | 仍需补更多 UI 自动化验收和高风险能力失败路径 |
@@ -45,7 +47,7 @@
 | extension ecosystem | 部分已落地 | route/status/middleware/subscriber/provider 注册、timeout/recover/summary 有代码；middleware 已有 connection/handshake ordering、rewrite 传递和 fail-open/fail-closed 验收；event subscriber 已有 at-least-once retry、dead-letter replay/drop 验收；官方 rule/policy 和 extension ecosystem 示例已覆盖常用 route/status/event/provider 场景。见 `internal/pluginmanager/extensions.go:1-220`、`examples/plugins/extension-ecosystem` | 每个 extension point 的独立执行型 conformance、示例和冲突治理还不完整 |
 | official rule/policy | 已落地 | `GoPluginAdapter` 对 `official.rule-policy` 走 builtin 特例；官方插件覆盖维护模式、host/upstream rewrite、source CIDR allow/deny、简单限流，以及 status MOTD/favicon/online/max/version/window。见 `internal/pluginmanager/manager.go:85-89`、`plugin/official/rulepolicy` | 这是官方内置插件，不代表通用 `builtin` runtime |
 | CLI/toolchain | 可用但需保持边界清晰 | `features`、`init/build/test/preflight/self-test/...`、`contract`、`conformance`、`schema export`、`sign`、promotion dry-run 等命令已有实现，`plugin features` 的 `reserved_commands` 当前为空；feature matrix 明确 promotion 支持 `cross_node_apply_mode=cli_admin_to_admin`，但 repository/operations 仍 `cross_node_apply=false`，extension point matrix 会把 `admin.auth.provider/v1` 和 `ingress.service/v1` 标为 `reserved`/`data_plane=false`，并通过 `ingress` fact block 标出 schema/preflight/conflict gates 已有但 listener lifecycle/data-plane 仍未实现，通过 `sandbox`/`wasm` fact block 标出 capability/contained-validation gates 已有但 supervisor、enforcement、WASM adapter/ABI/cache/fuel 等仍未实现；instrumentation 有 metadata gate 和 gateway/CI artifact digest binding，`conformance.default_release_gate=true`、`package_fixture_failures_block_preflight=true`、`missing_fixture_required=false`、`missing_fixture_policy_gate=true`，strict preflight 可用 `--require-conformance-fixture`；`schema export --section cli` 与 `plugin features.cli.implemented_commands` 共用命令事实源，`schema export --section admin-api` 已给 plugin service state/crash policy/runtime adapter/host/node response 输出 JSON Schema `$defs`，`schema export --section conformance-fixture` 已输出 `conformance.json` 契约。见 `cmd/gateway/plugin_cli_toolchain.go` | CLI 输出需要持续作为 roadmap 事实源，不能让 dry-run 或 reserved backend 能力看起来已经接管数据面 |
-| `go-plugin-process` | 部分实现 | service mode、desired/active、host summary、runtime adapter factory、plugin-host 子进程、UDS control、supervisor start/stop、host 内 lifecycle、loaded host crash summary refresh、unexpected clean exit crash classification、service-level last error persistence、persisted configurable crash backoff/window policy、crash-loop auto-isolation、supervised/stale control socket cleanup、metadata-backed process orphan sweep、无 metadata 的 stale active control socket handshake orphan cleanup、Linux `/proc` process-table orphan discovery、`upstream.connect/v1` dialer bridge 和 protocol-proxy drain-only stream bridge 已有。见 `internal/pluginmanager/future.go`、`internal/pluginmanager/runtime_lifecycle.go`、`internal/pluginmanager/process_runtime.go` | 跨节点 crash policy 协调、跨平台进程表 orphan discovery 和完整迁移仍未实现 |
+| `go-plugin-process` | 部分实现 | service mode、desired/active、host summary、runtime adapter factory、plugin-host 子进程、UDS control、supervisor start/stop、host 内 lifecycle、loaded host crash summary refresh、unexpected clean exit crash classification、service-level last error persistence、persisted configurable crash backoff/window policy、crash-loop auto-isolation、supervised/stale control socket cleanup、metadata-backed process orphan sweep、无 metadata 的 stale active control socket handshake orphan cleanup、Linux `/proc` process-table orphan discovery、`legacy upstream-connect contract` dialer bridge 和 connection takeover drain-only stream bridge 已有。见 `internal/pluginmanager/future.go`、`internal/pluginmanager/runtime_lifecycle.go`、`internal/pluginmanager/process_runtime.go` | 跨节点 crash policy 协调、跨平台进程表 orphan discovery 和完整迁移仍未实现 |
 | `sandbox-process` | 模型/预留 | runtime/service mode gate 会阻断未启用或无法强制 capability 的 artifact。见 `internal/pluginmanager/manager.go:1593-1627`、`internal/pluginmanager/governance.go:507-519` | 没有 sandbox supervisor、control RPC、OS/container enforcement |
 | WASM | 模型/预留 | `WASMRunner` 只是按 behavior 字符串模拟 panic/timeout/memory，并把 validation 限定在 rule/route/config validate 等低风险 extension point。见 `internal/pluginmanager/future.go:188-233` | 没有 wazero/wasmtime loader、host ABI、fuel/memory enforcement |
 | `ingress.service/v1` | 模型/预留 | extension point schema 已进入 CLI/features/manifest contract；capability schema validation 已覆盖 `protocol`、`bind`、`port`、TLS secret ref 和 health check 基础字段，preflight/governance 会报告 `ingress_service_schema_valid` 或 `ingress_service_invalid`；governance 已对已启用 ingress 插件声明做 plugin-vs-plugin `ingress_port_conflict` 检查，并会用启动时注入的 TCP/Admin、KCP、QUIC、WebSocket reservation 输出 `ingress_reserved_listener_conflict`；同时继续以 `ingress_service_reserved` 阻断启用 | 没有 gateway-managed listener、TLS/secret 装载、health/drain data-plane；内置服务 reservation 是启动快照，服务运行期变更后需要重启或刷新 manager 才会进入该治理检查 |
@@ -57,8 +59,8 @@
 
 | 阶段 | 阶段目标是否明确 | 当前状态判断 | Roadmap 判断 |
 | --- | --- | --- | --- |
-| 阶段 1：Managed Binary Plugin MVP | 明确要求 binary `.mcgp`、Plugin Manager、desired/runtime state、`upstream.connect/v1` dialer、Admin API/CLI、示例 | 大部分已落地 | 应进入验收加固：端到端 fixture、重启恢复、失败路径、dispatch 不回归 |
-| 阶段 2：Protocol Proxy MVP | 明确要求 protocol-proxy、initial data replay、drain/force close、MC capability、`mc-auth-proxy` 示例 | 核心数据面已落地 | 下一步不是再扩展 MC core，而是补 smoke fixture、异常路径和示例验收 |
+| 阶段 1：Managed Binary Plugin MVP | 明确要求 binary `.mcgp`、Plugin Manager、desired/runtime state、`legacy upstream-connect contract` dialer、Admin API/CLI、示例 | 大部分已落地 | 应进入验收加固：端到端 fixture、重启恢复、失败路径、dispatch 不回归 |
+| 阶段 2：Protocol Proxy MVP | 明确要求 connection takeover、initial data replay、drain/force close、MC capability、`mc-auth-proxy` 示例 | 核心数据面已落地 | 下一步不是再扩展 MC core，而是补 smoke fixture、异常路径和示例验收 |
 | 阶段 3：Source Package Builder | 明确要求 source `.mcgp`、builder、provenance、build log、GC；生产推荐 container builder | release-pinned builder workflow、prod container 默认、local-process prod 阻断、external CI provenance gate、构建日志脱敏、环境白名单、GC protected references 和 completed build log 清理均已有 focused tests | M3 可关闭；不要把 M4+ conformance/governance 扩展混入本阶段 |
 | 阶段 4：Admin UI、配置、Secret、回滚 | 明确要求 UI 管理闭环、schema/dry-run、secret ref、artifact/config rollback | UI/API/管理闭环已落地 | 需要做 UI truthfulness，尤其 runtime service mode 不能暗示未实现能力可用 |
 | 阶段 5：Governance And Release Gates | 明确要求 review、risk、conflict、preflight/self-test、benchmark、advisory | 主体已落地 | 需要把治理从“有模型”推进到“release gate 证据”：conformance、fixtures、策略快照验收 |
@@ -70,8 +72,8 @@
 
 这些属于阶段文档已经明确要求的功能，不是额外发散：
 
-- 阶段 1：binary `.mcgp`、manifest 静态校验、artifact 登记、Plugin Manager、desired/runtime state、dispatch table、`upstream.connect/v1` dialer mode、load/enable/disable/delete、基础审计、`upstream-rewrite` 示例。
-- 阶段 2：protocol-proxy mode、initial data replay、双向 copy、active proxy connection、draining/force close、MC capability manifest、`mc-auth-proxy` 示例和 protocol smoke helper。
+- 阶段 1：binary `.mcgp`、manifest 静态校验、artifact 登记、Plugin Manager、desired/runtime state、dispatch table、`legacy upstream-connect contract` route.resolve/v1 provider、load/enable/disable/delete、基础审计、`upstream-rewrite` 示例。
+- 阶段 2：connection takeover mode、initial data replay、双向 copy、active proxy connection、draining/force close、MC capability manifest、`mc-auth-proxy` 示例和 protocol smoke helper。
 - 阶段 3：source `.mcgp`、build job、local-process/container builder、build provenance、module summary、build log、source/build/artifact GC。
 - 阶段 4：Admin UI、配置 schema、runtime dry-run、sensitive diff、SecretStore、secret version、artifact rollback、config snapshot rollback、权限。
 - 阶段 5：policy profile、review、warning override、conflict analysis、preflight/self-test、benchmark gate、denylist/quarantine/revoke/advisory。
@@ -94,7 +96,7 @@
 
 - `contract`、`conformance`、`schema export` 已不再停留在 reserved，`conformance.json` 已支持显式 golden fixture 文件。
 - 每个 extension point 仍需要真实执行型 golden fixture：输入、输出、错误码、timeout、panic、fail policy。
-- protocol-proxy 已有 `initial_data_once`、`panic_recovered`、`timeout_deadline`、`endpoint_close`、`client_close`、`backpressure_large_packet`、`drain_disable_new_connections`、`force_close_draining` 场景声明；真实 MC packet/backpressure fixture 已由 `protocol/smoke`、manager 测试和 `mc-auth-proxy` 示例测试覆盖，后续还需要更多异常路径和跨版本 smoke。
+- connection takeover 已有 `byte_integrity`、`panic_recovered`、`timeout_deadline`、`endpoint_close`、`client_close`、`backpressure_large_packet`、`drain_disable_new_connections`、`force_close_draining` 场景声明；真实 MC packet/backpressure fixture 已由 `protocol/smoke`、manager 测试和 `mc-auth-proxy` 示例测试覆盖，后续还需要更多异常路径和跨版本 smoke。
 - governance 已有 review、warning override、advisory、supply-chain、rollback、repository apply、promotion apply 场景声明；packaged conformance failure 已接入默认 release gate，缺失 fixture 已有 strict preflight/Manager policy gate，但默认仍兼容不阻断，后续还需要逐步切默认和补真实执行型报告。
 
 ### 3. Source build 的生产边界
@@ -120,10 +122,10 @@
 ### 6. Runtime 扩展前置条件
 
 - runtime adapter lifecycle/factory 已落地 Validate/Prepare/Start/Health/Reload/Drain/Stop/Diagnostics，`go-plugin-process` 当前返回 partial process data-plane，sandbox/WASM 仍返回明确 unsupported。
-- `plugin-host` 子命令、`mc-gateway-plugin-host/v1` handshake、UDS control channel、supervisor start/stop foundation、host 内 Init/ReloadConfig/Destroy lifecycle、loaded host crash summary refresh、service-level last error persistence、persisted configurable restart backoff/max/window policy、crash-loop auto-isolation、supervised/stale control socket cleanup、metadata-backed process orphan sweep、无 metadata 的 stale active control socket handshake orphan cleanup、Linux `/proc` process-table orphan discovery、`upstream.connect/v1` dialer bridge 和 protocol-proxy drain-only stream bridge 已落地；`go-plugin-process` 仍需要跨节点 crash policy 协调和跨平台进程表 orphan discovery。
+- `plugin-host` 子命令、`mc-gateway-plugin-host/v1` handshake、UDS control channel、supervisor start/stop foundation、host 内 Init/ReloadConfig/Destroy lifecycle、loaded host crash summary refresh、service-level last error persistence、persisted configurable restart backoff/max/window policy、crash-loop auto-isolation、supervised/stale control socket cleanup、metadata-backed process orphan sweep、无 metadata 的 stale active control socket handshake orphan cleanup、Linux `/proc` process-table orphan discovery、`legacy upstream-connect contract` dialer bridge 和 connection takeover drain-only stream bridge 已落地；`go-plugin-process` 仍需要跨节点 crash policy 协调和跨平台进程表 orphan discovery。
 - sandbox-process 需要把 capability 变成 OS/container 级强约束，而不是只做审计。
 - WASM 需要 host ABI、module cache、fuel/time/memory limit 和限定 extension point。
-- sandbox/isolated runtime 如果支持 protocol-proxy，必须先定义 `stream.proxy/v1` 或 `upstream.connect/v2`，不能直接复用进程内 `net.Conn` 语义；可信 `go-plugin-process` 当前通过内部 host control stream bridge 承载 drain-only。
+- sandbox/isolated runtime 如果支持 connection takeover，必须先定义 `stream.proxy/v1` 或 `legacy upstream-connect contract`，不能直接复用进程内 `net.Conn` 语义；可信 `go-plugin-process` 当前通过内部 host control stream bridge 承载 drain-only。
 
 ## 当前 runtime 到底实现了哪些
 
@@ -135,15 +137,15 @@
 - `Plugin` symbol 或 manifest `entry_symbol` 查找。
 - `ReloadConfig()`、`Init()`、`Destroy()` 生命周期。
 - SQLite/Admin 唯一管理入口；旧 `[plugin.*]` TOML loader、`Config.Plugin` 和并行 hook dispatch 已移除。
-- `upstream.connect/v1` dialer mode。
+- `legacy upstream-connect contract` route.resolve/v1 provider。
 - legacy `HookUpstream` 由正式 Plugin Manager 映射为 managed dialer handler。
-- `upstream.connect/v1` protocol-proxy mode 在进程内通过 `net.Conn` 接管。
+- `legacy upstream-connect contract` connection takeover mode 在进程内通过 `net.Conn` 接管。
 - panic recover、handler timeout、active proxy count、drain 和 force close。
 - `official.rule-policy` builtin 特例，但它不是通用第三方 builtin runtime。
 
 ### 部分实现或预留
 
-- `go-plugin-process` service mode：能保存 desired/active、显示 host summary、从 loaded host process 刷新 crash summary、对 crash loop 做 service-level last error persistence 和 persisted configurable restart backoff/max/window policy、自动从 dispatch 隔离 crash-loop host、启动真实 plugin-host 子进程、在子进程内加载 Go plugin、清理 supervised/stale control socket、metadata-backed process orphan sweep、无 metadata 的 stale active control socket 和 Linux `/proc` process-table orphan，并通过 UDS relay 支持 `upstream.connect/v1` dialer mode 和 protocol-proxy drain-only；跨节点 crash policy 协调和跨平台进程表 orphan discovery 尚未完成。
+- `go-plugin-process` service mode：能保存 desired/active、显示 host summary、从 loaded host process 刷新 crash summary、对 crash loop 做 service-level last error persistence 和 persisted configurable restart backoff/max/window policy、自动从 dispatch 隔离 crash-loop host、启动真实 plugin-host 子进程、在子进程内加载 Go plugin、清理 supervised/stale control socket、metadata-backed process orphan sweep、无 metadata 的 stale active control socket 和 Linux `/proc` process-table orphan，并通过 UDS relay 支持 `legacy upstream-connect contract` route.resolve/v1 provider 和 connection takeover drain-only；跨节点 crash policy 协调和跨平台进程表 orphan discovery 尚未完成。
 - `sandbox-process` runtime：manifest/runtime type 和 gate 存在，但没有 sandbox。
 - `wasm` runtime：只有 `WASMRunner` 模拟 timeout/panic/memory，不是真实 WASM。
 - runtime-neutral CLI adapter：只有 `go-plugin` 有 build/test adapter，其他 runtime 返回 reserved。
@@ -177,7 +179,7 @@
 
 1. binary `.mcgp` 上传、load、enable、disable、delete、restart recovery 端到端测试。
 2. `upstream-rewrite` binary/source 构建和启用 fixture；示例已覆盖匹配 host dialer rewrite 和非匹配 `api.ErrPass`。
-3. protocol-proxy golden 场景声明和运行时测试已覆盖 initial data replay、panic、timeout、endpoint close、client close、backpressure 大包、drain、force close；后续补更多真实 MC 异常路径和跨版本 smoke。
+3. connection takeover golden 场景声明和运行时测试已覆盖 initial data replay、panic、timeout、endpoint close、client close、backpressure 大包、drain、force close；后续补更多真实 MC 异常路径和跨版本 smoke。
 4. `mc-auth-proxy` 示例已覆盖登录失败响应、backend unavailable 分支、fixture_accept backend 转发大包、低基数 auth 事件和 `auth.attempts` metric。
 5. dispatch plan 和 active proxy summary 纳入验收。
 
@@ -228,14 +230,14 @@ source package 已有 local-process 和 container 路径，prod 默认 container
 
 1. enable、rollback、repository import admission preview、本地 repository import apply 和本地 target promotion apply 已统一走 governance；repository/promotion apply 只写入目标环境 desired state，不自动启用 active 流量；手动 remote artifact transfer 已落地，CLI promotion 跨网关 apply 已串联 artifact package transfer 和目标侧 apply，repository apply 跨节点编排仍需继续补齐。
 2. preflight/self-test/benchmark 结果和 review 指纹绑定 artifact/config/scope/rollout/runtime limits/policy hash；instrumentation metadata 已要求 `available` 状态必须携带 generated diff hash、gateway binary digest、CI artifact digest、passing conformance、benchmark 和 smoke evidence，且 Admin 列表已展示 digest binding 和三类证据状态。
-3. conflict analysis 覆盖 protocol-proxy scope、provider singleton、middleware ordering。
+3. conflict analysis 覆盖 connection takeover scope、provider singleton、middleware ordering。
 4. advisory revoke/quarantine 后验证 upstream dispatch、extension dispatch 和 route cache 被移除，后台任务停止，runtime 进入 draining，且 rollback 阻断。
 5. warning override TTL 过期后重新阻断。
-6. conformance golden fixtures 已支持 protocol-proxy、route/status/rule/middleware 和 governance gate 场景声明；`invalid_config`/`missing_secret` 已先使用 manifest 证据判断 pass/skip/fail，packaged fixture failure 已接入默认 preflight/governance gate，缺失 packaged fixture 可通过 strict preflight/Manager policy gate 强制阻断，且 instrumentation release metadata 已先接入 conformance/benchmark/smoke pass gate。后续要补真实 fixture 输入执行并逐步把缺失 fixture strict gate 变成默认发布策略。
+6. conformance golden fixtures 已支持 connection takeover、route/status/rule/middleware 和 governance gate 场景声明；`invalid_config`/`missing_secret` 已先使用 manifest 证据判断 pass/skip/fail，packaged fixture failure 已接入默认 preflight/governance gate，缺失 packaged fixture 可通过 strict preflight/Manager policy gate 强制阻断，且 instrumentation release metadata 已先接入 conformance/benchmark/smoke pass gate。后续要补真实 fixture 输入执行并逐步把缺失 fixture strict gate 变成默认发布策略。
 
 验收：
 
-- 高风险 protocol-proxy 未 review 不能在 prod 启用。
+- 高风险 connection takeover 未 review 不能在 prod 启用。
 - advisory 命中 artifact 不能 rollback；quarantine 命中后不会继续从旧 dispatch 或 route cache 接管流量。
 - benchmark 超阈值进入 warning/blocking，且 override 行为可审计。
 
@@ -287,9 +289,9 @@ source package 已有 local-process 和 container 路径，prod 默认 container
 1. plugin-host 子进程或子命令（已落地）。
 2. UDS control channel 和 host protocol version negotiation（已落地）。
 3. Start/Init/ReloadConfig/Health/Destroy/Drain/Stop lifecycle 已作为 adapter/control contract 落地，host 内 Init/ReloadConfig/Destroy 已能加载真实 Go plugin。
-4. supervisor start/stop 已有 foundation，并已接入 `upstream.connect/v1` dialer 和 protocol-proxy drain-only process data-plane。
+4. supervisor start/stop 已有 foundation，并已接入 `legacy upstream-connect contract` dialer 和 connection takeover drain-only process data-plane。
 5. crash tracking、unexpected clean exit crash classification、loaded host summary refresh、service-level last error persistence、persisted configurable restart backoff/max/window policy、crash-loop auto-isolation、supervised/stale control socket cleanup、metadata-backed process orphan sweep、无 metadata 的 stale active control socket cleanup 和 Linux `/proc` process-table orphan cleanup 已有 foundation；跨节点 crash policy 协调和跨平台进程表 orphan discovery 仍需接入。
-6. `upstream.connect/v1` dialer mode 和 protocol-proxy drain-only 已支持。
+6. `legacy upstream-connect contract` route.resolve/v1 provider 和 connection takeover drain-only 已支持。
 
 验收：
 
@@ -303,10 +305,10 @@ source package 已有 local-process 和 container 路径，prod 默认 container
 
 应做：
 
-1. `stream.proxy/v1` 或 `upstream.connect/v2`，定义 half-close、backpressure、deadline、cancel、byte accounting。
+1. `stream.proxy/v1` 或 `legacy upstream-connect contract`，定义 half-close、backpressure、deadline、cancel、byte accounting。
 2. sandbox supervisor 和 filesystem/network/env/cpu/memory/secret capability enforcement。
 3. WASM host ABI、module loader/cache、fuel/time/memory limits。
-4. 首批 WASM extension point 限定在 rule/route/config validate 等低风险场景；当前 placeholder validation 已拒绝 `upstream.connect/v1` 等高风险 extension point。
+4. 首批 WASM extension point 限定在 rule/route/config validate 等低风险场景；当前 placeholder validation 已拒绝 `legacy upstream-connect contract` 等高风险 extension point。
 5. `ingress.service/v1` schema 已保留，CLI/preflight 会校验 capability 声明，governance 会检查已启用 ingress 插件之间以及启动时内置服务 reservation 的端口冲突，且启用会被 `ingress_service_reserved` 阻断；listener owner、TLS/secret 装载和 disable drain 仍需实现。
 
 验收：
@@ -358,10 +360,10 @@ source package 已有 local-process 和 container 路径，prod 默认 container
 如果下一步要继续实现，建议按下面顺序拆任务：
 
 1. **修正事实表达**：更新 `plugin features`、Admin runtime service panel、文档状态表，明确 implemented/partial/reserved/stub。
-2. **补阶段 1/2 验收**：binary/source upstream-rewrite、protocol-proxy、mc-auth-proxy fixture、disable/drain/restart recovery。
+2. **补阶段 1/2 验收**：binary/source upstream-rewrite、connection takeover、mc-auth-proxy fixture、disable/drain/restart recovery。
 3. **补阶段 4 验收**：config/secret/rollback UI/API 失败路径和审计。
 4. **实现 container builder**：把 source package 从开发可用推进到生产可控。
-5. **补 conformance 框架**：至少覆盖 manifest、upstream.connect、protocol-proxy、route/status/rule、governance gate。
+5. **补 conformance 框架**：至少覆盖 manifest、upstream.connect、connection takeover、route/status/rule、governance gate。
 6. **压实 governance/operations**：review/preflight/self-test/benchmark/advisory、diagnostic、GC、background task。
 7. **按价值收尾 extension ecosystem**：official rule/policy、route provider、status ping、event subscriber。
 8. **再进入 runtime 扩展**：`go-plugin-process` drain-only、stream relay、sandbox、WASM。

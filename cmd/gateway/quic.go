@@ -18,6 +18,7 @@ import (
 
 	quic "github.com/quic-go/quic-go"
 	"github.com/rs/zerolog/log"
+	"github.com/tursom/mc-gateway/plugin/api"
 )
 
 type (
@@ -28,6 +29,14 @@ type (
 		quic.Stream
 	}
 )
+
+func (c quicConn) QUICIngressContext() *api.QUICIngressContext {
+	return &api.QUICIngressContext{ApplicationProtocol: c.Connection.ConnectionState().TLS.NegotiatedProtocol}
+}
+
+func (c quicConn) IngressTransport() (string, string) {
+	return "quic", serviceNameQUIC
+}
 
 func runQuic(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {

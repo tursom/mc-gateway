@@ -150,7 +150,7 @@ export interface RepositoryUpdateCandidate {
   version_comparison_stable: boolean;
 }
 
-export interface PluginProxyConnection {
+export interface PluginConnectionSession {
   id: number;
   plugin_id: string;
   artifact_id: string;
@@ -434,8 +434,8 @@ export interface PluginView {
   builds?: PluginBuild[];
   artifacts?: PluginArtifact[];
   manifest?: Record<string, unknown>;
-  active_proxy_connections?: number;
-  proxy_connections?: PluginProxyConnection[];
+  active_connection_sessions?: number;
+  connection_sessions?: PluginConnectionSession[];
   governance?: GovernanceStatus;
   governance_error?: string;
   rollout_status?: PluginRolloutStatus;

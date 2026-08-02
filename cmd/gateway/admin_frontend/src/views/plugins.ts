@@ -6,7 +6,7 @@ import { badge, el, escapeAttr, escapeHTML, getFormInput, getFormSelect } from "
 import { formatValue, localizeMessage, requiredText, ui, yesNo } from "../i18n.js";
 import { isAdmin } from "../session.js";
 import { state } from "../state.js";
-import type { PluginArtifact, PluginBuild, PluginDryRunResult, PluginExtensionPointFeature, PluginFeatureFacts, PluginHostRuntimeSummary, PluginInstrumentation, PluginNodeRuntimeState, PluginNodeState, PluginOperations, PluginProxyConnection, PluginRuntimeAdapterStatus, PluginRuntimeFeature, PluginSecret, PluginServiceModeFeature, PluginServiceStatus, PluginSnapshot, PluginView, RepositoryUpdateReport } from "../types.js";
+import type { PluginArtifact, PluginBuild, PluginConnectionSession, PluginDryRunResult, PluginExtensionPointFeature, PluginFeatureFacts, PluginHostRuntimeSummary, PluginInstrumentation, PluginNodeRuntimeState, PluginNodeState, PluginOperations, PluginRuntimeAdapterStatus, PluginRuntimeFeature, PluginSecret, PluginServiceModeFeature, PluginServiceStatus, PluginSnapshot, PluginView, RepositoryUpdateReport } from "../types.js";
 
 interface PluginsResponse {
   plugins?: PluginView[];
@@ -193,7 +193,7 @@ export function renderPluginDetail(plugin: PluginView | null = selectedPlugin())
       ${detailStat(ui("Loaded"), shortID(plugin.loaded_artifact_id))}
       ${detailStat(ui("Restart"), requiredText(Boolean(plugin.restart_required)))}
       ${detailStat(ui("Health"), formatValue(plugin.health || ""))}
-      ${detailStat(ui("Active proxy"), plugin.active_proxy_connections || 0)}
+      ${detailStat(ui("Active sessions"), plugin.active_connection_sessions || 0)}
     </div>
     ${plugin.last_error ? `<div class="alert inline-alert">${escapeHTML(localizeMessage(plugin.last_error))}</div>` : ""}
     <div class="plugin-layout">
@@ -302,8 +302,8 @@ export function renderPluginDetail(plugin: PluginView | null = selectedPlugin())
         <pre id="pluginOperationsOutput" class="log-output"></pre>
       </section>
       <section class="panel">
-        <h3>${escapeHTML(ui("Active proxy connections"))}</h3>
-        ${proxyConnectionList(plugin.proxy_connections || [])}
+        <h3>${escapeHTML(ui("Active connection sessions"))}</h3>
+        ${connectionSessionList(plugin.connection_sessions || [])}
       </section>
     </div>
   `;
@@ -403,8 +403,8 @@ function pluginServiceModes(): PluginServiceModeFeature[] {
   }
   return [
     { mode: "in-process", implemented: true, maturity: "implemented", data_plane: true, requires_restart: false },
-    { mode: "go-plugin-process", implemented: true, maturity: "partial", data_plane: true, requires_restart: true, unsupported_reason: "go-plugin-process supports upstream.connect/v1 dialer mode and protocol-proxy drain-only with persisted crash policy and per-node crash isolation; fd-live migration, sandbox enforcement, full isolation, and non-Linux process-table orphan discovery are not implemented" },
-    { mode: "sandbox-process", implemented: true, maturity: "partial", data_plane: true, requires_restart: true, reason_code: "sandbox_data_plane_partial", unsupported_reason: "sandbox-process data-plane is partial; selected request/response extension points and upstream.connect/v1 protocol-proxy use sandbox stream.proxy/v1 relay with drain-only lifecycle; broader isolation and governance hardening remain incomplete" },
+    { mode: "go-plugin-process", implemented: true, maturity: "partial", data_plane: true, requires_restart: true, unsupported_reason: "go-plugin-process supports upstream.connect/v2 takeover with persisted crash policy and per-node crash isolation; fd-live migration, sandbox enforcement, full isolation, and non-Linux process-table orphan discovery are not implemented" },
+    { mode: "sandbox-process", implemented: true, maturity: "partial", data_plane: true, requires_restart: true, reason_code: "sandbox_data_plane_partial", unsupported_reason: "sandbox-process data-plane is partial; selected request/response extension points and upstream.connect/v2 takeover use the sandbox stream relay with drain-only lifecycle; broader isolation and governance hardening remain incomplete" },
   ];
 }
 
@@ -1459,11 +1459,11 @@ function snapshotList(snapshots: PluginSnapshot[], canWrite: boolean): string {
   `).join("")}</div>`;
 }
 
-function proxyConnectionList(connections: PluginProxyConnection[]): string {
-  if (connections.length === 0) {
-    return `<div class="empty">${escapeHTML(ui("No active proxy connections"))}</div>`;
+function connectionSessionList(sessions: PluginConnectionSession[]): string {
+  if (sessions.length === 0) {
+    return `<div class="empty">${escapeHTML(ui("No active connection sessions"))}</div>`;
   }
-  return `<div class="mini-list">${connections.map((conn) => `
+  return `<div class="mini-list">${sessions.map((conn) => `
     <div class="mini-row">
       <span>#${escapeHTML(conn.id)}</span>
       <span>${escapeHTML(shortID(conn.artifact_id))} · ${escapeHTML(conn.handler_id)}</span>

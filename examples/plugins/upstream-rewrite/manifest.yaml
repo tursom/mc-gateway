@@ -18,11 +18,11 @@ go_version: go1.24.4
 go_os: linux
 go_arch: amd64
 extension_points:
-  - type: hook
-    key: upstream.connect/v1
+  - type: provider
+    key: route.resolve/v1
 capabilities:
   extension_points:
-    - upstream.connect/v1
+    - route.resolve/v1
   network:
     outbound:
       - tcp:*:*

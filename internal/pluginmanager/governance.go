@@ -1012,40 +1012,6 @@ func (m *Manager) preflightChecks(ctx context.Context, plugin PluginRecord, arti
 			},
 		})
 	}
-	scope := manifestScope(manifest)
-	if upstreamModeFromArtifact(artifact) == UpstreamModeProtocolProxy && len(scope.Values) == 0 {
-		result.Checks = append(result.Checks, PreflightCheck{Code: "scope_global", Severity: GateSeverityWarning, Message: "plugin scope defaults to global"})
-	}
-	rollout := manifestRollout(manifest)
-	if upstreamModeFromArtifact(artifact) == UpstreamModeProtocolProxy && rollout.Mode == "all" && normalizeProfile(profile) == PolicyProfileProd {
-		result.Checks = append(result.Checks, PreflightCheck{Code: "rollout_all_prod", Severity: GateSeverityWarning, Message: "prod rollout applies to all traffic"})
-	}
-	if upstreamModeFromArtifact(artifact) == UpstreamModeProtocolProxy {
-		var summary CapabilitySummary
-		_ = json.Unmarshal([]byte(artifact.CapabilitiesSummaryJSON), &summary)
-		if summary.Minecraft == nil {
-			result.Checks = append(result.Checks, PreflightCheck{Code: "minecraft_capability_missing", Severity: GateSeverityBlocking, Message: "protocol-proxy plugins must declare minecraft capability"})
-		} else {
-			if summary.Minecraft.ProtocolVersions.Min == 0 && summary.Minecraft.ProtocolVersions.Max == 0 && len(summary.Minecraft.ProtocolVersions.Tested) == 0 {
-				result.Checks = append(result.Checks, PreflightCheck{Code: "minecraft_protocol_untested", Severity: GateSeverityWarning, Message: "minecraft capability does not declare tested protocol versions"})
-			}
-			if len(summary.Minecraft.Forwarding.Supported) == 0 {
-				result.Checks = append(result.Checks, PreflightCheck{Code: "backend_forwarding_warning", Severity: GateSeverityWarning, Message: "backend forwarding behavior is not declared"})
-			}
-			if summary.Minecraft.Forwarding.RequiresSecret {
-				hasSecret := false
-				for _, spec := range manifest.Secrets {
-					if spec.Required {
-						hasSecret = true
-						break
-					}
-				}
-				if !hasSecret {
-					result.Checks = append(result.Checks, PreflightCheck{Code: "backend_forwarding_secret_missing", Severity: GateSeverityBlocking, Message: "minecraft forwarding requires a declared required secret"})
-				}
-			}
-		}
-	}
 	if external := externalDependencies(manifest); len(external) > 0 {
 		result.Checks = append(result.Checks, PreflightCheck{Code: "external_dependencies_declared", Severity: GateSeverityInfo, Message: "plugin declares external dependencies", Details: map[string]any{"dependencies": external}})
 	}
@@ -1660,51 +1626,14 @@ func (m *Manager) externalCIProvenancePreflightChecks(ctx context.Context, artif
 
 func (m *Manager) conflictAnalysis(ctx context.Context, target PluginRecord, artifact ArtifactRecord, manifest Manifest) (ConflictAnalysis, error) {
 	analysis := ConflictAnalysis{CreatedAt: m.repo.now().Unix(), Plan: m.DispatchPlan(ctx)}
-	targetProtocolProxy := upstreamModeFromArtifact(artifact) == UpstreamModeProtocolProxy
 	targetIngress := manifestHasExtensionPoint(manifest, ExtensionIngressService)
-	if !targetProtocolProxy && !targetIngress {
+	if !targetIngress {
 		analysis.OK = true
 		return analysis, nil
 	}
 	plugins, err := m.repo.ListPlugins(ctx)
 	if err != nil {
 		return ConflictAnalysis{}, err
-	}
-	if targetProtocolProxy {
-		targetScope := manifestScope(manifest)
-		for _, plugin := range plugins {
-			if plugin.ID == target.ID || plugin.RuntimeState != RuntimeEnabled || plugin.ActiveArtifactID == "" {
-				continue
-			}
-			otherArtifact, err := m.repo.Artifact(ctx, plugin.ActiveArtifactID)
-			if err != nil {
-				continue
-			}
-			if upstreamModeFromArtifact(otherArtifact) != UpstreamModeProtocolProxy {
-				continue
-			}
-			var otherManifest Manifest
-			if json.Unmarshal([]byte(otherArtifact.MetadataJSON), &otherManifest) != nil {
-				continue
-			}
-			otherScope := manifestScope(otherManifest)
-			if scopesOverlap(targetScope, otherScope) {
-				analysis.Issues = append(analysis.Issues, issue("scope_overlap", GateSeverityBlocking, "protocol-proxy scope overlaps enabled plugin", target.ID, artifact.ID, map[string]any{
-					"other_plugin_id":   plugin.ID,
-					"other_artifact_id": otherArtifact.ID,
-					"scope":             targetScope.Values,
-				}))
-				analysis.Issues = append(analysis.Issues, issue("protocol_proxy_singleton", GateSeverityBlocking, "only one protocol-proxy plugin can own an overlapping scope", target.ID, artifact.ID, map[string]any{
-					"other_plugin_id": plugin.ID,
-				}))
-			} else if target.Priority >= plugin.Priority {
-				analysis.Issues = append(analysis.Issues, issue("shadowed_handler", GateSeverityWarning, "protocol-proxy handler may be shadowed by a higher priority plugin", target.ID, artifact.ID, map[string]any{
-					"other_plugin_id": plugin.ID,
-					"other_priority":  plugin.Priority,
-					"priority":        target.Priority,
-				}))
-			}
-		}
 	}
 	if targetIngress {
 		targetIngressCapability := ingressCapabilityFromArtifact(artifact, manifest)
@@ -1975,7 +1904,7 @@ func (m *Manager) benchmarkIssues(ctx context.Context, artifact ArtifactRecord, 
 		}))
 	}
 	if latest.ActiveProxyCapacity > 0 {
-		active := m.activeProxyCountLocked(artifact.PluginID)
+		active := m.activeConnectionSessionCountLocked(artifact.PluginID)
 		if int64(active) > latest.ActiveProxyCapacity {
 			issues = append(issues, issue("active_proxy_capacity_exceeded", GateSeverityBlocking, "active proxy connections exceed benchmarked capacity", artifact.PluginID, artifact.ID, map[string]any{
 				"active":   active,
@@ -2123,9 +2052,6 @@ func riskLevel(manifest Manifest, artifact ArtifactRecord) string {
 				return risk
 			}
 		}
-	}
-	if upstreamModeFromArtifact(artifact) == UpstreamModeProtocolProxy {
-		return RiskHigh
 	}
 	if artifact.RuntimeType == RuntimeSandbox && len(highRiskSandboxRequiredCapabilities(requiredRuntimeCapabilities(artifact))) > 0 {
 		return RiskHigh

@@ -1,10 +1,10 @@
 {
   "fixtures": [
     {
-      "name": "upstream connect dialer",
+      "name": "route override",
       "status": "pass",
-      "expected": "dialer_mode_declared",
-      "extension": "upstream.connect/v1"
+      "expected": "route_override_declared",
+      "extension": "route.resolve/v1"
     },
     {
       "name": "invalid_config",

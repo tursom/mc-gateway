@@ -4,21 +4,33 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/tursom/mc-gateway/plugin/api"
+	"github.com/tursom/mc-gateway/plugin/sandboxsdk"
 )
 
 const (
-	PluginHostSchemaVersion       = "mc-gateway.plugin-host/v1"
-	PluginHostProtocol            = "mc-gateway-plugin-host/v1"
-	PluginHostControlChannelUnix  = "unix-socket"
-	PluginHostCommandHandshake    = "handshake"
-	PluginHostCommandInit         = "init"
-	PluginHostCommandReloadConfig = "reload_config"
-	PluginHostCommandDestroy      = "destroy"
-	PluginHostCommandDrain        = "drain"
-	PluginHostCommandStop         = "stop"
-	PluginHostCommandShutdown     = "shutdown"
-	PluginHostCommandUpstream     = "upstream_connect"
-	PluginHostCommandStreamProxy  = "stream_proxy"
+	PluginHostSchemaVersion           = "mc-gateway.plugin-host/v1"
+	PluginHostProtocol                = "mc-gateway-plugin-host/v1"
+	PluginHostControlChannelUnix      = "unix-socket"
+	PluginHostCommandHandshake        = "handshake"
+	PluginHostCommandInit             = "init"
+	PluginHostCommandReloadConfig     = "reload_config"
+	PluginHostCommandDestroy          = "destroy"
+	PluginHostCommandDrain            = "drain"
+	PluginHostCommandStop             = "stop"
+	PluginHostCommandShutdown         = "shutdown"
+	PluginHostCommandTakeoverOpen     = "takeover_open"
+	PluginHostCommandTakeoverWait     = "takeover_wait"
+	PluginHostCommandTakeoverComplete = "takeover_complete"
+)
+
+type TakeoverAction = sandboxsdk.TakeoverAction
+
+const (
+	TakeoverActionHandled = sandboxsdk.TakeoverActionHandled
+	TakeoverActionNext    = sandboxsdk.TakeoverActionNext
+	TakeoverActionCore    = sandboxsdk.TakeoverActionCore
 )
 
 type PluginHostFeature struct {
@@ -69,14 +81,13 @@ type PluginHostControlRequest struct {
 }
 
 type PluginHostControlResponse struct {
-	RequestID string                 `json:"request_id,omitempty"`
-	OK        bool                   `json:"ok"`
-	Code      string                 `json:"code,omitempty"`
-	Error     string                 `json:"error,omitempty"`
-	Handshake *PluginHostHandshake   `json:"handshake,omitempty"`
-	Lifecycle *PluginHostLifecycle   `json:"lifecycle,omitempty"`
-	Upstream  *PluginHostUpstream    `json:"upstream,omitempty"`
-	Stream    *PluginHostStreamProxy `json:"stream,omitempty"`
+	RequestID string               `json:"request_id,omitempty"`
+	OK        bool                 `json:"ok"`
+	Code      string               `json:"code,omitempty"`
+	Error     string               `json:"error,omitempty"`
+	Handshake *PluginHostHandshake `json:"handshake,omitempty"`
+	Lifecycle *PluginHostLifecycle `json:"lifecycle,omitempty"`
+	Takeover  *PluginHostTakeover  `json:"takeover,omitempty"`
 }
 
 type PluginHostInitRequest struct {
@@ -100,35 +111,31 @@ type PluginHostLifecycle struct {
 	UpdatedAt       int64    `json:"updated_at,omitempty"`
 }
 
-type PluginHostUpstreamConnectRequest struct {
-	Host             string            `json:"host,omitempty"`
-	Upstream         string            `json:"upstream,omitempty"`
-	InitialData      []byte            `json:"initial_data,omitempty"`
-	Metadata         map[string]string `json:"metadata,omitempty"`
-	ConnectionID     string            `json:"connection_id,omitempty"`
-	TraceID          string            `json:"trace_id,omitempty"`
-	SourceAddr       string            `json:"source_addr,omitempty"`
-	ServerHost       string            `json:"server_host,omitempty"`
-	RawServerHost    string            `json:"raw_server_host,omitempty"`
-	ProtocolVersion  int               `json:"protocol_version,omitempty"`
-	NextState        int               `json:"next_state,omitempty"`
-	RouteID          string            `json:"route_id,omitempty"`
-	RouteTags        []string          `json:"route_tags,omitempty"`
-	UpstreamRaw      string            `json:"upstream_raw,omitempty"`
-	UpstreamProtocol string            `json:"upstream_protocol,omitempty"`
-	UpstreamAddress  string            `json:"upstream_address,omitempty"`
-	Transport        string            `json:"transport,omitempty"`
-	ServiceName      string            `json:"service_name,omitempty"`
-	ListenerPort     int               `json:"listener_port,omitempty"`
-	DeadlineUnixMS   int64             `json:"deadline_unix_ms,omitempty"`
+type PluginHostTakeoverRequest struct {
+	SessionID           string             `json:"session_id"`
+	ConnectionID        string             `json:"connection_id,omitempty"`
+	TraceID             string             `json:"trace_id,omitempty"`
+	PeerAddr            string             `json:"peer_addr,omitempty"`
+	LocalAddr           string             `json:"local_addr,omitempty"`
+	EffectiveSourceAddr string             `json:"effective_source_addr,omitempty"`
+	Metadata            map[string]string  `json:"metadata,omitempty"`
+	Ingress             api.IngressContext `json:"ingress"`
+	DeadlineUnixMS      int64              `json:"deadline_unix_ms,omitempty"`
 }
 
-type PluginHostUpstream struct {
-	Connected bool `json:"connected"`
+type PluginHostTakeover struct {
+	SessionID           string            `json:"session_id,omitempty"`
+	Connected           bool              `json:"connected,omitempty"`
+	Action              TakeoverAction    `json:"action,omitempty"`
+	Endpoint            string            `json:"endpoint,omitempty"`
+	EffectiveSourceAddr string            `json:"effective_source_addr,omitempty"`
+	Metadata            map[string]string `json:"metadata,omitempty"`
+	Error               string            `json:"error,omitempty"`
 }
 
-type PluginHostStreamProxy struct {
-	Connected bool `json:"connected"`
+type PluginHostTakeoverSessionRequest struct {
+	SessionID string `json:"session_id"`
+	Error     string `json:"error,omitempty"`
 }
 
 func PluginHostProtocolFeature() PluginHostFeature {
@@ -194,8 +201,9 @@ func PluginHostLifecycleCommands() []string {
 		PluginHostCommandDestroy,
 		PluginHostCommandDrain,
 		PluginHostCommandStop,
-		PluginHostCommandUpstream,
-		PluginHostCommandStreamProxy,
+		PluginHostCommandTakeoverOpen,
+		PluginHostCommandTakeoverWait,
+		PluginHostCommandTakeoverComplete,
 	}
 }
 

@@ -216,11 +216,11 @@ err := gateway.RegisterBackgroundTask(api.BackgroundTask{
 - 手动任务必须可超时、可取消、可审计。
 - 任务失败不应破坏连接 hot path。
 
-## `HandleConn`
+## 连接所有权
 
-`HandleConn(conn net.Conn)` 适合 protocol-proxy 插件完成前置处理后，把连接交还给 gateway 主流程。使用时要明确连接所有权，避免同一连接被插件和 gateway 同时读写。
-
-大多数 upstream dialer 插件不需要 `HandleConn`；直接返回上游 `net.Conn` 即可。
+`Gateway.HandleConn` 已删除。`upstream.connect/v2` handler 通过阻塞的
+`Flow.Next` 或 `Flow.Core` 交还连接；不调用 continuation 表示插件完整处理。
+handler 返回后宿主关闭 root connection。
 
 ## 敏感信息约束
 
@@ -229,6 +229,7 @@ err := gateway.RegisterBackgroundTask(api.BackgroundTask{
 - secret、token、session response
 - 玩家 UUID、玩家名，除非有明确脱敏或聚合策略
 - packet payload
+- WebSocket Upgrade request headers
 - 外部系统原始响应体
 - 私有网络完整拓扑
 

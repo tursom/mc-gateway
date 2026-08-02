@@ -2,11 +2,7 @@
 
 package main
 
-import (
-	"net"
-
-	"github.com/tursom/mc-gateway/plugin/api"
-)
+import "github.com/tursom/mc-gateway/plugin/api"
 
 type PluginImpl struct {
 	api.AbstractPlugin
@@ -36,18 +32,18 @@ func (p *PluginImpl) ReloadConfig(config any) error {
 func (p *PluginImpl) Init(gateway api.Gateway) error {
 	return api.RegisterHookHandler(
 		gateway,
-		api.HookUpstreamConnect,
-		func(req api.UpstreamConnectRequest) bool {
-			return p.config.MatchHost == "" || req.Host == p.config.MatchHost || req.Upstream == p.config.MatchHost
+		api.HookRouteResolve,
+		func(req api.RouteResolveRequest) bool {
+			return p.config.MatchHost == "" || req.Host == p.config.MatchHost
 		},
-		func(req api.UpstreamConnectRequest) (net.Conn, error) {
+		func(req api.RouteResolveRequest) (api.RouteDecision, error) {
 			if p.config.Upstream == "" {
-				return nil, api.ErrPass
+				return api.RouteDecision{Action: api.RouteDecisionPass}, nil
 			}
-			if p.config.MatchHost != "" && req.Host != p.config.MatchHost && req.Upstream != p.config.MatchHost {
-				return nil, api.ErrPass
+			if p.config.MatchHost != "" && req.Host != p.config.MatchHost {
+				return api.RouteDecision{Action: api.RouteDecisionPass}, nil
 			}
-			return net.Dial("tcp", p.config.Upstream)
+			return api.RouteDecision{Action: api.RouteDecisionOverride, Upstream: p.config.Upstream}, nil
 		},
 	)
 }

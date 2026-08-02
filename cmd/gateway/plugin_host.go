@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -22,8 +23,9 @@ import (
 )
 
 type pluginHostControlServer struct {
-	protocol  string
-	startedAt int64
+	protocol   string
+	startedAt  int64
+	socketPath string
 
 	mu         sync.Mutex
 	pluginID   string
@@ -32,6 +34,39 @@ type pluginHostControlServer struct {
 	gateway    *pluginmanager.Gateway
 	state      string
 	updatedAt  int64
+	takeovers  map[string]*pluginHostTakeoverSession
+}
+
+type pluginHostTakeoverSession struct {
+	action   chan pluginmanager.PluginHostTakeover
+	complete chan error
+	done     chan error
+	cancel   context.CancelFunc
+}
+
+type cancelOnCloseConn struct {
+	net.Conn
+	once   sync.Once
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnCloseConn) Close() error {
+	c.once.Do(c.cancel)
+	return c.Conn.Close()
+}
+
+func (c *cancelOnCloseConn) CloseWrite() error {
+	if closer, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return closer.CloseWrite()
+	}
+	return c.Conn.Close()
+}
+
+func (c *cancelOnCloseConn) CloseRead() error {
+	if closer, ok := c.Conn.(interface{ CloseRead() error }); ok {
+		return closer.CloseRead()
+	}
+	return nil
 }
 
 func runPluginHostCLI(args []string) (bool, int) {
@@ -115,7 +150,10 @@ func servePluginHostControl(socketPath, protocol string) error {
 	defer listener.Close()
 	defer os.Remove(socketPath)
 
-	server := &pluginHostControlServer{protocol: protocol, startedAt: time.Now().Unix(), state: pluginmanager.RuntimeNotLoaded}
+	server := &pluginHostControlServer{
+		protocol: protocol, startedAt: time.Now().Unix(), socketPath: socketPath,
+		state: pluginmanager.RuntimeNotLoaded, takeovers: make(map[string]*pluginHostTakeoverSession),
+	}
 	shutdown := make(chan struct{})
 	var closeOnce sync.Once
 	stop := func() {
@@ -159,18 +197,19 @@ func preparePluginHostSocketPath(socketPath string) error {
 
 func handlePluginHostControlConn(conn net.Conn, server *pluginHostControlServer, stop func()) {
 	defer conn.Close()
-	decoder := json.NewDecoder(conn)
+	reader := bufio.NewReader(conn)
 	encoder := json.NewEncoder(conn)
 	for {
-		var req pluginmanager.PluginHostControlRequest
-		if err := decoder.Decode(&req); err != nil {
+		line, err := reader.ReadBytes('\n')
+		if err != nil && len(line) == 0 {
 			if !errors.Is(err, io.EOF) {
-				_ = encoder.Encode(pluginmanager.PluginHostControlResponse{
-					OK:    false,
-					Code:  "invalid_json",
-					Error: err.Error(),
-				})
+				_ = encoder.Encode(pluginmanager.PluginHostControlResponse{OK: false, Code: "invalid_json", Error: err.Error()})
 			}
+			return
+		}
+		var req pluginmanager.PluginHostControlRequest
+		if err := json.Unmarshal(line, &req); err != nil {
+			_ = encoder.Encode(pluginmanager.PluginHostControlResponse{OK: false, Code: "invalid_json", Error: err.Error()})
 			return
 		}
 		resp, shouldStop, stream := handlePluginHostControlRequest(server, req)
@@ -181,7 +220,7 @@ func handlePluginHostControlConn(conn net.Conn, server *pluginHostControlServer,
 			return
 		}
 		if stream != nil {
-			relayPluginHostStream(conn, stream)
+			relayPluginHostStream(&bufferedPluginHostConn{Conn: conn, reader: reader}, stream)
 			return
 		}
 		if shouldStop {
@@ -189,6 +228,39 @@ func handlePluginHostControlConn(conn net.Conn, server *pluginHostControlServer,
 			return
 		}
 	}
+}
+
+type bufferedPluginHostConn struct {
+	net.Conn
+	reader io.Reader
+}
+
+func (c *bufferedPluginHostConn) Read(p []byte) (int, error) {
+	if c.reader != nil {
+		n, err := c.reader.Read(p)
+		if n > 0 {
+			return n, nil
+		}
+		if !errors.Is(err, io.EOF) {
+			return n, err
+		}
+		c.reader = nil
+	}
+	return c.Conn.Read(p)
+}
+
+func (c *bufferedPluginHostConn) CloseWrite() error {
+	if closer, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return closer.CloseWrite()
+	}
+	return c.Conn.Close()
+}
+
+func (c *bufferedPluginHostConn) CloseRead() error {
+	if closer, ok := c.Conn.(interface{ CloseRead() error }); ok {
+		return closer.CloseRead()
+	}
+	return nil
 }
 
 func handlePluginHostControlRequest(server *pluginHostControlServer, req pluginmanager.PluginHostControlRequest) (pluginmanager.PluginHostControlResponse, bool, net.Conn) {
@@ -291,78 +363,67 @@ func handlePluginHostControlRequest(server *pluginHostControlServer, req pluginm
 		resp.OK = true
 		resp.Lifecycle = &lifecycle
 		return resp, false, nil
-	case pluginmanager.PluginHostCommandUpstream:
+	case pluginmanager.PluginHostCommandTakeoverOpen:
 		if err := validatePluginHostRequestProtocol(req.Protocol); err != nil {
 			resp.Code = "invalid_protocol"
 			resp.Error = err.Error()
 			return resp, false, nil
 		}
-		var payload pluginmanager.PluginHostUpstreamConnectRequest
+		var payload pluginmanager.PluginHostTakeoverRequest
 		if err := json.Unmarshal(req.Payload, &payload); err != nil {
 			resp.Code = "invalid_request"
 			resp.Error = err.Error()
 			return resp, false, nil
 		}
-		stream, err := server.connectUpstream(payload)
-		if errors.Is(err, api.ErrPass) {
-			resp.Code = "pass"
-			resp.Error = err.Error()
-			return resp, false, nil
-		}
-		if errors.Is(err, api.ErrBlocked) {
-			resp.Code = "blocked"
-			resp.Error = err.Error()
-			return resp, false, nil
-		}
+		stream, err := server.openTakeover(payload)
 		if err != nil {
-			resp.Code = "upstream_failed"
+			resp.Code = "takeover_open_failed"
 			resp.Error = err.Error()
-			return resp, false, nil
-		}
-		if stream == nil {
-			resp.Code = "pass"
-			resp.Error = api.ErrPass.Error()
 			return resp, false, nil
 		}
 		resp.OK = true
-		resp.Upstream = &pluginmanager.PluginHostUpstream{Connected: true}
+		resp.Takeover = &pluginmanager.PluginHostTakeover{SessionID: payload.SessionID, Connected: true}
 		return resp, false, stream
-	case pluginmanager.PluginHostCommandStreamProxy:
+	case pluginmanager.PluginHostCommandTakeoverWait:
 		if err := validatePluginHostRequestProtocol(req.Protocol); err != nil {
 			resp.Code = "invalid_protocol"
 			resp.Error = err.Error()
 			return resp, false, nil
 		}
-		var payload pluginmanager.PluginHostUpstreamConnectRequest
+		var payload pluginmanager.PluginHostTakeoverSessionRequest
 		if err := json.Unmarshal(req.Payload, &payload); err != nil {
 			resp.Code = "invalid_request"
 			resp.Error = err.Error()
 			return resp, false, nil
 		}
-		stream, err := server.streamProxy(payload)
-		if errors.Is(err, api.ErrPass) {
-			resp.Code = "pass"
-			resp.Error = err.Error()
-			return resp, false, nil
-		}
-		if errors.Is(err, api.ErrBlocked) {
-			resp.Code = "blocked"
-			resp.Error = err.Error()
-			return resp, false, nil
-		}
+		action, err := server.waitTakeover(payload.SessionID)
 		if err != nil {
-			resp.Code = "stream_proxy_failed"
+			resp.Code = "takeover_wait_failed"
 			resp.Error = err.Error()
-			return resp, false, nil
-		}
-		if stream == nil {
-			resp.Code = "pass"
-			resp.Error = api.ErrPass.Error()
 			return resp, false, nil
 		}
 		resp.OK = true
-		resp.Stream = &pluginmanager.PluginHostStreamProxy{Connected: true}
-		return resp, false, stream
+		resp.Takeover = &action
+		return resp, false, nil
+	case pluginmanager.PluginHostCommandTakeoverComplete:
+		if err := validatePluginHostRequestProtocol(req.Protocol); err != nil {
+			resp.Code = "invalid_protocol"
+			resp.Error = err.Error()
+			return resp, false, nil
+		}
+		var payload pluginmanager.PluginHostTakeoverSessionRequest
+		if err := json.Unmarshal(req.Payload, &payload); err != nil {
+			resp.Code = "invalid_request"
+			resp.Error = err.Error()
+			return resp, false, nil
+		}
+		finalErr := server.completeTakeover(payload)
+		resp.OK = true
+		resp.Takeover = &pluginmanager.PluginHostTakeover{SessionID: payload.SessionID}
+		if finalErr != nil {
+			resp.Takeover.Error = finalErr.Error()
+		}
+		return resp, false, nil
 	default:
 		resp.Code = "invalid_command"
 		if command == "" {
@@ -396,7 +457,7 @@ func (s *pluginHostControlServer) initPlugin(req pluginmanager.PluginHostInitReq
 	if err != nil {
 		return pluginmanager.PluginHostLifecycle{}, err
 	}
-	gateway := pluginmanager.NewGateway(pluginID, nil, nil, nil)
+	gateway := pluginmanager.NewGateway(pluginID, nil, nil)
 	if err := instance.Init(gateway); err != nil {
 		return pluginmanager.PluginHostLifecycle{}, err
 	}
@@ -501,75 +562,280 @@ func (s *pluginHostControlServer) destroyPlugin() (pluginmanager.PluginHostLifec
 	return s.lifecycleLocked(now), nil
 }
 
-func (s *pluginHostControlServer) connectUpstream(payload pluginmanager.PluginHostUpstreamConnectRequest) (net.Conn, error) {
+func (s *pluginHostControlServer) openTakeover(payload pluginmanager.PluginHostTakeoverRequest) (net.Conn, error) {
 	s.mu.Lock()
 	gateway := s.gateway
 	state := s.state
-	s.mu.Unlock()
 	if gateway == nil || state == pluginmanager.RuntimeDisabled || state == pluginmanager.RuntimeNotLoaded {
+		s.mu.Unlock()
 		return nil, errors.New("plugin-host has no initialized plugin")
 	}
-	req := pluginHostUpstreamRequest(payload)
-	if hook, ok := gateway.UpstreamConnectHandler(); ok {
-		if accept := hook.Acceptor(); accept != nil && !accept(req) {
-			return nil, api.ErrPass
-		}
-		return hook.Handler()(req)
+	handler, ok := gateway.UpstreamConnectHandlerV2()
+	if !ok {
+		s.mu.Unlock()
+		return nil, errors.New("plugin-host has no upstream.connect/v2 handler")
 	}
-	if hook, ok := gateway.LegacyUpstreamHandler(); ok {
-		if accept := hook.Acceptor(); accept != nil && !accept(nil, payload.Upstream) {
-			return nil, api.ErrPass
-		}
-		return hook.Handler()(nil, payload.Upstream)
+	if payload.SessionID == "" {
+		s.mu.Unlock()
+		return nil, errors.New("takeover session id is required")
 	}
-	return nil, api.ErrPass
-}
-
-func (s *pluginHostControlServer) streamProxy(payload pluginmanager.PluginHostUpstreamConnectRequest) (net.Conn, error) {
-	s.mu.Lock()
-	gateway := s.gateway
-	state := s.state
-	s.mu.Unlock()
-	if gateway == nil || state == pluginmanager.RuntimeDisabled || state == pluginmanager.RuntimeNotLoaded {
-		return nil, errors.New("plugin-host has no initialized plugin")
+	if _, exists := s.takeovers[payload.SessionID]; exists {
+		s.mu.Unlock()
+		return nil, errors.New("takeover session already exists")
 	}
-	req := pluginHostUpstreamRequest(payload)
-	if hook, ok := gateway.UpstreamConnectHandler(); ok {
-		if accept := hook.Acceptor(); accept != nil && !accept(req) {
-			return nil, api.ErrPass
-		}
-		return hook.Handler()(req)
-	}
-	return nil, api.ErrPass
-}
-
-func pluginHostUpstreamRequest(payload pluginmanager.PluginHostUpstreamConnectRequest) api.UpstreamConnectRequest {
-	ctx := context.Background()
+	takeoverCtx, cancel := context.WithCancel(context.Background())
 	if payload.DeadlineUnixMS > 0 {
-		ctx, _ = context.WithDeadline(ctx, time.UnixMilli(payload.DeadlineUnixMS))
+		var deadlineCancel context.CancelFunc
+		takeoverCtx, deadlineCancel = context.WithDeadline(takeoverCtx, time.UnixMilli(payload.DeadlineUnixMS))
+		baseCancel := cancel
+		cancel = func() {
+			deadlineCancel()
+			baseCancel()
+		}
 	}
-	return api.UpstreamConnectRequest{
-		Context:          ctx,
-		Host:             payload.Host,
-		Upstream:         payload.Upstream,
-		InitialData:      append([]byte(nil), payload.InitialData...),
-		Metadata:         payload.Metadata,
-		ConnectionID:     payload.ConnectionID,
-		TraceID:          payload.TraceID,
-		SourceAddr:       payload.SourceAddr,
-		ServerHost:       payload.ServerHost,
-		RawServerHost:    payload.RawServerHost,
-		ProtocolVersion:  payload.ProtocolVersion,
-		NextState:        payload.NextState,
-		RouteID:          payload.RouteID,
-		RouteTags:        append([]string(nil), payload.RouteTags...),
-		UpstreamRaw:      payload.UpstreamRaw,
-		UpstreamProtocol: payload.UpstreamProtocol,
-		UpstreamAddress:  payload.UpstreamAddress,
-		Transport:        payload.Transport,
-		ServiceName:      payload.ServiceName,
-		ListenerPort:     payload.ListenerPort,
+	session := &pluginHostTakeoverSession{
+		action: make(chan pluginmanager.PluginHostTakeover, 1), complete: make(chan error, 1), done: make(chan error, 1),
+		cancel: cancel,
 	}
+	pluginStream, relayStream, err := newPluginHostStreamPair()
+	if err != nil {
+		cancel()
+		s.mu.Unlock()
+		return nil, err
+	}
+	s.takeovers[payload.SessionID] = session
+	s.mu.Unlock()
+
+	flow := &pluginHostTakeoverFlow{server: s, sessionID: payload.SessionID, session: session}
+	req := pluginHostTakeoverRequest(takeoverCtx, payload, pluginStream, flow)
+	go func() {
+		var handlerErr error
+		func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					handlerErr = fmt.Errorf("plugin-host takeover panic: %v", rec)
+				}
+			}()
+			handlerErr = handler(req)
+		}()
+		used, running := flow.handlerReturned()
+		if running {
+			cancel()
+			_ = pluginStream.Close()
+			if handlerErr == nil {
+				handlerErr = errors.New("takeover continuation outlived its handler invocation")
+			}
+		}
+		if !used {
+			session.action <- pluginmanager.PluginHostTakeover{
+				SessionID: payload.SessionID, Action: pluginmanager.TakeoverActionHandled, Error: errorString(handlerErr),
+			}
+		}
+		_ = pluginStream.Close()
+		session.done <- handlerErr
+	}()
+	return &cancelOnCloseConn{Conn: relayStream, cancel: cancel}, nil
+}
+
+func newPluginHostStreamPair() (net.Conn, net.Conn, error) {
+	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		return nil, nil, err
+	}
+	defer listener.Close()
+	accept := make(chan struct {
+		conn *net.TCPConn
+		err  error
+	}, 1)
+	go func() {
+		conn, acceptErr := listener.AcceptTCP()
+		accept <- struct {
+			conn *net.TCPConn
+			err  error
+		}{conn: conn, err: acceptErr}
+	}()
+	relay, err := net.DialTCP("tcp", nil, listener.Addr().(*net.TCPAddr))
+	if err != nil {
+		return nil, nil, err
+	}
+	accepted := <-accept
+	if accepted.err != nil {
+		_ = relay.Close()
+		return nil, nil, accepted.err
+	}
+	return accepted.conn, relay, nil
+}
+
+func pluginHostTakeoverRequest(ctx context.Context, payload pluginmanager.PluginHostTakeoverRequest, stream net.Conn, flow api.UpstreamConnectFlow) api.UpstreamConnectRequestV2 {
+	return api.UpstreamConnectRequestV2{
+		Context: ctx, ConnectionID: payload.ConnectionID, TraceID: payload.TraceID,
+		PeerAddr: payload.PeerAddr, LocalAddr: payload.LocalAddr,
+		Connection: api.ConnectionState{
+			Stream: stream, EffectiveSourceAddr: payload.EffectiveSourceAddr,
+			Metadata: clonePluginHostMetadata(payload.Metadata),
+		},
+		Ingress: payload.Ingress.Clone(), Flow: flow,
+	}
+}
+
+type pluginHostTakeoverFlow struct {
+	server    *pluginHostControlServer
+	sessionID string
+	session   *pluginHostTakeoverSession
+	mu        sync.Mutex
+	state     pluginHostTakeoverFlowState
+}
+
+type pluginHostTakeoverFlowState uint8
+
+const (
+	pluginHostTakeoverFlowAvailable pluginHostTakeoverFlowState = iota
+	pluginHostTakeoverFlowRunning
+	pluginHostTakeoverFlowRunningAfterHandlerReturn
+	pluginHostTakeoverFlowUsed
+	pluginHostTakeoverFlowExpired
+)
+
+func (f *pluginHostTakeoverFlow) Next(state api.ConnectionState) error {
+	return f.continueWith(pluginmanager.TakeoverActionNext, state)
+}
+func (f *pluginHostTakeoverFlow) Core(state api.ConnectionState) error {
+	return f.continueWith(pluginmanager.TakeoverActionCore, state)
+}
+
+func (f *pluginHostTakeoverFlow) continueWith(action pluginmanager.TakeoverAction, state api.ConnectionState) error {
+	f.mu.Lock()
+	switch f.state {
+	case pluginHostTakeoverFlowRunning, pluginHostTakeoverFlowRunningAfterHandlerReturn, pluginHostTakeoverFlowUsed:
+		f.mu.Unlock()
+		return api.ErrContinuationUsed
+	case pluginHostTakeoverFlowExpired:
+		f.mu.Unlock()
+		return errors.New("takeover continuation is no longer available")
+	case pluginHostTakeoverFlowAvailable:
+		f.state = pluginHostTakeoverFlowRunning
+	default:
+		f.mu.Unlock()
+		return errors.New("takeover continuation has invalid state")
+	}
+	f.mu.Unlock()
+	defer func() {
+		f.mu.Lock()
+		f.state = pluginHostTakeoverFlowUsed
+		f.mu.Unlock()
+	}()
+	if state.Stream == nil {
+		err := errors.New("takeover replacement stream is nil")
+		f.session.action <- pluginmanager.PluginHostTakeover{SessionID: f.sessionID, Action: pluginmanager.TakeoverActionHandled, Error: err.Error()}
+		return err
+	}
+	endpoint := filepath.Join(filepath.Dir(f.server.socketPath), "takeover-"+f.sessionID+".sock")
+	_ = os.Remove(endpoint)
+	listener, err := net.Listen("unix", endpoint)
+	if err != nil {
+		f.session.action <- pluginmanager.PluginHostTakeover{SessionID: f.sessionID, Action: pluginmanager.TakeoverActionHandled, Error: err.Error()}
+		return err
+	}
+	defer listener.Close()
+	defer os.Remove(endpoint)
+	relayDone := make(chan struct{})
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			relayPluginHostReplacement(conn, state.Stream)
+		}
+		close(relayDone)
+	}()
+	f.session.action <- pluginmanager.PluginHostTakeover{
+		SessionID: f.sessionID, Action: action, Endpoint: endpoint,
+		EffectiveSourceAddr: state.EffectiveSourceAddr, Metadata: clonePluginHostMetadata(state.Metadata),
+	}
+	err = <-f.session.complete
+	_ = listener.Close()
+	<-relayDone
+	return err
+}
+
+func (f *pluginHostTakeoverFlow) handlerReturned() (used, running bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	switch f.state {
+	case pluginHostTakeoverFlowAvailable:
+		f.state = pluginHostTakeoverFlowExpired
+		return false, false
+	case pluginHostTakeoverFlowRunning:
+		f.state = pluginHostTakeoverFlowRunningAfterHandlerReturn
+		return true, true
+	case pluginHostTakeoverFlowRunningAfterHandlerReturn:
+		return true, true
+	case pluginHostTakeoverFlowUsed:
+		return true, false
+	case pluginHostTakeoverFlowExpired:
+		return false, false
+	default:
+		return false, false
+	}
+}
+
+func (s *pluginHostControlServer) waitTakeover(sessionID string) (pluginmanager.PluginHostTakeover, error) {
+	s.mu.Lock()
+	session := s.takeovers[sessionID]
+	s.mu.Unlock()
+	if session == nil {
+		return pluginmanager.PluginHostTakeover{}, errors.New("takeover session not found")
+	}
+	action := <-session.action
+	if action.Action == pluginmanager.TakeoverActionHandled {
+		<-session.done
+		s.mu.Lock()
+		delete(s.takeovers, sessionID)
+		s.mu.Unlock()
+	}
+	return action, nil
+}
+
+func (s *pluginHostControlServer) completeTakeover(payload pluginmanager.PluginHostTakeoverSessionRequest) error {
+	s.mu.Lock()
+	session := s.takeovers[payload.SessionID]
+	s.mu.Unlock()
+	if session == nil {
+		return errors.New("takeover session not found")
+	}
+	var downstreamErr error
+	if payload.Error != "" {
+		downstreamErr = errors.New(payload.Error)
+	}
+	session.complete <- downstreamErr
+	finalErr := <-session.done
+	s.mu.Lock()
+	delete(s.takeovers, payload.SessionID)
+	s.mu.Unlock()
+	session.cancel()
+	return finalErr
+}
+
+func relayPluginHostReplacement(a, b net.Conn) {
+	defer a.Close()
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go copyAndClosePluginHostStream(&wg, a, b)
+	go copyAndClosePluginHostStream(&wg, b, a)
+	wg.Wait()
+}
+
+func clonePluginHostMetadata(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
+}
+
+func errorString(err error) string {
+	if err != nil {
+		return err.Error()
+	}
+	return ""
 }
 
 func relayPluginHostStream(controlConn, pluginConn net.Conn) {

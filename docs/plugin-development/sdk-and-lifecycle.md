@@ -70,7 +70,7 @@ func (p *PluginImpl) ReloadConfig(config any) error {
 
 func (p *PluginImpl) Init(gateway api.Gateway) error {
 	p.gateway = gateway
-	return api.RegisterHookHandler(gateway, api.HookUpstreamConnect, p.accept, p.connect)
+	return api.RegisterUpstreamConnectHandlerV2(gateway, p.takeover)
 }
 ```
 
@@ -105,7 +105,7 @@ return api.RegisterHookHandler(
 | `api.ErrPass` | 当前插件主动跳过，让后续插件或默认流程继续 |
 | `api.ErrBlocked` | 插件明确阻断操作 |
 | 其它 error | 视扩展点和 fail policy 处理，并记录错误计数 |
-| panic | gateway 会 recover，记录 panic，并按扩展点失败策略处理 |
+| panic | gateway 会 recover 并记录；`upstream.connect/v2` 直接关闭连接，不 fallback |
 
 ## 超时和 Context
 
@@ -114,7 +114,7 @@ return api.RegisterHookHandler(
 - 使用请求中的 `Context`。
 - 外部 IO 传递 context 或设置 deadline。
 - 不在 hot path 中做无限等待。
-- 对 protocol-proxy 和 background task 明确设置连接 deadline、任务 timeout 或取消逻辑。
+- 对 connection takeover 和 background task 明确处理 deadline、取消与 drain。
 
 示例：
 
@@ -160,7 +160,8 @@ func (p *PluginImpl) Init(gateway api.Gateway) error {
 - 对需要重建连接池、缓存或外部客户端的配置，先准备新资源，再切换引用。
 - secret 轮换时支持 dual-read 或明确声明需要 reload/restart。
 
-Go plugin 代码不能真正卸载。禁用后新连接不会进入插件，但已在处理中的 protocol-proxy 连接可能继续 drain。
+Go plugin 代码不能真正卸载。禁用后新连接不会进入插件；已有 connection
+session 会 drain，管理员也可以强制关闭 root connection 来解开整条嵌套调用链。
 
 ## Preflight 和 Self-test
 

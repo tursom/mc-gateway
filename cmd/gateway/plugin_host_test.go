@@ -11,7 +11,59 @@ import (
 	"time"
 
 	"github.com/tursom/mc-gateway/internal/pluginmanager"
+	"github.com/tursom/mc-gateway/plugin/api"
 )
+
+func TestPluginHostTakeoverStreamCloseCancelsHandlerContext(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	gateway := pluginmanager.NewGateway("cancel-plugin", nil, nil)
+	if err := api.RegisterUpstreamConnectHandlerV2(gateway, func(req api.UpstreamConnectRequestV2) error {
+		close(started)
+		<-req.Context.Done()
+		close(canceled)
+		return req.Context.Err()
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server := &pluginHostControlServer{
+		gateway: gateway, state: pluginmanager.RuntimeEnabled,
+		socketPath: filepath.Join(t.TempDir(), "plugin-host.sock"),
+		takeovers:  make(map[string]*pluginHostTakeoverSession),
+	}
+	stream, err := server.openTakeover(pluginmanager.PluginHostTakeoverRequest{SessionID: "cancel-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("takeover handler did not start")
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("stream close did not cancel takeover handler context")
+	}
+}
+
+func TestPluginHostTakeoverFlowExpiresWhenHandlerReturns(t *testing.T) {
+	flow := &pluginHostTakeoverFlow{}
+	used, running := flow.handlerReturned()
+	if used || running {
+		t.Fatalf("handlerReturned() = (%v, %v), want false, false", used, running)
+	}
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	err := flow.Next(api.ConnectionState{Stream: left})
+	if err == nil || err.Error() != "takeover continuation is no longer available" {
+		t.Fatalf("retained Next() error = %v, want unavailable continuation", err)
+	}
+}
 
 func TestPluginHostHandshakeCommand(t *testing.T) {
 	output := captureStdout(t, func() {
@@ -241,18 +293,6 @@ func TestPluginHostSupervisorStartsAndStopsHost(t *testing.T) {
 	stopped := process.Summary()
 	if stopped.State != pluginmanager.RuntimeDisabled || stopped.CrashCount != 0 || stopped.ExitedAt == 0 {
 		t.Fatalf("stopped summary = %+v, want clean disabled host", stopped)
-	}
-}
-
-func TestPluginHostUpstreamRequestRestoresDeadline(t *testing.T) {
-	deadline := time.Now().Add(500 * time.Millisecond).Truncate(time.Millisecond)
-	req := pluginHostUpstreamRequest(pluginmanager.PluginHostUpstreamConnectRequest{
-		Host:           "play.example",
-		DeadlineUnixMS: deadline.UnixMilli(),
-	})
-	got, ok := req.Context.Deadline()
-	if req.Host != "play.example" || !ok || !got.Equal(deadline) {
-		t.Fatalf("pluginHostUpstreamRequest() deadline = %v ok=%v req=%+v, want %v", got, ok, req, deadline)
 	}
 }
 

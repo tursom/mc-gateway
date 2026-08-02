@@ -1,13 +1,14 @@
 # MC Auth Proxy Plugin
 
-This example registers `upstream.connect/v1` in protocol-proxy mode. It receives
-the complete Minecraft byte stream from the gateway, reads the handshake and
-login start packets, then returns a login disconnect response unless
-`fixture_accept` is enabled.
+This example registers `upstream.connect/v2`. It takes over the untouched client
+stream, reads the handshake and login start packets, then returns a login
+disconnect response unless `fixture_accept` is enabled. When the configured host
+does not match, it calls `Next` with a replay wrapper so downstream handlers and
+core still receive every byte.
 
 The example is intentionally small: gateway core does not parse authentication
 results, identity mapping, forwarding, or play packets. Those responsibilities
-belong inside a protocol-proxy plugin.
+belong inside a connection takeover plugin.
 
 The fixture emits `auth.success` / `auth.failure` events and an `auth.attempts`
 counter with low-cardinality `result` and `mode` labels.

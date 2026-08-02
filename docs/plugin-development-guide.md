@@ -28,7 +28,7 @@
 | Manifest source 单一维护 | `manifest` schema、manifest parser | [Manifest 和包格式](plugin-development/manifest-and-package.md) |
 | SDK 生命周期 | `plugin/api.Plugin` | [SDK 生命周期和入口](plugin-development/sdk-and-lifecycle.md) |
 | 配置加载和 dry-run | `NewConfigObj`、`ReloadConfig`、`config validate` | [SDK 生命周期和入口](plugin-development/sdk-and-lifecycle.md)、[发布治理和供应链](plugin-development/release-governance.md) |
-| `upstream.connect/v1` dialer/protocol-proxy | `extension_points`、`HookUpstreamConnect` | [扩展点开发](plugin-development/extension-points.md) |
+| `upstream.connect/v2` connection takeover | `extension_points`、`HookUpstreamConnectV2` | [扩展点开发](plugin-development/extension-points.md) |
 | route/status/rule/middleware/provider/event 扩展点 | `ExtensionPointFeatures()`、`plugin/api/hook.go` | [扩展点开发](plugin-development/extension-points.md) |
 | `auth.provider/v1` 和 `admin.auth.provider/v1` 边界 | `plugin features` maturity | [扩展点开发](plugin-development/extension-points.md) |
 | 事件、指标、日志、数据、文件、外部依赖、后台任务 | `api.Gateway`、manifest specs | [宿主能力](plugin-development/host-capabilities.md) |

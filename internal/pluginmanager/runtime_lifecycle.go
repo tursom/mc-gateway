@@ -155,7 +155,7 @@ func (factory RuntimeAdapterFactory) AdapterFor(serviceMode, runtimeType string)
 			status.DataPlane = true
 			status.Lifecycle = true
 			status.ControlChannel = "wazero-host-abi"
-			status.UnsupportedReason = "wasm runtime only supports low-risk extension points; protocol-proxy, network, file, and high-risk extension points are not supported"
+			status.UnsupportedReason = "wasm runtime only supports low-risk extension points; upstream.connect/v2, network, file, and other high-risk extension points are not supported"
 			return WASMAdapter{Mode: PluginServiceModeInProcess}, completeStatus()
 		default:
 			status.Adapter = "unknown"
@@ -273,7 +273,7 @@ func (a UnsupportedRuntimeAdapter) err() error {
 }
 
 func (a GoPluginAdapter) ValidateArtifact(_ context.Context, artifact ArtifactRecord) error {
-	if artifact.RuntimeType == RuntimeBuiltin || artifact.PluginID == "official.rule-policy" {
+	if artifact.RuntimeType == RuntimeBuiltin {
 		return nil
 	}
 	if artifact.RuntimeType != "" && artifact.RuntimeType != RuntimeGoPlugin {

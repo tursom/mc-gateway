@@ -1,3 +1,5 @@
+> **Archived:** This document records the superseded pre-v2 plugin design. Current behavior is defined by `docs/plugin-development/extension-points.md`.
+
 # 插件系统设计
 
 ## 背景
@@ -24,8 +26,8 @@
 - 尽量支持热加载：兼容且未加载过的插件可以不重启加载并启用。
 - 明确热卸载限制：Go plugin 不能真正从进程中卸载，只能逻辑禁用。
 - 通过 manifest source 记录插件 ID、版本、目标平台、构建 Go 版本、SDK/API 版本、声明的 extension point 和配置 schema；源码目录只维护一份 `manifest.yaml/yml/toml/jsonc/json`，`.mcgp` 包内统一物化为 canonical `manifest.json`。
-- 插件能力采用 Extension Point 模型，Hook 是其中一种；第一版先落 `upstream.connect/v1`。
-- `upstream.connect/v1` 必须支持插件返回自管 `net.Conn`，用于实现完整 stream endpoint/protocol proxy。
+- 插件能力采用 Extension Point 模型，Hook 是其中一种；第一版先落 `legacy upstream-connect contract`。
+- `legacy upstream-connect contract` 必须支持插件返回自管 `net.Conn`，用于实现完整 stream endpoint/protocol proxy。
 - MC 正版/三方登录、身份映射、forwarding 和登录后的协议处理属于插件业务逻辑，不由 gateway core 拼装。
 - 提供示例插件和完整开发、构建、上传、启用文档。
 
@@ -47,8 +49,8 @@
 | 构建环境 | 开发可 local-process，生产默认 container builder；prod 会阻断 local-process source-built artifact，并记录 builder/Go/module/provenance 供 governance 和 supply-chain assessment 使用；external CI 产物已有 provenance assessment gate | 第一版 | 源码包构建、供应链 |
 | 沙箱 | 第一版不提供沙箱；sandbox-process/WASM 作为未来 runtime adapter | 未来 | Sandbox Runtime、WASM 模型 |
 | Extension Point 模型 | Hook 只是类型之一，统一采用 hook/middleware/provider/event/rule 等 extension point | 第一版模型，部分预留 | Extension Point 设计 |
-| `upstream.connect/v1` | 第一版主扩展点，支持 dialer mode 和 protocol-proxy mode，返回 `net.Conn` | 第一版 | Hook、net.Conn 接管契约 |
-| MC 正版/三方登录 | 由 protocol-proxy 插件完整实现，core 不拼装登录流程、不消费认证结果 | 第一版能力 | Minecraft 登录插件职责划分 |
+| `legacy upstream-connect contract` | 第一版主扩展点，支持 route.resolve/v1 provider 和 connection takeover mode，返回 `net.Conn` | 第一版 | Hook、net.Conn 接管契约 |
+| MC 正版/三方登录 | 由 connection takeover 插件完整实现，core 不拼装登录流程、不消费认证结果 | 第一版能力 | Minecraft 登录插件职责划分 |
 | 登录后逻辑 | configuration/play 阶段代理、身份转发、策略和失败响应都由插件自行处理 | 第一版能力 | Minecraft Auth Proxy 插件设计模板 |
 | 功能点覆盖 | 从连接治理、MC 运营、安全风控、外部集成、Admin 扩展和实验能力反推 extension point | 设计覆盖 | 功能点覆盖清单 |
 | 游戏侧 `auth.provider/v1` | 仅作为未来插件间复用认证来源，不是 core 登录流水线 | 预留 | Provider |
@@ -58,7 +60,7 @@
 | 观测事件 | 插件可上报脱敏业务事件和自定义指标，core 只展示/转发，不改变 MC 登录结果 | 第一版/预留 | 插件业务事件和自定义指标 |
 | Mock/Mixin | mock 只用于测试，mixin/source weaving 不作为普通插件；正式能力应抽象为 provider/middleware/rule | 设计约束 | Mock 和 Mixin 的定位 |
 | 非侵入注入 | 借鉴构建期插桩思路，但只作为官方 build-time instrumentation 未来能力 | 未来 | Build-Time Instrumentation |
-| 示例插件 | 至少提供 upstream rewrite 和 mc-auth-proxy，覆盖 dialer/protocol-proxy 能力 | 第一版文档/示例 | 示例插件 |
+| 示例插件 | 至少提供 upstream rewrite 和 mc-auth-proxy，覆盖 dialer/connection takeover 能力 | 第一版文档/示例 | 示例插件 |
 
 ## 需求覆盖审计
 
@@ -77,7 +79,7 @@
 | 沙箱功能要有未来路线 | 第一版不提供沙箱；预留 sandbox-process、WASM、capability enforcement、stream relay 和 egress 策略 | Sandbox Runtime、Runtime Adapter、第一版默认策略 |
 | Alibaba 非侵入 Go 注入的参考价值 | 作为官方/组织 build-time instrumentation 未来能力，不作为普通运行时插件或热加载机制 | Build-Time Instrumentation |
 | 功能点要尽可能前置考虑 | 已按连接治理、MC 运营、安全风控、动态路由、外部集成、Admin 扩展、仓库、自定义入口、sandbox/WASM 和构建期增强做覆盖表 | 功能点覆盖清单、插件能力矩阵 |
-| MC 正版/三方登录插件能力 | 可以实现，但由 protocol-proxy 插件完整负责登录、身份映射、forwarding 和后续协议处理；core 不消费认证结果 | Minecraft 登录插件职责划分、Minecraft Auth Proxy 插件设计模板 |
+| MC 正版/三方登录插件能力 | 可以实现，但由 connection takeover 插件完整负责登录、身份映射、forwarding 和后续协议处理；core 不消费认证结果 | Minecraft 登录插件职责划分、Minecraft Auth Proxy 插件设计模板 |
 | 游戏侧 `auth.provider/v1` 边界 | 只作为未来插件间复用认证来源，不是 gateway core 登录流水线，也不是第一版登录插件依赖 | Provider、已收敛决策 |
 | Admin 外部登录边界 | `admin.auth.provider/v1` 只影响管理页 OIDC/LDAP/SSO，本地 admin break-glass 保留，不影响 MC 连接路径 | Admin Auth Provider、Admin API |
 | 示例插件和开发文档 | 规划 upstream rewrite、mc-auth-proxy、status 示例，配套 CLI、harness、conformance 和发布门禁 | 示例插件、开发者体验、测试矩阵 |
@@ -102,11 +104,11 @@
 | 入口传输层 | TCP、KCP、QUIC、WebSocket 入口识别、连接来源、服务名、端口复用分支观测 | `connection.accept/v1`、`connection.filter/v1` | 预留 |
 | 连接层 | 新连接过滤、拒绝、限流、来源地址策略、连接级审计 | `connection.filter/v1`、`connection.accept/v1` | 预留 |
 | 握手层 | 读取和改写 Minecraft handshake、按 host/protocol 做策略 | `handshake.filter/v1` | 预留 |
-| 路由层 | 动态路由、外部路由源、按来源/host/route 元数据选择后端、fallback；按玩家选择后端只属于 protocol-proxy 插件内部或未来 MC 协议扩展 | `route.resolve/v1`、`route.resolver/v1` | 预留 |
-| 上游层 | 自定义拨号、TCP/KCP/QUIC/HAProxy 上游、隧道、代理、服务发现、灰度、蓝绿、故障转移 | `upstream.connect/v1` | 第一版 |
-| 协议代理层 | 插件自管 `net.Conn`，实现完整 MC 协议代理和登录流程 | `upstream.connect/v1` protocol-proxy mode | 第一版能力 |
-| 游戏认证层 | 正版/三方登录、白名单、权限系统、身份映射和后续协议处理 | `upstream.connect/v1` protocol-proxy mode | 第一版由 protocol-proxy 插件完整实现 |
-| Minecraft 状态层 | Server list ping、MOTD、favicon、在线人数展示、版本提示 | `status.ping/v1`、`upstream.connect/v1` protocol-proxy mode | 预留；第一版可由 protocol-proxy 实现 |
+| 路由层 | 动态路由、外部路由源、按来源/host/route 元数据选择后端、fallback；按玩家选择后端只属于 connection takeover 插件内部或未来 MC 协议扩展 | `route.resolve/v1`、`route.resolver/v1` | 预留 |
+| 上游层 | 自定义拨号、TCP/KCP/QUIC/HAProxy 上游、隧道、代理、服务发现、灰度、蓝绿、故障转移 | `legacy upstream-connect contract` | 第一版 |
+| 协议代理层 | 插件自管 `net.Conn`，实现完整 MC 协议代理和登录流程 | `legacy upstream-connect contract` connection takeover mode | 第一版能力 |
+| 游戏认证层 | 正版/三方登录、白名单、权限系统、身份映射和后续协议处理 | `legacy upstream-connect contract` connection takeover mode | 第一版由 connection takeover 插件完整实现 |
+| Minecraft 状态层 | Server list ping、MOTD、favicon、在线人数展示、版本提示 | `status.ping/v1`、`legacy upstream-connect contract` connection takeover mode | 预留；第一版可由 connection takeover 实现 |
 | Minecraft 包处理层 | packet 观测、brand、modded handshake、配置阶段策略、压缩阈值策略 | `minecraft.packet.observe/v1`、`minecraft.packet.filter/v1` | 预留；谨慎开放 |
 | Admin 认证层 | 管理页登录接入 LDAP、OIDC、企业 SSO | `admin.auth.provider/v1` | 预留 |
 | 策略层 | host rewrite、IP 黑白名单、限流、维护模式、条件路由 | rule/policy engine、middleware、hook | 预留，建议官方插件 |
@@ -115,14 +117,14 @@
 | 构建期扩展 | 源码包构建、受控插桩、官方高级插件生成产物 | builder、build-time instrumentation | 源码构建第一版，插桩未来 |
 | 自定义入口服务 | 插件提供 TLS、PROXY inbound、自定义 UDP 隧道、Bedrock/Geyser 类协议入口 | `ingress.service/v1`、service provider | 未来能力 |
 
-第一版的实际强能力集中在 `upstream.connect/v1`：
+第一版的实际强能力集中在 `legacy upstream-connect contract`：
 
-- dialer mode 可以替换上游连接创建。
-- protocol-proxy mode 可以让插件接管完整连接字节流。
-- protocol-proxy 插件可以把 Minecraft 登录和登录后的代理链路全部做在插件内部。
+- route.resolve/v1 provider 可以替换上游连接创建。
+- connection takeover mode 可以让插件接管完整连接字节流。
+- connection takeover 插件可以把 Minecraft 登录和登录后的代理链路全部做在插件内部。
 - gateway core 不提供 Minecraft 登录流水线；它只提供连接接管、初始握手回放、生命周期、配置、secret、观测和治理支撑。
 - gateway core 不消费插件内部的登录结果、身份上下文或后续协议状态；这些内容只由插件用于自己的协议代理和业务逻辑。
-- 一旦 protocol-proxy 插件接管连接，该连接的 Minecraft 语义所有权归插件；gateway core 不再从后续字节流推导玩家名、UUID、认证状态、forwarding 状态或 play 阶段信息。
+- 一旦 connection takeover 插件接管连接，该连接的 Minecraft 语义所有权归插件；gateway core 不再从后续字节流推导玩家名、UUID、认证状态、forwarding 状态或 play 阶段信息。
 - 源码包和二进制包统一进入 artifact 管理。
 - Admin 负责上传、构建、加载、启用、禁用、删除和审计。
 
@@ -132,17 +134,17 @@
 
 | 功能点 | 用户能做什么 | 推荐实现形态 | 阶段和边界 |
 | --- | --- | --- | --- |
-| 自定义上游连接 | 私有隧道、SOCKS/HTTP proxy、内网穿透、云厂商专线、自定义 KCP/QUIC/HAProxy 拨号 | `upstream.connect/v1` dialer mode | 第一版主路径；插件返回真实 `net.Conn` |
-| 完整协议代理 | 自行实现 MC 登录、configuration/play 代理、forwarding、后端选择和失败响应 | `upstream.connect/v1` protocol-proxy mode | 第一版能力；core 不解释登录结果 |
-| 正版/三方登录 | Mojang/Yggdrasil、Yggdrasil-like、自定义账号系统、混合认证、profile cache | protocol-proxy 插件内部模块，未来可复用 `auth.provider/v1` | 第一版由插件完整实现；`auth.provider/v1` 只做未来插件间复用 |
-| 玩家维度策略 | 白名单、黑名单、ban、会员、权限、风控、玩家分流、玩家 sticky | protocol-proxy 插件内部实现 | 第一版 core 不维护玩家身份上下文 |
-| 连接安全治理 | IP/CIDR 黑白名单、来源限流、连接频率控制、基础 anti-bot、地域策略 | `connection.filter/v1`、rule/policy engine | 预留；第一版可由 protocol-proxy 或官方规则插件覆盖部分场景 |
-| 握手治理 | host rewrite、host alias、protocol version gate、legacy ping 兼容、非法 handshake 拒绝 | `handshake.filter/v1`、`status.ping/v1` | 预留；第一版完整控制可走 protocol-proxy |
-| 状态页和维护模式 | MOTD、favicon、online/max players、版本提示、维护窗口、按 host 展示不同状态 | `status.ping/v1` 或 protocol-proxy | 预留；需要轻量化时再实现专用 status hook |
-| Modded 兼容 | Forge/Fabric/FML handshake、modded backend 选择、modpack 提示和协议透传 | protocol-proxy，未来 `minecraft.packet.*` | 第一版 core 不理解 modded protocol |
+| 自定义上游连接 | 私有隧道、SOCKS/HTTP proxy、内网穿透、云厂商专线、自定义 KCP/QUIC/HAProxy 拨号 | `legacy upstream-connect contract` route.resolve/v1 provider | 第一版主路径；插件返回真实 `net.Conn` |
+| 完整协议代理 | 自行实现 MC 登录、configuration/play 代理、forwarding、后端选择和失败响应 | `legacy upstream-connect contract` connection takeover mode | 第一版能力；core 不解释登录结果 |
+| 正版/三方登录 | Mojang/Yggdrasil、Yggdrasil-like、自定义账号系统、混合认证、profile cache | connection takeover 插件内部模块，未来可复用 `auth.provider/v1` | 第一版由插件完整实现；`auth.provider/v1` 只做未来插件间复用 |
+| 玩家维度策略 | 白名单、黑名单、ban、会员、权限、风控、玩家分流、玩家 sticky | connection takeover 插件内部实现 | 第一版 core 不维护玩家身份上下文 |
+| 连接安全治理 | IP/CIDR 黑白名单、来源限流、连接频率控制、基础 anti-bot、地域策略 | `connection.filter/v1`、rule/policy engine | 预留；第一版可由 connection takeover 或官方规则插件覆盖部分场景 |
+| 握手治理 | host rewrite、host alias、protocol version gate、legacy ping 兼容、非法 handshake 拒绝 | `handshake.filter/v1`、`status.ping/v1` | 预留；第一版完整控制可走 connection takeover |
+| 状态页和维护模式 | MOTD、favicon、online/max players、版本提示、维护窗口、按 host 展示不同状态 | `status.ping/v1` 或 connection takeover | 预留；需要轻量化时再实现专用 status hook |
+| Modded 兼容 | Forge/Fabric/FML handshake、modded backend 选择、modpack 提示和协议透传 | connection takeover，未来 `minecraft.packet.*` | 第一版 core 不理解 modded protocol |
 | Packet 观测和过滤 | brand 观测、packet 统计、特定 packet 限速、debug packet logging、协议审计 | `minecraft.packet.observe/v1`、`minecraft.packet.filter/v1` | 预留；filter 高风险，默认不进第一版 |
-| 动态路由 | 从 CMDB、Kubernetes、Consul、Nacos、HTTP API 取后端，按健康或权重 fallback | `route.resolve/v1`、`route.resolver/v1`、后台任务缓存 | 预留；第一版可用 `upstream.connect/v1` + 插件缓存 |
-| 灰度和实验 | 蓝绿、金丝雀、按 source/host/route tag/时间窗口分流、快速回滚 | scope/rollout + `upstream.connect/v1` 或 route provider | 第一版支持 source IP sticky；玩家 sticky 由 protocol-proxy 自己实现 |
+| 动态路由 | 从 CMDB、Kubernetes、Consul、Nacos、HTTP API 取后端，按健康或权重 fallback | `route.resolve/v1`、`route.resolver/v1`、后台任务缓存 | 预留；第一版可用 `legacy upstream-connect contract` + 插件缓存 |
+| 灰度和实验 | 蓝绿、金丝雀、按 source/host/route tag/时间窗口分流、快速回滚 | scope/rollout + `legacy upstream-connect contract` 或 route provider | 第一版支持 source IP sticky；玩家 sticky 由 connection takeover 自己实现 |
 | 外部依赖集成 | 会员、风控、权限、告警、日志、对象存储、消息队列、配置中心 | `ExternalClient`、background task、event subscriber | 第一版提供声明、治理和受控 client；native 无法强制阻止绕过 |
 | 数据同步任务 | 周期同步路由、白名单、封禁列表、证书/资源、远端配置和缓存预热 | background task + PluginDataStore/FileStore | 第一版设计支持 interval/manual；cron 预留 |
 | 观测导出 | 自定义指标、业务事件、trace、审计 sink、外部 SIEM/Prometheus/OTel | plugin event/custom metric/event subscriber/exporter | 第一版提供摘要和 API；外部 exporter 可逐步落地 |
@@ -152,22 +154,22 @@
 | 插件仓库 | 官方/组织仓库、版本发现、离线导入、候选版本对比 | repository index + local import | 未来；不能绕过本地 review 和 enable |
 | 进程级热卸载 | 主进程保留管理面，子进程运行 Go plugin 数据面；升级时 drain 或迁移连接 | `go-plugin-process` runtime、fd passing、shared memory migration | 未来；管理后台配置服务启动模式，默认单进程 |
 | 自定义入口 | Bedrock/Geyser、TLS termination、PROXY inbound、自定义 UDP 隧道、sidecar 入口 | `ingress.service/v1` + supervisor/service model | 未来；第一版不允许插件自行监听端口 |
-| 跨语言和不可信插件 | Python/JS/Rust 插件、低信任规则、强资源隔离 | sandbox-process、WASM | 未来；`upstream.connect/v1` 的 `net.Conn` 语义不直接复用 |
+| 跨语言和不可信插件 | Python/JS/Rust 插件、低信任规则、强资源隔离 | sandbox-process、WASM | 未来；`legacy upstream-connect contract` 的 `net.Conn` 语义不直接复用 |
 | 构建期增强 | 官方观测插桩、安全治理插桩、统一错误/trace 注入 | build-time instrumentation | 未来官方/组织 CI 能力，不是普通热加载插件 |
 
 这些功能点对应的设计含义：
 
-- 第一版必须把 `upstream.connect/v1` 做成足够强的 stream endpoint，否则 MC 登录、协议代理和高级上游能力都无法成立。
-- 涉及玩家身份、登录结果、packet payload 和 session response 的能力默认归 protocol-proxy 插件内部所有；core 只接收脱敏事件、指标和健康摘要。
+- 第一版必须把 `legacy upstream-connect contract` 做成足够强的 stream endpoint，否则 MC 登录、协议代理和高级上游能力都无法成立。
+- 涉及玩家身份、登录结果、packet payload 和 session response 的能力默认归 connection takeover 插件内部所有；core 只接收脱敏事件、指标和健康摘要。
 - 常见运维需求应优先沉淀成官方 rule/policy 插件、声明式配置或 Admin action，减少用户为简单规则写 Go 源码包。
-- 未来新增 extension point 时，应优先补齐“更低成本、更低风险”的专用入口，而不是削弱 protocol-proxy 插件的完整接管能力。
+- 未来新增 extension point 时，应优先补齐“更低成本、更低风险”的专用入口，而不是削弱 connection takeover 插件的完整接管能力。
 - sandbox、WASM、ingress service 和 build-time instrumentation 是不同技术路线，不能混成同一个插件 ABI。
 
 ## 典型插件场景
 
 ### 动态上游和灰度发布
 
-插件通过 `upstream.connect/v1` 在 dialer mode 下接管上游连接：
+插件通过 `legacy upstream-connect contract` 在 route.resolve/v1 provider 下接管上游连接：
 
 - 从 Kubernetes、Consul、Nacos、HTTP API 或云厂商 API 获取后端。
 - 按 host、来源 IP、时间窗口、权重或后端健康状态选择 upstream。
@@ -176,7 +178,7 @@
 
 ### Minecraft 登录和协议代理
 
-插件通过 `upstream.connect/v1` 在 protocol-proxy mode 下返回自管 `net.Conn`：
+插件通过 `legacy upstream-connect contract` 在 connection takeover mode 下返回自管 `net.Conn`：
 
 - 解析 handshake、login start 和后续 Minecraft 协议。
 - 实现正版 Yggdrasil 登录。
@@ -196,9 +198,9 @@
 - core 调用插件拿到 `AuthResult` 后再由 core 继续处理 login/configuration/play。
 - core 维护全局玩家身份上下文，并把玩家名、UUID 或权限作为后续路由、灰度、限流的通用输入。
 - core 根据插件上报的 `auth.success`、`auth.failure` 事件改变连接结果。
-- protocol-proxy 插件只实现 session 校验，剩余 Minecraft 登录协议由 core 拼装。
+- connection takeover 插件只实现 session 校验，剩余 Minecraft 登录协议由 core 拼装。
 
-如果需要按玩家维度做策略，应由已经解析登录协议的 protocol-proxy 插件在插件内部实现，或由未来专门的 Minecraft 协议 extension point 显式暴露；第一版 core 不把玩家身份作为通用 extension point 输入。
+如果需要按玩家维度做策略，应由已经解析登录协议的 connection takeover 插件在插件内部实现，或由未来专门的 Minecraft 协议 extension point 显式暴露；第一版 core 不把玩家身份作为通用 extension point 输入。
 
 ### Minecraft 状态和协议增强
 
@@ -212,7 +214,7 @@
 - 观测 brand、configuration 阶段和 play 阶段关键 packet。
 - 对特定 packet 做审计、限流或拒绝。
 
-第一版不需要 gateway core 内置这些 Minecraft 协议能力。需要完整控制时，插件可以用 protocol-proxy mode 自行实现。后续如果要降低插件开发成本，可以引入专门的 `status.ping/v1`、`minecraft.packet.observe/v1` 和 `minecraft.packet.filter/v1`。
+第一版不需要 gateway core 内置这些 Minecraft 协议能力。需要完整控制时，插件可以用 connection takeover mode 自行实现。后续如果要降低插件开发成本，可以引入专门的 `status.ping/v1`、`minecraft.packet.observe/v1` 和 `minecraft.packet.filter/v1`。
 
 ### 规则化运维能力
 
@@ -275,7 +277,7 @@
 
 - 和当前探索代码一致，改造成本低。
 - 插件可以直接使用 Go 标准库和 gateway 暴露的 typed API。
-- `upstream.connect/v1` 第一版需要返回 `net.Conn`，进程内插件能自然表达这个能力。
+- `legacy upstream-connect contract` 第一版需要返回 `net.Conn`，进程内插件能自然表达这个能力。
 
 需要接受的代价：
 
@@ -350,7 +352,7 @@ upstream-rewrite.mcgp
     }
   },
   "extension_points": [
-    { "type": "hook", "key": "upstream.connect/v1" }
+    { "type": "hook", "key": "legacy upstream-connect contract" }
   ],
   "features": {
     "required": [
@@ -365,7 +367,7 @@ upstream-rewrite.mcgp
     ]
   },
   "capabilities": {
-    "extension_points": ["upstream.connect/v1"],
+    "extension_points": ["legacy upstream-connect contract"],
     "network": { "outbound": ["tcp:*:*"] },
     "filesystem": { "read": [], "write": [] },
     "env": []
@@ -373,7 +375,7 @@ upstream-rewrite.mcgp
   "runtime_limits": {
     "handler_timeout_ms": 3000,
     "max_concurrent_calls": 128,
-    "max_active_proxy_connections": 1024,
+    "max_active_connection_sessions": 1024,
     "failure_threshold": {
       "window_seconds": 60,
       "max_error_rate": 0.2,
@@ -428,7 +430,7 @@ upstream-rewrite.mcgp
     }
   },
   "extension_points": [
-    { "type": "hook", "key": "upstream.connect/v1" }
+    { "type": "hook", "key": "legacy upstream-connect contract" }
   ],
   "features": {
     "required": [
@@ -442,7 +444,7 @@ upstream-rewrite.mcgp
     ]
   },
   "capabilities": {
-    "extension_points": ["upstream.connect/v1"],
+    "extension_points": ["legacy upstream-connect contract"],
     "network": { "outbound": ["tcp:*:*"] },
     "filesystem": { "read": [], "write": [] },
     "env": []
@@ -450,7 +452,7 @@ upstream-rewrite.mcgp
   "runtime_limits": {
     "handler_timeout_ms": 3000,
     "max_concurrent_calls": 128,
-    "max_active_proxy_connections": 1024
+    "max_active_connection_sessions": 1024
   },
   "config_schema": {
     "type": "object",
@@ -509,7 +511,7 @@ capabilities 用于声明插件期望访问的能力。第一版 native plugin �
 {
   "capabilities": {
     "extension_points": [
-      "upstream.connect/v1"
+      "legacy upstream-connect contract"
     ],
     "protocols": {
       "ingress_transports": ["tcp", "websocket"],
@@ -623,7 +625,7 @@ type PluginRuntimeInfo struct {
 
 - handler timeout。
 - max concurrent handler calls。
-- max active protocol-proxy connections。
+- max active connection takeover connections。
 - background task timeout 和不可重入。
 - event subscriber queue length。
 - log rate 和单条日志大小。
@@ -667,7 +669,7 @@ type RuntimeAdapterLifecycle interface {
 
 | Runtime | 可以支持 | 不适合支持 |
 | --- | --- | --- |
-| `go-plugin` | typed Go API、返回 `net.Conn`、protocol-proxy、低改造成本 | 不可信插件、强资源隔离、跨语言 |
+| `go-plugin` | typed Go API、返回 `net.Conn`、connection takeover、低改造成本 | 不可信插件、强资源隔离、跨语言 |
 | `go-plugin-process` | Go 插件数据面隔离、进程级卸载、可选 fd/shm 连接迁移 | 跨语言 ABI、强不可信隔离、跨平台 fd 迁移 |
 | `sandbox-process` | 强隔离、跨语言、可重启、可回收资源 | 直接返回进程内 `net.Conn`、低延迟 hot path |
 | `wasm` | 规则、路由、配置校验、轻量策略 | 长连接 protocol proxy、任意网络访问、复杂 Go SDK |
@@ -676,14 +678,14 @@ type RuntimeAdapterLifecycle interface {
 runtime adapter 设计规则：
 
 - extension point 声明必须标注支持哪些 runtime。
-- `upstream.connect/v1` protocol-proxy mode 支持 `go-plugin` in-process 和 `go-plugin-process` drain-only stream bridge。
+- `legacy upstream-connect contract` connection takeover mode 支持 `go-plugin` in-process 和 `go-plugin-process` drain-only stream bridge。
 - `go-plugin-process` 需要新的服务启动模式，不能在运行中从单进程无缝切换；管理后台可以保存 desired mode，并提示重启后生效。
 - sandbox-process 如果要实现协议代理，需要改成进程间 stream relay，而不是返回 Go `net.Conn`。
 - wasm 适合 `route.resolve/v1`、rule/policy engine 和配置校验，不作为第一版连接代理方案。
 - Admin 页面必须展示 runtime type 和该 runtime 下 capabilities 是否强制执行。
 - 同一个 `.mcgp` manifest 可以声明 runtime type，但不能在一个 artifact 中混用多个 runtime。
 
-当前代码状态：`in-process + go-plugin` 已通过 `RuntimeAdapterLifecycle` 运行；`go-plugin-process` 已有 `plugin-host` 同 binary 子命令、`mc-gateway-plugin-host/v1` handshake、UDS control channel、supervisor start/stop foundation、host 内 Init/ReloadConfig/Destroy lifecycle、loaded host crash summary refresh、persisted configurable restart backoff/max/window policy、crash-loop auto-isolation、per-node crash isolation、service-level last error persistence、supervised/stale control socket cleanup、metadata-backed process orphan sweep、无 metadata 的 stale active control socket handshake orphan cleanup、Linux `/proc` process-table orphan discovery、`upstream.connect/v1` dialer mode 的跨进程 UDS relay，以及 protocol-proxy drain-only stream bridge。fd/live 迁移、sandbox enforcement、完整不可信隔离和非 Linux process-table orphan discovery 仍是未来工作。
+当前代码状态：`in-process + go-plugin` 已通过 `RuntimeAdapterLifecycle` 运行；`go-plugin-process` 已有 `plugin-host` 同 binary 子命令、`mc-gateway-plugin-host/v1` handshake、UDS control channel、supervisor start/stop foundation、host 内 Init/ReloadConfig/Destroy lifecycle、loaded host crash summary refresh、persisted configurable restart backoff/max/window policy、crash-loop auto-isolation、per-node crash isolation、service-level last error persistence、supervised/stale control socket cleanup、metadata-backed process orphan sweep、无 metadata 的 stale active control socket handshake orphan cleanup、Linux `/proc` process-table orphan discovery、`legacy upstream-connect contract` route.resolve/v1 provider 的跨进程 UDS relay，以及 connection takeover drain-only stream bridge。fd/live 迁移、sandbox enforcement、完整不可信隔离和非 Linux process-table orphan discovery 仍是未来工作。
 
 ### Go Plugin Process Runtime，部分实现和未来能力
 
@@ -696,14 +698,14 @@ gateway main process
   -> owns listeners / Admin / SQLite / desired state
   -> starts plugin-host process
   -> asks plugin-host to create upstream dialer connection
-  -> later passes accepted connection fd or stream endpoint for protocol-proxy
+  -> later passes accepted connection fd or stream endpoint for connection takeover
   -> supervises health, drain, restart and migration
 
 plugin-host process
   -> plugin.Open(plugin.so)
   -> owns plugin instance and Go globals
   -> runs upstream dialer data plane first
-  -> later runs protocol-proxy data plane through a stream/fd protocol
+  -> later runs connection takeover data plane through a stream/fd protocol
   -> exits to release loaded .so and Go heap
 ```
 
@@ -712,7 +714,7 @@ plugin-host process
 | Mode | 说明 | 默认策略 |
 | --- | --- | --- |
 | `in-process` | 主进程直接 `plugin.Open`，使用 `go-plugin` runtime | 第一版默认，性能最好，不能真正热卸载 |
-| `go-plugin-process` | 主进程不加载 `.so`，为 Go 插件启动 plugin-host 子进程 | 部分可用：`upstream.connect/v1` dialer mode 和 protocol-proxy drain-only；live migration 仍是未来能力 |
+| `go-plugin-process` | 主进程不加载 `.so`，为 Go 插件启动 plugin-host 子进程 | 部分可用：`legacy upstream-connect contract` route.resolve/v1 provider 和 connection takeover drain-only；live migration 仍是未来能力 |
 | `sandbox-process` | 独立进程或容器运行跨语言/隔离插件 | 未来能力，和 `go-plugin-process` 分开 |
 
 管理后台应提供一个 gateway 级系统配置项，用来决定服务下一次启动时采用哪种插件服务模式。该配置不是插件 manifest 的一部分，也不能由单个插件在运行时覆盖。
@@ -770,7 +772,7 @@ plugin-host process
 | --- | --- | --- |
 | `drain-only` | 主进程停止给旧 plugin-host 分配新连接，旧连接自然结束或管理员 force close，随后退出旧子进程 | 默认，简单可靠 |
 | `fd-live` | 旧 plugin-host 在安全点把 client/backend fd 交回主进程，主进程启动新 plugin-host 后转交 fd | 透明转发、简单 dialer |
-| `fd-live-shm` | 在 `fd-live` 基础上，用共享内存迁移用户态 buffer 和插件状态快照 | 高性能 protocol-proxy，高复杂度 |
+| `fd-live-shm` | 在 `fd-live` 基础上，用共享内存迁移用户态 buffer 和插件状态快照 | 高性能 connection takeover，高复杂度 |
 
 fd 交接规则：
 
@@ -784,7 +786,7 @@ fd 交接规则：
 
 - 共享内存只用于迁移稳定格式的数据，不能共享 Go pointer、map、chan、interface、goroutine 或 `net.Conn`。
 - 可放入共享内存的数据包括 pending read/write buffer、ring buffer、packet parser offset、协议 phase、trace/connection metadata、deadline、业务状态快照和校验和。
-- protocol-proxy 插件必须显式实现 `quiesce/snapshot/restore` 契约，并声明 state schema version。
+- connection takeover 插件必须显式实现 `quiesce/snapshot/restore` 契约，并声明 state schema version。
 - MC 协议迁移应优先发生在安全点，例如 packet boundary、压缩帧边界、登录完成后或插件声明的可恢复阶段。
 - encryption/compression/profile cache/forwarding 状态只有在插件能稳定序列化时才能迁移；否则必须 drain-only。
 
@@ -857,7 +859,7 @@ type MigratableConnection interface {
 不适合场景：
 
 - 用户上传后热加载的业务插件。
-- MC 正版/三方登录 protocol-proxy；这类能力仍应走 `upstream.connect/v1` 或未来 stream proxy。
+- MC 正版/三方登录 connection takeover；这类能力仍应走 `legacy upstream-connect contract` 或未来 stream proxy。
 - 修改 gateway 内部业务语义，例如改路由表写入、绕过权限、改 Admin session 签发。
 - 在生产节点上临时织入代码并直接替换运行中进程。
 - 绕过公开 API/ABI 访问内部未文档化结构。
@@ -896,7 +898,7 @@ type MigratableConnection interface {
 - 第一版不实现 sandbox runtime。
 - 不保证 sandbox-process 能达到进程内 Go plugin 的 hot path 延迟。
 - 不让跨进程插件直接返回 gateway 进程内的 `net.Conn`。
-- 不把 WASM 用作完整 Minecraft protocol-proxy 的默认方案。
+- 不把 WASM 用作完整 Minecraft connection takeover 的默认方案。
 
 #### Sandbox Process 模型
 
@@ -929,7 +931,7 @@ gateway
 | provider | RPC 调用，gateway 管理超时、熔断和 fallback |
 | event subscriber | 异步队列 + RPC 投递，允许丢弃策略 |
 | middleware | 只适合结构化、有限 payload 的场景 |
-| protocol-proxy | 需要 stream relay，不使用 `net.Conn` 返回值 |
+| connection takeover | 需要 stream relay，不使用 `net.Conn` 返回值 |
 
 stream relay 候选方案：
 
@@ -940,7 +942,7 @@ stream relay 候选方案：
 | gRPC streaming | 协议统一、便于跨语言 | 长连接字节流开销较高，背压和半关闭语义复杂 |
 | socket passing | 接近原生连接语义 | 实现复杂，跨平台和语言支持差 |
 
-如果 sandbox-process 支持 protocol-proxy，应定义新的 extension point 版本，例如 `upstream.connect/v2` 或 `stream.proxy/v1`：
+如果 sandbox-process 支持 connection takeover，应定义新的 extension point 版本，例如 `legacy upstream-connect contract` 或 `stream.proxy/v1`：
 
 ```go
 type StreamProxyRequest struct {
@@ -1039,7 +1041,7 @@ WASM 的 capabilities 可以更容易强制：默认无文件、无网络、无�
 | 能力 | `go-plugin` | `sandbox-process` | `wasm` |
 | --- | --- | --- | --- |
 | upstream dialer | 直接返回 `net.Conn` | 可通过 gateway-owned dialer provider 或 stream relay | 不建议 |
-| protocol-proxy | 第一版主路径 | 需要 `stream.proxy/v1` | 不建议 |
+| connection takeover | 第一版主路径 | 需要 `stream.proxy/v1` | 不建议 |
 | route resolve | 可支持 | 适合 | 适合 |
 | event sink | 可支持 | 适合 | 适合轻量 transform |
 | rule/policy | 可支持 | 可支持 | 最适合 |
@@ -1047,7 +1049,7 @@ WASM 的 capabilities 可以更容易强制：默认无文件、无网络、无�
 
 迁移原则：
 
-- 不把 `upstream.connect/v1` 的 `(net.Conn, error)` 强行映射到 sandbox-process。
+- 不把 `legacy upstream-connect contract` 的 `(net.Conn, error)` 强行映射到 sandbox-process。
 - 新增跨进程 extension point version，而不是改变 v1 语义。
 - manifest 可以声明同一插件源码支持多个 runtime，但每个 artifact 只能有一个 runtime type。
 - Admin 应展示相同插件在不同 runtime 下的能力差异、性能预算和权限强制状态。
@@ -1122,7 +1124,7 @@ WASM artifact 示例：
     "gateway": ">=0.1.0",
     "plugin_api": "plugin-api/v1",
     "extension_points": [
-      "upstream.connect/v1"
+      "legacy upstream-connect contract"
     ],
     "plugins": [
       { "id": "official-rule-engine", "version": ">=0.1.0", "optional": true }
@@ -1308,8 +1310,8 @@ manifest 可以增加 `composition`：
   "composition": {
     "exclusive_extension_points": [
       {
-        "key": "upstream.connect/v1",
-        "mode": "protocol-proxy",
+        "key": "legacy upstream-connect contract",
+        "mode": "connection takeover",
         "reason": "only one protocol proxy can own the stream"
       }
     ],
@@ -1350,7 +1352,7 @@ scope 重叠检查：
 - transport、service name 或 upstream protocol 集合相交视为重叠。
 - 空 scope 视为全局匹配，和任何 scope 重叠。
 
-静态分析不能证明不重叠时，应返回 `potential_conflict`，由管理员确认或收窄 scope。protocol-proxy、认证、packet filter 和 provider 单例类冲突默认应阻断，而不是只提示。
+静态分析不能证明不重叠时，应返回 `potential_conflict`，由管理员确认或收窄 scope。connection takeover、认证、packet filter 和 provider 单例类冲突默认应阻断，而不是只提示。
 
 ### Secret 引用
 
@@ -1430,7 +1432,7 @@ reload 策略：
 | `restart_required` | native plugin 已加载状态无法安全更新时提示重启 |
 | `manual` | 只提示 Runbook，不自动调用插件 |
 
-secret rotation 不应直接改变已有 protocol-proxy 连接的协议状态。对长连接，默认只影响新连接；插件如果支持 per-connection key refresh，必须在 manifest 中声明。
+secret rotation 不应直接改变已有 connection takeover 连接的协议状态。对长连接，默认只影响新连接；插件如果支持 per-connection key refresh，必须在 manifest 中声明。
 
 ## 供应链元数据
 
@@ -1494,7 +1496,7 @@ manifest 可以增加 `documentation`：
       "privacy_notes": "player identifiers are hashed before event export"
     },
     "operations": {
-      "rollback": "disable plugin or rollback to previous artifact; existing protocol-proxy connections drain",
+      "rollback": "disable plugin or rollback to previous artifact; existing connection takeover connections drain",
       "secret_rotation": "rotate velocity_forwarding_secret with dual-read grace period",
       "known_failure_modes": ["session_timeout", "backend_dial_failed", "forwarding_failed"]
     },
@@ -1526,7 +1528,7 @@ README 最低要求：
 文档门禁：
 
 - 开发模式可以缺 README，但进入 `review_required` 或 `restricted` 策略时，缺 README 至少是 `warning`。
-- protocol-proxy、访问 secret、声明 external dependencies、写入 plugin_data、导出事件到外部系统或启用 packet rewrite 的插件，缺 README 或 data handling 声明应进入 `review_required`。
+- connection takeover、访问 secret、声明 external dependencies、写入 plugin_data、导出事件到外部系统或启用 packet rewrite 的插件，缺 README 或 data handling 声明应进入 `review_required`。
 - `restricted` 模式可以配置为缺 README、LICENSE、Runbook、support contact 或 data handling 声明时阻断 enable。
 - 文档声明与 manifest 结构化字段冲突时，以结构化字段为准，并把冲突列为发布门禁 warning。
 - 文档更新属于 artifact 变化，需要重新生成 artifact sha256 和 policy evaluation。
@@ -1595,7 +1597,7 @@ trusted plugin 不能只靠口头约定。第一版即使不强制签名，也�
   "denied_artifact_sha256": [],
   "allowed_plugin_prefixes": [],
   "required_review_for": [
-    "protocol-proxy",
+    "connection takeover",
     "capabilities_changed",
     "unknown_source",
     "missing_sbom",
@@ -1612,7 +1614,7 @@ trusted plugin 不能只靠口头约定。第一版即使不强制签名，也�
   },
   "documentation_policy": {
     "require_readme_for_risky_plugin": true,
-    "require_runbook_for_protocol_proxy": true,
+    "require_runbook_for_takeover": true,
     "require_data_handling_for_external_data": true
   },
   "override_policy": {
@@ -1646,7 +1648,7 @@ trusted plugin 不能只靠口头约定。第一版即使不强制签名，也�
 - signature、SBOM、license、provenance、README/Runbook/data handling 元数据。
 - runtime type、artifact type、Go/API/GOOS/GOARCH。
 - capabilities、extension points、runtime limits。
-- 是否 protocol-proxy、是否 source package、是否 major upgrade。
+- 是否 connection takeover、是否 source package、是否 major upgrade。
 - 是否命中 organization allowlist/denylist。
 
 第一版支持策略评估、本地/导入式漏洞库和治理展示，不强制接入外部漏洞库或签名验证服务。即便签名不强制，artifact sha256 和来源仍必须记录并参与审计。
@@ -1675,7 +1677,7 @@ warning override：
 | --- | --- | --- |
 | `info` | 有 SBOM、license 明确、capabilities 未变化 | 展示 |
 | `warning` | 未签名、未知 license、source package 构建、minor upgrade | 要求确认 |
-| `high` | protocol-proxy、secret ref 变化、scope 扩大、capabilities 变化 | 二次确认，可要求审批 |
+| `high` | connection takeover、secret ref 变化、scope 扩大、capabilities 变化 | 二次确认，可要求审批 |
 | `critical` | artifact sha256 被 denylist 命中、Go/API 不兼容、缺失必需 secret | 阻断启用 |
 
 风险评级应写入发布门禁结果，并在 repository import admission preview、promotion import、artifact switch、enable 和 rollback 时重新计算。rollback 也不能绕过 denylist；如果旧 artifact 已被撤销，只允许管理员执行隔离恢复流程，不应重新接入真实流量。
@@ -1767,7 +1769,7 @@ denylist 命中时：
 
 - 未启用插件：阻断 load/enable。
 - 已启用插件：进入 `quarantined` 或 `disabled_by_policy` 状态，新连接不再调用该插件。
-- protocol-proxy 插件已有连接进入 draining；管理员可以强制关闭。
+- connection takeover 插件已有连接进入 draining；管理员可以强制关闭。
 - 管理页展示撤销原因、影响范围、是否需要重启和回滚建议。
 - 写入审计日志。
 
@@ -1780,7 +1782,7 @@ allowlist 不应单独代表安全。allowlist 只说明来源被组织接受，
 1. 管理员将 artifact sha256 或 plugin ID 加入 denylist。
 2. Plugin Manager 立即从 dispatch table 移除相关 handler。
 3. 新连接不再进入该插件。
-4. 对 protocol-proxy 插件，按策略 drain 或 force close 现有连接。
+4. 对 connection takeover 插件，按策略 drain 或 force close 现有连接。
 5. 标记相关 plugin secrets 为 rotation required。
 6. 阻止 rollback 到被撤销 artifact。
 7. 在 promotion/drift/report 中标记该 artifact 已撤销。
@@ -2129,7 +2131,7 @@ Admin 和 CLI 应展示 fingerprint diff，例如 Go patch 版本、CGO、build 
 | handler ID | 插件内唯一，小写字母、数字、点、短横线 | `default`、`auth.proxy` |
 | background task ID | 插件内唯一 | `sync-routes`、`refresh-cache` |
 | secret name | 小写字母、数字、下划线、短横线 | `velocity_forwarding_secret` |
-| extension point key | `<domain>.<action>/v<version>` | `upstream.connect/v1` |
+| extension point key | `<domain>.<action>/v<version>` | `legacy upstream-connect contract` |
 
 规则：
 
@@ -2214,7 +2216,7 @@ plugin/contracts/
 - request 字段名、类型、是否可选、隐私等级和零值语义。
 - response 或 error 语义。
 - 超时、并发、dry-run、fallback 默认策略。
-- 是否允许 protocol-proxy。
+- 是否允许 connection takeover。
 
 `features.json` 至少描述：
 
@@ -2245,7 +2247,7 @@ conformance suite 应覆盖：
 - required/optional feature 协商和 `ErrFeatureUnavailable`。
 - extension point 注册和未声明 extension point 拒绝。
 - handler ordering、priority、ErrPass、ErrBlocked 和 panic recover。
-- `upstream.connect/v1` request 字段、initial data 只读语义和 protocol-proxy 初始回放。
+- `legacy upstream-connect contract` request 字段、initial data 只读语义和 connection takeover 初始回放。
 - config schema 校验、config migration 和 `ReloadConfig()` dry-run。
 - SecretStore 授权、缺失 secret、轮换和脱敏。
 - Admin API 稳定错误码。
@@ -2264,8 +2266,8 @@ conformance suite 应包含两类 fixture：
 
 示例插件不只是文档材料，也应作为契约测试：
 
-- `upstream-rewrite` 是最小 dialer mode fixture。
-- `mc-auth-proxy` 是 protocol-proxy 能力上限 fixture。
+- `upstream-rewrite` 是最小 route.resolve/v1 provider fixture。
+- `mc-auth-proxy` 是 connection takeover 能力上限 fixture。
 - 未来 `mc-status-motd` 是结构化 Minecraft status extension fixture。
 - rule/policy 示例用于验证 config schema UI hint 和 rule engine 边界。
 
@@ -2468,7 +2470,7 @@ display_name TEXT NOT NULL DEFAULT '',
 多实例适合：
 
 - 同一个插件用不同配置处理不同 scope。
-- 同一个 protocol-proxy 插件服务不同认证源。
+- 同一个 connection takeover 插件服务不同认证源。
 - 同一个 event sink 插件写入不同外部系统。
 
 多实例约束：
@@ -2868,7 +2870,7 @@ CREATE INDEX idx_plugin_file_resources_plugin_ns
   "desired_artifact_id": "sha256:...",
   "restart_required": false,
   "extension_points": [
-    { "type": "hook", "key": "upstream.connect/v1" }
+    { "type": "hook", "key": "legacy upstream-connect contract" }
   ],
   "error": ""
 }
@@ -3004,7 +3006,7 @@ CREATE TABLE plugin_node_states (
 - 节点级 rollback。
 - 某些节点需要重启才能清理已加载 Go plugin。
 - 管理页展示每个节点的 artifact、health、active calls、active proxy connections 和 restart required。
-- 对 protocol-proxy 插件，draining 是节点本地过程；全局禁用需要等待所有节点 draining 完成或管理员强制关闭。
+- 对 connection takeover 插件，draining 是节点本地过程；全局禁用需要等待所有节点 draining 完成或管理员强制关闭。
 
 第一版如果只支持单实例，文档和 UI 应明确写出；但数据模型中的 artifact、desired/runtime state、content-addressed 路径和 node state 预留应避免后续重构。
 
@@ -3262,7 +3264,7 @@ normal -> revoked
 
 - `policy_state=blocked/revoked` 时，runtime 目标强制视为 disabled。
 - `policy_state=review_required` 时，不能从 disabled 收敛到 enabled；已经 enabled 的插件如果只是需要重新审批配置，应保持旧 dispatch table，直到管理员批准新组合。
-- `policy_state=quarantined` 时，立即从 dispatch table 移除 handler，protocol-proxy 连接进入 draining 或 force-close。
+- `policy_state=quarantined` 时，立即从 dispatch table 移除 handler，connection takeover 连接进入 draining 或 force-close。
 - `desired_state=deleted` 时，必须先停止新流量，再进入文件和 runtime 清理流程。
 - rollback 不能绕过 `policy_state`；目标 artifact 的策略状态必须重新计算。
 
@@ -3470,7 +3472,7 @@ reload 用于在不切换 artifact 的情况下应用配置或 secret 变化。�
 3. 调用新配置的 `ReloadConfig()` dry run。
 4. 如果插件声明 `reload_mode=hot`，在当前实例上调用 reload，并更新 dispatch table metadata。
 5. 如果插件不支持 hot reload，标记 `reload_required` 或走重新创建实例流程。
-6. protocol-proxy 已有连接默认继续使用旧配置；新连接使用新配置。
+6. connection takeover 已有连接默认继续使用旧配置；新连接使用新配置。
 
 secret 轮换流程：
 
@@ -3482,7 +3484,7 @@ secret 轮换流程：
 6. 如果策略是 `reload_required` 或 `manual`，只更新 desired state 和管理页提示，不自动调用插件。
 7. grace period 结束后清理旧 secret version，并记录审计日志。
 
-protocol-proxy 插件规则：
+connection takeover 插件规则：
 
 - forwarding secret 轮换默认只影响新连接。
 - 已认证的长连接不应因为 secret 轮换被强制重放登录流程。
@@ -3843,7 +3845,7 @@ promotion-bundle/
   },
   "runtime_limits": {
     "handler_timeout_ms": 3000,
-    "max_active_proxy_connections": 1024
+    "max_active_connection_sessions": 1024
   }
 }
 ```
@@ -3967,7 +3969,7 @@ desired_fingerprint = hash(
 - 校验 artifact sha256、manifest metadata 和 config hash。
 - 重新绑定目标环境 secret，不复制源环境 secret。
 - 执行插件 load dry-run、config dry-run 和 health check。
-- 对 protocol-proxy 插件运行最小 smoke test，例如握手、登录失败响应和 backend dial。
+- 对 connection takeover 插件运行最小 smoke test，例如握手、登录失败响应和 backend dial。
 - 生成演练报告，列出缺失 artifact、缺失 secret、版本不兼容和配置漂移。
 
 灾备演练不应默认启用插件处理真实流量。只有管理员明确确认后，才可以把演练环境切为 active。
@@ -3995,7 +3997,7 @@ scope 规则：
 - gateway 在 dispatch 前先做 scope 过滤；不匹配的插件不进入 handler 调用，也不计入 handler error。
 - host 通配、CIDR 和 route tag 解析由 gateway core 提供稳定语义。
 - 插件仍可以在业务逻辑里做更细粒度判断，但不应依赖未文档化的 gateway 内部状态。
-- scope 变更需要原子发布新 dispatch table，不应影响已有 protocol-proxy 连接。
+- scope 变更需要原子发布新 dispatch table，不应影响已有 connection takeover 连接。
 
 `plugins.rollout_json` 描述灰度策略：
 
@@ -4015,7 +4017,7 @@ rollout 规则：
 
 - 第一版可以只支持 percentage + sticky key；allowlist、denylist 和时间窗口预留。
 - gateway 侧 sticky key 只能使用 source IP、host、route ID、route tag、protocol version、transport、service name 和 upstream protocol 等 core 已知元数据。
-- 玩家名、UUID 或认证结果不能作为 gateway 侧 rollout sticky key；玩家维度灰度只能由 protocol-proxy 插件在其内部实现，或等待未来专门的 Minecraft 协议 extension point。
+- 玩家名、UUID 或认证结果不能作为 gateway 侧 rollout sticky key；玩家维度灰度只能由 connection takeover 插件在其内部实现，或等待未来专门的 Minecraft 协议 extension point。
 - percentage 必须用稳定 hash 计算，避免同一来源或 host 在短时间内反复切换路径。
 - 对 first-match hook，未命中 rollout 的插件等价于 pass，不应调用 handler。
 - 灰度策略变更必须写审计日志，并在 Admin 页面显示当前生效范围。
@@ -4024,7 +4026,7 @@ rollout 规则：
 `dry_run` 用于评估插件决策但不改变连接结果：
 
 - dry-run 插件可以被调用，但其 handled/reject/error 结果只记录日志和指标，不影响实际连接。
-- dry-run 不适合 protocol-proxy mode，因为插件一旦接管 `net.Conn` 就会改变数据路径。对 protocol-proxy 插件，dry-run 应禁止启用或只允许调用轻量 `Evaluate()` 接口。
+- dry-run 不适合 connection takeover mode，因为插件一旦接管 `net.Conn` 就会改变数据路径。对 connection takeover 插件，dry-run 应禁止启用或只允许调用轻量 `Evaluate()` 接口。
 - dry-run 的指标必须带 `dry_run=true` 维度或在结果中明确标记，避免和真实处理混淆。
 - 安全类插件从 dry-run 切换到 enforced 模式需要管理员确认。
 
@@ -4062,7 +4064,7 @@ rollout 规则：
 | chain middleware | 按配置 fail open 或 fail closed |
 | provider | 当前 provider 失败后尝试 fallback provider；没有 fallback 则返回错误 |
 | event subscriber | 丢弃本次事件并记录 timeout |
-| protocol-proxy mode | 插件接管连接后由插件负责协议级超时；gateway 只管理连接生命周期和指标 |
+| connection takeover mode | 插件接管连接后由插件负责协议级超时；gateway 只管理连接生命周期和指标 |
 
 安全相关插件可以配置 `fail_closed=true`。观测类插件默认 `fail_open=true`。
 
@@ -4073,7 +4075,7 @@ rollout 规则：
 - 最大并发 handler 调用数。
 - 最大等待队列长度。
 - 队列满时的行为：pass、reject、drop event 或 fail closed。
-- protocol-proxy mode 的最大活跃连接数。
+- connection takeover mode 的最大活跃连接数。
 
 当插件达到并发上限时，gateway 不能无限创建 goroutine 或无限缓存事件。
 
@@ -4092,7 +4094,7 @@ Plugin Manager 需要维护运行时错误计数：
 - 标记 degraded。
 - 临时跳过该插件。
 - 自动禁用该插件。
-- 仅对新连接禁用，保留已有 protocol-proxy 连接。
+- 仅对新连接禁用，保留已有 connection takeover 连接。
 - 写入审计日志和管理页告警。
 
 熔断策略必须可配置，默认不应因为观测类插件失败而中断玩家连接。
@@ -4105,25 +4107,25 @@ Plugin Manager 需要维护运行时错误计数：
 
 | 场景 | 默认预算 | 超出处理 |
 | --- | --- | --- |
-| `upstream.connect/v1` dialer mode handler | P95 < 10ms，不含插件自建上游连接耗时 | 记录 slow call，计入熔断窗口 |
+| `legacy upstream-connect contract` route.resolve/v1 provider handler | P95 < 10ms，不含插件自建上游连接耗时 | 记录 slow call，计入熔断窗口 |
 | `connection.filter/v1` | P95 < 2ms | 超时按 fail open/closed 策略 |
 | `route.resolve/v1` | P95 < 5ms | fallback 到默认路由或 fail closed |
 | event subscriber | 单事件处理 < 100ms | 超时丢弃本次事件 |
 | HealthCheck | 1-3s | 标记 degraded 或 not_ready |
 | background task | 由任务声明，默认 30s | 取消 context，记录失败 |
-| protocol-proxy active connection | 不设固定处理耗时 | 受 active connection、idle timeout 和 health 管理 |
+| connection takeover active connection | 不设固定处理耗时 | 受 active connection、idle timeout 和 health 管理 |
 
 预算规则：
 
 - 连接路径预算只统计 gateway 调用插件 handler 的时间。
-- dialer mode 中插件如果负责拨号，拨号耗时应单独记录为 plugin-owned dial duration。
-- protocol-proxy mode 是长连接，不用 handler latency 评价整体性能，应看 active connections、吞吐、错误率和 idle timeout。
+- route.resolve/v1 provider 中插件如果负责拨号，拨号耗时应单独记录为 plugin-owned dial duration。
+- connection takeover mode 是长连接，不用 handler latency 评价整体性能，应看 active connections、吞吐、错误率和 idle timeout。
 - 默认慢调用不会立即中断连接，但会进入指标、日志和告警。
 - 安全类插件可以配置 fail closed，但必须显式展示风险。
 
 ### 性能基准和容量规划
 
-性能预算定义的是运行期阈值，性能基准定义的是上线前证据。插件进入生产前，尤其是 protocol-proxy、认证、路由和 provider 类插件，应能证明它在目标容量下不会明显拖慢连接路径。
+性能预算定义的是运行期阈值，性能基准定义的是上线前证据。插件进入生产前，尤其是 connection takeover、认证、路由和 provider 类插件，应能证明它在目标容量下不会明显拖慢连接路径。
 
 基准类型：
 
@@ -4131,8 +4133,8 @@ Plugin Manager 需要维护运行时错误计数：
 | --- | --- | --- |
 | micro benchmark | 测单个 handler 纯逻辑开销 | route、filter、policy、provider |
 | integration benchmark | 测 gateway 调用插件的完整开销 | 所有连接路径插件 |
-| protocol smoke benchmark | 测握手、登录失败、backend dial 等端到端路径 | protocol-proxy |
-| soak test | 长时间运行，观察 goroutine、内存、连接和错误漂移 | protocol-proxy、后台任务 |
+| protocol smoke benchmark | 测握手、登录失败、backend dial 等端到端路径 | connection takeover |
+| soak test | 长时间运行，观察 goroutine、内存、连接和错误漂移 | connection takeover、后台任务 |
 | regression benchmark | 和上一 artifact 或基线比较 | 升级、promotion、回滚前 |
 
 建议基准指标：
@@ -4149,7 +4151,7 @@ Plugin Manager 需要维护运行时错误计数：
 - external dependency latency，例如 session server。
 - shutdown/drain duration。
 
-protocol-proxy 插件不能只看 handler latency。它需要额外关注：
+connection takeover 插件不能只看 handler latency。它需要额外关注：
 
 - 最大并发连接数。
 - 每连接平均 goroutine 数。
@@ -4168,8 +4170,8 @@ max_new_conn_per_sec = min(
   external_dependency_budget
 )
 
-max_protocol_proxy_connections = min(
-  runtime_limits.max_active_proxy_connections,
+max_takeover_connections = min(
+  runtime_limits.max_active_connection_sessions,
   memory_budget_bytes / estimated_bytes_per_connection,
   fd_budget / fds_per_connection
 )
@@ -4178,7 +4180,7 @@ max_protocol_proxy_connections = min(
 估算规则：
 
 - handler P99 必须按目标机器、目标 Go 版本和目标 runtime 测量。
-- protocol-proxy 的每连接资源必须用 soak test 估算，不能只凭代码审查。
+- connection takeover 的每连接资源必须用 soak test 估算，不能只凭代码审查。
 - 外部认证源、CMDB、仓库和监控 API 必须单独设置 dependency timeout 和并发上限。
 - 如果插件依赖远程服务，应记录 fail open/closed 策略对容量的影响。
 - benchmark 结果只作为基线，不替代生产监控和灰度。
@@ -4186,7 +4188,7 @@ max_protocol_proxy_connections = min(
 发布门禁中的性能检查：
 
 - 新插件没有基线时，至少跑 smoke benchmark 和配置 dry-run。
-- protocol-proxy 插件应跑最小并发连接 benchmark。
+- connection takeover 插件应跑最小并发连接 benchmark。
 - artifact 升级时与上一 active artifact 比较 P95/P99、错误率和资源占用。
 - 如果 P99 退化超过阈值，例如 20%，进入高风险确认。
 - 如果超过 runtime limits 或触发 goroutine/连接泄漏检测，应阻断启用。
@@ -4205,7 +4207,7 @@ benchmark 结果应保存为 artifact 附属元数据：
     "handler_p95_ms": 4.2,
     "handler_p99_ms": 8.7,
     "conn_per_sec": 1200,
-    "max_active_proxy_connections": 5000,
+    "max_active_connection_sessions": 5000,
     "estimated_bytes_per_connection": 32768
   }
 }
@@ -4383,7 +4385,7 @@ type HealthCheck interface {
 
 - enable 前如果插件实现 HealthCheck，应在 `ReloadConfig()` 和 `Init()` 后执行一次 readiness check。
 - 健康检查必须有短超时，例如 1-3 秒。
-- protocol-proxy 插件如果外部认证源不可用，可以按配置 fail open、fail closed 或 degraded。
+- connection takeover 插件如果外部认证源不可用，可以按配置 fail open、fail closed 或 degraded。
 - 健康状态变化应更新 runtime state、指标和审计/事件。
 - Admin 页面需要显示最近一次 health check 时间、状态、摘要和失败原因。
 
@@ -4401,7 +4403,7 @@ Plugin Manager 至少应维护内存态指标，并通过 Admin metrics 页面/A
 | `plugin_panics_total` | counter | `plugin_id`、`extension_point`、`handler_id` | handler panic 次数 |
 | `plugin_timeouts_total` | counter | `plugin_id`、`extension_point`、`handler_id` | handler 超时次数 |
 | `plugin_active_calls` | gauge | `plugin_id`、`extension_point` | 当前运行中的 handler 调用数 |
-| `plugin_active_proxy_connections` | gauge | `plugin_id` | protocol-proxy mode 当前连接数 |
+| `plugin_active_connection_sessions` | gauge | `plugin_id` | connection takeover mode 当前连接数 |
 | `plugin_backpressure_drops_total` | counter | `plugin_id`、`extension_point`、`reason` | 背压导致的 pass、reject 或 drop 次数 |
 | `plugin_circuit_breaker_state` | gauge | `plugin_id` | 0=closed，1=open，2=half-open |
 | `plugin_scope_matches_total` | counter | `plugin_id`、`extension_point`、`result` | scope/rollout 命中或跳过次数 |
@@ -4590,11 +4592,11 @@ MC 登录插件示例：
 - session server 超时：插件上报 `auth.failure{reason="session_timeout"}` 和 dependency latency metric。
 - backend forwarding 失败：插件上报 `forwarding.failed`，但 forwarding secret 不进入事件属性。
 
-这套事件和指标 API 只提供观测出口，不改变 `upstream.connect/v1` 的责任划分。gateway core 不消费这些事件来决定 MC 登录结果，也不把事件作为登录流水线的一部分。
+这套事件和指标 API 只提供观测出口，不改变 `legacy upstream-connect contract` 的责任划分。gateway core 不消费这些事件来决定 MC 登录结果，也不把事件作为登录流水线的一部分。
 
 ### Tracing 和上下文传播
 
-日志、指标和审计回答的是不同问题，但排查一次连接故障时需要把它们串起来。Plugin Manager 应提供统一 trace/context 语义，让一次 client connection、插件 handler、外部依赖调用、backend dial 和 protocol-proxy 转发能通过 `trace_id`、`connection_id` 和 span 关联。
+日志、指标和审计回答的是不同问题，但排查一次连接故障时需要把它们串起来。Plugin Manager 应提供统一 trace/context 语义，让一次 client connection、插件 handler、外部依赖调用、backend dial 和 connection takeover 转发能通过 `trace_id`、`connection_id` 和 span 关联。
 
 基本标识：
 
@@ -4615,9 +4617,9 @@ span 边界建议：
 | `gateway.connection` | 新客户端连接进入到连接关闭 |
 | `gateway.route.lookup` | route snapshot lookup |
 | `plugin.handler` | 每次 extension point handler 调用 |
-| `plugin.protocol_proxy` | protocol-proxy 插件接管后的长连接生命周期 |
+| `plugin.takeover` | connection takeover 插件接管后的长连接生命周期 |
 | `plugin.external_dependency` | 插件访问声明的 external dependency |
-| `plugin.backend_dial` | protocol-proxy 插件连接 backend |
+| `plugin.backend_dial` | connection takeover 插件连接 backend |
 | `plugin.action` | Admin 执行插件 action |
 | `plugin.background_task` | 后台任务一次执行 |
 | `plugin.health_check` | 健康检查一次执行 |
@@ -4643,7 +4645,7 @@ tracing 规则：
 
 - gateway 调用插件时传入的 `context.Context` 必须携带 trace/span 信息。
 - 插件创建后台任务、外部依赖请求和 backend dial 时应沿用传入 context。
-- protocol-proxy 插件接管长连接后，应为连接生命周期创建长 span，并为关键阶段添加事件，例如 auth_start、auth_result、backend_dial、forwarding_start、disconnect。
+- connection takeover 插件接管长连接后，应为连接生命周期创建长 span，并为关键阶段添加事件，例如 auth_start、auth_result、backend_dial、forwarding_start、disconnect。
 - external dependency span 的属性只能包含 dependency ID、purpose、error kind、status code class 和 duration，不包含完整 URL query、token、玩家名或 session response。
 - trace 采样率必须可配置，默认可以只采样错误、慢调用、管理操作和少量正常请求。
 - trace export 是未来能力；第一版可以先在内存最近 trace 摘要和诊断包中展示。
@@ -4789,7 +4791,7 @@ type Gateway interface {
 - gateway 应提供基础脱敏 helper，例如对 secret ref、token 字段和 known secret name 做 mask。
 - 插件日志应有级别、速率限制和单条大小限制，避免故障插件刷爆磁盘。
 - panic stack 可以进入内部日志，但 Admin 页面只展示摘要；完整 stack 需要 admin 权限。
-- protocol-proxy 插件不能默认记录完整 Minecraft packet payload；需要显式 debug 开关，并且默认关闭。
+- connection takeover 插件不能默认记录完整 Minecraft packet payload；需要显式 debug 开关，并且默认关闭。
 
 诊断包可以作为未来 Admin 能力，用于排查插件问题。诊断包应包含：
 
@@ -4812,7 +4814,7 @@ type Gateway interface {
 
 1. 先从 dispatch table 移除插件，让新连接不再进入该插件。
 2. 对普通 hook/middleware/provider，等待当前调用完成或超时。
-3. 对 protocol-proxy mode，允许已有连接继续到自然关闭，或按管理员操作强制关闭。
+3. 对 connection takeover mode，允许已有连接继续到自然关闭，或按管理员操作强制关闭。
 4. 调用 `Destroy()` 释放插件全局资源。
 5. 更新 runtime state。
 
@@ -4850,7 +4852,7 @@ dispatch table 生成前必须执行冲突分析：
 
 典型 blocking conflict：
 
-- 两个 protocol-proxy 插件在同一 host 或全局 scope 下都声明 `upstream.connect/v1` 接管。
+- 两个 connection takeover 插件在同一 host 或全局 scope 下都声明 `legacy upstream-connect contract` 接管。
 - 两个 provider 都声明同一个 singleton provider name，且没有 fallback/selection 策略。
 - middleware 排序形成环，例如 A before B、B before A。
 - 插件声明 exclusive extension point，但已有重叠 scope 的插件启用。
@@ -4858,7 +4860,7 @@ dispatch table 生成前必须执行冲突分析：
 
 典型 warning conflict：
 
-- 两个 dialer mode 插件 scope 可能重叠，但 priority 明确，低优先级插件可能永远不会执行。
+- 两个 route.resolve/v1 provider 插件 scope 可能重叠，但 priority 明确，低优先级插件可能永远不会执行。
 - event subscriber 多个插件订阅同一事件，可能产生额外开销。
 - all hook 中多个插件都会处理同一请求，错误中断策略需要管理员确认。
 - route resolver provider 有多个候选，但配置了 fallback。
@@ -4908,7 +4910,7 @@ Extension Point 必须稳定命名和版本化：
 
 | Key | 类型 | 阶段 | 说明 |
 | --- | --- | --- | --- |
-| `upstream.connect/v1` | hook | 第一版 | 路由命中后、默认拨号前，插件可以返回真实上游连接或自管 stream endpoint |
+| `legacy upstream-connect contract` | hook | 第一版 | 路由命中后、默认拨号前，插件可以返回真实上游连接或自管 stream endpoint |
 | `ingress.service/v1` | provider/service | 未来 | 插件声明自定义入口服务，由 gateway/supervisor 管理 listener 和 lifecycle |
 | `connection.accept/v1` | hook/event | 预留 | 新连接进入后通知或检查 |
 | `connection.filter/v1` | middleware | 预留 | 连接级过滤、限流、拒绝、附加上下文 |
@@ -4930,7 +4932,7 @@ Extension Point 必须稳定命名和版本化：
 第一版内置 hook：
 
 ```text
-upstream.connect/v1
+legacy upstream-connect contract
 ```
 
 它发生在：
@@ -4939,7 +4941,7 @@ upstream.connect/v1
 client handshake
   -> parse Minecraft host
   -> route snapshot lookup
-  -> upstream.connect/v1 extension point
+  -> legacy upstream-connect contract extension point
   -> default upstream dial
   -> proxyConnections
 ```
@@ -4971,9 +4973,9 @@ client handshake
 设计规则：
 
 - `Transport` 描述客户端到 gateway 的入口，`UpstreamProtocol` 描述 gateway/plugin 到 backend 的连接方式，二者不能混用。
-- `upstream.connect/v1` 插件可以忽略默认 `UpstreamProtocol` 并返回自己的 `net.Conn`；Admin 仍需要展示它覆盖了默认上游协议。
-- dialer mode 插件如果只是实现另一种拨号方式，应在事件、指标和诊断里记录 effective upstream protocol，例如 `custom-tunnel`、`socks5`、`tailscale`。
-- protocol-proxy mode 插件可以自行连接 TCP/KCP/QUIC/HAProxy backend，也可以完全不使用 route 中的 upstream；但必须在配置和 health/preflight 中说明 backend 类型。
+- `legacy upstream-connect contract` 插件可以忽略默认 `UpstreamProtocol` 并返回自己的 `net.Conn`；Admin 仍需要展示它覆盖了默认上游协议。
+- route.resolve/v1 provider 插件如果只是实现另一种拨号方式，应在事件、指标和诊断里记录 effective upstream protocol，例如 `custom-tunnel`、`socks5`、`tailscale`。
+- connection takeover mode 插件可以自行连接 TCP/KCP/QUIC/HAProxy backend，也可以完全不使用 route 中的 upstream；但必须在配置和 health/preflight 中说明 backend 类型。
 - HAProxy upstream 表示 gateway 向 backend 写 PROXY protocol header。插件如果自己实现真实 IP 转发，必须声明 forwarding mode，避免重复写入或后端误信任。
 - WebSocket 入口的 HTTP upgrade 和 TCP/Admin 端口复用分流由 gateway core 处理；插件默认只接收已经归类为 Minecraft stream 的连接。
 - 插件不应接管 Admin HTTP 分支。Admin 自身扩展走 `admin.*` extension point 或声明式 UI，而不是在 TCP/Web 分流前截获 HTTP。
@@ -4982,20 +4984,20 @@ client handshake
 
 - TCP/Admin 共享端口先由 core 判断 HTTP/Admin/WebSocket 分支还是 Minecraft TCP 分支。
 - `connection.accept/v1` 如果未来在分流前触发，只能做轻量观测和来源拒绝，不能读取任意首包导致分流不稳定。
-- 第一版 `upstream.connect/v1` 发生在 Minecraft handshake 解析和 route lookup 之后，不会看到 Admin HTTP 请求。
-- 端口复用的 initial packet replay 必须和 `upstream.connect/v1.InitialData` 共用同一套只读/回放语义，避免首包被重复消费。
+- 第一版 `legacy upstream-connect contract` 发生在 Minecraft handshake 解析和 route lookup 之后，不会看到 Admin HTTP 请求。
+- 端口复用的 initial packet replay 必须和 `legacy upstream-connect contract.InitialData` 共用同一套只读/回放语义，避免首包被重复消费。
 
 scope 扩展：
 
 - scope 应支持 `transport`、`service_name`、`listener_port`、`upstream_protocol` 和 `route_id`。
-- protocol-proxy 插件如果只支持 TCP 入口或不支持 WebSocket/KCP/QUIC，需要在 manifest capabilities 或 Minecraft capability 中声明；启用时对 scope 做兼容提示。
-- rollout sticky key 默认仍以 source IP/connection metadata 为主；玩家名 sticky 只能由 protocol-proxy 插件在自己解析登录后实现。
+- connection takeover 插件如果只支持 TCP 入口或不支持 WebSocket/KCP/QUIC，需要在 manifest capabilities 或 Minecraft capability 中声明；启用时对 scope 做兼容提示。
+- rollout sticky key 默认仍以 source IP/connection metadata 为主；玩家名 sticky 只能由 connection takeover 插件在自己解析登录后实现。
 
 ### 插件自定义入口服务，未来能力
 
 第一版的插件只能在 gateway core 已接受并归类的连接上工作，不能直接新增监听端口。原因是入口服务涉及端口冲突、Admin 服务启停、systemd/Docker/host network 暴露、TLS 证书、UDP socket、权限和健康检查，必须纳入统一服务模型。
 
-未来如果需要插件提供新的入口，例如 TLS termination、PROXY protocol inbound、自定义 UDP 隧道、Bedrock/Geyser 协议适配或专用 sidecar 入口，应设计独立的 `ingress.service/v1`，而不是复用 `upstream.connect/v1`。
+未来如果需要插件提供新的入口，例如 TLS termination、PROXY protocol inbound、自定义 UDP 隧道、Bedrock/Geyser 协议适配或专用 sidecar 入口，应设计独立的 `ingress.service/v1`，而不是复用 `legacy upstream-connect contract`。
 
 `ingress.service/v1` 设计要求：
 
@@ -5078,19 +5080,19 @@ request 规则：
 
 - 新字段只能追加，已有字段语义不能改变。
 - `InitialData` 必须是副本或只读视图，插件修改它不能影响 gateway 内部 buffer。
-- `Source` 不作为插件读写数据通道；protocol-proxy 必须通过返回的 `net.Conn` 接管。
+- `Source` 不作为插件读写数据通道；connection takeover 必须通过返回的 `net.Conn` 接管。
 - `RawServerHost` 可能包含敏感或非标准数据，日志默认不记录。
 - `SourceAddr`、玩家名、UUID 不应进入指标标签。
 - `Transport`、`ServiceName`、`UpstreamProtocol` 是低基数字段，可以用于指标标签；`ListenerPort` 是否作为标签由部署规模决定。
 - `WebSocketPath` 和 `QUICApplicationProtocol` 进入日志和诊断摘要时需要限长和低基数化。
 - `Metadata` 不能承载 secret、token、完整协议 payload 或高基数字段。
 
-第一版 handler 返回 `(net.Conn, error)`。后续如果需要表达更丰富结果，可以新增 `upstream.connect/v2`：
+第一版 handler 返回 `(net.Conn, error)`。后续如果需要表达更丰富结果，可以新增 `legacy upstream-connect contract`：
 
 ```go
 type UpstreamConnectResult struct {
     Conn          net.Conn
-    Mode          string // dialer/protocol-proxy
+    Mode          string // dialer/connection takeover
     Decision      string // handled/pass/reject
     RejectReason  string
     Backend       string
@@ -5098,13 +5100,13 @@ type UpstreamConnectResult struct {
 }
 ```
 
-`upstream.connect/v1` 不在返回值中携带身份信息；后续 `upstream.connect/v2` 即使增加结构化 result，也不应让 gateway core 消费 Minecraft 登录身份并拼装登录流程。身份 forwarding、登录结果和登录后的协议处理都由 protocol-proxy 插件自己写入、代理或通过观测事件上报。对 gateway core 来说，plugin-owned `net.Conn` 是 opaque stream endpoint，而不是可解析的 Minecraft 登录子流程。
+`legacy upstream-connect contract` 不在返回值中携带身份信息；后续 `legacy upstream-connect contract` 即使增加结构化 result，也不应让 gateway core 消费 Minecraft 登录身份并拼装登录流程。身份 forwarding、登录结果和登录后的协议处理都由 connection takeover 插件自己写入、代理或通过观测事件上报。对 gateway core 来说，plugin-owned `net.Conn` 是 opaque stream endpoint，而不是可解析的 Minecraft 登录子流程。
 
-该 opaque 语义是协议代理能力成立的关键约束。gateway core 只能基于调用前已经拥有的连接元数据、handshake 元数据、route 元数据、scope 和插件运行时状态做治理；不能从 protocol-proxy 插件内部拿到玩家身份后再参与 Minecraft 业务决策。插件如果需要把玩家身份传给 backend，应直接按目标 backend 支持的 forwarding 协议写入后端连接。
+该 opaque 语义是协议代理能力成立的关键约束。gateway core 只能基于调用前已经拥有的连接元数据、handshake 元数据、route 元数据、scope 和插件运行时状态做治理；不能从 connection takeover 插件内部拿到玩家身份后再参与 Minecraft 业务决策。插件如果需要把玩家身份传给 backend，应直接按目标 backend 支持的 forwarding 协议写入后端连接。
 
-`upstream.connect/v1` 调用模式：
+`legacy upstream-connect contract` 调用模式：
 
-- `upstream.connect/v1` 是 first-match hook。
+- `legacy upstream-connect contract` 是 first-match hook。
 - 按 `plugins.priority` 升序调用。
 - priority 相同按插件 ID 升序调用。
 - 插件内多个 handler 时按注册顺序或 handler priority 调用。
@@ -5114,35 +5116,35 @@ type UpstreamConnectResult struct {
 - handler 返回其他 error 时本次连接失败并记录日志。
 - 没有插件处理时走默认 upstream dial。
 
-`upstream.connect/v1` 支持两种使用模式：
+`legacy upstream-connect contract` 支持两种使用模式：
 
 | 模式 | 返回值 | 适合场景 |
 | --- | --- | --- |
-| dialer mode | 插件返回真实上游连接 | 自定义拨号、隧道、代理、服务发现、灰度和 fallback |
-| protocol-proxy mode | 插件返回自管 `net.Conn`，并在插件内部继续代理协议 | 完整协议代理、MC 正版/三方登录、登录策略、后续 play 阶段协议处理 |
+| route.resolve/v1 provider | 插件返回真实上游连接 | 自定义拨号、隧道、代理、服务发现、灰度和 fallback |
+| connection takeover mode | 插件返回自管 `net.Conn`，并在插件内部继续代理协议 | 完整协议代理、MC 正版/三方登录、登录策略、后续 play 阶段协议处理 |
 
-dialer mode 示例：
+route.resolve/v1 provider 示例：
 
 ```text
 client
   -> gateway
-  -> upstream.connect/v1
+  -> legacy upstream-connect contract
   -> plugin net.Dial/custom tunnel
   -> backend
 ```
 
-protocol-proxy mode 示例：
+connection takeover mode 示例：
 
 ```text
 client
   -> gateway
-  -> upstream.connect/v1
+  -> legacy upstream-connect contract
   -> plugin-owned net.Conn endpoint
   -> plugin Minecraft protocol proxy
   -> backend
 ```
 
-在 protocol-proxy mode 中，插件可以返回一个由插件控制的连接端点，例如 `net.Pipe()` 的一端。gateway 会把已经读取到的初始 handshake 包写入该连接，并继续把客户端后续字节转发到该连接。插件在另一端读取完整 Minecraft 字节流，因此可以自行实现：
+在 connection takeover mode 中，插件可以返回一个由插件控制的连接端点，例如 `net.Pipe()` 的一端。gateway 会把已经读取到的初始 handshake 包写入该连接，并继续把客户端后续字节转发到该连接。插件在另一端读取完整 Minecraft 字节流，因此可以自行实现：
 
 - handshake 和 login start 解析。
 - online-mode encryption request/response。
@@ -5160,7 +5162,7 @@ client
 
 正版/三方登录插件在本设计中应被视为“插件实现的完整业务能力”，而不是 gateway core 暴露若干认证回调后由 core 拼装登录流程。
 
-结论：按当前设计，正版/三方登录插件可以实现。它不依赖 gateway core 实现任何 Minecraft 登录业务逻辑，也不依赖第一版实现 `auth.provider/v1`。必要条件是 `upstream.connect/v1` 支持 protocol-proxy mode，并且 gateway 能把初始 handshake bytes 回放到插件返回的 `net.Conn`。
+结论：按当前设计，正版/三方登录插件可以实现。它不依赖 gateway core 实现任何 Minecraft 登录业务逻辑，也不依赖第一版实现 `auth.provider/v1`。必要条件是 `legacy upstream-connect contract` 支持 connection takeover mode，并且 gateway 能把初始 handshake bytes 回放到插件返回的 `net.Conn`。
 
 需要纠正的边界是：正版/三方登录以及登录后的逻辑不是 gateway core 的职责，也不是 core 调用插件拿到认证结果后继续处理。插件接管 stream 后，应由插件自己完成认证、身份映射、后端连接、forwarding、configuration/play 阶段代理、失败响应和连接关闭。gateway core 只负责把连接稳定交给插件，并围绕这个交接点做生命周期和治理。
 
@@ -5175,13 +5177,13 @@ client
 
 gateway core 负责：
 
-- 在路由命中后、默认拨号前调用 `upstream.connect/v1`。
+- 在路由命中后、默认拨号前调用 `legacy upstream-connect contract`。
 - 将已读取的初始 Minecraft handshake 数据交还给插件自管连接。
 - 把客户端连接和插件返回的 `net.Conn` 做稳定转发。
 - 提供插件生命周期、配置、secret、指标、审计、超时、并发和 draining 支撑。
 - 捕获 handler panic、timeout 和错误，保护 dispatch table 和其他插件。
 
-因此，MC 正版/三方登录插件只依赖 `upstream.connect/v1` 的 protocol-proxy mode 就可以成立。`auth.provider/v1` 只能作为未来插件之间复用认证来源的抽象，例如多个 protocol-proxy 插件共用同一个 Yggdrasil-like session verifier；它不是 gateway core 登录流水线，也不是第一版实现登录插件的必要条件。
+因此，MC 正版/三方登录插件只依赖 `legacy upstream-connect contract` 的 connection takeover mode 就可以成立。`auth.provider/v1` 只能作为未来插件之间复用认证来源的抽象，例如多个 connection takeover 插件共用同一个 Yggdrasil-like session verifier；它不是 gateway core 登录流水线，也不是第一版实现登录插件的必要条件。
 
 SDK/API 约束：
 
@@ -5192,7 +5194,7 @@ SDK/API 约束：
 - 插件如果需要内部拆分登录逻辑，应在插件包内自行组织模块，或未来通过插件间 `auth.provider/v1` provider 复用；gateway core 仍不参与登录状态机。
 - 管理页展示的登录成功率、认证失败原因和 forwarding 失败只能来自插件主动上报的脱敏事件、指标、health 和诊断摘要。
 
-protocol-proxy mode 的约束：
+connection takeover mode 的约束：
 
 - 插件必须在返回自管 `net.Conn` 前启动对应的读写处理，否则 gateway 写入初始包时可能阻塞。
 - 插件负责关闭自管连接、后端连接和内部 goroutine。
@@ -5203,7 +5205,7 @@ protocol-proxy mode 的约束：
 
 ### `net.Conn` 接管契约
 
-`upstream.connect/v1` 返回的 `net.Conn` 必须满足 Go `net.Conn` 基本语义。gateway 会把它视为“上游连接”并执行双向转发。
+`legacy upstream-connect contract` 返回的 `net.Conn` 必须满足 Go `net.Conn` 基本语义。gateway 会把它视为“上游连接”并执行双向转发。
 
 gateway 负责：
 
@@ -5224,7 +5226,7 @@ gateway 负责：
 关闭和 deadline 规则：
 
 - gateway 可以为初始写入设置短 write deadline，避免插件返回不可读 conn 导致连接路径挂死。
-- protocol-proxy 插件接管后，协议级超时由插件负责；gateway 只管理连接级 idle timeout 和转发 timeout。
+- connection takeover 插件接管后，协议级超时由插件负责；gateway 只管理连接级 idle timeout 和转发 timeout。
 - 如果底层连接支持 half-close，gateway 可以优先使用 half-close；不支持时退化为 Close。
 - 插件 `Close()` 必须幂等。
 - 插件不能在 `Close()` 中长期阻塞。
@@ -5238,7 +5240,7 @@ gateway 负责：
 
 ### Minecraft 协议能力声明
 
-protocol-proxy 插件能接管完整 Minecraft 字节流，但管理员仍需要知道插件声称支持哪些协议版本、协议阶段、认证模式、forwarding 模式和 modded 边界。否则插件启用后才发现某些客户端版本、backend 或 modded 客户端不兼容，排障成本很高。
+connection takeover 插件能接管完整 Minecraft 字节流，但管理员仍需要知道插件声称支持哪些协议版本、协议阶段、认证模式、forwarding 模式和 modded 边界。否则插件启用后才发现某些客户端版本、backend 或 modded 客户端不兼容，排障成本很高。
 
 manifest 可以增加 `minecraft`：
 
@@ -5296,9 +5298,9 @@ manifest 可以增加 `minecraft`：
 
 - manifest 声明不代表 gateway core 会解析这些阶段，也不代表 core 会代替插件返回 kick、pass 或 close；它用于管理页展示、发布门禁、测试矩阵和示例文档。
 - gateway 已知的 `ProtocolVersion` 可以在 dispatch 前用于 scope/rollout 和兼容提示。
-- 如果请求的 protocol version 不在插件声明范围内，第一版 gateway 只做兼容提示或按 scope/rollout 跳过插件；一旦进入 protocol-proxy handler，unsupported version 的 kick、pass、close 都由插件自己实现。
+- 如果请求的 protocol version 不在插件声明范围内，第一版 gateway 只做兼容提示或按 scope/rollout 跳过插件；一旦进入 connection takeover handler，unsupported version 的 kick、pass、close 都由插件自己实现。
 - 如果插件声明 `unsupported_policy=pass`，它不应在不支持版本上接管连接；这需要插件的 acceptor 或 handler 自行返回 `api.ErrPass`。
-- protocol-proxy 插件如果启用 forwarding，必须声明 supported forwarding mode 和 secret requirement。
+- connection takeover 插件如果启用 forwarding，必须声明 supported forwarding mode 和 secret requirement。
 - backend 如果要求 Velocity/Bungee forwarding，管理页应提示 backend 直连保护和 secret 配置。
 - modded 支持必须保守声明；unknown modded 默认不应被当作 supported。
 
@@ -5311,21 +5313,21 @@ manifest 可以增加 `minecraft`：
 
 发布门禁：
 
-- protocol-proxy 插件启用前展示 Minecraft 能力矩阵。
+- connection takeover 插件启用前展示 Minecraft 能力矩阵。
 - scope 中包含的 protocol version 超出插件声明范围时进入 warning 或 blocking。
 - forwarding mode 变更、从 transparent 改为 handled、开启 packet rewrite 都属于高风险变更。
 - promotion import 应对比源/目标环境 backend forwarding 配置和插件 forwarding 支持。
 
 ### Minecraft Auth Proxy 插件设计模板
 
-`mc-auth-proxy` 是 protocol-proxy mode 的代表性插件。它的目标不是让 gateway core 增加登录逻辑，而是在插件内部完整实现 Minecraft 登录代理。
+`mc-auth-proxy` 是 connection takeover mode 的代表性插件。它的目标不是让 gateway core 增加登录逻辑，而是在插件内部完整实现 Minecraft 登录代理。
 
 处理流程：
 
 ```text
 client
   -> gateway reads initial handshake
-  -> upstream.connect/v1
+  -> legacy upstream-connect contract
   -> mc-auth-proxy returns plugin-owned net.Conn
   -> plugin reads handshake/login start
   -> plugin performs auth flow
@@ -5350,7 +5352,7 @@ client
 
 gateway core 职责：
 
-- 提供 `upstream.connect/v1` stream endpoint。
+- 提供 `legacy upstream-connect contract` stream endpoint。
 - 回放初始 handshake bytes。
 - 提供配置、secret、日志、指标、scope、rollout、health、draining 和生命周期。
 - 不解析 login/encryption/session/forwarding 业务协议，不决定正版/三方登录成败，也不拼装登录后协议链路。
@@ -5469,7 +5471,7 @@ HealthCheck 建议：
 | --- | --- | --- |
 | `connection.accept/v1` | all | 新连接进入后通知插件，可用于限流、审计 |
 | `route.resolve/v1` | first-match 或 transform | 路由查询前后改写目标 |
-| `upstream.connect/v1` | first-match | 接管上游连接创建 |
+| `legacy upstream-connect contract` | first-match | 接管上游连接创建 |
 | `connection.close/v1` | all async | 连接关闭后通知插件 |
 | `metrics.collect/v1` | all | 插件导出指标 |
 
@@ -5502,7 +5504,7 @@ Middleware 设计原则：
 - 维护模式提示。
 - 按 host/source/route tag 返回不同状态。
 
-`status.ping/v1` 不应要求插件接管完整连接。它可以由 gateway core 解析 status request 后调用插件返回响应结构。第一版如果不实现该扩展点，仍可由 protocol-proxy 插件完整处理 status state。
+`status.ping/v1` 不应要求插件接管完整连接。它可以由 gateway core 解析 status request 后调用插件返回响应结构。第一版如果不实现该扩展点，仍可由 connection takeover 插件完整处理 status state。
 
 `minecraft.packet.observe/v1` 只做观测：
 
@@ -5517,13 +5519,13 @@ Middleware 设计原则：
 - 必须限制 packet 类型和大小。
 - 必须有严格超时、panic recover 和 fail open/closed 策略。
 - 默认不进入第一版主路径。
-- 对 play 阶段 packet 改写容易破坏协议兼容，建议优先由 protocol-proxy 插件自行实现。
+- 对 play 阶段 packet 改写容易破坏协议兼容，建议优先由 connection takeover 插件自行实现。
 
 modded handshake 处理：
 
 - Forge/Fabric/FML 等 modded handshake 可能改变 server address、login payload 或 configuration 阶段行为。
 - 第一版不要求 gateway core 理解 modded protocol。
-- 需要 modded 支持的插件应使用 protocol-proxy mode，或等待后续专门 extension point。
+- 需要 modded 支持的插件应使用 connection takeover mode，或等待后续专门 extension point。
 
 ### 路由解析层
 
@@ -5532,9 +5534,9 @@ modded handshake 处理：
 第一版边界：
 
 - SQLite route snapshot 仍是默认路由来源。
-- `upstream.connect/v1` 发生在 route lookup 之后，可以覆盖默认上游连接，但不应反向修改 SQLite routes。
+- `legacy upstream-connect contract` 发生在 route lookup 之后，可以覆盖默认上游连接，但不应反向修改 SQLite routes。
 - `route.resolve/v1` 和 `route.resolver/v1` 第一版只预留；如果提前实现，也必须生成可审计的 route decision。
-- 插件如果需要同步外部 CMDB/服务发现结果，第一版更适合写成后台任务加本地插件缓存，再由 `upstream.connect/v1` 使用，而不是直接改 gateway route 表。
+- 插件如果需要同步外部 CMDB/服务发现结果，第一版更适合写成后台任务加本地插件缓存，再由 `legacy upstream-connect contract` 使用，而不是直接改 gateway route 表。
 
 动态路由合成模型：
 
@@ -5543,7 +5545,7 @@ Minecraft handshake host
   -> normalize host
   -> SQLite route snapshot lookup
   -> optional route.resolve/v1 transform/override
-  -> upstream.connect/v1
+  -> legacy upstream-connect contract
   -> effective upstream
 ```
 
@@ -5602,7 +5604,7 @@ Provider 用于替换某类能力实现。Mock 的运行时价值应收敛为 Pr
 
 - 它不是第一版 MC 正版/三方登录插件的必要依赖。
 - 它不定义 gateway core 的 Minecraft 登录流水线。
-- 它只用于插件之间复用认证来源，例如一个 protocol-proxy 插件调用另一个插件提供的 session verifier。
+- 它只用于插件之间复用认证来源，例如一个 connection takeover 插件调用另一个插件提供的 session verifier。
 - 即使未来实现，调用方仍应是负责协议代理的插件，而不是 gateway core。
 
 Provider 设计原则：
@@ -5615,7 +5617,7 @@ Provider 设计原则：
 
 ### Admin Auth Provider
 
-`admin.auth.provider/v1` 是管理页登录扩展点，不是 Minecraft 游戏侧登录扩展点。它只负责让 Admin 页面接入 OIDC、LDAP、企业 SSO 或内部身份平台；不会被 `upstream.connect/v1`、MC 登录插件或游戏连接路径调用。
+`admin.auth.provider/v1` 是管理页登录扩展点，不是 Minecraft 游戏侧登录扩展点。它只负责让 Admin 页面接入 OIDC、LDAP、企业 SSO 或内部身份平台；不会被 `legacy upstream-connect contract`、MC 登录插件或游戏连接路径调用。
 
 基本原则：
 
@@ -5702,7 +5704,7 @@ Admin login page
 - 删除或禁用 provider 前，Admin 页面必须提示受影响的外部身份链接和现有 session 处理策略。
 - 多个 Admin auth provider 可以并存，但同一个 callback path、provider ID 或 login method ID 不能冲突。
 
-`admin.auth.provider/v1` 第一版可以先作为预留设计；即使提前实现，也应独立于 MC 登录插件，不改变 `upstream.connect/v1` 的责任划分。
+`admin.auth.provider/v1` 第一版可以先作为预留设计；即使提前实现，也应独立于 MC 登录插件，不改变 `legacy upstream-connect contract` 的责任划分。
 
 ### Event Subscriber
 
@@ -6301,7 +6303,7 @@ type SelfTester interface {
 自测规则：
 
 - `quick` 只做本地、短耗时检查，适合上传后和启用前默认执行。
-- `protocol-smoke` 可以构造握手、登录失败响应、backend dial 等 fixture，适合 protocol-proxy 插件。
+- `protocol-smoke` 可以构造握手、登录失败响应、backend dial 等 fixture，适合 connection takeover 插件。
 - `integration` 可以访问声明的 external dependencies，但必须使用 `ExternalClient` 和受控 timeout。
 - `soak` 属于上线前或 staging 证据，不应在生产 Admin 请求里同步执行。
 - 自测结果只保存摘要和证据 ID，不保存 secret、token、完整 response、完整 packet payload 或玩家隐私原文。
@@ -6419,7 +6421,7 @@ type Gateway interface {
 
 - `plugin/api` 稳定 API 文档。
 - `examples/plugins/upstream-rewrite` 最小模板。
-- `examples/plugins/mc-auth-proxy` protocol-proxy 模板。
+- `examples/plugins/mc-auth-proxy` connection takeover 模板。
 - manifest source 多格式解析和 canonical JSON schema。
 - 统一的 `gateway plugin init/build/test` 开发工具链。
 
@@ -6493,8 +6495,8 @@ CLI 规则：
 - 构建兼容性检查。
 - mock `api.Gateway`。
 - extension point handler 单元测试 helper。
-- `upstream.connect/v1` 的 dialer mode 测试 helper。
-- protocol-proxy mode 的 net.Pipe 测试 helper。
+- `legacy upstream-connect contract` 的 route.resolve/v1 provider 测试 helper。
+- connection takeover mode 的 net.Pipe 测试 helper。
 - 构造 Minecraft handshake/login packet 的测试工具。
 
 测试工具应覆盖：
@@ -6524,7 +6526,7 @@ CLI 规则：
 | 入口传输 | TCP、KCP、QUIC、WebSocket、TCP/Admin 端口复用、initial packet replay |
 | 上游协议 | TCP、KCP、QUIC、HAProxy upstream、custom dialer、真实 IP 转发边界 |
 | 组合冲突 | composition constraints、scope overlap、provider 单例、middleware 排序环、shadowed handler |
-| protocol-proxy | 初始 handshake 回放、net.Pipe、deadline、Close、初始写入失败 |
+| connection takeover | 初始 handshake 回放、net.Pipe、deadline、Close、初始写入失败 |
 | 治理 | timeout、panic recover、并发上限、背压、熔断、draining |
 | tracing | trace ID、connection ID、span parent、context propagation、采样和脱敏 |
 | 性能 | micro benchmark、integration benchmark、protocol smoke、soak、regression threshold |
@@ -6543,8 +6545,8 @@ CLI 规则：
 
 示例插件也需要测试：
 
-- `upstream-rewrite` 覆盖 dialer mode。
-- `mc-auth-proxy` 覆盖 protocol-proxy mode、登录失败响应和 forwarding secret 引用。
+- `upstream-rewrite` 覆盖 route.resolve/v1 provider。
+- `mc-auth-proxy` 覆盖 connection takeover mode、登录失败响应和 forwarding secret 引用。
 - 示例插件 source/binary `.mcgp` 都能通过 validate、compat、build 和 conformance。
 
 ### 发布门禁
@@ -6567,10 +6569,10 @@ CLI 规则：
 - 当前 artifact/config/scope/runtime limits 组合已有有效 review，或当前策略不要求 review。
 - source package 构建成功，且构建产物 manifest 与 artifact 记录一致。
 - HealthCheck 如果存在，ready 或按策略允许 degraded。
-- 高风险插件或 protocol-proxy 插件至少通过 quick self-test；涉及协议接管时建议通过 protocol-smoke。
+- 高风险插件或 connection takeover 插件至少通过 quick self-test；涉及协议接管时建议通过 protocol-smoke。
 - 高风险或连接路径插件的 benchmark/smoke 结果未超过 runtime limits。
-- dispatch plan 不存在 blocking conflict，例如 protocol-proxy scope 重叠、provider 单例冲突或 middleware 排序环。
-- protocol-proxy 插件的 Minecraft protocol version、forwarding mode 和 scope/protocol version 兼容性已检查。
+- dispatch plan 不存在 blocking conflict，例如 connection takeover scope 重叠、provider 单例冲突或 middleware 排序环。
+- connection takeover 插件的 Minecraft protocol version、forwarding mode 和 scope/protocol version 兼容性已检查。
 - 插件声明的 transport、service name 和 upstream protocol 支持范围与当前 scope 兼容。
 - 如果插件接管 HAProxy upstream 或自定义真实 IP forwarding，已检查不会与 gateway 默认 HAProxy protocol 重复或冲突。
 
@@ -6585,12 +6587,12 @@ CLI 规则：
 - Minecraft 能力矩阵、unsupported protocol policy、modded 边界和 forwarding secret 要求已查看。
 - 最近构建日志无明显风险。
 - 配置快照已创建。
-- 灰度 scope/rollout 已设置，尤其是 protocol-proxy 插件。
+- 灰度 scope/rollout 已设置，尤其是 connection takeover 插件。
 - 回滚 artifact 可用。
 
 高风险变更需要二次确认：
 
-- 启用 protocol-proxy 插件。
+- 启用 connection takeover 插件。
 - 从 dry-run 切换到 enforced。
 - capabilities 变更。
 - secret 引用变更。
@@ -6787,7 +6789,7 @@ scope 扩展规则：
 | `GET` | `/admin/api/plugins/{id}/config-snapshots` | 查看配置/desired state 快照列表 |
 | `POST` | `/admin/api/plugins/{id}/config-snapshots/{snapshot_id}/diff` | 查看快照与当前 desired state 的脱敏 diff |
 | `POST` | `/admin/api/plugins/{id}/config-snapshots/{snapshot_id}/rollback` | 回滚 config 或完整 desired state 到指定快照 |
-| `POST` | `/admin/api/plugins/{id}/draining/force-close` | 强制关闭 draining 的 protocol-proxy 连接 |
+| `POST` | `/admin/api/plugins/{id}/draining/force-close` | 强制关闭 draining 的 connection takeover 连接 |
 | `GET` | `/admin/api/plugins/{id}/events` | 查看插件业务事件脱敏摘要 |
 | `GET` | `/admin/api/plugins/{id}/route-decisions` | 查看插件动态路由和上游覆盖的最近决策摘要 |
 | `GET` | `/admin/api/plugins/{id}/event-subscriptions` | 查看事件订阅、队列、投递状态和死信摘要 |
@@ -7035,10 +7037,10 @@ API 错误响应应包含稳定错误码，便于管理页和 CLI 处理：
 
 - 自定义 upstream 拨号。
 - 自定义 tunnel、代理和服务发现。
-- protocol-proxy mode 下的完整 Minecraft 协议代理。
+- connection takeover mode 下的完整 Minecraft 协议代理。
 - MC 正版/三方登录、身份转发和登录后协议处理。
-- 玩家维度白名单、黑名单、ban、会员、权限、风控和分流策略，前提是由 protocol-proxy 插件自己解析并持有玩家身份。
-- Minecraft status ping、MOTD、维护模式、unsupported version 提示和 modded handshake 兼容，第一版可由 protocol-proxy 插件自行实现。
+- 玩家维度白名单、黑名单、ban、会员、权限、风控和分流策略，前提是由 connection takeover 插件自己解析并持有玩家身份。
+- Minecraft status ping、MOTD、维护模式、unsupported version 提示和 modded handshake 兼容，第一版可由 connection takeover 插件自行实现。
 - 在 gateway 已有 TCP/KCP/QUIC/WebSocket 入口上按 transport/upstream protocol 做差异化策略。
 - 连接级策略、限流、黑白名单。
 - 动态后端选择、灰度、蓝绿、fallback。
@@ -7092,7 +7094,7 @@ API 错误响应应包含稳定错误码，便于管理页和 CLI 处理：
 | 已知恶意 artifact 被再次启用 | 回滚或跨环境导入重新引入风险代码 | denylist、准入策略、撤销审计、阻断 enable/rollback |
 | Go ABI 不兼容 | 加载失败或启动失败 | Go/API/GOOS/GOARCH preflight，manifest schema 校验 |
 | 插件 panic 或阻塞 | 连接路径故障、goroutine 堆积 | panic recover、timeout、并发限制、熔断 |
-| protocol-proxy 插件实现错误 | 玩家无法登录、身份转发错误 | 示例、测试 harness、health check、dry-run 限制 |
+| connection takeover 插件实现错误 | 玩家无法登录、身份转发错误 | 示例、测试 harness、health check、dry-run 限制 |
 | secret 泄漏 | forwarding secret、外部 API token 泄漏 | SecretStore、日志脱敏、审计不记录明文、诊断包脱敏 |
 | 源码包构建供应链风险 | 构建时访问外网、私有 token 泄漏 | builder 隔离、环境变量白名单、vendor 模式、日志限制 |
 | 上传包攻击 | zip slip、zip bomb、特殊文件 | 静态包校验、大小限制、拒绝特殊文件 |
@@ -7160,7 +7162,7 @@ API 错误响应应包含稳定错误码，便于管理页和 CLI 处理：
 1. 在插件列表查看 error rate、timeout、panic、active proxy connections。
 2. 如果是灰度插件，先把 rollout percentage 调到 0。
 3. 如果是普通 hook，执行 disable，让新连接绕过插件。
-4. 如果是 protocol-proxy 插件，先 disable 新流量，再观察 draining。
+4. 如果是 connection takeover 插件，先 disable 新流量，再观察 draining。
 5. 必要时执行 force-close draining connections。
 6. 回滚到上一个 artifact 或配置快照。
 7. 导出诊断包，保留 artifact sha256、日志摘要和审计记录。
@@ -7201,7 +7203,7 @@ API 错误响应应包含稳定错误码，便于管理页和 CLI 处理：
 4. 触发 hot reload 或标记 reload required。
 5. 观察插件 health、auth failure、forwarding failure 和 secret reload 审计事件。
 6. grace period 结束后撤销旧版本。
-7. 对 protocol-proxy 插件，确认新连接使用新版本，旧连接自然结束或按维护窗口关闭。
+7. 对 connection takeover 插件，确认新连接使用新版本，旧连接自然结束或按维护窗口关闭。
 
 ### secret 泄漏怀疑
 
@@ -7211,7 +7213,7 @@ API 错误响应应包含稳定错误码，便于管理页和 CLI 处理：
 2. 创建新 secret version，并按策略 hot reload、reload 或 disable 依赖插件。
 3. 如果是 forwarding secret 泄漏，后端也必须同步轮换；无法 dual-read 时先关闭新流量。
 4. 检查插件日志、审计日志和诊断包是否出现明文。
-5. 对可能受影响的 protocol-proxy 连接执行 draining 或 force-close。
+5. 对可能受影响的 connection takeover 连接执行 draining 或 force-close。
 6. 导出审计记录，标记相关 artifact、插件版本和 secret version。
 
 ### 插件安全公告命中
@@ -7221,7 +7223,7 @@ API 错误响应应包含稳定错误码，便于管理页和 CLI 处理：
 1. 查看 advisory severity、affected rule、match type 和 recommended action。
 2. 如果有 fixed version，先执行 compat、policy evaluation 和 staging smoke test。
 3. 对 `block_new_enable` 或更高动作，阻断 rollback 和 promotion apply 到受影响 artifact。
-4. 对 `quarantine` 或 `revoke`，从 dispatch table 移除插件并处理 protocol-proxy draining。
+4. 对 `quarantine` 或 `revoke`，从 dispatch table 移除插件并处理 connection takeover draining。
 5. 如果 advisory 要求 secret rotation，执行对应 secret 正常轮换或泄漏处置 Runbook。
 6. 标记 advisory match 为 mitigated、acknowledged 或 ignored；ignored 必须有有效期和原因。
 7. 导出诊断和审计记录，记录旧 artifact、新 artifact、advisory ID 和处理人。
@@ -7277,13 +7279,13 @@ examples/plugins/upstream-rewrite/
 }
 ```
 
-- 注册 `upstream.connect/v1` extension point handler。
+- 注册 `legacy upstream-connect contract` extension point handler。
 - 当 `ServerHost` 命中配置时，插件自己 `net.Dial` 到配置 upstream 并返回连接。
 - 不命中时返回 pass，让 gateway 走默认 upstream。
 
 ### Minecraft Auth Proxy 示例
 
-需要提供 `examples/plugins/mc-auth-proxy`，用于展示 protocol-proxy mode 的能力边界。它可以先作为文档级或实验性示例存在，不要求第一阶段完整生产可用。
+需要提供 `examples/plugins/mc-auth-proxy`，用于展示 connection takeover mode 的能力边界。它可以先作为文档级或实验性示例存在，不要求第一阶段完整生产可用。
 
 ```text
 examples/plugins/mc-auth-proxy/
@@ -7299,7 +7301,7 @@ examples/plugins/mc-auth-proxy/
 
 示例能力：
 
-- 注册 `upstream.connect/v1` extension point handler。
+- 注册 `legacy upstream-connect contract` extension point handler。
 - 命中指定 host 时返回插件自管 `net.Conn`。
 - 插件内部解析 handshake 和 login start。
 - 插件内部完成正版或三方 Yggdrasil session 校验。
@@ -7313,7 +7315,7 @@ examples/plugins/mc-auth-proxy/
 - 展示 forwarding secret 通过 SecretStore 引用，不写入普通配置。
 - 展示 session server 超时、backend dial 失败和 unsupported protocol version 的失败策略。
 
-该示例说明：`upstream.connect/v1` 不只是拨号替换点，也可以作为完整 stream endpoint，让插件实现自己的 Minecraft 协议代理。
+该示例说明：`legacy upstream-connect contract` 不只是拨号替换点，也可以作为完整 stream endpoint，让插件实现自己的 Minecraft 协议代理。
 
 ### Minecraft Status 示例，未来能力
 
@@ -7365,7 +7367,7 @@ examples/plugins/mc-status-motd/
 1. 保留现有 `api.Plugin`、`api.Gateway`、`RegisterHookHandler` 和 `HookUpstream`，避免已打包插件失效。
 2. Plugin Manager 接管插件加载、实例创建、JSON 配置解码、生命周期和 runtime state。
 3. `cmd/gateway/plugin.go` 及其全局 `plugins`、`hooks`、`pluginLock` 已删除，连接路径只读取 Plugin Manager 发布的 dispatch snapshot。
-4. 旧 `HookUpstream` 由 Plugin Manager 映射到 `upstream.connect/v1` 的请求上下文；兼容逻辑不在 gateway 数据面重复实现。
+4. 旧 `HookUpstream` 由 Plugin Manager 映射到 `legacy upstream-connect contract` 的请求上下文；兼容逻辑不在 gateway 数据面重复实现。
 5. `gatewayconfig.Config.Plugin`、`DecodePluginConfig` 和 `[plugin.*]` TOML loader 已删除，不提供兼容期或迁移告警。
 6. SQLite/Admin 是上传、构建、加载、启用、禁用、配置、删除和回滚的唯一管理入口，Admin API 改变 desired state 后由 Plugin Manager 收敛。
 7. 生产制品统一为 `.mcgp` artifact；正式 runtime adapter 仍使用 `plugin.Open` 加载包内已校验的 `plugin.so`。
@@ -7413,7 +7415,7 @@ examples/plugins/mc-status-motd/
 - 把 upstream hook 收敛为 request struct。
 - 定义第一批预留 extension point 类型：middleware、provider、event subscriber。
 - 提供 manifest 校验工具和插件测试 harness。
-- 提供 protocol-proxy mode 的测试 helper。
+- 提供 connection takeover mode 的测试 helper。
 - 提供 benchmark harness 和 regression benchmark profile。
 - 定义配置迁移接口和插件私有数据接口。
 - 定义 plugin_data schema、迁移、快照、配额、retention 和导入导出规则。
@@ -7541,10 +7543,10 @@ examples/plugins/mc-status-motd/
 ### 阶段 6：示例和文档
 
 - 提供 upstream rewrite 示例插件。
-- 提供 mc-auth-proxy protocol-proxy 示例插件。
+- 提供 mc-auth-proxy connection takeover 示例插件。
 - 示例插件支持二进制包和源码包两种 `.mcgp` 打包方式。
 - 示例插件纳入 conformance suite，作为 SDK/API 契约回归基线。
-- 示例插件提供 benchmark profile，至少覆盖 upstream handler 和 protocol-proxy smoke。
+- 示例插件提供 benchmark profile，至少覆盖 upstream handler 和 connection takeover smoke。
 - 提供插件开发文档。
 - 提供能力矩阵、Extension Point 清单、能力边界和常见场景文档。
 - 提供源码包构建环境、供应链元数据、权限、审计和排障文档。
@@ -7575,7 +7577,7 @@ examples/plugins/mc-status-motd/
 - 定义 `go-plugin-process` supervisor、plugin-host 生命周期、fd passing、drain-only、fd-live 和 fd-live-shm 迁移契约。
 - 定义共享内存迁移 state schema、safe point、quiesce/snapshot/restore conformance。
 - 定义 `sandbox-process` control RPC protocol。
-- 定义跨进程 stream relay 和 `stream.proxy/v1` 或 `upstream.connect/v2`。
+- 定义跨进程 stream relay 和 `stream.proxy/v1` 或 `legacy upstream-connect contract`。
 - 实现 sandbox supervisor、心跳、crash loop 检测和进程级资源限制。
 - 将 capabilities 映射到文件系统、网络、环境变量、secret、CPU 和内存强制策略。
 - 实现 secret handle/RPC，不通过环境变量注入长期 secret。
@@ -7608,9 +7610,9 @@ examples/plugins/mc-status-motd/
 - review、promotion、drift、rollback 和审计使用统一 canonical hash、desired fingerprint 和脱敏 diff；CLI 与 Admin 结果一致。
 - config snapshot 保存 artifact/config/scope/rollout/runtime limits/features/policy hash；回滚快照时重新执行当前策略和发布门禁。
 - denylist 命中的 artifact 不能 load、enable、rollback 或通过 promotion import 应用到生产。
-- 已启用插件被撤销后，新连接不再进入该插件，protocol-proxy 连接进入 draining 或 force close，并提示重启彻底移除已加载 native code。
+- 已启用插件被撤销后，新连接不再进入该插件，connection takeover 连接进入 draining 或 force close，并提示重启彻底移除已加载 native code。
 - runtime adapter 明确 `go-plugin`、`sandbox-process`、`wasm` 和 build-time instrumentation 的能力边界。
-- 文档明确 `go-plugin-process` 是部分可用的可选服务启动模式：当前已有 plugin-host command/handshake/UDS control、supervisor start/stop foundation、host 内 lifecycle、loaded host crash summary refresh、persisted configurable restart backoff/max/window policy、crash-loop auto-isolation、per-node crash isolation、service-level last error persistence、supervised/stale control socket cleanup、metadata-backed process orphan sweep、无 metadata 的 stale active control socket handshake orphan cleanup、Linux `/proc` process-table orphan discovery、`upstream.connect/v1` dialer bridge 和 protocol-proxy drain-only stream bridge；fd/live migration、sandbox enforcement、完整不可信隔离和非 Linux process-table orphan discovery 仍是未来能力。
+- 文档明确 `go-plugin-process` 是部分可用的可选服务启动模式：当前已有 plugin-host command/handshake/UDS control、supervisor start/stop foundation、host 内 lifecycle、loaded host crash summary refresh、persisted configurable restart backoff/max/window policy、crash-loop auto-isolation、per-node crash isolation、service-level last error persistence、supervised/stale control socket cleanup、metadata-backed process orphan sweep、无 metadata 的 stale active control socket handshake orphan cleanup、Linux `/proc` process-table orphan discovery、`legacy upstream-connect contract` dialer bridge 和 connection takeover drain-only stream bridge；fd/live migration、sandbox enforcement、完整不可信隔离和非 Linux process-table orphan discovery 仍是未来能力。
 - Admin 能保存 gateway 插件服务 desired mode，展示 active mode、restart required、plugin-host/supervisor 状态和迁移能力；切换 `in-process`/`go-plugin-process` 不承诺运行中生效。
 - `go-plugin-process` 连接迁移分为 `drain-only`、`fd-live` 和 `fd-live-shm`；默认 `drain-only`，live migration 必须由插件显式声明并通过 conformance。
 - 文档明确 fd 只迁移内核 socket，共享内存只迁移稳定格式的用户态 buffer/state，不能共享 Go heap 对象。
@@ -7619,8 +7621,8 @@ examples/plugins/mc-status-motd/
 - build-time instrumentation 被明确为未来官方构建期能力；它产出 gateway binary，不进入 `.mcgp` 热加载 lifecycle，也不能通过 Admin 页面按插件启用/禁用。
 - 如果未来启用 build-time instrumentation，构建产物必须记录 instrumentation manifest、builder identity、source sha256、generated diff hash、Go/API 版本，并通过 conformance、benchmark 和 smoke test。
 - sandbox-process 设计明确 control RPC、stream relay、supervisor、secret RPC、资源限制和 crash loop 策略。
-- WASM 设计明确只适合 route/rule/config validate 等轻量能力，不承诺完整 protocol-proxy。
-- 跨进程 protocol-proxy 不复用 `upstream.connect/v1` 的 `net.Conn` 返回语义，需要新的 extension point 版本或 stream proxy 模型。
+- WASM 设计明确只适合 route/rule/config validate 等轻量能力，不承诺完整 connection takeover。
+- 跨进程 connection takeover 不复用 `legacy upstream-connect contract` 的 `net.Conn` 返回语义，需要新的 extension point 版本或 stream proxy 模型。
 - sandbox runtime 如果无法强制 manifest 声明的必需 capability，启用会被阻断而不是降级为只审计。
 - 插件 ID、handler ID、task ID、secret name 和 extension point key 有明确命名规范。
 - API 兼容、废弃和降级策略明确，旧 artifact 回滚不会绕过 config_version 检查。
@@ -7650,7 +7652,7 @@ examples/plugins/mc-status-motd/
 - mock/mixin/monkey patch 不作为生产插件机制；mock 只用于测试，mixin/source weaving 只能作为受控 build-time instrumentation。
 - composition constraints 能声明 exclusive extension point、conflicts_with、before/after、provides/consumes。
 - dispatch plan 能解释同一 extension point 下 handler 的最终顺序、scope 重叠、blocking/warning conflict 和 shadowed handler。
-- protocol-proxy scope 重叠、provider 单例冲突和 middleware 排序环会阻断启用，旧 dispatch table 不受影响。
+- connection takeover scope 重叠、provider 单例冲突和 middleware 排序环会阻断启用，旧 dispatch table 不受影响。
 - config schema UI hint 可以驱动 secret ref、sensitive、advanced、restart/reload required 等表单行为。
 - 声明式 Admin UI 可以渲染配置布局、状态面板、文档链接和受控 action，但第一版不会执行插件包内 HTML/JavaScript。
 - 插件 action 必须鉴权、二次确认 dangerous action、超时、panic recover、脱敏返回并写审计日志。
@@ -7658,10 +7660,10 @@ examples/plugins/mc-status-motd/
 - 插件性能预算、slow call、P95/P99 延迟和告警状态可在管理页查看。
 - benchmark harness 能输出 micro、integration、protocol smoke、soak 和 regression profile 的摘要结果。
 - artifact 能保存 benchmark 摘要和报告路径，管理页能展示基线对比和退化比例。
-- 发布门禁能基于 benchmark 结果识别超过 runtime limits、P99 明显退化和 protocol-proxy 容量不足。
+- 发布门禁能基于 benchmark 结果识别超过 runtime limits、P99 明显退化和 connection takeover 容量不足。
 - 发布门禁能执行通用 preflight；插件实现 Preflight/SelfTest 时能复用其结果，并展示脱敏证据和阻断原因。
 - scope、rollout 和 dry-run 可以限制插件只影响指定 host、route、source 或百分比流量。
-- dry-run 模式不会改变真实连接结果，且 protocol-proxy 插件不能以接管连接的方式 dry-run。
+- dry-run 模式不会改变真实连接结果，且 connection takeover 插件不能以接管连接的方式 dry-run。
 - 插件 HealthCheck 的 ready/degraded/not_ready 会影响启用状态和管理页告警。
 - 后台任务支持 interval/manual schedule、run-on-start、jitter、timeout、non-reentrant、最近运行摘要和 skipped 记录。
 - 后台任务在 disable、shutdown 和 artifact switch 时会被取消或等待超时，不会阻塞连接路径。
@@ -7684,11 +7686,11 @@ examples/plugins/mc-status-motd/
 - Admin API 使用稳定 permission key 做鉴权；admin/member/guest 只是默认角色映射。
 - `admin.auth.provider/v1` 如果实现，必须保留本地 SQLite admin break-glass 登录；外部身份源不可替代初始 setup，也不能导致所有管理员被锁定。
 - Admin 外部登录 session 必须由 gateway 签发；插件只返回外部身份、groups/claims 摘要和脱敏认证证据，不能绕过 CSRF、权限检查和审计。
-- Admin auth provider 状态只影响管理页外部登录方式，不影响 Minecraft 连接路径、MC 正版/三方登录插件或 `upstream.connect/v1` 调度。
+- Admin auth provider 状态只影响管理页外部登录方式，不影响 Minecraft 连接路径、MC 正版/三方登录插件或 `legacy upstream-connect contract` 调度。
 - plugin_data value 导出需要 `plugin.data.export`，member 默认只能查看摘要。
 - plugin runtime files 默认只展示摘要、用量、namespace、data class 和 GC candidate；文件内容导出需要单独权限和脱敏流程。
 - secret 更新、依赖阻断、熔断、自动禁用和强制关闭连接都有审计日志。
-- secret 支持 version、rotation state、dual-read grace period、hot reload/reload required/restart required 和 revoke；protocol-proxy 长连接默认不被轮换强制改变协议状态。
+- secret 支持 version、rotation state、dual-read grace period、hot reload/reload required/restart required 和 revoke；connection takeover 长连接默认不被轮换强制改变协议状态。
 - 插件配置迁移失败时不会切换 active artifact。
 - plugin_data schema 迁移失败时不会切换 active artifact；回滚前会检查旧 artifact 是否支持当前 data schema。
 - plugin_data 有 data class、schema version、配额、retention 和 GC 规则；超过配额时写入失败且不会无限增长 SQLite。
@@ -7700,7 +7702,7 @@ examples/plugins/mc-status-motd/
 - promotion bundle 导入会校验 artifact sha256、Go/API/runtime 兼容性、config hash、config schema、secret mapping 和环境覆盖；本地 apply 需要目标侧提供 config。
 - 跨环境导入能展示 artifact/config/scope/rollout/runtime limits diff，缺失 secret 会阻断启用。
 - drift 检测使用 artifact sha256、canonical config/scope/rollout/runtime limits/features/policy hash 和 desired fingerprint，不依赖 version 字符串。
-- 灾备演练能在不接入真实流量的情况下验证 artifact、manifest、config、secret rebind、load dry-run、health check 和 protocol-proxy smoke test。
+- 灾备演练能在不接入真实流量的情况下验证 artifact、manifest、config、secret rebind、load dry-run、health check 和 connection takeover smoke test。
 - preflight/self-test 结果不包含 secret、token、完整外部 response、完整 packet payload 或玩家隐私原文。
 - 插件删除时可以选择保留或删除 `plugin_data`。
 - 插件删除时可以选择保留或删除 runtime data 目录；cache/tmp/log/diagnostic 可以按策略清理。
@@ -7708,23 +7710,23 @@ examples/plugins/mc-status-motd/
 - 启用插件失败时，旧 dispatch table 不受影响。
 - 禁用插件后，新连接不再调用该插件 extension point handler。
 - 删除插件后，DB 记录和可删除文件被清理；已加载插件提示重启后彻底清理。
-- `upstream.connect/v1` 返回的 `net.Conn` 契约明确覆盖初始 handshake 回放、deadline、关闭、初始写入失败和错误 fallback。
-- `upstream.connect/v1` request contract 明确包含 connection ID、trace ID、source、host、protocol version、route、initial data、scope 和 metadata，并规定隐私/只读约束。
-- `upstream.connect/v1` 示例插件可以按文档完整跑通。
-- protocol-proxy mode 示例能证明插件可以接管完整 Minecraft 字节流并自行实现登录代理。
-- protocol-proxy 插件可以声明 Minecraft protocol versions、states、auth modes、forwarding、modded 和 packet features。
+- `legacy upstream-connect contract` 返回的 `net.Conn` 契约明确覆盖初始 handshake 回放、deadline、关闭、初始写入失败和错误 fallback。
+- `legacy upstream-connect contract` request contract 明确包含 connection ID、trace ID、source、host、protocol version、route、initial data、scope 和 metadata，并规定隐私/只读约束。
+- `legacy upstream-connect contract` 示例插件可以按文档完整跑通。
+- connection takeover mode 示例能证明插件可以接管完整 Minecraft 字节流并自行实现登录代理。
+- connection takeover 插件可以声明 Minecraft protocol versions、states、auth modes、forwarding、modded 和 packet features。
 - 管理页能提示 scope/protocol version 超出插件支持范围、forwarding mode 不匹配和 unsupported protocol policy。
 - `mc-auth-proxy` 设计模板覆盖 auth mode、session server、profile cache、forwarding secret、backend 保护、失败策略和 health check。
 - `mc-auth-proxy` 示例至少展示正版或三方 Yggdrasil-like 登录、Velocity modern forwarding secret 引用和登录失败响应。
-- 文档明确 status ping、MOTD、modded handshake 和 packet observe/filter 的扩展边界；第一版可由 protocol-proxy 插件自行实现。
+- 文档明确 status ping、MOTD、modded handshake 和 packet observe/filter 的扩展边界；第一版可由 connection takeover 插件自行实现。
 - 文档包含按用户功能点反推的覆盖清单，覆盖连接治理、MC 登录和运营、动态路由、外部依赖、后台同步、观测导出、Admin 扩展、自定义入口、sandbox/WASM 和构建期增强。
 - 每个功能点都标明推荐实现形态、第一版能力边界和未来 extension point，不能只有抽象 hook 名称。
-- 玩家维度策略、风控、白名单、ban、会员和分流被明确归入 protocol-proxy 插件内部或未来 MC 协议扩展；第一版 core 不维护玩家身份上下文。
+- 玩家维度策略、风控、白名单、ban、会员和分流被明确归入 connection takeover 插件内部或未来 MC 协议扩展；第一版 core 不维护玩家身份上下文。
 - Admin action、后台任务、外部依赖、PluginDataStore、PluginFileStore 和声明式 UI 被明确作为插件实际落地复杂功能所需的支撑能力。
 - 自定义入口、跨语言插件、不可信插件和构建期插桩被明确区分为不同未来路线，不能复用第一版 `go-plugin` ABI 做含糊承诺。
 - manifest 校验工具能发现缺字段、版本不兼容和 unsupported extension point。
-- 插件测试 harness 能覆盖 dialer mode 和 protocol-proxy mode。
-- 测试矩阵覆盖包格式、ABI、生命周期、配置、extension point、入口传输、上游协议、protocol-proxy、治理、secret、artifact 和 Admin 权限。
+- 插件测试 harness 能覆盖 route.resolve/v1 provider 和 connection takeover mode。
+- 测试矩阵覆盖包格式、ABI、生命周期、配置、extension point、入口传输、上游协议、connection takeover、治理、secret、artifact 和 Admin 权限。
 - 运维 Runbook 覆盖连接失败、启用失败、构建失败、secret 泄漏怀疑、磁盘占用过高和多实例部分失败。
 - CLI 工具至少覆盖 manifest validate、build/package、inspect、compat、test、promotion export/import/diff、drift 和 dr-drill 的设计。
 - CLI 工具覆盖 plugin_data inspect/export/gc，且 data gc 支持 dry-run。
@@ -7778,7 +7780,7 @@ examples/plugins/mc-status-motd/
 | confirm token | 默认由 gateway 生成一次性 token，绑定 actor、plugin ID、action ID、desired fingerprint 和 5 分钟 TTL |
 | 签名 | 第一版记录和展示，不强制校验，除非组织策略开启 |
 | README | 高风险插件缺 README 进入 review_required；restricted 可配置为阻断 |
-| Runbook | protocol-proxy 插件缺 Runbook 进入 review_required |
+| Runbook | connection takeover 插件缺 Runbook 进入 review_required |
 | data handling | 访问 external dependency、导出事件或处理玩家数据时必须声明；缺失进入 review_required |
 | license | manifest 使用 SPDX expression；未知为 `NOASSERTION` 并进入 warning |
 | SBOM | 第一版优先支持 SPDX JSON；缺失默认 warning，高风险插件可配置为 review_required |
@@ -7791,7 +7793,7 @@ examples/plugins/mc-status-motd/
 
 | 项 | 第一版默认值 |
 | --- | --- |
-| `upstream.connect/v1` handler timeout | 3s |
+| `legacy upstream-connect contract` handler timeout | 3s |
 | `route.resolve/v1` 预留 timeout | 500ms |
 | event subscriber timeout | 1s，默认 fail open |
 | background task timeout | 30s |
@@ -7801,7 +7803,7 @@ examples/plugins/mc-status-motd/
 | stale generation event/metric | 默认丢弃并计入 stale counter；诊断中保留摘要 |
 | Destroy timeout | 默认 5s，超时后移除 dispatch 并标记 cleanup warning |
 | max concurrent handler calls | 128 |
-| max active protocol-proxy connections | 1024 |
+| max active connection takeover connections | 1024 |
 | 熔断 | panic、timeout、error rate 超阈值进入 degraded；安全类插件可配置 fail closed |
 | HealthCheck not_ready | 阻止新启用；已启用插件按策略 degraded 或移出 dispatch |
 | ExternalClient | 官方插件和示例插件默认使用；native 插件绕过时只做风险提示 |
@@ -7816,7 +7818,7 @@ examples/plugins/mc-status-motd/
 | preflight enforcement | blocking/error 阻断 enable；warning 需要管理员确认 |
 | benchmark profile | 默认分 local-fast、ci-contract、staging-capacity、prod-canary 四档 |
 | performance regression | P95/P99 或错误率相对基线退化超过 20% 进入 warning；超过 50% 或超过 runtime limit 阻断高风险发布 |
-| protocol-proxy benchmark | 第一版 synthetic packet 必需；真实客户端回放作为 staging/prod 证据增强 |
+| connection takeover benchmark | 第一版 synthetic packet 必需；真实客户端回放作为 staging/prod 证据增强 |
 | trace sampling | 默认采样错误、慢调用、管理操作和 1% 正常连接 |
 | external `traceparent` | 默认不注入第三方依赖请求 |
 | Admin metrics API | 第一版实现，作为统一观测模型的主出口 |
@@ -7857,9 +7859,9 @@ examples/plugins/mc-status-motd/
 | 项 | 第一版默认值 |
 | --- | --- |
 | scope 维度 | host、route ID、route tag、source CIDR、protocol version、transport、service name、upstream protocol |
-| rollout | percentage + source IP sticky；玩家名 sticky 由 protocol-proxy 插件自行实现或未来扩展 |
-| dry-run | 非 protocol-proxy handler 可支持；protocol-proxy 默认禁止接管式 dry-run |
-| composition conflict | protocol-proxy/provider 单例冲突强制阻断；其他 warning 可管理员确认 |
+| rollout | percentage + source IP sticky；玩家名 sticky 由 connection takeover 插件自行实现或未来扩展 |
+| dry-run | 非 connection takeover handler 可支持；connection takeover 默认禁止接管式 dry-run |
+| composition conflict | connection takeover/provider 单例冲突强制阻断；其他 warning 可管理员确认 |
 | warning override | 需要理由、有效期和审计日志 |
 | transport support | 未声明时默认只按 TCP 兼容；启用到 KCP/QUIC/WebSocket scope 需要声明支持 |
 | HAProxy upstream | 插件自定义真实 IP forwarding 与 route `haproxy://` 重叠时进入高风险确认或阻断 |
@@ -7875,7 +7877,7 @@ examples/plugins/mc-status-motd/
 | scope overlap 静态分析 | 第一版至少覆盖 exact host、简单 wildcard、route ID、route tag、source CIDR、protocol version、transport/service/upstream protocol |
 | 环境覆盖格式 | 使用字段路径 map，形式接近 `plugin_id -> field_path -> value`；JSON Patch 可作为未来导入格式 |
 | forwarding route 交叉校验 | 第一版允许 route/upstream 可选声明 backend type、期望 forwarding mode、直连保护和真实 IP 信任边界；只用于 preflight/warning，core 不实现 MC 登录或 forwarding |
-| modded handshake 示例 | 第一版不提供官方示例；交给 protocol-proxy 插件自行实现，官方只提供 fixture/声明字段 |
+| modded handshake 示例 | 第一版不提供官方示例；交给 connection takeover 插件自行实现，官方只提供 fixture/声明字段 |
 
 ### 多实例和未来 runtime
 
@@ -7889,7 +7891,7 @@ examples/plugins/mc-status-motd/
 | sandbox stream relay | 本机优先 Unix domain socket；gRPC streaming 只用于低吞吐结构化流或跨语言控制面 |
 | sandbox egress 限制 | 优先依赖部署平台/容器/network policy 强制；gateway 只做声明、审计和 ExternalClient 受控出口 |
 | WASM runtime | 优先 wazero，先定义 host ABI 和 contract；wasmtime 作为需要原生性能或组件模型时的未来选项 |
-| 跨进程协议代理扩展点 | 使用 `stream.proxy/v1` 表达跨进程 stream relay；`upstream.connect/v2` 保留给进程内上游连接结果增强 |
+| 跨进程协议代理扩展点 | 使用 `stream.proxy/v1` 表达跨进程 stream relay；`legacy upstream-connect contract` 保留给进程内上游连接结果增强 |
 | SBOM 漏洞扫描 | 第一版支持本地/导入式/外部 feed 漏洞库按 SBOM dependency rescan 并进入治理；feed scheduler 为显式配置能力，完整自动扫描链后续实现 |
 | license policy | 第一版支持本地 allowlist/denylist 配置；组织中心同步作为未来能力 |
 
@@ -7899,17 +7901,17 @@ examples/plugins/mc-status-motd/
 
 | 问题 | 收敛决策 |
 | --- | --- |
-| protocol-proxy dry-run | 第一版禁止接管式 dry-run；只允许非 protocol-proxy handler dry-run，或未来单独设计轻量 `Evaluate()` |
+| connection takeover dry-run | 第一版禁止接管式 dry-run；只允许非 connection takeover handler dry-run，或未来单独设计轻量 `Evaluate()` |
 | 后台任务 cron | 第一版只支持 interval/manual；cron 只保留 schema |
 | 多实例部署 | 第一版明确单实例主路径；已实现 gateway node heartbeat、插件维度 node runtime state、partial rollout 展示、local artifact package mirror 和 background task lease；远端分发和 cross-node apply 仍为后续工作 |
 | 同一 plugin ID 多实例 | 第一版不允许；未来引入 instance ID、数据隔离和排序规则 |
 | 源码包构建位置 | gateway 主进程不直接执行构建；开发可 local-process builder，生产推荐 container builder 或外部 CI |
-| MC 登录业务边界 | 正版/三方登录、身份映射、forwarding 和登录后的协议处理都由 protocol-proxy 插件负责；core 只提供连接交接和治理能力 |
-| 游戏侧 `auth.provider/v1` | 第一版只预留，MC 正版/三方登录不依赖它，由 protocol-proxy 插件完整实现 |
-| `status.ping/v1` | 第一版预留；需要完整控制时由 protocol-proxy 插件处理 status state |
+| MC 登录业务边界 | 正版/三方登录、身份映射、forwarding 和登录后的协议处理都由 connection takeover 插件负责；core 只提供连接交接和治理能力 |
+| 游戏侧 `auth.provider/v1` | 第一版只预留，MC 正版/三方登录不依赖它，由 connection takeover 插件完整实现 |
+| `status.ping/v1` | 第一版预留；需要完整控制时由 connection takeover 插件处理 status state |
 | packet filter | 第一版不开放 play 阶段 filter；只预留 observe/filter 设计 |
 | sandbox/WASM runtime | 第一版 runtime adapter 只实现 `go-plugin`；sandbox-process/WASM 保留 manifest/runtime schema 和未来设计 |
-| go-plugin-process runtime | 部分可用的可选服务启动模式，当前支持 Go plugin 进程级加载、host lifecycle、persisted configurable restart backoff/max/window policy、crash-loop auto-isolation、per-node crash isolation、service-level last error persistence、supervised/stale control socket cleanup、metadata-backed process orphan sweep、无 metadata 的 stale active control socket handshake orphan cleanup、Linux `/proc` process-table orphan discovery、`upstream.connect/v1` dialer bridge 和 protocol-proxy drain-only stream bridge；fd/live migration、sandbox enforcement、完整不可信隔离和非 Linux process-table orphan discovery 仍是未来能力 |
+| go-plugin-process runtime | 部分可用的可选服务启动模式，当前支持 Go plugin 进程级加载、host lifecycle、persisted configurable restart backoff/max/window policy、crash-loop auto-isolation、per-node crash isolation、service-level last error persistence、supervised/stale control socket cleanup、metadata-backed process orphan sweep、无 metadata 的 stale active control socket handshake orphan cleanup、Linux `/proc` process-table orphan discovery、`legacy upstream-connect contract` dialer bridge 和 connection takeover drain-only stream bridge；fd/live migration、sandbox enforcement、完整不可信隔离和非 Linux process-table orphan discovery 仍是未来能力 |
 | 插件新增 listener | 第一版不允许；未来走 `ingress.service/v1` 和统一服务管理 |
 | build-time instrumentation | 第一版不启用；未来仅官方/组织 CI profile，可观测不可热加载 |
 | 仓库 | 第一版不进入主路径；即使实现也只导入本地 artifact，不自动启用 |
@@ -7918,24 +7920,24 @@ examples/plugins/mc-status-motd/
 | SBOM/license | 第一版记录、展示并进入 warning/review；本地/导入式漏洞库可按 SBOM dependency rescan，组织级策略同步作为后续增强 |
 | `mc-auth-proxy` 示例范围 | 第一版至少实现正版或三方 Yggdrasil-like 之一，另一个保留配置模板；offline fallback 默认关闭且必须显式启用 |
 | Minecraft protocol version 展示 | 第一版只展示数字 protocol version；名称映射作为未来便利功能 |
-| unsupported protocol version | 由 protocol-proxy 插件按 manifest 策略处理，示例默认 kick；core 不代替返回 kick/pass/close |
+| unsupported protocol version | 由 connection takeover 插件按 manifest 策略处理，示例默认 kick；core 不代替返回 kick/pass/close |
 | forwarding 示例 | 第一版示例优先 Velocity modern forwarding；BungeeCord/custom forwarding 保留模板或文档 |
 | session/profile cache | 示例默认内存缓存；需要跨重启时使用 PluginDataStore，并受配额/retention 约束 |
 | optional dependency 降级 | 插件 manifest 声明降级策略，管理员只能选择更保守策略 |
 | benchmark profile | 默认 local-fast、ci-contract、staging-capacity、prod-canary 四档 |
 | 性能回归阈值 | 退化超过 20% 进入 warning，超过 50% 或超过 runtime limit 阻断高风险发布 |
-| protocol-proxy 容量证据 | 第一版 synthetic packet 必需，真实客户端回放作为 staging/prod 增强证据 |
+| connection takeover 容量证据 | 第一版 synthetic packet 必需，真实客户端回放作为 staging/prod 增强证据 |
 | external dependency 声明 | 声明 outbound 或使用 ExternalClient 时必须声明；native 未声明只提示风险，sandbox 阻断 |
 | external dependency fail policy | auth/entitlement 默认 fail closed，route 默认 fallback，audit/metrics 默认 fail open |
 | trace/connection ID | 第一版 gateway 自生成随机 ID；未来再兼容 W3C traceparent 和多实例 node 前缀 |
 | 自定义前端 UI | 第一版不支持；未来只能走 iframe sandbox 或独立 origin，不允许插件直接注入 Admin DOM |
 | future instance ID | 多实例未来默认系统生成 instance ID，管理员只设置 display name |
 | 多实例 artifact 分发 | 优先对象存储或控制面分发，节点本地 content-addressed 缓存；共享文件系统只作为简单部署选项 |
-| sandbox stream relay | future 默认 Unix domain socket；gRPC streaming 不作为高吞吐 protocol-proxy 首选 |
+| sandbox stream relay | future 默认 Unix domain socket；gRPC streaming 不作为高吞吐 connection takeover 首选 |
 | sandbox control RPC | future 默认 Unix domain socket + gRPC/Connect；跨主机才考虑 TCP + mTLS |
 | sandbox egress enforcement | future 默认依赖容器/部署平台 network policy，gateway 提供声明、审计和受控 ExternalClient |
 | WASM runtime | future 首选 wazero 并先固定 host ABI；wasmtime 作为后续可选 |
-| stream proxy 命名 | 跨进程协议代理使用 `stream.proxy/v1`；`upstream.connect/v2` 只用于进程内连接结果增强 |
+| stream proxy 命名 | 跨进程协议代理使用 `stream.proxy/v1`；`legacy upstream-connect contract` 只用于进程内连接结果增强 |
 | 环境覆盖格式 | 第一版使用字段路径 map；JSON Patch 作为未来可选导入格式 |
 | 隐私脱敏策略 | 默认保守脱敏；环境策略可放宽展示方式，但短期明文诊断必须有权限、TTL 和审计 |
 | alert silence | 第一版实现 Admin 本地静默窗口；外部 Prometheus/Alertmanager 等系统静默只作为未来集成 |

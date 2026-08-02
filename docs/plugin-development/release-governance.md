@@ -76,7 +76,7 @@ go run ./cmd/gateway plugin benchmark dist/<plugin-id>.mcgp \
   --baseline-diff 0.05
 ```
 
-Benchmark 证据应和扩展点风险匹配。protocol-proxy、connection filter、handshake filter 和 route resolver 属于 hot path，不能只提供 manifest 检查。
+Benchmark 证据应和扩展点风险匹配。connection takeover、connection filter、handshake filter 和 route resolver 属于 hot path，不能只提供 manifest 检查。
 
 ## Review 和 Override
 

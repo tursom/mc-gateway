@@ -117,7 +117,7 @@ type pluginConformanceFixtureFile struct {
 	RouteDecisions                       []string                           `json:"route_decisions"`
 	StatusHosts                          []string                           `json:"status_hosts"`
 	StreamProxyScenarios                 []pluginmanager.StreamProxyFixture `json:"stream_proxy_scenarios"`
-	ProtocolProxyScenarios               []string                           `json:"protocol_proxy_scenarios"`
+	TakeoverScenarios                    []string                           `json:"takeover_scenarios"`
 	RuleEvaluationOutcomes               []string                           `json:"rule_evaluation_outcomes"`
 	ConnectionFilterScenarios            []string                           `json:"connection_filter_scenarios"`
 	HandshakeFilterScenarios             []string                           `json:"handshake_filter_scenarios"`
@@ -586,8 +586,8 @@ func pluginFeatureFactsFor(options pluginmanager.RuntimeFeatureFactsOptions) map
 			"stream_proxy_protocol":                    pluginmanager.StreamProxyProtocolV1,
 			"stream_proxy_semantics":                   []string{"half_close", "deadline", "backpressure", "cancel", "byte_accounting"},
 			"sandbox_required_coverage":                pluginmanager.SandboxConformanceRequiredCoverage(),
-			"protocol_proxy_scenarios": []string{
-				"initial_data_once",
+			"takeover_scenarios": []string{
+				"byte_integrity",
 				"panic_recovered",
 				"timeout_deadline",
 				"endpoint_close",
@@ -943,14 +943,12 @@ func extensionContractChecks(manifest pluginmanager.Manifest) []map[string]any {
 
 func capabilityContractChecks(manifest pluginmanager.Manifest) []map[string]any {
 	checks := []map[string]any{}
+	supported := supportedExtensionPointKeysForCLI()
 	var caps struct {
-		ExtensionPoints  []string `json:"extension_points"`
-		RequiredFeatures []string `json:"required_features"`
-		Features         []string `json:"features"`
-		UpstreamConnect  struct {
-			Mode string `json:"mode"`
-		} `json:"upstream_connect"`
-		Ingress *pluginmanager.IngressCapability `json:"ingress"`
+		ExtensionPoints  []string                         `json:"extension_points"`
+		RequiredFeatures []string                         `json:"required_features"`
+		Features         []string                         `json:"features"`
+		Ingress          *pluginmanager.IngressCapability `json:"ingress"`
 	}
 	if len(manifest.Capabilities) == 0 {
 		return append(checks, cliCheck("capabilities", "warning", "capabilities object is empty", nil))
@@ -959,6 +957,15 @@ func capabilityContractChecks(manifest pluginmanager.Manifest) []map[string]any 
 		return append(checks, cliCheck("capabilities", "blocking", "capabilities must be valid JSON object", map[string]any{"error": err.Error()}))
 	}
 	declared := stringSet(caps.ExtensionPoints)
+	for _, key := range caps.ExtensionPoints {
+		if key == "upstream.connect/v1" || key == "upstream" {
+			checks = append(checks, cliCheck("capability_extension_removed", "blocking", "capability extension point was removed; use upstream.connect/v2", map[string]any{"key": key}))
+			continue
+		}
+		if !supported[key] {
+			checks = append(checks, cliCheck("capability_extension_unsupported", "blocking", "capability extension point is not supported by this gateway", map[string]any{"key": key}))
+		}
+	}
 	for _, point := range manifest.ExtensionPoints {
 		if len(declared) > 0 && !declared[point.Key] {
 			checks = append(checks, cliCheck("capability_extension_missing", "warning", "capabilities.extension_points does not list manifest extension point", map[string]any{"key": point.Key}))
@@ -969,13 +976,9 @@ func capabilityContractChecks(manifest pluginmanager.Manifest) []map[string]any 
 			checks = append(checks, cliCheck("required_feature_missing", "blocking", "required feature is not supported by this gateway", map[string]any{"feature": feature}))
 		}
 	}
-	switch caps.UpstreamConnect.Mode {
-	case "", pluginmanager.UpstreamModeDialer, pluginmanager.UpstreamModeProtocolProxy:
-		if caps.UpstreamConnect.Mode != "" {
-			checks = append(checks, cliCheck("upstream_connect_mode", "info", "upstream connect mode is supported", map[string]any{"mode": caps.UpstreamConnect.Mode}))
-		}
-	default:
-		checks = append(checks, cliCheck("upstream_connect_mode", "blocking", "upstream connect mode is not supported", map[string]any{"mode": caps.UpstreamConnect.Mode}))
+	var rawCapabilities map[string]json.RawMessage
+	if json.Unmarshal(manifest.Capabilities, &rawCapabilities) == nil && len(rawCapabilities["upstream_connect"]) > 0 {
+		checks = append(checks, cliCheck("upstream_connect_removed", "blocking", "capabilities.upstream_connect was removed; declare upstream.connect/v2 in capabilities.extension_points", nil))
 	}
 	if hasExtensionPointForCLI(manifest, pluginmanager.ExtensionIngressService) {
 		if problems := pluginmanager.ValidateIngressCapability(manifest, caps.Ingress); len(problems) > 0 {
@@ -1021,16 +1024,13 @@ func conformanceFixturesForCLI(opts pluginContractCLIOptions, manifest pluginman
 	fixtures := []map[string]any{
 		{"name": "contract", "status": passFail(contractOK), "extension": ""},
 	}
-	mode := upstreamConnectModeForCLI(manifest)
 	if hasExtensionPointForCLI(manifest, pluginmanager.ExtensionUpstreamConnect) {
-		fixtures = append(fixtures, map[string]any{"name": "upstream.connect/v1", "status": "pass", "mode": mode})
-		if mode == pluginmanager.UpstreamModeProtocolProxy {
-			fixtures = append(fixtures,
-				map[string]any{"name": "protocol-proxy.initial_data", "status": "pass"},
-				map[string]any{"name": "protocol-proxy.panic", "status": "pass"},
-				map[string]any{"name": "protocol-proxy.timeout", "status": "pass"},
-			)
-		}
+		fixtures = append(fixtures,
+			map[string]any{"name": "upstream.connect/v2", "status": "pass"},
+			map[string]any{"name": "takeover.byte_integrity", "status": "pass"},
+			map[string]any{"name": "takeover.panic", "status": "pass"},
+			map[string]any{"name": "takeover.timeout", "status": "pass"},
+		)
 	}
 	for _, item := range []struct {
 		name string
@@ -1210,8 +1210,8 @@ func normalizeConformanceFixtureFileForCLI(opts pluginContractCLIOptions, file p
 		}
 		fixtures = append(fixtures, fixture)
 	}
-	protocolProxyExpected := map[string]string{
-		"initial_data_once":             "initial_data_replayed_once",
+	takeoverExpected := map[string]string{
+		"byte_integrity":                "minecraft_bytes_preserved",
 		"panic_recovered":               "panic_recovered",
 		"timeout_deadline":              "deadline_enforced",
 		"endpoint_close":                "endpoint_half_close_propagated",
@@ -1220,24 +1220,23 @@ func normalizeConformanceFixtureFileForCLI(opts pluginContractCLIOptions, file p
 		"drain_disable_new_connections": "new_connections_rejected_while_draining",
 		"force_close_draining":          "active_proxies_closed_after_deadline",
 	}
-	for _, scenario := range file.ProtocolProxyScenarios {
+	for _, scenario := range file.TakeoverScenarios {
 		scenario = strings.TrimSpace(scenario)
 		if scenario == "" {
 			continue
 		}
-		expected := protocolProxyExpected[scenario]
+		expected := takeoverExpected[scenario]
 		if expected == "" {
 			expected = scenario
 		}
 		fixtures = append(fixtures, map[string]any{
-			"name":      "protocol-proxy." + scenario,
+			"name":      "takeover." + scenario,
 			"status":    "pass",
 			"extension": pluginmanager.ExtensionUpstreamConnect,
-			"mode":      pluginmanager.UpstreamModeProtocolProxy,
 			"scenario":  scenario,
 			"expected":  expected,
 		})
-		executeConformanceProtocolProxyFixtureForCLI(opts, fixtures[len(fixtures)-1], executor)
+		executeConformanceTakeoverFixtureForCLI(opts, fixtures[len(fixtures)-1], executor)
 	}
 	for _, host := range file.StatusHosts {
 		fixtures = append(fixtures, map[string]any{
@@ -1428,7 +1427,7 @@ func executeSandboxConformanceFixturesForCLI(opts pluginContractCLIOptions, file
 			RouteDecisions:         file.RouteDecisions,
 			RuleEvaluationOutcomes: file.RuleEvaluationOutcomes,
 			StreamProxyScenarios:   file.StreamProxyScenarios,
-			ProtocolProxyScenarios: file.ProtocolProxyScenarios,
+			TakeoverScenarios:      file.TakeoverScenarios,
 		})
 		fixture["evidence"] = evidence
 		if err != nil {
@@ -1899,17 +1898,17 @@ func executeConformanceRouteFixtureForCLI(_ pluginContractCLIOptions, fixture ma
 	fixture["error"] = "route fixture returned unexpected decision"
 }
 
-func executeConformanceProtocolProxyFixtureForCLI(_ pluginContractCLIOptions, fixture map[string]any, executor *conformanceExecutorForCLI) {
+func executeConformanceTakeoverFixtureForCLI(_ pluginContractCLIOptions, fixture map[string]any, executor *conformanceExecutorForCLI) {
 	if executor == nil {
 		return
 	}
 	fixture["mode"] = "executable"
-	if upstreamConnectModeForCLI(executor.manifest) != pluginmanager.UpstreamModeProtocolProxy {
+	if !hasExtensionPointForCLI(executor.manifest, pluginmanager.ExtensionUpstreamConnect) {
 		fixture["status"] = "fail"
-		fixture["error"] = "protocol-proxy scenario requires upstream.connect/v1 protocol-proxy manifest"
+		fixture["error"] = "takeover scenario requires upstream.connect/v2 manifest"
 		return
 	}
-	if err := executeProtocolProxyHarnessFixtureForCLI(fixture); err != nil {
+	if err := executeTakeoverHarnessFixtureForCLI(fixture); err != nil {
 		conformanceFail(fixture, err)
 		return
 	}
@@ -2569,10 +2568,8 @@ type conformanceHarnessPlugin struct {
 
 func (p *conformanceHarnessPlugin) Init(gateway api.Gateway) error {
 	switch p.mode {
-	case "protocol_proxy":
-		return api.RegisterHookHandler(gateway, api.HookUpstreamConnect,
-			func(api.UpstreamConnectRequest) bool { return !p.blockProxy },
-			p.handleProtocolProxy)
+	case "takeover":
+		return api.RegisterUpstreamConnectHandlerV2(gateway, p.handleTakeover)
 	case "route":
 		return api.RegisterHookHandler(gateway, api.HookRouteResolve,
 			func(api.RouteResolveRequest) bool { return true },
@@ -2630,35 +2627,37 @@ func (p *conformanceHarnessPlugin) Init(gateway api.Gateway) error {
 	}
 }
 
-func (p *conformanceHarnessPlugin) handleProtocolProxy(req api.UpstreamConnectRequest) (net.Conn, error) {
+func (p *conformanceHarnessPlugin) handleTakeover(req api.UpstreamConnectRequestV2) error {
+	if p.blockProxy {
+		return req.Flow.Next(req.Connection)
+	}
 	if p.scenario == "panic_recovered" {
-		panic("conformance protocol proxy panic")
+		panic("conformance takeover panic")
 	}
 	if p.scenario == "timeout_deadline" {
-		time.Sleep(2 * pluginmanager.DefaultHandlerTimeout)
-		return nil, api.ErrPass
+		<-req.Context.Done()
+		return req.Context.Err()
 	}
-	gatewayEnd, pluginEnd := net.Pipe()
-	go func() {
-		defer pluginEnd.Close()
-		buf := make([]byte, 4096)
-		_ = pluginEnd.SetDeadline(time.Now().Add(2 * time.Second))
-		n, _ := pluginEnd.Read(buf)
-		if n > 0 && p.readCh != nil {
-			select {
-			case p.readCh <- append([]byte(nil), buf[:n]...):
-			default:
-			}
-		}
-		switch p.scenario {
-		case "endpoint_close":
-			return
+	buf := make([]byte, 4096)
+	_ = req.Connection.Stream.SetDeadline(time.Now().Add(2 * time.Second))
+	n, _ := req.Connection.Stream.Read(buf)
+	if n > 0 && p.readCh != nil {
+		select {
+		case p.readCh <- append([]byte(nil), buf[:n]...):
 		default:
-			_, _ = pluginEnd.Write([]byte("ok"))
 		}
-	}()
-	_ = req
-	return gatewayEnd, nil
+	}
+	if p.scenario != "endpoint_close" {
+		_, _ = req.Connection.Stream.Write([]byte("ok"))
+	}
+	if p.scenario == "drain_disable_new_connections" || p.scenario == "force_close_draining" {
+		_, err := req.Connection.Stream.Read(buf)
+		if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrClosedPipe) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func (p *conformanceHarnessPlugin) handleRouteResolve(req api.RouteResolveRequest) (api.RouteDecision, error) {
@@ -2770,10 +2769,10 @@ func (p *conformanceHarnessPlugin) providerRegistration(providerType string) api
 	}
 }
 
-func executeProtocolProxyHarnessFixtureForCLI(fixture map[string]any) error {
+func executeTakeoverHarnessFixtureForCLI(fixture map[string]any) error {
 	scenario := strings.TrimSpace(fmt.Sprint(fixture["scenario"]))
 	readCh := make(chan []byte, 1)
-	manager, artifact, cleanup, err := newConformanceHarnessManager("protocol-proxy-conformance", "protocol_proxy", scenario, pluginmanager.UpstreamModeProtocolProxy, readCh)
+	manager, artifact, cleanup, err := newConformanceHarnessManager("takeover-conformance", "takeover", scenario, "takeover", readCh)
 	if err != nil {
 		return err
 	}
@@ -2801,58 +2800,96 @@ func executeProtocolProxyHarnessFixtureForCLI(fixture map[string]any) error {
 	clientGateway, clientSide := net.Pipe()
 	defer clientSide.Close()
 	errCh := make(chan error, 1)
+	takeoverCtx := context.Background()
+	cancelTakeover := func() {}
+	if scenario == "timeout_deadline" {
+		takeoverCtx, cancelTakeover = context.WithTimeout(takeoverCtx, 20*time.Millisecond)
+	}
+	defer cancelTakeover()
 	go func() {
-		_, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{
-			Host:        "play.example",
-			Source:      clientGateway,
-			InitialData: initial,
-		})
-		errCh <- err
+		req := api.UpstreamConnectRequestV2{Context: takeoverCtx, ConnectionID: "conformance", Connection: api.ConnectionState{Stream: clientGateway, EffectiveSourceAddr: "127.0.0.1:1"}}
+		errCh <- manager.HandleConnection(takeoverCtx, req, func(context.Context, api.ConnectionState) error { return nil })
 	}()
 	_ = clientSide.SetDeadline(time.Now().Add(2 * time.Second))
 	if scenario != "client_close" && scenario != "panic_recovered" && scenario != "timeout_deadline" {
-		if err := writeAll(clientSide, login); err != nil && scenario != "endpoint_close" {
+		if err := writeAll(clientSide, append(initial, login...)); err != nil && scenario != "endpoint_close" {
 			return err
 		}
 	}
+	if scenario == "drain_disable_new_connections" || scenario == "force_close_draining" {
+		select {
+		case got := <-readCh:
+			fixture["actual_initial_bytes"] = len(got)
+		case <-time.After(2 * time.Second):
+			return errors.New("takeover handler did not become active")
+		}
+		if _, err := manager.Disable(context.Background(), "cli", artifact.PluginID); err != nil {
+			return err
+		}
+		coreCalled := false
+		left, right := net.Pipe()
+		resultErr := manager.HandleConnection(context.Background(), api.UpstreamConnectRequestV2{Connection: api.ConnectionState{Stream: left}}, func(context.Context, api.ConnectionState) error {
+			coreCalled = true
+			return nil
+		})
+		_ = left.Close()
+		_ = right.Close()
+		if resultErr != nil {
+			return resultErr
+		}
+		fixture["actual_handled_after_disable"] = !coreCalled
+		if !coreCalled {
+			return errors.New("takeover handler accepted new connection after disable")
+		}
+		if scenario == "force_close_draining" {
+			closed, err := manager.ForceCloseDraining(context.Background(), "cli", artifact.PluginID)
+			if err != nil {
+				return err
+			}
+			fixture["actual_force_closed"] = closed
+			if closed != 1 {
+				return fmt.Errorf("force close count = %d, want 1", closed)
+			}
+		}
+		_ = clientSide.Close()
+		select {
+		case err := <-errCh:
+			if err != nil {
+				fixture["actual_error"] = err.Error()
+			}
+		case <-time.After(2 * time.Second):
+			return errors.New("draining takeover session did not finish")
+		}
+		return nil
+	}
 	_ = clientSide.Close()
 	err = <-errCh
-	fixture["actual_path"] = "manager.ConnectUpstream"
+	fixture["actual_path"] = "manager.HandleConnection"
 	fixture["actual_error"] = ""
 	if err != nil {
 		fixture["actual_error"] = err.Error()
 	}
 	switch scenario {
-	case "panic_recovered", "timeout_deadline":
+	case "panic_recovered":
+		if err == nil || !strings.Contains(err.Error(), "panic") {
+			return fmt.Errorf("takeover panic was not recovered as an error: %v", err)
+		}
 		return nil
-	case "drain_disable_new_connections":
-		if _, err := manager.Disable(context.Background(), "cli", artifact.PluginID); err != nil {
-			return err
+	case "timeout_deadline":
+		if !errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("takeover deadline error = %v, want context deadline exceeded", err)
 		}
-		result, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{Host: "play.example"})
-		if err != nil {
-			return err
-		}
-		fixture["actual_handled_after_disable"] = result.Handled
-		if result.Handled {
-			return errors.New("protocol proxy accepted new connection after disable")
-		}
-	case "force_close_draining":
-		closed, err := manager.ForceCloseDraining(context.Background(), "cli", artifact.PluginID)
-		if err != nil {
-			return err
-		}
-		fixture["actual_force_closed"] = closed
+		return nil
 	default:
 		select {
 		case got := <-readCh:
 			fixture["actual_initial_bytes"] = len(got)
 			if len(got) == 0 {
-				return errors.New("protocol proxy did not receive initial data")
+				return errors.New("takeover handler did not receive client data")
 			}
 		default:
-			if scenario == "initial_data_once" || scenario == "backpressure_large_packet" {
-				return errors.New("protocol proxy did not observe initial data")
+			if scenario == "byte_integrity" || scenario == "backpressure_large_packet" {
+				return errors.New("takeover handler did not observe client data")
 			}
 		}
 	}
@@ -3033,7 +3070,7 @@ func executeGovernanceHarnessFixtureForCLI(fixture map[string]any, scenario, pro
 	}
 	switch scenario {
 	case "review_required":
-		manager, artifact, cleanup, err := newConformanceHarnessManager("governance-review", "protocol_proxy", "initial_data_once", pluginmanager.UpstreamModeProtocolProxy, nil)
+		manager, artifact, cleanup, err := newConformanceHarnessManager("governance-review", "takeover", "byte_integrity", "takeover", nil)
 		if err != nil {
 			return err
 		}
@@ -3343,7 +3380,7 @@ func conformanceHarnessManifest(pluginID, mode, scenario, upstreamMode string) p
 		pluginID = "conformance-harness"
 	}
 	if upstreamMode == "" {
-		upstreamMode = pluginmanager.UpstreamModeDialer
+		upstreamMode = "takeover"
 	}
 	manifest := pluginmanager.Manifest{
 		SchemaVersion: pluginmanager.SchemaVersion,
@@ -3362,14 +3399,13 @@ func conformanceHarnessManifest(pluginID, mode, scenario, upstreamMode string) p
 		GOARCH:       runtime.GOARCH,
 		ConfigSchema: json.RawMessage(`{"type":"object"}`),
 		RuntimeLimits: pluginmanager.RuntimeLimits{
-			HandlerTimeoutMS:      int(pluginmanager.DefaultHandlerTimeout / time.Millisecond),
-			InitialWriteTimeoutMS: 1000,
+			HandlerTimeoutMS: int(pluginmanager.DefaultHandlerTimeout / time.Millisecond),
 		},
 	}
 	switch mode {
-	case "protocol_proxy":
+	case "takeover":
 		manifest.ExtensionPoints = []pluginmanager.ExtensionPoint{{Type: "hook", Key: pluginmanager.ExtensionUpstreamConnect}}
-		manifest.Capabilities = json.RawMessage(`{"upstream_connect":{"mode":"` + upstreamMode + `"},"scope":{"type":"host","values":["play.example"]},"rollout":{"mode":"canary"},"minecraft":{"protocol_versions":{"tested":[767]},"forwarding":{"supported":["none"],"default":"none"}}}`)
+		manifest.Capabilities = json.RawMessage(`{"extension_points":["upstream.connect/v2"],"governance":{"risk_level":"high"}}`)
 	case "route":
 		manifest.ExtensionPoints = []pluginmanager.ExtensionPoint{{Type: "provider", Key: pluginmanager.ExtensionRouteResolve}}
 		manifest.Capabilities = json.RawMessage(`{"extension_points":["route.resolve/v1"],"route":{"cache_ttl_ms":60000,"external_refresh":true,"sqlite_fallback":true,"decision_explain":true}}`)
@@ -3863,8 +3899,8 @@ func conformanceFixtureSchemaForCLI() map[string]any {
 					},
 				},
 			},
-			"protocol_proxy_scenarios": stringArray(
-				"initial_data_once",
+			"takeover_scenarios": stringArray(
+				"byte_integrity",
 				"panic_recovered",
 				"timeout_deadline",
 				"endpoint_close",
@@ -3986,19 +4022,6 @@ func hasExtensionPointForCLI(manifest pluginmanager.Manifest, key string) bool {
 		}
 	}
 	return false
-}
-
-func upstreamConnectModeForCLI(manifest pluginmanager.Manifest) string {
-	var caps struct {
-		UpstreamConnect struct {
-			Mode string `json:"mode"`
-		} `json:"upstream_connect"`
-	}
-	_ = json.Unmarshal(manifest.Capabilities, &caps)
-	if caps.UpstreamConnect.Mode == "" {
-		return pluginmanager.UpstreamModeDialer
-	}
-	return caps.UpstreamConnect.Mode
 }
 
 func passFail(ok bool) string {
@@ -5115,10 +5138,10 @@ func manifestExplanation(key string) (map[string]any, bool) {
 			"required": true,
 			"summary":  "Declared extension points used for static validation, governance, conflict analysis, and Admin display.",
 		},
-		"upstream.connect/v1": {
+		"upstream.connect/v2": {
 			"key":     pluginmanager.ExtensionUpstreamConnect,
 			"type":    "hook",
-			"summary": "Extension point for replacing upstream connection creation or returning a protocol-proxy stream endpoint.",
+			"summary": "Pre-Minecraft connection takeover chain with blocking Next and Core continuations.",
 		},
 		"ingress.service/v1": {
 			"key":      pluginmanager.ExtensionIngressService,
@@ -5238,7 +5261,7 @@ func runPluginBenchmarkCLI(args []string) error {
 
 func runPluginInitCLI(args []string) error {
 	opts := pluginInitCLIOptions{
-		Template:  "upstream-dialer",
+		Template:  "takeover",
 		Runtime:   pluginmanager.RuntimeGoPlugin,
 		Extension: pluginmanager.ExtensionUpstreamConnect,
 		Format:    manifestFormatYAML,
@@ -5287,6 +5310,9 @@ func runPluginInitCLI(args []string) error {
 	}
 	if opts.Module == "" {
 		opts.Module = "example.com/" + opts.ID
+	}
+	if opts.Template != "takeover" {
+		return fmt.Errorf("unsupported plugin template %q; supported template: takeover", opts.Template)
 	}
 	if err := validateManifestTemplateFormat(opts.Format); err != nil {
 		return err
@@ -6914,10 +6940,6 @@ func manifestTemplate(opts pluginInitCLIOptions) string {
 }
 
 func manifestSourceJSONTemplate(opts pluginInitCLIOptions, jsonc bool) string {
-	mode := pluginmanager.UpstreamModeDialer
-	if opts.Template == "protocol-proxy" {
-		mode = pluginmanager.UpstreamModeProtocolProxy
-	}
 	prefix := ""
 	if jsonc {
 		prefix = "// Human-maintained plugin manifest. Build packages normalize this into manifest.json.\n"
@@ -6948,29 +6970,20 @@ func manifestSourceJSONTemplate(opts pluginInitCLIOptions, jsonc bool) string {
     { "type": "hook", "key": %q }
   ],
   "capabilities": {
-    "upstream_connect": { "mode": %q }
+    "extension_points": ["upstream.connect/v2"]
   },
   "runtime_limits": {
-    "handler_timeout_ms": 3000,
-    "initial_write_timeout_ms": 1000
+    "handler_timeout_ms": 3000
   },
   "config_schema": {
-    "type": "object",
-    "properties": {
-      "match_host": { "type": "string" },
-      "upstream": { "type": "string" }
-    }
+	"type": "object"
   }
 }
-`, prefix, opts.ID, opts.Name, opts.Name+" plugin.", opts.Extension, mode)
+`, prefix, opts.ID, opts.Name, opts.Name+" plugin.", opts.Extension)
 	return manifest
 }
 
 func manifestYAMLTemplate(opts pluginInitCLIOptions) string {
-	mode := pluginmanager.UpstreamModeDialer
-	if opts.Template == "protocol-proxy" {
-		mode = pluginmanager.UpstreamModeProtocolProxy
-	}
 	return fmt.Sprintf(`# 人工维护的插件清单；构建插件包时会规范化为 manifest.json。
 schema_version: mc-gateway.plugin/v1
 id: %q
@@ -6995,26 +7008,16 @@ extension_points:
   - type: hook
     key: %q
 capabilities:
-  upstream_connect:
-    mode: %q
+  extension_points:
+    - upstream.connect/v2
 runtime_limits:
   handler_timeout_ms: 3000
-  initial_write_timeout_ms: 1000
 config_schema:
   type: object
-  properties:
-    match_host:
-      type: string
-    upstream:
-      type: string
-`, opts.ID, opts.Name, opts.Name+" plugin.", opts.Extension, mode)
+`, opts.ID, opts.Name, opts.Name+" plugin.", opts.Extension)
 }
 
 func manifestTOMLTemplate(opts pluginInitCLIOptions) string {
-	mode := pluginmanager.UpstreamModeDialer
-	if opts.Template == "protocol-proxy" {
-		mode = pluginmanager.UpstreamModeProtocolProxy
-	}
 	return fmt.Sprintf(`# 人工维护的插件清单；构建插件包时会规范化为 manifest.json。
 schema_version = "mc-gateway.plugin/v1"
 id = %q
@@ -7042,48 +7045,28 @@ vendor_required = false
 type = "hook"
 key = %q
 
-[capabilities.upstream_connect]
-mode = %q
+[capabilities]
+extension_points = ["upstream.connect/v2"]
 
 [runtime_limits]
 handler_timeout_ms = 3000
-initial_write_timeout_ms = 1000
 
 [config_schema]
 type = "object"
-
-[config_schema.properties.match_host]
-type = "string"
-
-[config_schema.properties.upstream]
-type = "string"
-`, opts.ID, opts.Name, opts.Name+" plugin.", opts.Extension, mode)
+`, opts.ID, opts.Name, opts.Name+" plugin.", opts.Extension)
 }
 
 func goPluginMainTemplate(opts pluginInitCLIOptions) string {
-	if opts.Template == "protocol-proxy" {
-		return protocolProxyMainTemplate()
-	}
-	return upstreamDialerMainTemplate()
+	return takeoverMainTemplate()
 }
 
-func upstreamDialerMainTemplate() string {
+func takeoverMainTemplate() string {
 	return `package main
 
-import (
-	"net"
-
-	"github.com/tursom/mc-gateway/plugin/api"
-)
+import "github.com/tursom/mc-gateway/plugin/api"
 
 type PluginImpl struct {
 	api.AbstractPlugin
-	config Config
-}
-
-type Config struct {
-	MatchHost string ` + "`json:\"match_host\"`" + `
-	Upstream  string ` + "`json:\"upstream\"`" + `
 }
 
 func Plugin() api.Plugin {
@@ -7091,81 +7074,15 @@ func Plugin() api.Plugin {
 }
 
 func (p *PluginImpl) NewConfigObj() any {
-	return &Config{}
+	return &struct{}{}
 }
 
-func (p *PluginImpl) ReloadConfig(config any) error {
-	if cfg, ok := config.(*Config); ok {
-		p.config = *cfg
-	}
-	return nil
-}
+func (p *PluginImpl) ReloadConfig(any) error { return nil }
 
 func (p *PluginImpl) Init(gateway api.Gateway) error {
-	return api.RegisterHookHandler(
-		gateway,
-		api.HookUpstreamConnect,
-		func(req api.UpstreamConnectRequest) bool {
-			return p.config.MatchHost == "" || req.Host == p.config.MatchHost || req.Upstream == p.config.MatchHost
-		},
-		func(req api.UpstreamConnectRequest) (net.Conn, error) {
-			if p.config.Upstream == "" {
-				return nil, api.ErrPass
-			}
-			if p.config.MatchHost != "" && req.Host != p.config.MatchHost && req.Upstream != p.config.MatchHost {
-				return nil, api.ErrPass
-			}
-			return net.Dial("tcp", p.config.Upstream)
-		},
-	)
-}
-`
-}
-
-func protocolProxyMainTemplate() string {
-	return `package main
-
-import (
-	"net"
-
-	"github.com/tursom/mc-gateway/plugin/api"
-)
-
-type PluginImpl struct {
-	api.AbstractPlugin
-	config Config
-}
-
-type Config struct {
-	MatchHost string ` + "`json:\"match_host\"`" + `
-}
-
-func Plugin() api.Plugin {
-	return &PluginImpl{}
-}
-
-func (p *PluginImpl) NewConfigObj() any {
-	return &Config{}
-}
-
-func (p *PluginImpl) ReloadConfig(config any) error {
-	if cfg, ok := config.(*Config); ok {
-		p.config = *cfg
-	}
-	return nil
-}
-
-func (p *PluginImpl) Init(gateway api.Gateway) error {
-	return api.RegisterHookHandler(
-		gateway,
-		api.HookUpstreamConnect,
-		func(req api.UpstreamConnectRequest) bool {
-			return p.config.MatchHost == "" || req.Host == p.config.MatchHost
-		},
-		func(req api.UpstreamConnectRequest) (net.Conn, error) {
-			return nil, api.ErrPass
-		},
-	)
+	return api.RegisterUpstreamConnectHandlerV2(gateway, func(req api.UpstreamConnectRequestV2) error {
+		return req.Flow.Next(req.Connection)
+	})
 }
 `
 }
@@ -7202,8 +7119,5 @@ gateway plugin build . --type both
 }
 
 func configTemplate(template string) string {
-	if template == "protocol-proxy" {
-		return "{\n  \"match_host\": \"play.example\"\n}\n"
-	}
-	return "{\n  \"match_host\": \"play.example\",\n  \"upstream\": \"127.0.0.1:25566\"\n}\n"
+	return "{}\n"
 }

@@ -73,9 +73,6 @@ type (
 	// Gateway 是宿主暴露给插件的能力集合。插件只能通过这些方法注册钩子、
 	// 上报观测数据、访问受限存储或创建后台任务。
 	Gateway interface {
-		// HandleConn 将连接交还给网关主流程，适合协议代理插件在完成前置处理后继续复用路由。
-		HandleConn(conn net.Conn)
-
 		// ExitWaitGroup 返回进程退出等待组，插件启动的长期 goroutine 应纳入该等待组。
 		ExitWaitGroup() *sync.WaitGroup
 
@@ -223,4 +220,10 @@ func RegisterHookHandler[Accept, Handle any](
 	handler Handle,
 ) error {
 	return gateway.Hook(hook.key, HookHandler[Accept, Handle]{accept, handler})
+}
+
+// RegisterUpstreamConnectHandlerV2 注册客户端连接接管处理器。该扩展点没有
+// 独立 acceptor；不处理当前连接时，handler 应调用 request.Flow.Next。
+func RegisterUpstreamConnectHandlerV2(gateway Gateway, handler UpstreamConnectHandlerV2) error {
+	return gateway.Hook(HookUpstreamConnectV2.key, handler)
 }

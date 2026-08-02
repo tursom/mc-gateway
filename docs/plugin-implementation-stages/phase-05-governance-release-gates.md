@@ -11,7 +11,7 @@
 阶段结束时必须能做到：
 
 - 高风险插件启用前需要 review。
-- protocol-proxy scope 重叠会阻断启用。
+- connection takeover scope 重叠会阻断启用。
 - 必需 secret、依赖、feature 缺失会阻断启用。
 - preflight/self-test 失败会阻断或进入 warning。
 - benchmark 结果超过阈值会进入 warning/blocking。
@@ -35,7 +35,7 @@
 实现：
 
 - scope overlap。
-- protocol-proxy singleton 冲突。
+- connection takeover singleton 冲突。
 - provider singleton 冲突。
 - middleware ordering cycle。
 - shadowed handler warning。
@@ -102,8 +102,8 @@
 
 ## 验收
 
-- 未 review 的高风险 protocol-proxy 插件不能在 prod profile 启用。
-- 两个同 scope protocol-proxy 插件不能同时启用。
+- 未 review 的高风险 connection takeover 插件不能在 prod profile 启用。
+- 两个同 scope connection takeover 插件不能同时启用。
 - required feature 缺失返回 `feature_missing`。
 - secret 缺失阻断启用。
 - advisory revoke 后不能 rollback 到受影响 artifact。
@@ -112,5 +112,5 @@
 ## 回滚策略
 
 - policy 变更不应立即删除运行中插件；先标记 drift/review_required 或 quarantine。
-- quarantine 从 dispatch table 移除插件，新连接不进入；已有 protocol-proxy 连接按策略 drain/force close。
+- quarantine 从 dispatch table 移除插件，新连接不进入；已有 connection takeover 连接按策略 drain/force close。
 - 管理员可以回滚到未受阻断的旧 artifact。

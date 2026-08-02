@@ -59,6 +59,21 @@ func TestReplayConnReadsPeekedBytesBeforeUnderlyingConn(t *testing.T) {
 	}
 }
 
+func TestReplayConnForwardsCloseWrite(t *testing.T) {
+	base := &halfCloseMuxTestConn{muxTestConn: newMuxTestConn(nil)}
+	conn := NewReplayConn(base, nil)
+	closer, ok := conn.(interface{ CloseWrite() error })
+	if !ok {
+		t.Fatal("replay connection does not expose CloseWrite")
+	}
+	if err := closer.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	if !base.writeClosed || base.closed {
+		t.Fatalf("writeClosed=%v closed=%v, want half-close only", base.writeClosed, base.closed)
+	}
+}
+
 func TestChanListenerAcceptCloseAndDeliver(t *testing.T) {
 	listener := NewChanListener(muxTestAddr("listener"), DefaultHTTPConnBacklog)
 	conn := newMuxTestConn(nil)
@@ -215,6 +230,16 @@ func TestHandleConnTimeoutClosesConn(t *testing.T) {
 type muxTestConn struct {
 	reader *bytes.Reader
 	closed bool
+}
+
+type halfCloseMuxTestConn struct {
+	*muxTestConn
+	writeClosed bool
+}
+
+func (c *halfCloseMuxTestConn) CloseWrite() error {
+	c.writeClosed = true
+	return nil
 }
 
 func newMuxTestConn(data []byte) *muxTestConn {

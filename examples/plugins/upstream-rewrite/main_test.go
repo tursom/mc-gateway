@@ -4,12 +4,8 @@ package main
 
 import (
 	"context"
-	"errors"
-	"io"
-	"net"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/tursom/mc-gateway/plugin/api"
 )
@@ -22,59 +18,35 @@ func TestPluginFactory(t *testing.T) {
 	}
 }
 
-func TestUpstreamRewriteDialerAndPass(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Listen() error = %v", err)
-	}
-	defer listener.Close()
-	accepted := make(chan struct{})
-	go func() {
-		conn, err := listener.Accept()
-		if err == nil {
-			_, _ = conn.Write([]byte("rewritten"))
-			_ = conn.Close()
-		}
-		close(accepted)
-	}()
-
+func TestUpstreamRewriteRouteOverrideAndPass(t *testing.T) {
 	plugin := &PluginImpl{}
-	if err := plugin.ReloadConfig(&Config{MatchHost: "play.example", Upstream: listener.Addr().String()}); err != nil {
+	if err := plugin.ReloadConfig(&Config{MatchHost: "play.example", Upstream: "rewritten:25565"}); err != nil {
 		t.Fatalf("ReloadConfig() error = %v", err)
 	}
 	gateway := &recordingGateway{hooks: make(map[string]any)}
 	if err := plugin.Init(gateway); err != nil {
 		t.Fatalf("Init() error = %v", err)
 	}
-	hook, ok := gateway.hooks[api.HookUpstreamConnect.Key()].(api.HookHandler[api.UpstreamConnectAcceptor, api.UpstreamConnectHandler])
+	hook, ok := gateway.hooks[api.HookRouteResolve.Key()].(api.HookHandler[api.RouteResolveAcceptor, api.RouteResolveHandler])
 	if !ok {
-		t.Fatalf("hook %q not registered: %#v", api.HookUpstreamConnect.Key(), gateway.hooks)
+		t.Fatalf("hook %q not registered: %#v", api.HookRouteResolve.Key(), gateway.hooks)
 	}
-	if !hook.Acceptor()(api.UpstreamConnectRequest{Host: "play.example"}) {
+	if !hook.Acceptor()(api.RouteResolveRequest{Host: "play.example"}) {
 		t.Fatal("acceptor rejected matching host")
 	}
-	if hook.Acceptor()(api.UpstreamConnectRequest{Host: "other.example", Upstream: "vanilla:25565"}) {
-		t.Fatal("acceptor accepted non-matching host/upstream")
+	if hook.Acceptor()(api.RouteResolveRequest{Host: "other.example"}) {
+		t.Fatal("acceptor accepted non-matching host")
 	}
-	conn, err := hook.Handler()(api.UpstreamConnectRequest{Host: "play.example"})
+	decision, err := hook.Handler()(api.RouteResolveRequest{Host: "play.example"})
 	if err != nil {
-		t.Fatalf("handler matching host error = %v", err)
+		t.Fatalf("matching route error = %v", err)
 	}
-	defer conn.Close()
-	response, err := io.ReadAll(conn)
-	if err != nil {
-		t.Fatalf("ReadAll(rewritten upstream) error = %v", err)
+	if decision.Action != api.RouteDecisionOverride || decision.Upstream != "rewritten:25565" {
+		t.Fatalf("matching route decision = %+v", decision)
 	}
-	if string(response) != "rewritten" {
-		t.Fatalf("rewritten upstream response = %q, want rewritten", response)
-	}
-	select {
-	case <-accepted:
-	case <-time.After(time.Second):
-		t.Fatal("rewritten upstream was not dialed")
-	}
-	if _, err := hook.Handler()(api.UpstreamConnectRequest{Host: "other.example", Upstream: "vanilla:25565"}); !errors.Is(err, api.ErrPass) {
-		t.Fatalf("handler non-match error = %v, want api.ErrPass", err)
+	decision, err = hook.Handler()(api.RouteResolveRequest{Host: "other.example"})
+	if err != nil || decision.Action != api.RouteDecisionPass {
+		t.Fatalf("non-matching route decision = %+v, error = %v", decision, err)
 	}
 }
 
@@ -83,7 +55,6 @@ type recordingGateway struct {
 	wg    sync.WaitGroup
 }
 
-func (g *recordingGateway) HandleConn(net.Conn)            {}
 func (g *recordingGateway) ExitWaitGroup() *sync.WaitGroup { return &g.wg }
 func (g *recordingGateway) Hook(hook string, handler any) error {
 	g.hooks[hook] = handler

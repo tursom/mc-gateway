@@ -309,8 +309,8 @@ func handleAdminPluginItem(w http.ResponseWriter, r *http.Request, rawPluginID s
 		adminhttp.WriteAPIError(w, http.StatusServiceUnavailable, "plugin manager is not initialized")
 		return
 	}
-	if strings.HasSuffix(rawPluginID, "/proxy-connections") {
-		handleAdminPluginProxyConnections(w, r, strings.TrimSuffix(rawPluginID, "/proxy-connections"))
+	if strings.HasSuffix(rawPluginID, "/connection-sessions") {
+		handleAdminPluginConnectionSessions(w, r, strings.TrimSuffix(rawPluginID, "/connection-sessions"))
 		return
 	}
 
@@ -365,7 +365,7 @@ func handleAdminPluginItem(w http.ResponseWriter, r *http.Request, rawPluginID s
 	}
 }
 
-func handleAdminPluginProxyConnections(w http.ResponseWriter, r *http.Request, rawPluginID string) {
+func handleAdminPluginConnectionSessions(w http.ResponseWriter, r *http.Request, rawPluginID string) {
 	if r.Method != http.MethodGet {
 		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
@@ -375,12 +375,12 @@ func handleAdminPluginProxyConnections(w http.ResponseWriter, r *http.Request, r
 		adminhttp.WriteAPIError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	connections, err := pluginsManager.ActiveProxyConnections(r.Context(), pluginID)
+	sessions, err := pluginsManager.ActiveConnectionSessions(r.Context(), pluginID)
 	if err != nil {
 		adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"proxy_connections": connections})
+	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"connection_sessions": sessions})
 }
 
 func handleAdminPluginConfig(w http.ResponseWriter, r *http.Request, rawSegment string) {
@@ -879,7 +879,7 @@ func handleAdminPluginDraining(w http.ResponseWriter, r *http.Request, rawPlugin
 		writePluginManagerError(w, err)
 		return
 	}
-	recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_force_close_draining", "plugin", pluginID, true, "draining protocol-proxy connections force closed", map[string]any{
+	recordAuditMetadata(r.Context(), session.Username, adminhttp.RequestSourceIP(r), "plugin_force_close_draining", "plugin", pluginID, true, "draining connection takeover sessions force closed", map[string]any{
 		"closed": closed,
 	})
 	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"closed": closed})
@@ -1517,12 +1517,12 @@ func pluginView(r *http.Request, plugin pluginmanager.PluginRecord, detail bool)
 			view["rollout_status"] = rollout
 			view["node_runtime_states"] = rollout.NodeRuntimeStates
 		}
-		view["active_proxy_connections"] = activeProxyConnections(plugin)
-		connections, err := pluginsManager.ActiveProxyConnections(r.Context(), plugin.ID)
+		sessions, err := pluginsManager.ActiveConnectionSessions(r.Context(), plugin.ID)
 		if err != nil {
 			return nil, err
 		}
-		view["proxy_connections"] = connections
+		view["active_connection_sessions"] = len(sessions)
+		view["connection_sessions"] = sessions
 		if operations, err := pluginsManager.OperationsSnapshot(r.Context(), plugin.ID); err == nil {
 			for _, summary := range operations.SandboxRuntimes {
 				if summary.PluginID == plugin.ID {
@@ -1621,21 +1621,6 @@ func pluginMinecraftSummary(artifact pluginmanager.ArtifactRecord) any {
 		return nil
 	}
 	return summary.Minecraft
-}
-
-func activeProxyConnections(plugin pluginmanager.PluginRecord) int64 {
-	var summary map[string]any
-	if json.Unmarshal([]byte(plugin.RuntimeSummaryJSON), &summary) != nil {
-		return 0
-	}
-	switch value := summary["active_proxy_connections"].(type) {
-	case float64:
-		return int64(value)
-	case int64:
-		return value
-	default:
-		return 0
-	}
 }
 
 func jsonObjectString(raw string) any {

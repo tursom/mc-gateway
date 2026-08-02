@@ -11,6 +11,14 @@ import (
 	"github.com/xtaci/kcp-go"
 )
 
+type kcpIngressConn struct {
+	net.Conn
+}
+
+func (kcpIngressConn) IngressTransport() (string, string) {
+	return "kcp", serviceNameKCP
+}
+
 func runKcp(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return nil
@@ -43,7 +51,7 @@ func runKcp(ctx context.Context) error {
 		tuneKcpConn(conn)
 
 		// KCP session 实现 net.Conn，可以直接进入统一网关请求流程。
-		go handleRequest(conn)
+		go handleRequest(kcpIngressConn{Conn: conn})
 	}
 }
 

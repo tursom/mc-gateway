@@ -21,7 +21,7 @@ go run ./cmd/gateway plugin manifest format .
 go run ./cmd/gateway plugin manifest format . --write
 go run ./cmd/gateway plugin manifest format . --canonical-json --type binary
 go run ./cmd/gateway plugin manifest explain runtime.type
-go run ./cmd/gateway plugin manifest explain upstream.connect/v1
+go run ./cmd/gateway plugin manifest explain upstream.connect/v2
 ```
 
 规则：
@@ -35,11 +35,11 @@ go run ./cmd/gateway plugin manifest explain upstream.connect/v1
 ```sh
 go run ./cmd/gateway plugin init ./my-plugin \
   --id my-plugin \
-  --template upstream-dialer \
+  --template takeover \
   --module example.com/my-plugin
 ```
 
-当前实现的模板分支是 `upstream-dialer` 和 `protocol-proxy`。其它 runtime 模板属于设计预留，不要在开发文档中承诺可直接生成。
+当前只提供 `takeover` 模板。上游重写应实现 `route.resolve/v1`，不再由连接 hook 负责拨号。
 
 ## 构建
 

@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
@@ -123,6 +124,24 @@ func runEnabledServices(ctx context.Context) error {
 func handleRequest(conn net.Conn) {
 	gatewayMetrics.ConnectionStarted()
 	defer gatewayMetrics.ConnectionFinished()
+	defer conn.Close()
+
+	peerAddr := conn.RemoteAddr().String()
+	localAddr := conn.LocalAddr().String()
+	ingress := connectionIngressContext(conn)
+	req := api.UpstreamConnectRequestV2{
+		Context:      context.Background(),
+		ConnectionID: randomHexID(8),
+		TraceID:      randomHexID(16),
+		PeerAddr:     peerAddr,
+		LocalAddr:    localAddr,
+		Connection: api.ConnectionState{
+			Stream:              conn,
+			EffectiveSourceAddr: peerAddr,
+			Metadata:            map[string]string{},
+		},
+		Ingress: ingress,
+	}
 
 	// 插件或协议解析器的 panic 不能杀掉监听协程；当前连接会被放弃，
 	// 进程继续服务其他客户端。
@@ -143,33 +162,44 @@ func handleRequest(conn net.Conn) {
 		}
 	}()
 
-	// 确保连接关闭
-	defer conn.Close()
-
-	client := mapToHost(conn)
-	if client == nil {
+	core := func(ctx context.Context, state api.ConnectionState) error {
+		return runCorePipeline(ctx, req, state)
+	}
+	if pluginsManager != nil {
+		if err := pluginsManager.HandleConnection(req.Context, req, core); err != nil {
+			log.Err(err).Str("client", peerAddr).Msg("connection takeover failed")
+		}
 		return
 	}
-	defer client.Close()
-
-	proxyConnections(conn, client)
+	if err := core(req.Context, req.Connection); err != nil {
+		log.Err(err).Str("client", peerAddr).Msg("connection core failed")
+	}
 }
 
-func mapToHost(conn net.Conn) net.Conn {
+func runCorePipeline(ctx context.Context, ingressReq api.UpstreamConnectRequestV2, state api.ConnectionState) error {
+	client := mapToHost(ctx, state.Stream, state.EffectiveSourceAddr, ingressReq.PeerAddr, ingressReq.Ingress)
+	if client == nil {
+		return nil
+	}
+	defer client.Close()
+	proxyConnections(state.Stream, client)
+	return nil
+}
+
+func mapToHost(ctx context.Context, conn net.Conn, effectiveSourceAddr, peerAddr string, ingress api.IngressContext) net.Conn {
 	// 连接过滤器在读取 Minecraft 握手前执行，因此可以按来源地址或传输类型
 	// 拒绝连接，同时不消耗客户端发送的协议字节。
 	if pluginsManager != nil {
-		transport, _, _ := connectionIngress(conn)
-		filter, err := pluginsManager.FilterConnection(context.Background(), api.ConnectionFilterRequest{
-			SourceAddr: conn.RemoteAddr().String(),
-			Transport:  transport,
+		filter, err := pluginsManager.FilterConnection(ctx, api.ConnectionFilterRequest{
+			SourceAddr: effectiveSourceAddr,
+			Transport:  ingress.Transport,
 		})
 		if err != nil {
-			log.Err(err).Str("client", conn.RemoteAddr().String()).Msg("connection filter failed")
+			log.Err(err).Str("client", peerAddr).Msg("connection filter failed")
 			return nil
 		}
 		if !filter.Allowed {
-			log.Info().Str("client", conn.RemoteAddr().String()).Str("plugin", filter.PluginID).Str("reason", filter.Reason).Msg("connection rejected by filter")
+			log.Info().Str("client", peerAddr).Str("plugin", filter.PluginID).Str("reason", filter.Reason).Msg("connection rejected by filter")
 			return nil
 		}
 	}
@@ -177,16 +207,16 @@ func mapToHost(conn net.Conn) net.Conn {
 	buf := getProxyBuffer()
 	defer putProxyBuffer(buf)
 
-	n, err := conn.Read(buf)
+	n, err := readMinecraftPacket(conn, buf)
 	if err != nil {
 		log.Err(err).
-			Str("client", conn.RemoteAddr().String()).
+			Str("client", peerAddr).
 			Msg("failed to reading hostname")
 		return nil
 	}
 	if n == 0 {
 		log.Err(errEmptyBuffer).
-			Str("client", conn.RemoteAddr().String()).
+			Str("client", peerAddr).
 			Msg("buffer is empty")
 		return nil
 	}
@@ -197,7 +227,7 @@ func mapToHost(conn net.Conn) net.Conn {
 	handshake := protocol.ParseHandshake(initialData)
 	if handshake.ServerHost == "" {
 		log.Err(errEmptyBuffer).
-			Str("client", conn.RemoteAddr().String()).
+			Str("client", peerAddr).
 			Msg("failed to parse mc host from buffer")
 		return nil
 	}
@@ -205,19 +235,19 @@ func mapToHost(conn net.Conn) net.Conn {
 	// 握手过滤器可以改写目标主机名。发生改写时要立刻重建首包，
 	// 确保上游看到的是改写后的 Minecraft 主机名，而不是客户端原始值。
 	if pluginsManager != nil {
-		filter, err := pluginsManager.FilterHandshake(context.Background(), api.HandshakeFilterRequest{
-			SourceAddr:      conn.RemoteAddr().String(),
+		filter, err := pluginsManager.FilterHandshake(ctx, api.HandshakeFilterRequest{
+			SourceAddr:      effectiveSourceAddr,
 			ServerHost:      handshake.ServerHost,
 			RawServerHost:   handshake.RawServerHost,
 			ProtocolVersion: handshake.ProtocolVersion,
 			NextState:       handshake.NextState,
 		})
 		if err != nil {
-			log.Err(err).Str("client", conn.RemoteAddr().String()).Str("host", handshake.ServerHost).Msg("handshake filter failed")
+			log.Err(err).Str("client", peerAddr).Str("host", handshake.ServerHost).Msg("handshake filter failed")
 			return nil
 		}
 		if !filter.Allowed {
-			log.Info().Str("client", conn.RemoteAddr().String()).Str("host", handshake.ServerHost).Str("plugin", filter.PluginID).Str("reason", filter.Reason).Msg("handshake rejected by filter")
+			log.Info().Str("client", peerAddr).Str("host", handshake.ServerHost).Str("plugin", filter.PluginID).Str("reason", filter.Reason).Msg("handshake rejected by filter")
 			return nil
 		}
 		if filter.RewriteHost != "" && filter.RewriteHost != handshake.ServerHost {
@@ -229,18 +259,18 @@ func mapToHost(conn net.Conn) net.Conn {
 	// 状态查询使用 NextState=1，并且可以由插件直接完整响应。
 	// 如果这里已经处理，就不会再为该查询打开上游连接。
 	if handshake.NextState == 1 {
-		if handled := handleStatusPing(conn, handshake); handled {
+		if handled := handleStatusPing(ctx, conn, effectiveSourceAddr, handshake); handled {
 			return nil
 		}
 	}
 
-	routeResult := resolveGatewayRoute(conn, handshake)
+	routeResult := resolveGatewayRoute(ctx, effectiveSourceAddr, peerAddr, handshake)
 	host := routeResult.Decision.Upstream
 	ok := routeResult.Source != "fallback_miss"
 	if routeResult.Decision.Action == api.RouteDecisionReject || host == "" {
 		gatewayMetrics.RouteMiss()
 		log.Err(errEmptyBuffer).
-			Str("client", conn.RemoteAddr().String()).
+			Str("client", peerAddr).
 			Str("host", handshake.ServerHost).
 			Str("route_source", routeResult.Source).
 			Str("route_action", routeResult.Decision.Action).
@@ -252,39 +282,12 @@ func mapToHost(conn net.Conn) net.Conn {
 	}
 
 	log.Debug().
-		Str("client", conn.RemoteAddr().String()).
+		Str("client", peerAddr).
 		Str("host", handshake.ServerHost).
 		Str("mc", host).
 		Msg("map to host")
 
 	var client net.Conn
-
-	if pluginsManager != nil {
-		req := newUpstreamConnectRequest(conn, host, handshake, initialData, ok)
-		result, err := pluginsManager.ConnectUpstream(context.Background(), req)
-		if err != nil {
-			if errors.Is(err, api.ErrBlocked) {
-				log.Info().
-					Str("client", conn.RemoteAddr().String()).
-					Str("host", handshake.ServerHost).
-					Msg("managed upstream plugin blocked connection")
-				return nil
-			}
-			log.Err(err).
-				Str("client", conn.RemoteAddr().String()).
-				Str("host", handshake.ServerHost).
-				Str("mc", host).
-				Msg("failed to invoke managed upstream plugin")
-			return nil
-		}
-		if result.Handled {
-			if result.Proxied {
-				return nil
-			}
-			client = result.Conn
-		}
-	}
-
 	if client == nil {
 		target := upstreamtarget.Parse(host)
 		// 路由值可以通过前缀选择非 TCP 传输；普通地址仍按 TCP 处理，
@@ -295,7 +298,7 @@ func mapToHost(conn net.Conn) net.Conn {
 		case upstreamtarget.ProtocolKCP:
 			client = upstreamKcp(target.Address)
 		case upstreamtarget.ProtocolHAProxy:
-			client = haProxyUpstream(conn, target.Address)
+			client = haProxyUpstream(effectiveSourceAddr, target.Address)
 		default:
 			client = upstreamTcp(target.Address)
 		}
@@ -308,7 +311,7 @@ func mapToHost(conn net.Conn) net.Conn {
 	// 都还有机会阻断、代理或改写连接。
 	if err := writeAll(client, initialData); err != nil {
 		log.Err(err).
-			Str("client", conn.RemoteAddr().String()).
+			Str("client", peerAddr).
 			Str("host", handshake.ServerHost).
 			Str("mc", host).
 			Msg("failed to write initial packet to upstream")
@@ -319,14 +322,46 @@ func mapToHost(conn net.Conn) net.Conn {
 	return client
 }
 
-func resolveGatewayRoute(conn net.Conn, handshake protocol.Handshake) pluginmanager.RouteResolveResult {
+func readMinecraftPacket(reader io.Reader, buf []byte) (int, error) {
+	length := 0
+	prefixLength := 0
+	for ; prefixLength < 5; prefixLength++ {
+		if prefixLength >= len(buf) {
+			return 0, io.ErrShortBuffer
+		}
+		if _, err := io.ReadFull(reader, buf[prefixLength:prefixLength+1]); err != nil {
+			return 0, err
+		}
+		current := buf[prefixLength]
+		length |= int(current&0x7f) << (7 * prefixLength)
+		if current&0x80 == 0 {
+			prefixLength++
+			break
+		}
+	}
+	if prefixLength == 5 && buf[prefixLength-1]&0x80 != 0 {
+		return 0, errors.New("minecraft packet length VarInt is too long")
+	}
+	if length <= 0 {
+		return 0, errors.New("minecraft packet length must be positive")
+	}
+	if length > len(buf)-prefixLength {
+		return 0, fmt.Errorf("minecraft packet length %d exceeds ingress buffer", length)
+	}
+	if _, err := io.ReadFull(reader, buf[prefixLength:prefixLength+length]); err != nil {
+		return 0, err
+	}
+	return prefixLength + length, nil
+}
+
+func resolveGatewayRoute(ctx context.Context, effectiveSourceAddr, peerAddr string, handshake protocol.Handshake) pluginmanager.RouteResolveResult {
 	upstream, hit := lookupRoute(handshake.ServerHost)
 	// SQLite 快照始终作为本地兜底。插件会同时拿到兜底决策和刷新回调，
 	// 因此可以选择性覆盖路由，而不必在插件里复制一套路由仓库逻辑。
 	req := api.RouteResolveRequest{
 		Host:             handshake.ServerHost,
 		RawServerHost:    handshake.RawServerHost,
-		SourceAddr:       conn.RemoteAddr().String(),
+		SourceAddr:       effectiveSourceAddr,
 		ProtocolVersion:  handshake.ProtocolVersion,
 		NextState:        handshake.NextState,
 		FallbackUpstream: upstream,
@@ -339,13 +374,13 @@ func resolveGatewayRoute(conn net.Conn, handshake protocol.Handshake) pluginmana
 		},
 	}
 	if pluginsManager != nil {
-		result, err := pluginsManager.ResolveRoute(context.Background(), req, func(req api.RouteResolveRequest) (string, bool) {
+		result, err := pluginsManager.ResolveRoute(ctx, req, func(req api.RouteResolveRequest) (string, bool) {
 			return lookupRoute(req.Host)
 		})
 		if err == nil {
 			return result
 		}
-		log.Err(err).Str("client", conn.RemoteAddr().String()).Str("host", handshake.ServerHost).Msg("route resolver failed")
+		log.Err(err).Str("client", peerAddr).Str("host", handshake.ServerHost).Msg("route resolver failed")
 	}
 	action := api.RouteDecisionFallback
 	source := "sqlite_fallback"
@@ -360,16 +395,16 @@ func resolveGatewayRoute(conn net.Conn, handshake protocol.Handshake) pluginmana
 	}
 }
 
-func handleStatusPing(conn net.Conn, handshake protocol.Handshake) bool {
+func handleStatusPing(ctx context.Context, conn net.Conn, effectiveSourceAddr string, handshake protocol.Handshake) bool {
 	if pluginsManager == nil {
 		return false
 	}
 	// Minecraft 状态响应是带长度前缀的 JSON 数据包。插件只提供高层字段，
 	// Minecraft 协议封包由 protocol.StatusResponsePacket 统一完成。
-	result, err := pluginsManager.StatusPing(context.Background(), api.StatusPingRequest{
+	result, err := pluginsManager.StatusPing(ctx, api.StatusPingRequest{
 		Host:            handshake.ServerHost,
 		RawServerHost:   handshake.RawServerHost,
-		SourceAddr:      conn.RemoteAddr().String(),
+		SourceAddr:      effectiveSourceAddr,
 		ProtocolVersion: handshake.ProtocolVersion,
 	})
 	if err != nil || !result.Handled {
@@ -406,60 +441,34 @@ func handleStatusPing(conn net.Conn, handshake protocol.Handshake) bool {
 	return true
 }
 
-func newUpstreamConnectRequest(conn net.Conn, upstream string, handshake protocol.Handshake, initialData []byte, routeHit bool) api.UpstreamConnectRequest {
-	target := upstreamtarget.Parse(upstream)
-	transport, serviceName, listenerPort := connectionIngress(conn)
-	// InitialData 使用副本，避免上游插件在其他处理器或日志路径仍引用回放缓冲区时
-	// 意外修改调用方持有的数据。
-	req := api.UpstreamConnectRequest{
-		Source:           conn,
-		Host:             handshake.ServerHost,
-		Upstream:         upstream,
-		InitialData:      append([]byte(nil), initialData...),
-		Metadata:         map[string]string{"route_hit": boolString(routeHit)},
-		ConnectionID:     randomHexID(8),
-		TraceID:          randomHexID(16),
-		SourceAddr:       conn.RemoteAddr().String(),
-		ServerHost:       handshake.ServerHost,
-		RawServerHost:    handshake.RawServerHost,
-		ProtocolVersion:  handshake.ProtocolVersion,
-		NextState:        handshake.NextState,
-		RouteID:          handshake.ServerHost,
-		RouteTags:        []string{},
-		UpstreamRaw:      upstream,
-		UpstreamProtocol: string(target.Protocol),
-		UpstreamAddress:  target.Address,
-		Transport:        transport,
-		ServiceName:      serviceName,
-		ListenerPort:     listenerPort,
-	}
-	return req
-}
-
-func connectionIngress(conn net.Conn) (transport string, serviceName string, listenerPort int) {
-	transport = "tcp"
-	serviceName = serviceNameTCPAdmin
+func connectionIngressContext(conn net.Conn) api.IngressContext {
+	ingress := api.IngressContext{Transport: "tcp", ServiceName: serviceNameTCPAdmin}
 	// 具体连接包装类型记录了客户端来自哪个监听器。该元数据会传给插件，
 	// 并出现在运维诊断中，同时不需要改变 net.Conn 接口。
-	switch conn.(type) {
-	case *webSocketConn:
-		transport = "websocket"
-		serviceName = serviceNameWebSocket
-	case quicConn:
-		transport = "quic"
-		serviceName = serviceNameQUIC
+	if tagged, ok := conn.(interface{ IngressTransport() (string, string) }); ok {
+		ingress.Transport, ingress.ServiceName = tagged.IngressTransport()
 	}
-	if addr, ok := conn.LocalAddr().(*net.TCPAddr); ok {
-		listenerPort = addr.Port
+	if quicIngress, ok := conn.(interface {
+		QUICIngressContext() *api.QUICIngressContext
+	}); ok {
+		ingress.QUIC = quicIngress.QUICIngressContext()
 	}
-	return transport, serviceName, listenerPort
-}
-
-func boolString(value bool) string {
-	if value {
-		return "true"
+	switch addr := conn.LocalAddr().(type) {
+	case *net.TCPAddr:
+		ingress.ListenerPort = addr.Port
+	case *net.UDPAddr:
+		ingress.ListenerPort = addr.Port
 	}
-	return "false"
+	if httpIngress, ok := conn.(interface {
+		HTTPIngressContext() *api.HTTPIngressContext
+	}); ok {
+		ingress.HTTP = httpIngress.HTTPIngressContext()
+		if _, tagged := conn.(interface{ IngressTransport() (string, string) }); !tagged {
+			ingress.Transport = "websocket"
+			ingress.ServiceName = serviceNameWebSocket
+		}
+	}
+	return ingress
 }
 
 func randomHexID(size int) string {

@@ -52,6 +52,7 @@ func TestNewAPIHandlerRoutesRequests(t *testing.T) {
 		{name: "plugin operations", method: http.MethodGet, path: "/admin/api/plugins/upstream-rewrite/operations", wantCall: "plugin_operations", wantSegment: "upstream-rewrite/operations"},
 		{name: "plugin operations task trigger", method: http.MethodPost, path: "/admin/api/plugins/upstream-rewrite/operations/tasks/sync/trigger", wantCall: "plugin_operations", wantSegment: "upstream-rewrite/operations/tasks/sync/trigger"},
 		{name: "plugin diagnostics", method: http.MethodGet, path: "/admin/api/plugins/upstream-rewrite/diagnostics", wantCall: "plugin_diagnostics", wantSegment: "upstream-rewrite"},
+		{name: "plugin connection sessions", method: http.MethodGet, path: "/admin/api/plugins/mc-auth-proxy/connection-sessions", wantCall: "plugin_item", wantSegment: "mc-auth-proxy/connection-sessions"},
 		{name: "plugin draining force close", method: http.MethodPost, path: "/admin/api/plugins/mc-auth-proxy/draining/force-close", wantCall: "plugin_draining", wantSegment: "mc-auth-proxy"},
 		{name: "plugin dispatch", method: http.MethodGet, path: "/admin/api/plugins/dispatch-plan", wantCall: "plugin_dispatch"},
 		{name: "plugin advisories", method: http.MethodGet, path: "/admin/api/plugin-advisories", wantCall: "plugin_advisories"},

@@ -25,7 +25,7 @@ func main() {
 	service := sandboxsdk.Service{
 		Registrations: []sandboxsdk.HandlerRegistration{
 			{
-				ExtensionPoint: "upstream.connect/v1",
+				ExtensionPoint: "upstream.connect/v2",
 				HandlerID:      "stream-main",
 				FailPolicy:     api.FailPolicyClose,
 				TimeoutMS:      1000,
@@ -74,6 +74,7 @@ func main() {
 				Connected:    true,
 				Protocol:     req.Protocol,
 				StreamID:     req.StreamID,
+				Action:       sandboxsdk.TakeoverActionHandled,
 				Endpoint:     endpoint,
 				EndpointType: "unix",
 			}, nil

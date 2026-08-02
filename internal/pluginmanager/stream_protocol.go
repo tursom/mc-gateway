@@ -61,7 +61,7 @@ func StreamProxyV1Contract() StreamProxyContract {
 	return StreamProxyContract{
 		Protocol: StreamProxyProtocolV1,
 		Commands: []string{
-			PluginHostCommandStreamProxy,
+			PluginHostCommandTakeoverOpen,
 			StreamFrameData,
 			StreamFrameHalfClose,
 			StreamFrameWindow,

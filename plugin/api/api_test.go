@@ -5,6 +5,7 @@ package api
 import (
 	"context"
 	"net"
+	"net/http"
 	"sync"
 	"testing"
 	"time"
@@ -28,14 +29,8 @@ func TestAbstractPluginDefaults(t *testing.T) {
 }
 
 func TestHookTypesAndHandlers(t *testing.T) {
-	if got := HookUpstreamConnect.Key(); got != "upstream.connect/v1" {
-		t.Fatalf("HookUpstreamConnect.Key() = %q, want upstream.connect/v1", got)
-	}
-	if got := HookUpstream.Key(); got != "upstream" {
-		t.Fatalf("HookUpstream.Key() = %q, want upstream", got)
-	}
-	if got := HookUpstream.AsAny().Key(); got != HookUpstream.Key() {
-		t.Fatalf("AsAny().Key() = %q, want %q", got, HookUpstream.Key())
+	if got := HookUpstreamConnectV2.Key(); got != "upstream.connect/v2" {
+		t.Fatalf("HookUpstreamConnectV2.Key() = %q, want upstream.connect/v2", got)
 	}
 
 	acceptor := func(net.Conn, string) bool { return true }
@@ -55,29 +50,35 @@ func TestHookTypesAndHandlers(t *testing.T) {
 
 func TestRegisterHookHandler(t *testing.T) {
 	gateway := &recordingGateway{hooks: make(map[string]any)}
-	acceptor := func(net.Conn, string) bool { return true }
-	handler := func(net.Conn, string) (net.Conn, error) { return nil, nil }
+	handler := UpstreamConnectHandlerV2(func(UpstreamConnectRequestV2) error { return nil })
 
-	if err := RegisterHookHandler(gateway, HookUpstream, acceptor, handler); err != nil {
-		t.Fatalf("RegisterHookHandler() error = %v", err)
+	if err := RegisterUpstreamConnectHandlerV2(gateway, handler); err != nil {
+		t.Fatalf("RegisterUpstreamConnectHandlerV2() error = %v", err)
 	}
 
-	rawHandler, ok := gateway.hooks[HookUpstream.Key()]
+	rawHandler, ok := gateway.hooks[HookUpstreamConnectV2.Key()]
 	if !ok {
-		t.Fatalf("hook %q was not registered", HookUpstream.Key())
+		t.Fatalf("hook %q was not registered", HookUpstreamConnectV2.Key())
 	}
-	registered, ok := rawHandler.(HookHandler[
-		func(net.Conn, string) bool,
-		func(net.Conn, string) (net.Conn, error),
-	])
+	registered, ok := rawHandler.(UpstreamConnectHandlerV2)
 	if !ok {
 		t.Fatalf("registered hook type = %T", rawHandler)
 	}
-	if registered.Acceptor() == nil {
-		t.Fatal("registered acceptor is nil")
-	}
-	if registered.Handler() == nil {
+	if registered == nil {
 		t.Fatal("registered handler is nil")
+	}
+}
+
+func TestIngressContextCloneCopiesMutableFacts(t *testing.T) {
+	original := IngressContext{
+		HTTP: &HTTPIngressContext{Headers: http.Header{"X-Test": []string{"original"}}},
+		QUIC: &QUICIngressContext{ApplicationProtocol: "minecraft"},
+	}
+	cloned := original.Clone()
+	cloned.HTTP.Headers.Set("X-Test", "changed")
+	cloned.QUIC.ApplicationProtocol = "changed"
+	if original.HTTP.Headers.Get("X-Test") != "original" || original.QUIC.ApplicationProtocol != "minecraft" {
+		t.Fatalf("Clone() mutated original ingress: %+v", original)
 	}
 }
 
@@ -85,8 +86,6 @@ type recordingGateway struct {
 	hooks map[string]any
 	wg    sync.WaitGroup
 }
-
-func (g *recordingGateway) HandleConn(net.Conn) {}
 
 func (g *recordingGateway) ExitWaitGroup() *sync.WaitGroup {
 	return &g.wg

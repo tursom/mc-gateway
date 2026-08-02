@@ -14,7 +14,7 @@ type Result struct {
 	Response []byte
 }
 
-func RunProtocolProxyFixture(initial []byte, handler func(net.Conn)) (Result, error) {
+func RunTakeoverFixture(initial []byte, handler func(net.Conn)) (Result, error) {
 	gatewayEnd, pluginEnd := net.Pipe()
 	done := make(chan struct{})
 	go func() {

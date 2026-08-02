@@ -1,7 +1,6 @@
 package pluginmanager
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -72,6 +71,320 @@ func TestSandboxControlRPCValidationErrors(t *testing.T) {
 	}
 }
 
+func TestSandboxTakeoverConformance(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		action     string
+		payload    string
+		wantReply  string
+		wantNext   bool
+		wantCore   bool
+		wantSource string
+		halfClose  bool
+		slowRead   bool
+	}{
+		{name: "next replacement", action: "next", payload: "Ndata", wantReply: "core", wantNext: true, wantSource: "198.51.100.10:0"},
+		{name: "core replacement", action: "core", payload: "Cdata", wantReply: "core", wantCore: true, wantSource: "198.51.100.10:0"},
+		{name: "handled", action: "handled", payload: "H", wantReply: "handled"},
+		{name: "half-close backpressure byte integrity", action: "next", payload: "N" + strings.Repeat("x", 512*1024), wantReply: "core", wantNext: true, wantSource: "198.51.100.10:0", halfClose: true, slowRead: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rootDir := t.TempDir()
+			rootPath := filepath.Join(rootDir, "root.sock")
+			replacementPath := filepath.Join(rootDir, "replacement.sock")
+			rootListener, err := net.Listen("unix", rootPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rootListener.Close()
+			var replacementListener net.Listener
+			if test.action != "handled" {
+				replacementListener, err = net.Listen("unix", replacementPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer replacementListener.Close()
+			}
+
+			peerDone := make(chan error, 1)
+			go func() {
+				rootEndpoint, acceptErr := rootListener.Accept()
+				if acceptErr != nil {
+					peerDone <- acceptErr
+					return
+				}
+				defer rootEndpoint.Close()
+				if test.action == "handled" {
+					data := make([]byte, len(test.payload))
+					if _, err := io.ReadFull(rootEndpoint, data); err != nil {
+						peerDone <- err
+						return
+					}
+					_, err := rootEndpoint.Write([]byte("handled"))
+					peerDone <- err
+					return
+				}
+				replacementEndpoint, acceptErr := replacementListener.Accept()
+				if acceptErr != nil {
+					peerDone <- acceptErr
+					return
+				}
+				relayTakeoverStream(rootEndpoint, replacementEndpoint)
+				peerDone <- nil
+			}()
+
+			process := &SandboxProcess{
+				PluginID: "sandbox-takeover", ArtifactID: "artifact", RuntimeInstanceID: "runtime", Generation: 1,
+				RootDir: rootDir, done: make(chan struct{}),
+				Registrations: []SandboxHandlerRegistration{{ExtensionPoint: ExtensionUpstreamConnect, HandlerID: "takeover", FailPolicy: api.FailPolicyClose, TimeoutMS: 5000}},
+			}
+			process.controlInvoker = func(_ context.Context, _ string, req SandboxControlRequest) (SandboxControlResponse, error) {
+				resp := SandboxControlResponse{
+					RequestID: req.RequestID, Command: req.Command, Protocol: req.Protocol,
+					PluginID: req.PluginID, ArtifactID: req.ArtifactID, RuntimeInstanceID: req.RuntimeInstanceID,
+					Generation: req.Generation, TraceID: req.TraceID, DeadlineUnixMS: req.DeadlineUnixMS, OK: true,
+				}
+				if req.Command == sandboxControlCommandStreamClose {
+					return resp, nil
+				}
+				var open SandboxStreamOpenRequest
+				if err := json.Unmarshal(req.Payload, &open); err != nil {
+					return SandboxControlResponse{}, err
+				}
+				if open.PeerAddr != "192.0.2.1:1234" || open.LocalAddr != "192.0.2.2:25565" || open.Ingress.HTTP == nil || open.Ingress.HTTP.Headers.Get("Authorization") != "secret" {
+					return SandboxControlResponse{}, fmt.Errorf("takeover facts = %+v", open)
+				}
+				resp.Stream = &SandboxStreamOpenResponse{
+					Connected: true, Protocol: open.Protocol, StreamID: open.StreamID, Action: TakeoverAction(test.action),
+					Endpoint: rootPath, ReplacementEndpoint: replacementPath,
+					EffectiveSourceAddr: test.wantSource, Metadata: map[string]string{"runtime": "sandbox"},
+				}
+				return resp, nil
+			}
+
+			var root, client net.Conn
+			if test.halfClose {
+				root, client = newTestTCPConnPair(t)
+			} else {
+				root, client = net.Pipe()
+			}
+			defer root.Close()
+			defer client.Close()
+			_ = client.SetDeadline(time.Now().Add(5 * time.Second))
+			flow := &sandboxTakeoverTestFlow{payload: test.payload, halfClose: test.halfClose, slowRead: test.slowRead}
+			req := takeoverRequest(root)
+			req.Flow = flow
+			done := make(chan error, 1)
+			go func() {
+				done <- (sandboxHostedPlugin{process: process}).takeoverStream(req, process.Registrations[0])
+			}()
+			if _, err := client.Write([]byte(test.payload)); err != nil {
+				t.Fatal(err)
+			}
+			if test.halfClose {
+				if err := client.(interface{ CloseWrite() error }).CloseWrite(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var reply []byte
+			if test.halfClose {
+				reply, err = io.ReadAll(client)
+			} else {
+				reply = make([]byte, len(test.wantReply))
+				_, err = io.ReadFull(client, reply)
+			}
+			if err != nil {
+				_ = client.Close()
+				select {
+				case takeoverErr := <-done:
+					t.Fatalf("read reply: %v; takeover: %v", err, takeoverErr)
+				case <-time.After(time.Second):
+					t.Fatalf("read reply: %v; takeover did not finish", err)
+				}
+			}
+			_ = client.Close()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("sandbox takeover did not finish")
+			}
+			if err := <-peerDone; err != nil {
+				t.Fatal(err)
+			}
+			if string(reply) != test.wantReply || flow.next != test.wantNext || flow.core != test.wantCore {
+				t.Fatalf("reply=%q next=%v core=%v", reply, flow.next, flow.core)
+			}
+		})
+	}
+}
+
+func TestSandboxTakeoverEndpointClosesOnContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	left, right := net.Pipe()
+	defer right.Close()
+	process := &SandboxProcess{done: make(chan struct{})}
+	wrapped := bindSandboxStreamEndpoint(ctx, process, "cancel-stream", left)
+	cancel()
+	waitForPluginManagerTest(t, func() bool { return process.activeStreams.Load() == 0 })
+	if _, err := right.Write([]byte("x")); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("write after cancel error = %v, want closed pipe", err)
+	}
+	_ = wrapped.Close()
+}
+
+func TestSandboxManagerForceCloseDrainingTakeover(t *testing.T) {
+	registration := SandboxHandlerRegistration{
+		ExtensionPoint: ExtensionUpstreamConnect,
+		HandlerID:      "takeover",
+		FailPolicy:     api.FailPolicyClose,
+		TimeoutMS:      5000,
+	}
+	peer := newFakeSandboxStreamPeer(t)
+	peer.action = TakeoverActionNext
+	replacementPath := filepath.Join(t.TempDir(), "replacement.sock")
+	replacementListener, err := net.Listen("unix", replacementPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replacementListener.Close()
+	peer.replacementEndpoint = replacementPath
+	replacementAccepted := make(chan net.Conn, 1)
+	go func() {
+		conn, _ := replacementListener.Accept()
+		replacementAccepted <- conn
+	}()
+	policy := SandboxPolicy{CPUSeconds: 1, MemoryBytes: 8 * 1024 * 1024, ExternalIsolation: true}
+	manager := New(Options{
+		DB: openPluginManagerTestDB(t), ArtifactRoot: t.TempDir(),
+		FutureRuntimeGates: FutureRuntimeGates{SandboxProcess: true},
+		SandboxSelfCheck:   func(SandboxPolicy) error { return nil }, SandboxPolicy: policy,
+	})
+	defer manager.Close(context.Background())
+	if _, err := manager.SetPluginServiceDesired(context.Background(), "admin", PluginServiceModeSandboxProcess); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ApplyPluginServiceMode(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	manager.adapter = SandboxProcessAdapter{
+		Policy: policy, SelfCheck: func(SandboxPolicy) error { return nil },
+		startProcess: func(_ context.Context, _ SandboxSupervisor, pluginID, artifactID, _ string, generation int64, configJSON string, _ SandboxSecretResolver) (*SandboxProcess, error) {
+			process := newSandboxControlProcessForTest(pluginID, artifactID, generation, configJSON)
+			process.SocketPath = "fake-sandbox-control.sock"
+			process.Registrations = []SandboxHandlerRegistration{registration}
+			process.registerOK = true
+			process.controlInvoker = peer.invoke
+			process.streamDialer = peer.dial
+			peer.process = process
+			return process, nil
+		},
+	}
+	manager.serviceMode = PluginServiceModeSandboxProcess
+	artifact := uploadSandboxDispatchArtifactForTest(t, manager, "sandbox-takeover-drain", []SandboxHandlerRegistration{registration})
+	enableSandboxDispatchArtifactForTest(t, manager, artifact)
+
+	root, client := net.Pipe()
+	defer client.Close()
+	coreEntered := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.HandleConnection(context.Background(), takeoverRequest(root), func(_ context.Context, state api.ConnectionState) error {
+			close(coreEntered)
+			_, err := state.Stream.Read(make([]byte, 1))
+			return err
+		})
+	}()
+	firstEndpoint := peer.nextPluginConn(t)
+	defer firstEndpoint.Close()
+	var replacementEndpoint net.Conn
+	select {
+	case replacementEndpoint = <-replacementAccepted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for sandbox replacement endpoint")
+	}
+	defer replacementEndpoint.Close()
+	select {
+	case <-coreEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sandbox replacement did not enter core")
+	}
+	disabled, err := manager.Disable(context.Background(), "admin", artifact.PluginID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disabled.RuntimeState != RuntimeDraining {
+		t.Fatalf("disabled runtime state = %q, want draining", disabled.RuntimeState)
+	}
+	closed, err := manager.ForceCloseDraining(context.Background(), "admin", artifact.PluginID)
+	if err != nil || closed != 1 {
+		t.Fatalf("ForceCloseDraining() = %d, %v", closed, err)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("force close did not unwind sandbox takeover")
+	}
+}
+
+type sandboxTakeoverTestFlow struct {
+	payload   string
+	next      bool
+	core      bool
+	halfClose bool
+	slowRead  bool
+}
+
+func (f *sandboxTakeoverTestFlow) Next(state api.ConnectionState) error {
+	f.next = true
+	return f.run(state)
+}
+
+func (f *sandboxTakeoverTestFlow) Core(state api.ConnectionState) error {
+	f.core = true
+	return f.run(state)
+}
+
+func (f *sandboxTakeoverTestFlow) run(state api.ConnectionState) error {
+	if state.EffectiveSourceAddr != "198.51.100.10:0" || state.Metadata["runtime"] != "sandbox" {
+		return fmt.Errorf("replacement state = %+v", state)
+	}
+	var data []byte
+	if f.halfClose {
+		buf := make([]byte, 4096)
+		for {
+			n, err := state.Stream.Read(buf)
+			data = append(data, buf[:n]...)
+			if err != nil {
+				if !errors.Is(err, io.EOF) {
+					return err
+				}
+				break
+			}
+			if f.slowRead {
+				time.Sleep(100 * time.Microsecond)
+			}
+		}
+	} else {
+		data = make([]byte, len(f.payload))
+		if _, err := io.ReadFull(state.Stream, data); err != nil {
+			return err
+		}
+	}
+	if string(data) != f.payload {
+		return fmt.Errorf("replacement bytes = %q, want %q", data, f.payload)
+	}
+	if _, err := state.Stream.Write([]byte("core")); err != nil {
+		return err
+	}
+	if f.halfClose {
+		return state.Stream.(interface{ CloseWrite() error }).CloseWrite()
+	}
+	return nil
+}
+
 func TestSandboxControlStartupSequenceRegisters(t *testing.T) {
 	process := newSandboxControlProcessForTest("sandbox-startup", "artifact-startup", 9, `{"safe":true}`)
 	handshake := process.HandleControlRequest(context.Background(), sandboxControlRequestForTest(t, process, sandboxControlCommandHandshake, SandboxHandshakeRequest{ABIVersion: SandboxProcessABIVersionV1}), nil)
@@ -112,7 +425,7 @@ func TestSandboxControlStartupSequenceRegisters(t *testing.T) {
 
 func TestSandboxControlRegisterFailureDoesNotPolluteDispatchTable(t *testing.T) {
 	process := newSandboxControlProcessForTest("sandbox-register-fail", "artifact-register-fail", 4, "")
-	gateway := NewGateway(process.PluginID, nil, nil, nil)
+	gateway := NewGateway(process.PluginID, nil, nil)
 
 	handshake := process.HandleControlRequest(context.Background(), sandboxControlRequestForTest(t, process, sandboxControlCommandHandshake, SandboxHandshakeRequest{ABIVersion: SandboxProcessABIVersionV1}), nil)
 	if !handshake.OK {
@@ -209,7 +522,7 @@ func TestSandboxProcessAdapterStartRequiresControlStartup(t *testing.T) {
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 			defer cancel()
-			instance, err := adapter.Start(ctx, prepared, artifact, pluginRecord, NewGateway(prepared.PluginID, nil, nil, nil))
+			instance, err := adapter.Start(ctx, prepared, artifact, pluginRecord, NewGateway(prepared.PluginID, nil, nil))
 			if tt.wantError != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
 					t.Fatalf("Start() error = %v, want %s", err, tt.wantError)
@@ -545,291 +858,17 @@ func TestSandboxManagerConfigValidateBlocksDryRun(t *testing.T) {
 	}
 }
 
-func TestSandboxProtocolProxyStreamRelayConformanceFocused(t *testing.T) {
-	peer := newFakeSandboxStreamPeer(t)
-	manager, artifact, _ := enableSandboxStreamProxyForTest(t, "sandbox-stream", peer, api.FailPolicyClose, 1000)
-
-	clientGateway, clientSide := newTestTCPConnPair(t)
-	defer clientSide.Close()
-	initial := []byte("initial")
-	next := []byte("next")
-	reply := []byte("sandbox-reply")
-	errCh := make(chan error, 1)
-	go func() {
-		_, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{
-			Host:         "play.example",
-			Upstream:     "backend",
-			Source:       clientGateway,
-			InitialData:  initial,
-			ConnectionID: "conn-1",
-			TraceID:      "trace-1",
-			Metadata: map[string]string{
-				"safe":          "value",
-				"api_token":     "plain-secret-value",
-				"authorization": "Bearer secret",
-			},
-		})
-		errCh <- err
-	}()
-	pluginConn := peer.nextPluginConn(t)
-	pluginDone := make(chan error, 1)
-	go func() {
-		defer pluginConn.Close()
-		got := make([]byte, len(initial)+len(next))
-		if _, err := io.ReadFull(pluginConn, got); err != nil {
-			pluginDone <- err
-			return
-		}
-		if !bytes.Equal(got, append(append([]byte(nil), initial...), next...)) {
-			pluginDone <- fmt.Errorf("plugin stream bytes = %q, want initial replay plus client bytes", got)
-			return
-		}
-		if _, err := pluginConn.Write(reply); err != nil {
-			pluginDone <- err
-			return
-		}
-		closeWrite(pluginConn)
-		_, err := io.Copy(io.Discard, pluginConn)
-		pluginDone <- err
-	}()
-	if _, err := clientSide.Write(next); err != nil {
-		t.Fatalf("client write error = %v", err)
-	}
-	gotReply := make([]byte, len(reply))
-	if _, err := io.ReadFull(clientSide, gotReply); err != nil {
-		t.Fatalf("client read reply error = %v", err)
-	}
-	if !bytes.Equal(gotReply, reply) {
-		t.Fatalf("client reply = %q, want %q", gotReply, reply)
-	}
-	if err := clientSide.CloseWrite(); err != nil {
-		t.Fatalf("client CloseWrite() error = %v", err)
-	}
-	if err := <-pluginDone; err != nil {
-		t.Fatalf("plugin stream error = %v", err)
-	}
-	if err := <-errCh; err != nil {
-		t.Fatalf("ConnectUpstream() error = %v", err)
-	}
-	open := peer.lastOpen(t)
-	if open.Protocol != StreamProxyProtocolV1 || open.ExtensionPoint != ExtensionUpstreamConnect || open.HandlerID != "upstream.connect/v1" {
-		t.Fatalf("stream_open request = %+v, want stream.proxy/v1 upstream.connect/v1", open)
-	}
-	if open.Metadata["safe"] != "value" || open.Metadata["api_token"] != "[redacted]" || open.Metadata["authorization"] != "[redacted]" {
-		t.Fatalf("stream_open metadata = %+v, want redacted secret metadata", open.Metadata)
-	}
-	if raw := peer.rawOpenPayload(t); bytes.Contains(raw, initial) || bytes.Contains(raw, []byte("plain-secret-value")) {
-		t.Fatalf("stream_open payload leaked initial bytes or secret metadata: %s", raw)
-	}
-	waitForPluginManagerTest(t, func() bool { return peer.closeCount() >= 1 })
-	plan := manager.DispatchPlan(context.Background())
-	if len(plan.Handlers) != 1 || plan.Handlers[0].PluginID != artifact.PluginID {
-		t.Fatalf("DispatchPlan handlers = %+v, want sandbox stream handler", plan.Handlers)
-	}
-	handler := plan.Handlers[0]
-	if handler.ProxyStarted != 1 || handler.ProxyCompleted != 1 || handler.ActiveProxy != 0 || handler.ProxyErrors != 0 {
-		t.Fatalf("proxy summary = %+v, want one clean completed sandbox stream", handler)
-	}
-	if got, want := handler.ProxyBytesIn, uint64(len(initial)+len(next)); got != want {
-		t.Fatalf("proxy bytes in = %d, want %d", got, want)
-	}
-	if got, want := handler.ProxyBytesOut, uint64(len(reply)); got != want {
-		t.Fatalf("proxy bytes out = %d, want %d", got, want)
-	}
-}
-
-func TestSandboxProtocolProxyClientAndEndpointClose(t *testing.T) {
-	t.Run("client close", func(t *testing.T) {
-		peer := newFakeSandboxStreamPeer(t)
-		manager, _, _ := enableSandboxStreamProxyForTest(t, "sandbox-client-close", peer, api.FailPolicyClose, 1000)
-		clientGateway, clientSide := newTestTCPConnPair(t)
-		errCh := make(chan error, 1)
-		go func() {
-			_, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{
-				Host:   "play.example",
-				Source: clientGateway,
-			})
-			errCh <- err
-		}()
-		pluginConn := peer.nextPluginConn(t)
-		pluginDone := make(chan error, 1)
-		go func() {
-			defer pluginConn.Close()
-			_, err := io.Copy(io.Discard, pluginConn)
-			pluginDone <- err
-		}()
-		if err := clientSide.Close(); err != nil {
-			t.Fatalf("client Close() error = %v", err)
-		}
-		if err := <-pluginDone; err != nil {
-			t.Fatalf("plugin read after client close error = %v", err)
-		}
-		if err := <-errCh; err != nil {
-			t.Fatalf("ConnectUpstream() error = %v", err)
-		}
-	})
-
-	t.Run("endpoint close", func(t *testing.T) {
-		peer := newFakeSandboxStreamPeer(t)
-		peer.mode = "endpoint_close"
-		manager, _, _ := enableSandboxStreamProxyForTest(t, "sandbox-endpoint-close", peer, api.FailPolicyClose, 1000)
-		clientGateway, clientSide := newTestTCPConnPair(t)
-		defer clientSide.Close()
-		errCh := make(chan error, 1)
-		go func() {
-			_, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{
-				Host:   "play.example",
-				Source: clientGateway,
-			})
-			errCh <- err
-		}()
-		_ = peer.nextPluginConn(t)
-		_ = clientSide.Close()
-		select {
-		case err := <-errCh:
-			if err != nil {
-				t.Fatalf("ConnectUpstream() error = %v", err)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("ConnectUpstream() did not return after sandbox endpoint close")
-		}
-	})
-}
-
-func TestSandboxProtocolProxyTimeoutBackpressureAndForceClose(t *testing.T) {
-	t.Run("timeout", func(t *testing.T) {
-		peer := newFakeSandboxStreamPeer(t)
-		peer.mode = "timeout"
-		manager, _, _ := enableSandboxStreamProxyForTest(t, "sandbox-timeout-stream", peer, api.FailPolicyClose, 20)
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
-		defer cancel()
-		result, err := manager.ConnectUpstream(ctx, api.UpstreamConnectRequest{Host: "play.example"})
-		if err == nil || !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("ConnectUpstream(timeout) = %+v err=%v, want deadline exceeded", result, err)
-		}
-	})
-
-	t.Run("backpressure and force close", func(t *testing.T) {
-		peer := newFakeSandboxStreamPeer(t)
-		manager, _, _ := enableSandboxStreamProxyForTest(t, "sandbox-force-close", peer, api.FailPolicyClose, 1000)
-		clientGateway, clientSide := newTestTCPConnPair(t)
-		defer clientSide.Close()
-		errCh := make(chan error, 1)
-		go func() {
-			_, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{
-				Host:   "play.example",
-				Source: clientGateway,
-			})
-			errCh <- err
-		}()
-		pluginConn := peer.nextPluginConn(t)
-		defer pluginConn.Close()
-		payload := bytes.Repeat([]byte("x"), 512*1024)
-		readDone := make(chan int, 1)
-		go func() {
-			buf := make([]byte, 4096)
-			total := 0
-			for total < len(payload) {
-				n, err := pluginConn.Read(buf)
-				if n > 0 {
-					total += n
-					time.Sleep(time.Millisecond)
-				}
-				if err != nil {
-					break
-				}
-			}
-			readDone <- total
-		}()
-		writeDone := make(chan error, 1)
-		go func() {
-			_, err := clientSide.Write(payload)
-			writeDone <- err
-		}()
-		select {
-		case err := <-writeDone:
-			if err != nil {
-				t.Fatalf("client large write error = %v", err)
-			}
-		case <-time.After(3 * time.Second):
-			t.Fatal("client large write timed out under sandbox stream relay backpressure")
-		}
-		if got := <-readDone; got != len(payload) {
-			t.Fatalf("plugin read bytes = %d, want %d", got, len(payload))
-		}
-		waitForPluginManagerTest(t, func() bool {
-			return manager.activeProxyCountLocked("sandbox-force-close") == 1
-		})
-		if _, err := manager.Disable(context.Background(), "admin", "sandbox-force-close"); err != nil {
-			t.Fatalf("Disable() error = %v", err)
-		}
-		active, err := manager.ActiveProxyConnections(context.Background(), "sandbox-force-close")
-		if err != nil {
-			t.Fatalf("ActiveProxyConnections() error = %v", err)
-		}
-		if len(active) != 1 || !active[0].Draining || active[0].ForceCloseRequested {
-			t.Fatalf("active sandbox proxy after disable = %+v, want draining stream", active)
-		}
-		closed, err := manager.ForceCloseDraining(context.Background(), "admin", "sandbox-force-close")
-		if err != nil {
-			t.Fatalf("ForceCloseDraining() error = %v", err)
-		}
-		if closed != 1 {
-			t.Fatalf("ForceCloseDraining() = %d, want 1", closed)
-		}
-		if err := <-errCh; err != nil {
-			t.Fatalf("ConnectUpstream() error = %v", err)
-		}
-		waitForPluginManagerTest(t, func() bool {
-			return manager.activeProxyCountLocked("sandbox-force-close") == 0
-		})
-	})
-}
-
-func TestSandboxProtocolProxyProcessCrashClosesActiveStreams(t *testing.T) {
-	peer := newFakeSandboxStreamPeer(t)
-	manager, _, process := enableSandboxStreamProxyForTest(t, "sandbox-crash-stream", peer, api.FailPolicyClose, 1000)
-	clientGateway, clientSide := newTestTCPConnPair(t)
-	defer clientSide.Close()
-	errCh := make(chan error, 1)
-	go func() {
-		_, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{
-			Host:   "play.example",
-			Source: clientGateway,
-		})
-		errCh <- err
-	}()
-	pluginConn := peer.nextPluginConn(t)
-	defer pluginConn.Close()
-	waitForPluginManagerTest(t, func() bool {
-		return manager.activeProxyCountLocked("sandbox-crash-stream") == 1
-	})
-	closeSandboxProcessForTest(process)
-	select {
-	case err := <-errCh:
-		if err != nil {
-			t.Fatalf("ConnectUpstream() error = %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("active sandbox stream did not close after process crash")
-	}
-	waitForPluginManagerTest(t, func() bool {
-		return manager.activeProxyCountLocked("sandbox-crash-stream") == 0
-	})
-	if os.Getpid() <= 0 {
-		t.Fatal("gateway process exited during sandbox process crash")
-	}
-}
-
 type fakeSandboxStreamPeer struct {
-	mu          sync.Mutex
-	mode        string
-	opens       []SandboxStreamOpenRequest
-	rawOpens    [][]byte
-	closes      []SandboxStreamCloseRequest
-	pluginConns chan net.Conn
-	makePair    func() (net.Conn, net.Conn)
-	process     *SandboxProcess
+	mu                  sync.Mutex
+	mode                string
+	opens               []SandboxStreamOpenRequest
+	rawOpens            [][]byte
+	closes              []SandboxStreamCloseRequest
+	pluginConns         chan net.Conn
+	makePair            func() (net.Conn, net.Conn)
+	process             *SandboxProcess
+	action              TakeoverAction
+	replacementEndpoint string
 }
 
 func newFakeSandboxStreamPeer(t *testing.T) *fakeSandboxStreamPeer {
@@ -877,6 +916,10 @@ func (p *fakeSandboxStreamPeer) invoke(ctx context.Context, _ string, req Sandbo
 			StreamID:     payload.StreamID,
 			Endpoint:     "/run/streams/" + payload.StreamID + ".sock",
 			EndpointType: "unix",
+			Action:       p.action,
+		}
+		if p.action == TakeoverActionNext || p.action == TakeoverActionCore {
+			resp.Stream.ReplacementEndpoint = p.replacementEndpoint
 		}
 		return resp, nil
 	case sandboxControlCommandStreamClose:
@@ -943,82 +986,6 @@ func (p *fakeSandboxStreamPeer) closeCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.closes)
-}
-
-func enableSandboxStreamProxyForTest(t *testing.T, pluginID string, peer *fakeSandboxStreamPeer, failPolicy string, timeoutMS int64) (*Manager, ArtifactRecord, *SandboxProcess) {
-	t.Helper()
-	if failPolicy == "" {
-		failPolicy = api.FailPolicyClose
-	}
-	if timeoutMS == 0 {
-		timeoutMS = 1000
-	}
-	policy := SandboxPolicy{CPUSeconds: 1, MemoryBytes: 8 * 1024 * 1024, ExternalIsolation: true}
-	manager := New(Options{
-		DB:                 openPluginManagerTestDB(t),
-		ArtifactRoot:       t.TempDir(),
-		FutureRuntimeGates: FutureRuntimeGates{SandboxProcess: true},
-		SandboxSelfCheck:   func(SandboxPolicy) error { return nil },
-		SandboxPolicy:      policy,
-	})
-	registration := SandboxHandlerRegistration{
-		ExtensionPoint: ExtensionUpstreamConnect,
-		HandlerID:      "upstream.connect/v1",
-		FailPolicy:     failPolicy,
-		TimeoutMS:      timeoutMS,
-		SchemaVersion:  1,
-		DeclaredCapabilities: []string{
-			StreamProxyProtocolV1,
-		},
-	}
-	manager.adapter = SandboxProcessAdapter{
-		Policy:    policy,
-		SelfCheck: func(SandboxPolicy) error { return nil },
-		startProcess: func(_ context.Context, _ SandboxSupervisor, pluginID, artifactID, _ string, generation int64, configJSON string, _ SandboxSecretResolver) (*SandboxProcess, error) {
-			process := newSandboxControlProcessForTest(pluginID, artifactID, generation, configJSON)
-			process.SocketPath = "fake-sandbox-stream-control.sock"
-			process.Registrations = []SandboxHandlerRegistration{registration}
-			process.registerOK = true
-			process.UpstreamMode = UpstreamModeProtocolProxy
-			process.controlInvoker = peer.invoke
-			process.streamDialer = peer.dial
-			peer.process = process
-			return process, nil
-		},
-	}
-	manager.serviceMode = PluginServiceModeSandboxProcess
-	artifact := uploadSandboxStreamArtifactForTest(t, manager, pluginID, timeoutMS)
-	if _, err := manager.SetDesired(context.Background(), "admin", pluginID, artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
-		t.Fatalf("SetDesired() error = %v", err)
-	}
-	approveGovernanceForTest(t, manager, pluginID, artifact.ID)
-	if _, err := manager.Enable(context.Background(), "admin", pluginID); err != nil {
-		t.Fatalf("Enable() error = %v", err)
-	}
-	if peer.process == nil {
-		t.Fatal("sandbox stream fake process was not started")
-	}
-	return manager, artifact, peer.process
-}
-
-func uploadSandboxStreamArtifactForTest(t *testing.T, manager *Manager, pluginID string, timeoutMS int64) ArtifactRecord {
-	t.Helper()
-	return uploadTestArtifactWithManifest(t, manager, pluginID, func(manifest *Manifest) {
-		manifest.Runtime.Type = RuntimeSandbox
-		manifest.ExtensionPoints = []ExtensionPoint{{Type: "hook", Key: ExtensionUpstreamConnect}}
-		manifest.Capabilities = json.RawMessage(`{
-			"extension_points":["upstream.connect/v1"],
-			"upstream_connect":{"mode":"protocol-proxy"},
-			"scope":{"type":"host","values":["play.example"]},
-			"rollout":{"mode":"canary"},
-			"minecraft":{
-				"protocol_versions":{"tested":[767]},
-				"forwarding":{"supported":["none"],"default":"none"}
-			}
-		}`)
-		manifest.RuntimeLimits.HandlerTimeoutMS = int(timeoutMS)
-		manifest.RuntimeLimits.InitialWriteTimeoutMS = 1000
-	})
 }
 
 type fakeSandboxControlPeer struct {

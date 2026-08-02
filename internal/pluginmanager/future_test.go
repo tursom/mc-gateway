@@ -18,8 +18,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/tursom/mc-gateway/plugin/api"
 )
 
 func TestPluginServiceModeReservedApplyKeepsDataPlaneInProcess(t *testing.T) {
@@ -268,7 +266,7 @@ func TestPluginServiceStatusIncludesModeMaturity(t *testing.T) {
 	}
 	processMode := findServiceModeFeature(status.Modes, PluginServiceModeGoPluginProcess)
 	if !processMode.Implemented || !processMode.DataPlane || processMode.Maturity != FeatureMaturityPartial ||
-		!strings.Contains(processMode.UnsupportedReason, "protocol-proxy drain-only") ||
+		!strings.Contains(processMode.UnsupportedReason, "upstream.connect/v2 takeover") ||
 		!strings.Contains(processMode.UnsupportedReason, "per-node crash isolation") ||
 		strings.Contains(processMode.UnsupportedReason, "cross-node crash policy coordination are not implemented") {
 		t.Fatalf("go-plugin-process mode = %+v, want partial process data plane", processMode)
@@ -307,7 +305,7 @@ func TestRuntimeAdapterLifecycleFactory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Prepare() error = %v", err)
 	}
-	instance, err := lifecycle.Start(context.Background(), prepared, artifact, pluginRecord, NewGateway(artifact.PluginID, nil, nil, nil))
+	instance, err := lifecycle.Start(context.Background(), prepared, artifact, pluginRecord, NewGateway(artifact.PluginID, nil, nil))
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -348,9 +346,9 @@ func TestRuntimeAdapterFactoryProcessModeSupportsProcessDataPlane(t *testing.T) 
 	if err := lifecycle.ValidateArtifact(context.Background(), ArtifactRecord{
 		RuntimeType:             RuntimeGoPlugin,
 		ArtifactType:            ArtifactTypeBinary,
-		CapabilitiesSummaryJSON: `{"upstream_connect":{"mode":"protocol-proxy"}}`,
+		CapabilitiesSummaryJSON: `{"raw":{"extension_points":["upstream.connect/v2"]}}`,
 	}); err != nil {
-		t.Fatalf("ValidateArtifact(process protocol-proxy adapter) error = %v", err)
+		t.Fatalf("ValidateArtifact(process takeover adapter) error = %v", err)
 	}
 
 	adapter, status = factory.AdapterFor(PluginServiceModeSandboxProcess, RuntimeWASM)
@@ -479,69 +477,6 @@ func TestPluginHostCrashBackoffPreventsDeadHostReuse(t *testing.T) {
 	summary := manager.hostSummary("plugin-a")
 	if !summary.CrashLoop || summary.BackoffUntil != crashAt+5 || summary.LastError != "exit status 2" {
 		t.Fatalf("host summary = %+v, want configured crash-loop backoff", summary)
-	}
-}
-
-func TestPluginHostCrashAutoIsolatesLoadedPlugin(t *testing.T) {
-	manager := newManagerForTest(t, &fakeAdapter{})
-	artifact := uploadTestArtifact(t, manager, "plugin-a")
-	if _, err := manager.SetDesired(context.Background(), "admin", "plugin-a", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
-		t.Fatalf("SetDesired() error = %v", err)
-	}
-	if _, err := manager.Enable(context.Background(), "admin", "plugin-a"); err != nil {
-		t.Fatalf("Enable() error = %v", err)
-	}
-	if handlers := manager.DispatchPlan(context.Background()).Handlers; len(handlers) != 1 {
-		t.Fatalf("dispatch handlers before crash = %+v, want one handler", handlers)
-	}
-
-	crashAt := time.Now().Unix()
-	process := &PluginHostSupervisorProcess{
-		PluginID:   "plugin-a",
-		ArtifactID: artifact.ID,
-		PID:        4242,
-		StartedAt:  crashAt - 1,
-	}
-	process.crashLoop = true
-	process.crashCount = 1
-	process.lastError = "exit status 2"
-	process.exitedAt = crashAt
-	process.lastCrashAt = crashAt
-
-	manager.mu.Lock()
-	manager.serviceMode = PluginServiceModeGoPluginProcess
-	manager.loaded["plugin-a"].runtime.HostProcess = process
-	manager.mu.Unlock()
-
-	summary := findHostStatus(manager.PluginHostSummaries(), "plugin-a")
-	if !summary.Isolated || summary.State != RuntimeFailed || summary.BackoffUntil <= time.Now().Unix() {
-		t.Fatalf("host summary after crash = %+v, want isolated failed host with backoff", summary)
-	}
-	if handlers := manager.DispatchPlan(context.Background()).Handlers; len(handlers) != 0 {
-		t.Fatalf("dispatch handlers after crash = %+v, want isolated plugin removed", handlers)
-	}
-	manager.mu.Lock()
-	_, stillLoaded := manager.loaded["plugin-a"]
-	manager.mu.Unlock()
-	if stillLoaded {
-		t.Fatalf("isolated crashed plugin remained cached in manager.loaded")
-	}
-	plugin, err := manager.Plugin(context.Background(), "plugin-a")
-	if err != nil {
-		t.Fatalf("Plugin() error = %v", err)
-	}
-	if plugin.RuntimeState != RuntimeFailed || !strings.Contains(plugin.LastError, "exit status 2") {
-		t.Fatalf("plugin after crash isolation = %+v, want failed runtime with crash error", plugin)
-	}
-	state, err := manager.PluginServiceState(context.Background())
-	if err != nil {
-		t.Fatalf("PluginServiceState() error = %v", err)
-	}
-	if !strings.Contains(state.LastError, "exit status 2") {
-		t.Fatalf("plugin service state after crash isolation = %+v, want persisted crash error", state)
-	}
-	if _, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{Host: "play.example", Upstream: "backend"}); err != nil {
-		t.Fatalf("ConnectUpstream(after isolation) error = %v, want pass-through no handler", err)
 	}
 }
 

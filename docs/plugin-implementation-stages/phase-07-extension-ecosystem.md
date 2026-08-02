@@ -4,7 +4,7 @@
 
 在稳定的插件主路径上扩展生态能力：route resolver、status ping、event subscriber、provider、middleware、rule/policy engine、Admin auth provider 和更多官方示例插件。
 
-阶段结束后，用户可以不写完整 protocol-proxy，也能用更低成本 extension point 完成常见运维需求。
+阶段结束后，用户可以不写完整 connection takeover，也能用更低成本 extension point 完成常见运维需求。
 
 ## 可用性检查点
 
@@ -117,7 +117,7 @@
 
 ## 实现说明
 
-- Route/status/middleware/provider/event subscriber 仍复用插件 `Gateway.Hook` 注册模型，新增 typed SDK 结构保持和 `upstream.connect/v1` 一致。
+- Route/status/middleware/provider/event subscriber 仍复用插件 `Gateway.Hook` 注册模型，新增 typed SDK 结构保持和 `upstream.connect/v2` 一致。
 - 官方 rule/policy 以内置官方插件 `official.rule-policy` 提供，管理员启用后通过插件配置完成 host rewrite、source CIDR allow/deny、simple rate limit、maintenance mode 和 upstream rewrite。
 - Admin auth provider 当前作为 provider registry 能力预留和展示，不进入 MC 连接路径，也不替代本地 admin break-glass 登录。
 - Route provider 失败时优先使用 provider cache，未命中时回退到 SQLite route snapshot。

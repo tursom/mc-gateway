@@ -29,7 +29,7 @@ func (m *Manager) Close(ctx context.Context) error {
 	case <-m.closeDone:
 		return m.closeErr
 	case <-ctx.Done():
-		m.forceCloseProxyConnections()
+		m.forceCloseConnectionSessions()
 		return ctx.Err()
 	}
 }
@@ -95,7 +95,7 @@ func (m *Manager) close(ctx context.Context) error {
 	}
 
 	if err := waitGroupContext(ctx, m.wg); err != nil {
-		m.forceCloseProxyConnections()
+		m.forceCloseConnectionSessions()
 		errs = append(errs, fmt.Errorf("wait for plugin goroutines: %w", err))
 	}
 	return errors.Join(errs...)
@@ -120,7 +120,7 @@ func (m *Manager) stopPendingRuntimeProcesses(ctx context.Context) []error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := m.stopRuntimeAdapter(ctx, loaded); err != nil {
+			if err := errors.Join(m.stopRuntimeInstance(ctx, loaded)...); err != nil {
 				errCh <- fmt.Errorf("stop pending runtime for plugin %q: %w", loaded.record.ID, err)
 			}
 		}()
@@ -189,19 +189,18 @@ func waitGroupContext(ctx context.Context, wg *sync.WaitGroup) error {
 	}
 }
 
-func (m *Manager) forceCloseProxyConnections() {
+func (m *Manager) forceCloseConnectionSessions() {
 	if m == nil {
 		return
 	}
-	m.proxyMu.Lock()
-	connections := make([]*proxyConnection, 0, len(m.proxyConns))
-	for _, connection := range m.proxyConns {
+	m.sessionMu.Lock()
+	sessions := make([]*connectionSession, 0, len(m.connectionSessions))
+	for _, connection := range m.connectionSessions {
 		connection.forceCloseRequested = true
-		connections = append(connections, connection)
+		sessions = append(sessions, connection)
 	}
-	m.proxyMu.Unlock()
-	for _, connection := range connections {
-		_ = connection.client.Close()
-		_ = connection.endpoint.Close()
+	m.sessionMu.Unlock()
+	for _, session := range sessions {
+		m.closeConnectionSessionStreams(session)
 	}
 }

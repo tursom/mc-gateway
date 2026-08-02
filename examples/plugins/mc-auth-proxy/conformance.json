@@ -1,26 +1,26 @@
 {
   "fixtures": [
     {
-      "name": "protocol proxy initial data",
+      "name": "takeover byte integrity",
       "status": "pass",
-      "expected": "initial_data_replayed_once",
-      "extension": "upstream.connect/v1"
+      "expected": "minecraft_bytes_preserved",
+      "extension": "upstream.connect/v2"
     },
     {
-      "name": "protocol proxy panic",
+      "name": "takeover panic",
       "status": "pass",
       "expected": "panic_recovered",
-      "extension": "upstream.connect/v1"
+      "extension": "upstream.connect/v2"
     },
     {
-      "name": "protocol proxy timeout",
+      "name": "takeover timeout",
       "status": "pass",
       "expected": "deadline_enforced",
-      "extension": "upstream.connect/v1"
+      "extension": "upstream.connect/v2"
     }
   ],
-  "protocol_proxy_scenarios": [
-    "initial_data_once",
+  "takeover_scenarios": [
+    "byte_integrity",
     "panic_recovered",
     "timeout_deadline",
     "endpoint_close",

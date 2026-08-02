@@ -14,7 +14,7 @@ go run ./cmd/gateway plugin validate dist/<plugin-id>.mcgp
 go run ./cmd/gateway plugin compat dist/<plugin-id>.mcgp
 ```
 
-涉及 Minecraft 协议、protocol-proxy、drain、timeout 或 packet 处理时，必须增加专门 fixture，而不能只依赖 manifest 检查。
+涉及 Minecraft 协议、connection takeover、drain、timeout 或 packet 处理时，必须增加专门 fixture，而不能只依赖 manifest 检查。
 
 ## `plugin test` Profile
 
@@ -51,7 +51,7 @@ go run ./cmd/gateway plugin contract . \
 - extension point 是否被当前 gateway 支持。
 - `capabilities.extension_points` 是否和 `extension_points` 对齐。
 - `required_features` 是否可用。
-- `upstream_connect.mode` 是否为 `dialer` 或 `protocol-proxy`。
+- legacy `capabilities.upstream_connect` 是否被明确拒绝。
 - `ingress.service/v1` schema 是否有效。
 - `config_schema` 是否是有效 JSON。
 - config fixture 是否是有效 JSON。
@@ -92,8 +92,8 @@ go run ./cmd/gateway plugin preflight dist/<plugin-id>.mcgp \
   ],
   "route_decisions": ["override", "fallback", "reject", "pass"],
   "status_hosts": ["blue.example", "red.example"],
-  "protocol_proxy_scenarios": [
-    "initial_data_once",
+  "takeover_scenarios": [
+    "byte_integrity",
     "panic_recovered",
     "timeout_deadline",
     "endpoint_close",
@@ -117,8 +117,7 @@ go run ./cmd/gateway plugin preflight dist/<plugin-id>.mcgp \
 
 | 扩展点 | 最低测试 |
 | --- | --- |
-| `upstream.connect/v1` dialer | host match、`ErrPass`、拨号失败、返回连接、默认路由不回归 |
-| `upstream.connect/v1` protocol-proxy | initial data 只回放一次、panic recover、timeout、client/backend close、backpressure、disable drain、force-close |
+| `upstream.connect/v2` | Next/Core、完整处理、拒绝、replacement byte integrity、panic/error/crash fail-closed、half-close、backpressure、cancel、drain、force-close |
 | `route.resolve/v1` | override、fallback、reject、pass、cache TTL、explanation |
 | `status.ping/v1` | host match、maintenance、版本和人数字段、未匹配 pass |
 | `rule.evaluate/v1` | allow、deny、错误 fail-closed、timeout、坏配置不破坏默认 route |
@@ -140,7 +139,7 @@ go run ./cmd/gateway plugin preflight dist/<plugin-id>.mcgp \
 - 禁用后新连接不进入插件。
 - 回滚前会重新执行当前门禁。
 
-protocol-proxy 插件还要证明：
+connection takeover 插件还要证明：
 
 - malformed packet 不会卡死连接。
 - 后端不可用能返回协议级失败或按策略关闭。

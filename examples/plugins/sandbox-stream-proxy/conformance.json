@@ -7,7 +7,7 @@
     {
       "name": "sandbox.stream_proxy",
       "status": "pass",
-      "extension": "upstream.connect/v1",
+      "extension": "upstream.connect/v2",
       "expected": "stream.proxy/v1",
       "coverage": ["sandbox.stream_half_close", "sandbox.stream_backpressure", "sandbox.stream_cancel"]
     }
@@ -53,5 +53,5 @@
       ]
     }
   ],
-  "protocol_proxy_scenarios": ["endpoint_close", "backpressure_large_packet"]
+  "takeover_scenarios": ["endpoint_close", "backpressure_large_packet"]
 }

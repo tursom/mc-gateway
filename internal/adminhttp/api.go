@@ -158,7 +158,7 @@ func NewAPIHandler(prefix string, handlers APIHandlers) http.HandlerFunc {
 				callSegmentHandler(w, r, handlers.PluginConfig, pluginPath)
 				return
 			}
-			if strings.HasSuffix(pluginPath, "/proxy-connections") {
+			if strings.HasSuffix(pluginPath, "/connection-sessions") {
 				callSegmentHandler(w, r, handlers.PluginItem, pluginPath)
 				return
 			}

@@ -3,12 +3,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/tursom/mc-gateway/plugin/api"
@@ -52,25 +54,13 @@ func (p *PluginImpl) ReloadConfig(config any) error {
 
 func (p *PluginImpl) Init(gateway api.Gateway) error {
 	p.gateway = gateway
-	return api.RegisterHookHandler(
-		gateway,
-		api.HookUpstreamConnect,
-		func(req api.UpstreamConnectRequest) bool {
-			return p.config.MatchHost == "" || req.Host == p.config.MatchHost
-		},
-		func(req api.UpstreamConnectRequest) (net.Conn, error) {
-			if p.config.MatchHost != "" && req.Host != p.config.MatchHost {
-				return nil, api.ErrPass
-			}
-			gatewayEnd, pluginEnd := net.Pipe()
-			go p.handleConn(req, pluginEnd)
-			return gatewayEnd, nil
-		},
-	)
+	return api.RegisterUpstreamConnectHandlerV2(gateway, func(req api.UpstreamConnectRequestV2) error {
+		p.handleConn(req, req.Connection.Stream)
+		return nil
+	})
 }
 
-func (p *PluginImpl) handleConn(req api.UpstreamConnectRequest, conn net.Conn) {
-	defer conn.Close()
+func (p *PluginImpl) handleConn(req api.UpstreamConnectRequestV2, conn net.Conn) {
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 
 	handshakePacket, err := readPacketFromConn(conn)
@@ -78,6 +68,12 @@ func (p *PluginImpl) handleConn(req api.UpstreamConnectRequest, conn net.Conn) {
 		return
 	}
 	handshake := protocol.ParseHandshake(handshakePacket)
+	if p.config.MatchHost != "" && handshake.ServerHost != p.config.MatchHost {
+		state := req.Connection
+		state.Stream = &authReplayConn{Conn: conn, reader: io.MultiReader(bytes.NewReader(handshakePacket), conn)}
+		_ = req.Flow.Next(state)
+		return
+	}
 	if handshake.ServerHost == "" || handshake.NextState != 2 {
 		p.emitAuthEvent(req.Context, "auth.failure", "bad_handshake")
 		_ = writeLoginDisconnect(conn, "Unsupported Minecraft handshake")
@@ -119,6 +115,27 @@ func (p *PluginImpl) handleConn(req api.UpstreamConnectRequest, conn net.Conn) {
 	_, _ = backend.Write(loginPacket)
 	copyBoth(conn, backend)
 	_ = req
+}
+
+type authReplayConn struct {
+	net.Conn
+	reader io.Reader
+}
+
+func (c *authReplayConn) Read(p []byte) (int, error) { return c.reader.Read(p) }
+
+func (c *authReplayConn) CloseWrite() error {
+	if closer, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return closer.CloseWrite()
+	}
+	return c.Conn.Close()
+}
+
+func (c *authReplayConn) CloseRead() error {
+	if closer, ok := c.Conn.(interface{ CloseRead() error }); ok {
+		return closer.CloseRead()
+	}
+	return nil
 }
 
 func (p *PluginImpl) emitAuthEvent(ctx context.Context, name, result string) {
@@ -213,14 +230,25 @@ func encodeVarInt(value int) []byte {
 }
 
 func copyBoth(a, b net.Conn) {
-	done := make(chan struct{}, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
 	go func() {
+		defer wg.Done()
 		_, _ = io.Copy(a, b)
-		done <- struct{}{}
+		closeWrite(a)
 	}()
 	go func() {
+		defer wg.Done()
 		_, _ = io.Copy(b, a)
-		done <- struct{}{}
+		closeWrite(b)
 	}()
-	<-done
+	wg.Wait()
+}
+
+func closeWrite(conn net.Conn) {
+	if closer, ok := conn.(interface{ CloseWrite() error }); ok {
+		_ = closer.CloseWrite()
+		return
+	}
+	_ = conn.Close()
 }

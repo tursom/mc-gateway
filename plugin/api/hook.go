@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http"
 	"time"
 	"unsafe"
 )
@@ -17,6 +18,8 @@ var (
 	ErrPass = errors.New("plugin handler pass")
 	// ErrBlocked 表示插件明确阻断当前连接或操作。
 	ErrBlocked = errors.New("plugin handler blocked")
+	// ErrContinuationUsed 表示同一个连接处理器重复选择后续流程。
+	ErrContinuationUsed = errors.New("upstream continuation already used")
 )
 
 type (
@@ -35,36 +38,54 @@ type (
 		handler  Handler
 	}
 
-	// UpstreamConnectRequest 是上游连接钩子的完整上下文。插件可读取首包、
-	// 路由结果、连接来源和链路 ID，以决定是否提供自己的上游连接。
-	UpstreamConnectRequest struct {
-		Context          context.Context
-		Source           net.Conn
-		Host             string
-		Upstream         string
-		InitialData      []byte
-		Metadata         map[string]string
-		ConnectionID     string
-		TraceID          string
-		SourceAddr       string
-		ServerHost       string
-		RawServerHost    string
-		ProtocolVersion  int
-		NextState        int
-		RouteID          string
-		RouteTags        []string
-		UpstreamRaw      string
-		UpstreamProtocol string
-		UpstreamAddress  string
-		Transport        string
-		ServiceName      string
-		ListenerPort     int
+	// ConnectionState 是插件可以交给后续插件或 core 的可变连接状态。
+	// PeerAddr、入口传输等原始事实不在这里，不能被插件改写。
+	ConnectionState struct {
+		Stream              net.Conn          `json:"-"`
+		EffectiveSourceAddr string            `json:"effective_source_addr,omitempty"`
+		Metadata            map[string]string `json:"metadata,omitempty"`
 	}
 
-	// UpstreamConnectAcceptor 返回 true 时，对应 Handler 才会被调用。
-	UpstreamConnectAcceptor func(UpstreamConnectRequest) bool
-	// UpstreamConnectHandler 返回 net.Conn 表示插件提供上游连接；返回 ErrPass 表示跳过。
-	UpstreamConnectHandler func(UpstreamConnectRequest) (net.Conn, error)
+	HTTPIngressContext struct {
+		Method  string      `json:"method,omitempty"`
+		Host    string      `json:"host,omitempty"`
+		Path    string      `json:"path,omitempty"`
+		Headers http.Header `json:"headers,omitempty"`
+	}
+
+	QUICIngressContext struct {
+		ApplicationProtocol string `json:"application_protocol,omitempty"`
+	}
+
+	IngressContext struct {
+		Transport    string              `json:"transport,omitempty"`
+		ServiceName  string              `json:"service_name,omitempty"`
+		ListenerPort int                 `json:"listener_port,omitempty"`
+		HTTP         *HTTPIngressContext `json:"http,omitempty"`
+		QUIC         *QUICIngressContext `json:"quic,omitempty"`
+	}
+
+	// UpstreamConnectFlow 是每个处理器的一次性 continuation。Next 进入下一个
+	// v2 插件（没有下一个时进入 core），Core 直接跳过剩余插件。
+	UpstreamConnectFlow interface {
+		Next(ConnectionState) error
+		Core(ConnectionState) error
+	}
+
+	// UpstreamConnectRequestV2 在 core 读取任何 Minecraft 字节前把客户端连接
+	// 交给插件。handler 在返回前拥有 Connection.Stream。
+	UpstreamConnectRequestV2 struct {
+		Context      context.Context     `json:"-"`
+		ConnectionID string              `json:"connection_id,omitempty"`
+		TraceID      string              `json:"trace_id,omitempty"`
+		PeerAddr     string              `json:"peer_addr,omitempty"`
+		LocalAddr    string              `json:"local_addr,omitempty"`
+		Connection   ConnectionState     `json:"connection"`
+		Ingress      IngressContext      `json:"ingress"`
+		Flow         UpstreamConnectFlow `json:"-"`
+	}
+
+	UpstreamConnectHandlerV2 func(UpstreamConnectRequestV2) error
 
 	// RouteResolveRequest 描述一次主机路由解析请求，并携带 SQLite 快照的兜底结果。
 	RouteResolveRequest struct {
@@ -233,6 +254,20 @@ type (
 	ProviderHandler  func() (ProviderRegistration, error)
 )
 
+// Clone 返回入口事实的深副本，避免插件通过 Header 或指针字段改写后续处理器看到的原始入口信息。
+func (c IngressContext) Clone() IngressContext {
+	if c.HTTP != nil {
+		httpIngress := *c.HTTP
+		httpIngress.Headers = c.HTTP.Headers.Clone()
+		c.HTTP = &httpIngress
+	}
+	if c.QUIC != nil {
+		quicIngress := *c.QUIC
+		c.QUIC = &quicIngress
+	}
+	return c
+}
+
 var (
 	// 路由决策动作使用字符串，方便 manifest、JSON API 和插件代码共享。
 	RouteDecisionPass     = "pass"
@@ -246,20 +281,12 @@ var (
 	FailPolicyOpen  = "fail_open"
 	FailPolicyClose = "fail_closed"
 
-	// HookUpstreamConnect 是新版上游连接钩子，携带完整请求上下文。
-	HookUpstreamConnect = HookType[
-		UpstreamConnectAcceptor,
-		UpstreamConnectHandler,
+	// HookUpstreamConnectV2 在 Minecraft 解析前转移客户端连接所有权。
+	HookUpstreamConnectV2 = HookType[
+		struct{},
+		UpstreamConnectHandlerV2,
 	]{
-		key: "upstream.connect/v1",
-	}
-
-	// HookUpstream 是旧版上游钩子，仅保留 source 和 host，供老插件兼容使用。
-	HookUpstream = HookType[
-		func(source net.Conn, host string) bool,
-		func(source net.Conn, host string) (net.Conn, error),
-	]{
-		key: "upstream",
+		key: "upstream.connect/v2",
 	}
 
 	// HookRouteResolve 允许插件覆盖或拒绝主机到上游的路由结果。

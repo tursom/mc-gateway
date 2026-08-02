@@ -58,6 +58,13 @@ func (c *replayConn) Read(p []byte) (int, error) {
 	return c.reader.Read(p)
 }
 
+func (c *replayConn) CloseWrite() error {
+	if closer, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return closer.CloseWrite()
+	}
+	return c.Conn.Close()
+}
+
 // ChanListener 把已识别为 HTTP 的连接投递给 http.Server。它实现 net.Listener，
 // 但没有真实 accept socket，只消费 Deliver 写入的连接。
 type ChanListener struct {

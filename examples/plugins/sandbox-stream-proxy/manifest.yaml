@@ -4,7 +4,7 @@ schema_version: mc-gateway.plugin/v1
 id: sandbox-stream-proxy
 name: Sandbox Stream Proxy
 version: 0.1.0
-description: Sandbox-process example for stream.proxy/v1 through upstream.connect/v1 protocol-proxy mode.
+description: Sandbox-process example for upstream.connect/v2 connection takeover.
 artifact_type: binary
 runtime:
   type: sandbox-process
@@ -21,15 +21,13 @@ go_os: linux
 go_arch: amd64
 extension_points:
   - type: hook
-    key: upstream.connect/v1
+    key: upstream.connect/v2
   - type: validator
     key: config.validate/v1
 capabilities:
   extension_points:
-    - upstream.connect/v1
+    - upstream.connect/v2
     - config.validate/v1
-  upstream_connect:
-    mode: protocol-proxy
   minecraft:
     protocol_versions:
       tested: [767]
@@ -48,7 +46,6 @@ capabilities:
       - process.restricted
 runtime_limits:
   handler_timeout_ms: 1000
-  initial_write_timeout_ms: 1000
   memory_bytes: 8388608
 config_schema:
   type: object

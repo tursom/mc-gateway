@@ -18,10 +18,11 @@
 | Service mode | 当前状态 | 开发含义 |
 | --- | --- | --- |
 | `in-process` | implemented | gateway 进程内加载 Go plugin |
-| `go-plugin-process` | partial | 子进程 plugin-host，支持部分 upstream/protocol-proxy drain-only 能力 |
+| `go-plugin-process` | partial | 子进程 plugin-host，支持 `upstream.connect/v2` takeover 与 drain |
 | `sandbox-process` | partial | 独立 sandbox 进程承载模式；切换需要 apply/restart 语义 |
 
-`go-plugin` in-process 能直接返回 `net.Conn`。跨进程、sandbox 和 WASM 不能复用这个内存内 `net.Conn` 语义，需要 stream relay 或新 ABI。
+`go-plugin` in-process 直接接收客户端 `net.Conn`。plugin-host 和 sandbox-process
+通过 takeover stream relay 表达同一契约；WASM 不支持 `upstream.connect/v2`。
 
 ## Go Plugin
 
@@ -29,8 +30,8 @@
 
 - 低改造成本。
 - 可用 Go typed API。
-- 可直接返回 `net.Conn`。
-- 适合 `upstream.connect/v1` dialer 和 protocol-proxy。
+- 可直接读取、包装或替换客户端 `net.Conn`。
+- 适合 `upstream.connect/v2` connection takeover。
 
 限制：
 
@@ -57,7 +58,7 @@
 - crash tracking、crash policy、backoff。
 - stream proxy protocol。
 - upstream connect。
-- protocol-proxy drain-only。
+- `upstream.connect/v2` 的 `Next`、`Core`、replacement stream 和 drain。
 
 限制：
 
@@ -69,8 +70,8 @@
 
 开发建议：
 
-- 不要假设 in-process `net.Conn` handler 可以无改动迁移到 plugin-host。
-- protocol-proxy 必须覆盖 drain-only、host crash、client close、endpoint close、backpressure。
+- handler API 与 in-process 相同，但 stream 会通过 Unix relay 跨进程承载。
+- takeover 必须覆盖 drain、host crash、client close、endpoint close、half-close 和 backpressure。
 - conformance 要包含 stream proxy fixture。
 
 命令：
@@ -96,7 +97,7 @@ Sandbox 是独立进程隔离 runtime，当前状态是 partial data-plane。默
 - crash loop policy。
 - diagnostic summary。
 - route/rule/config request-response dispatch。
-- protocol-proxy stream relay。
+- `upstream.connect/v2` takeover stream relay。
 - conformance fixture release gate。
 
 开发边界：
@@ -105,7 +106,7 @@ Sandbox 是独立进程隔离 runtime，当前状态是 partial data-plane。默
 - secret 通过 handle/RPC 访问，不进入 env 或普通 config。
 - 网络访问必须声明并被策略允许。
 - 不直接返回进程内 `net.Conn`。
-- 高风险 stream/protocol-proxy 需要专门 stream relay 语义。
+- takeover stream 必须使用 SDK 的 endpoint、replacement endpoint 和 action 契约。
 
 Manifest 能力示例：
 
@@ -138,7 +139,7 @@ WASM runtime 当前是 partial/future-gated，适合低风险 validation 类扩�
 开发边界：
 
 - 优先用于 `config.validate/v1`、`rule.evaluate/v1` 等轻量逻辑。
-- 不用于 `upstream.connect/v1` protocol-proxy。
+- 明确不支持 `upstream.connect/v2`。
 - 不直接访问 secret、文件、网络，除非 host ABI 显式提供。
 - trap、timeout、memory limit 必须被 conformance 覆盖。
 

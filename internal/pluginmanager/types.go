@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"net"
 	"sync"
 	"time"
 
@@ -31,7 +30,7 @@ const (
 	SandboxProcessProtocolV1   = "mc-gateway-sandbox-process/v1"
 	SandboxProcessABIVersionV1 = "mc-gateway.sandbox-process.abi/v1"
 
-	ExtensionUpstreamConnect   = "upstream.connect/v1"
+	ExtensionUpstreamConnect   = "upstream.connect/v2"
 	ExtensionRouteResolve      = "route.resolve/v1"
 	ExtensionRouteResolver     = "route.resolver/v1"
 	ExtensionRuleEvaluate      = "rule.evaluate/v1"
@@ -44,9 +43,6 @@ const (
 	ExtensionAuthProvider      = "auth.provider/v1"
 	ExtensionAdminAuthProvider = "admin.auth.provider/v1"
 	ExtensionIngressService    = "ingress.service/v1"
-
-	UpstreamModeDialer        = "dialer"
-	UpstreamModeProtocolProxy = "protocol-proxy"
 
 	ArtifactStatusUploaded  = "uploaded"
 	ArtifactStatusValidated = "validated"
@@ -81,7 +77,7 @@ const (
 	PluginServiceModeGoPluginProcess = "go-plugin-process"
 	PluginServiceModeSandboxProcess  = "sandbox-process"
 
-	GoPluginProcessPartialUnsupportedReason = "go-plugin-process supports upstream.connect/v1 dialer mode and protocol-proxy drain-only with persisted crash policy and per-node crash isolation; fd-live migration, sandbox enforcement, full isolation, and non-Linux process-table orphan discovery are not implemented"
+	GoPluginProcessPartialUnsupportedReason = "go-plugin-process supports upstream.connect/v2 takeover with persisted crash policy and per-node crash isolation; fd-live migration, sandbox enforcement, full isolation, and non-Linux process-table orphan discovery are not implemented"
 
 	PluginNodeStatusOnline = "online"
 	PluginNodeStatusStale  = "stale"
@@ -173,7 +169,6 @@ const (
 	DefaultPackageMaxEntries             = 2048
 	DefaultExtractedMaxBytes             = 256 * 1024 * 1024
 	DefaultNonRuntimeMaxBytes            = 16 * 1024 * 1024
-	DefaultInitialWriteTimeout           = time.Second
 	DefaultExternalTimeout               = 5 * time.Second
 	DefaultBuildLogMaxBytes              = 64 * 1024
 	DefaultEventQueueLimit               = 1000
@@ -255,9 +250,8 @@ type ExtensionPoint struct {
 }
 
 type RuntimeLimits struct {
-	HandlerTimeoutMS      int `json:"handler_timeout_ms"`
-	InitialWriteTimeoutMS int `json:"initial_write_timeout_ms"`
-	MemoryBytes           int `json:"memory_bytes,omitempty"`
+	HandlerTimeoutMS int `json:"handler_timeout_ms"`
+	MemoryBytes      int `json:"memory_bytes,omitempty"`
 }
 
 type SecretSpec struct {
@@ -331,7 +325,6 @@ type FileStoreSpec struct {
 }
 
 type CapabilitySummary struct {
-	UpstreamConnect UpstreamConnectCapability `json:"upstream_connect,omitempty"`
 	Route           RouteCapability           `json:"route,omitempty"`
 	Status          StatusCapability          `json:"status,omitempty"`
 	Middleware      MiddlewareCapability      `json:"middleware,omitempty"`
@@ -351,10 +344,6 @@ type CapabilitySummary struct {
 type RuntimeCapability struct {
 	RequiredCapabilities []string `json:"required_capabilities,omitempty"`
 	RequiredFeatures     []string `json:"required_features,omitempty"`
-}
-
-type UpstreamConnectCapability struct {
-	Mode string `json:"mode,omitempty"`
 }
 
 type RouteCapability struct {
@@ -882,7 +871,7 @@ type BenchmarkRequest struct {
 	BaselineDiff        float64 `json:"baseline_diff"`
 }
 
-type ProxyConnectionSummary struct {
+type ConnectionSessionSummary struct {
 	ID                  uint64 `json:"id"`
 	PluginID            string `json:"plugin_id"`
 	ArtifactID          string `json:"artifact_id"`
@@ -891,7 +880,7 @@ type ProxyConnectionSummary struct {
 	DurationMS          int64  `json:"duration_ms"`
 	Draining            bool   `json:"draining"`
 	ForceCloseRequested bool   `json:"force_close_requested"`
-	LastProxyError      string `json:"last_proxy_error,omitempty"`
+	LastSessionError    string `json:"last_session_error,omitempty"`
 }
 
 type OperationRecord struct {
@@ -1477,31 +1466,29 @@ type DispatchPlan struct {
 }
 
 type DispatchHandlerSummary struct {
-	PluginID         string `json:"plugin_id"`
-	ArtifactID       string `json:"artifact_id"`
-	Priority         int    `json:"priority"`
-	HandlerID        string `json:"handler_id"`
-	ExtensionPoint   string `json:"extension_point"`
-	Mode             string `json:"mode"`
-	TimeoutMS        int64  `json:"timeout_ms"`
-	Calls            uint64 `json:"calls"`
-	Errors           uint64 `json:"errors"`
-	Panics           uint64 `json:"panics"`
-	Timeouts         uint64 `json:"timeouts"`
-	Blocked          uint64 `json:"blocked"`
-	ActiveProxy      int64  `json:"active_proxy_connections"`
-	DrainingProxy    int64  `json:"draining_proxy_connections"`
-	ProxyStarted     uint64 `json:"proxy_connections_started"`
-	ProxyCompleted   uint64 `json:"proxy_connections_completed"`
-	ProxyForceClosed uint64 `json:"proxy_connections_force_closed"`
-	ProxyErrors      uint64 `json:"proxy_errors"`
-	LastProxyError   string `json:"last_proxy_error,omitempty"`
-	ProxyBytesIn     uint64 `json:"proxy_bytes_in"`
-	ProxyBytesOut    uint64 `json:"proxy_bytes_out"`
-	ProxyDurationMS  uint64 `json:"proxy_duration_ms"`
-	DurationCount    uint64 `json:"duration_count"`
-	DurationSumMS    uint64 `json:"duration_sum_ms"`
-	DurationMaxMS    uint64 `json:"duration_max_ms"`
+	PluginID                      string `json:"plugin_id"`
+	ArtifactID                    string `json:"artifact_id"`
+	Priority                      int    `json:"priority"`
+	HandlerID                     string `json:"handler_id"`
+	ExtensionPoint                string `json:"extension_point"`
+	Mode                          string `json:"mode"`
+	TimeoutMS                     int64  `json:"timeout_ms"`
+	Calls                         uint64 `json:"calls"`
+	Errors                        uint64 `json:"errors"`
+	Panics                        uint64 `json:"panics"`
+	Timeouts                      uint64 `json:"timeouts"`
+	Blocked                       uint64 `json:"blocked"`
+	ActiveSessions                int64  `json:"active_connection_sessions"`
+	DrainingSessions              int64  `json:"draining_connection_sessions"`
+	ConnectionSessionsStarted     uint64 `json:"connection_sessions_started"`
+	ConnectionSessionsCompleted   uint64 `json:"connection_sessions_completed"`
+	ConnectionSessionsForceClosed uint64 `json:"connection_sessions_force_closed"`
+	ConnectionSessionErrors       uint64 `json:"connection_session_errors"`
+	LastSessionError              string `json:"last_session_error,omitempty"`
+	ConnectionSessionDurationMS   uint64 `json:"connection_session_duration_ms"`
+	DurationCount                 uint64 `json:"duration_count"`
+	DurationSumMS                 uint64 `json:"duration_sum_ms"`
+	DurationMaxMS                 uint64 `json:"duration_max_ms"`
 }
 
 type OperationsSnapshot struct {
@@ -1784,33 +1771,19 @@ type OperationsExporterSink interface {
 	ExportOperations(context.Context, OperationsExportBatch) error
 }
 
-type UpstreamResult struct {
-	Conn            net.Conn
-	Handled         bool
-	Mode            string
-	PluginID        string
-	HandlerID       string
-	InitialDataSent bool
-	Proxied         bool
-	handler         *upstreamHandler
-	runtimeReserved bool
-}
-
 type Gateway struct {
-	PluginID   string
-	handleConn func(net.Conn)
-	wg         *sync.WaitGroup
-	hooks      map[string]any
-	ops        *PluginOperations
+	PluginID string
+	wg       *sync.WaitGroup
+	hooks    map[string]any
+	ops      *PluginOperations
 }
 
-func NewGateway(pluginID string, handleConn func(net.Conn), wg *sync.WaitGroup, ops *PluginOperations) *Gateway {
+func NewGateway(pluginID string, wg *sync.WaitGroup, ops *PluginOperations) *Gateway {
 	return &Gateway{
-		PluginID:   pluginID,
-		handleConn: handleConn,
-		wg:         wg,
-		hooks:      make(map[string]any),
-		ops:        ops,
+		PluginID: pluginID,
+		wg:       wg,
+		hooks:    make(map[string]any),
+		ops:      ops,
 	}
 }
 
@@ -1825,12 +1798,6 @@ func (g *Gateway) RegisteredHooks() map[string]any {
 func (g *Gateway) Hook(hook string, handler any) error {
 	g.hooks[hook] = handler
 	return nil
-}
-
-func (g *Gateway) HandleConn(conn net.Conn) {
-	if g.handleConn != nil {
-		g.handleConn(conn)
-	}
 }
 
 func (g *Gateway) ExitWaitGroup() *sync.WaitGroup {
@@ -1889,13 +1856,8 @@ func (g *Gateway) RegisterBackgroundTask(task api.BackgroundTask) error {
 	return g.ops.RegisterBackgroundTask(task)
 }
 
-func (g *Gateway) LegacyUpstreamHandler() (api.HookHandler[func(net.Conn, string) bool, func(net.Conn, string) (net.Conn, error)], bool) {
-	handler, ok := g.hooks[api.HookUpstream.Key()].(api.HookHandler[func(net.Conn, string) bool, func(net.Conn, string) (net.Conn, error)])
-	return handler, ok
-}
-
-func (g *Gateway) UpstreamConnectHandler() (api.HookHandler[api.UpstreamConnectAcceptor, api.UpstreamConnectHandler], bool) {
-	handler, ok := g.hooks[api.HookUpstreamConnect.Key()].(api.HookHandler[api.UpstreamConnectAcceptor, api.UpstreamConnectHandler])
+func (g *Gateway) UpstreamConnectHandlerV2() (api.UpstreamConnectHandlerV2, bool) {
+	handler, ok := g.hooks[api.HookUpstreamConnectV2.Key()].(api.UpstreamConnectHandlerV2)
 	return handler, ok
 }
 

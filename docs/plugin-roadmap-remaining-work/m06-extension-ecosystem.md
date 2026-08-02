@@ -57,4 +57,4 @@ git diff --check
 ## 回滚边界
 
 - route、status、rule、event、middleware、provider 插件都可通过 disable 从 dispatch plan 移除。
-- extension ecosystem 失败不影响默认 route fallback，也不影响已稳定的 `upstream.connect/v1` 主路径。
+- extension ecosystem 失败不影响默认 route fallback，也不影响已稳定的 `upstream.connect/v2` 主路径。

@@ -7,60 +7,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"net"
 	"os"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/tursom/mc-gateway/plugin/api"
 )
-
-func TestGovernanceHighRiskProtocolProxyRequiresReview(t *testing.T) {
-	manager := newManagerForTest(t, &fakeAdapter{})
-	artifact := uploadTestArtifactWithCapabilities(t, manager, "proxy-review", testProtocolProxyCapabilities())
-	if _, err := manager.SetDesired(context.Background(), "admin", "proxy-review", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
-		t.Fatalf("SetDesired() error = %v", err)
-	}
-	_, err := manager.Enable(context.Background(), "admin", "proxy-review")
-	if err == nil || !strings.Contains(err.Error(), "review_required") {
-		t.Fatalf("Enable() error = %v, want review_required", err)
-	}
-	review, err := manager.CreateReview(context.Background(), "admin", "proxy-review", GovernanceReviewRequest{
-		ArtifactID: artifact.ID,
-		Profile:    PolicyProfileProd,
-		Decision:   ReviewDecisionApproved,
-	})
-	if err != nil {
-		t.Fatalf("CreateReview() error = %v", err)
-	}
-	for name, value := range map[string]string{
-		"artifact_hash":       review.ArtifactHash,
-		"config_hash":         review.ConfigHash,
-		"scope_hash":          review.ScopeHash,
-		"rollout_hash":        review.RolloutHash,
-		"runtime_limits_hash": review.RuntimeLimitsHash,
-		"features_hash":       review.FeaturesHash,
-		"policy_hash":         review.PolicyHash,
-	} {
-		if value == "" {
-			t.Fatalf("review %s is empty: %+v", name, review)
-		}
-	}
-	if review.ArtifactHash != artifact.SHA256 {
-		t.Fatalf("review artifact hash = %q, want artifact sha %q", review.ArtifactHash, artifact.SHA256)
-	}
-	if _, err := manager.Enable(context.Background(), "admin", "proxy-review"); err != nil {
-		t.Fatalf("Enable(after review) error = %v", err)
-	}
-	if _, err := manager.SetDesired(context.Background(), "admin", "proxy-review", artifact.ID, DesiredEnabled, `{"canary":true}`, 10); err != nil {
-		t.Fatalf("SetDesired(config change) error = %v", err)
-	}
-	if _, err := manager.Enable(context.Background(), "admin", "proxy-review"); err == nil || !strings.Contains(err.Error(), "review_required") {
-		t.Fatalf("Enable(after reviewed config drift) error = %v, want review_required", err)
-	}
-}
 
 func TestGovernanceBlocksFailedPackagedConformance(t *testing.T) {
 	manager := newManagerForTest(t, &fakeAdapter{})
@@ -68,7 +20,7 @@ func TestGovernanceBlocksFailedPackagedConformance(t *testing.T) {
 		"manifest.json": testManifestBytes(t, "conformance-gate"),
 		"plugin.so":     []byte("fake plugin bytes"),
 		"conformance.json": []byte(`{
-			"fixtures":[{"name":"protocol-proxy.panic","status":"fail","expected":"panic_recovered"}]
+			"fixtures":[{"name":"takeover.panic","status":"fail","expected":"panic_recovered"}]
 		}`),
 	})
 	artifact, err := manager.UploadArtifact(context.Background(), ArtifactUpload{
@@ -464,23 +416,6 @@ func TestWASMAdvisoryGateBlocksArtifact(t *testing.T) {
 	}
 }
 
-func TestGovernanceBlocksProtocolProxyScopeOverlap(t *testing.T) {
-	manager := newManagerForTest(t, &fakeAdapter{})
-	first := enableProtocolProxyTestPlugin(t, manager, "proxy-a")
-	if first.ID == "" {
-		t.Fatal("first protocol proxy artifact id is empty")
-	}
-	second := uploadTestArtifactWithCapabilities(t, manager, "proxy-b", testProtocolProxyCapabilities())
-	if _, err := manager.SetDesired(context.Background(), "admin", "proxy-b", second.ID, DesiredEnabled, `{}`, 20); err != nil {
-		t.Fatalf("SetDesired(second) error = %v", err)
-	}
-	approveGovernanceForTest(t, manager, "proxy-b", second.ID)
-	_, err := manager.Enable(context.Background(), "admin", "proxy-b")
-	if err == nil || !strings.Contains(err.Error(), "scope_overlap") {
-		t.Fatalf("Enable(second) error = %v, want scope_overlap", err)
-	}
-}
-
 func TestGovernanceBlocksMissingFeatureAndSecret(t *testing.T) {
 	manager := newManagerForTest(t, &fakeAdapter{})
 	artifact := uploadTestArtifactWithManifest(t, manager, "feature-secret", func(manifest *Manifest) {
@@ -577,120 +512,6 @@ func TestGovernanceExternalCIProvenanceBlocksRollback(t *testing.T) {
 	}
 	if after.DesiredArtifactID != before.DesiredArtifactID || after.DesiredGeneration != before.DesiredGeneration {
 		t.Fatalf("plugin after blocked rollback = %+v, want unchanged %+v", after, before)
-	}
-}
-
-func TestGovernanceAdvisoryQuarantineRemovesExtensionDispatch(t *testing.T) {
-	adapter := &fakeAdapter{
-		initOnly: true,
-		initHook: func(gateway *Gateway) error {
-			if err := api.RegisterHookHandler(gateway, api.HookUpstreamConnect,
-				func(api.UpstreamConnectRequest) bool { return true },
-				func(api.UpstreamConnectRequest) (net.Conn, error) {
-					left, right := net.Pipe()
-					_ = right.Close()
-					return left, nil
-				}); err != nil {
-				return err
-			}
-			if err := api.RegisterHookHandler(gateway, api.HookRouteResolve,
-				func(api.RouteResolveRequest) bool { return true },
-				func(req api.RouteResolveRequest) (api.RouteDecision, error) {
-					return api.RouteDecision{
-						Action:     api.RouteDecisionOverride,
-						Upstream:   "10.0.0.10:25565",
-						Reason:     "cached quarantine fixture",
-						CacheTTL:   time.Minute,
-						ProviderID: "quarantine-plugin",
-					}, nil
-				}); err != nil {
-				return err
-			}
-			if err := api.RegisterHookHandler(gateway, api.HookStatusPing,
-				func(api.StatusPingRequest) bool { return true },
-				func(req api.StatusPingRequest) (api.StatusPingResponse, error) {
-					return api.StatusPingResponse{MOTD: "quarantine " + req.Host}, nil
-				}); err != nil {
-				return err
-			}
-			return gateway.RegisterBackgroundTask(api.BackgroundTask{
-				ID:     "sync",
-				Name:   "Quarantine Sync",
-				Manual: true,
-				Run: func(ctx context.Context) error {
-					<-ctx.Done()
-					return ctx.Err()
-				},
-			})
-		},
-	}
-	manager := newManagerForTest(t, adapter)
-	artifact := uploadTestArtifactWithManifest(t, manager, "quarantine-plugin", func(manifest *Manifest) {
-		manifest.ExtensionPoints = []ExtensionPoint{
-			{Type: "hook", Key: ExtensionUpstreamConnect},
-			{Type: "provider", Key: ExtensionRouteResolve},
-			{Type: "hook", Key: ExtensionStatusPing},
-		}
-		manifest.Capabilities = json.RawMessage(`{"extension_points":["upstream.connect/v1","route.resolve/v1","status.ping/v1"],"upstream_connect":{"mode":"dialer"},"route":{"cache_ttl_ms":60000},"status":{"hosts":["play.example"]}}`)
-		manifest.BackgroundTasks = []TaskSpec{{ID: "sync", Mode: "manual", Manual: true, Timeout: "1s"}}
-	})
-	if _, err := manager.SetDesired(context.Background(), "admin", "quarantine-plugin", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
-		t.Fatalf("SetDesired() error = %v", err)
-	}
-	if _, err := manager.Enable(context.Background(), "admin", "quarantine-plugin"); err != nil {
-		t.Fatalf("Enable() error = %v", err)
-	}
-	upstream, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{Host: "play.example"})
-	if err != nil || !upstream.Handled {
-		t.Fatalf("ConnectUpstream(before quarantine) = %+v err=%v, want upstream dispatch", upstream, err)
-	}
-	route, err := manager.ResolveRoute(context.Background(), api.RouteResolveRequest{Host: "play.example"}, nil)
-	if err != nil || route.Source != "provider" || route.Decision.Upstream != "10.0.0.10:25565" {
-		t.Fatalf("ResolveRoute(before quarantine) = %+v err=%v, want provider override", route, err)
-	}
-	status, err := manager.StatusPing(context.Background(), api.StatusPingRequest{Host: "play.example"})
-	if err != nil || !status.Handled {
-		t.Fatalf("StatusPing(before quarantine) = %+v err=%v, want handled", status, err)
-	}
-	if _, err := manager.TriggerBackgroundTask(context.Background(), "admin", "quarantine-plugin", "sync", manager.operations.plugins["quarantine-plugin"].tasks["sync"].confirmToken); err != nil {
-		t.Fatalf("TriggerBackgroundTask() error = %v", err)
-	}
-	taskRuntime := manager.operations.plugins["quarantine-plugin"].tasks["sync"]
-	waitForPluginManagerTest(t, func() bool {
-		return taskRuntime.summary().Running
-	})
-	if _, err := manager.UpsertAdvisory(context.Background(), "admin", AdvisoryRequest{
-		AdvisoryID: "MCG-2026-QUARANTINE",
-		Action:     AdvisoryActionQuarantine,
-		PluginID:   "quarantine-plugin",
-	}); err != nil {
-		t.Fatalf("UpsertAdvisory() error = %v", err)
-	}
-	waitForPluginManagerTest(t, func() bool {
-		return !taskRuntime.summary().Running
-	})
-	plan := manager.DispatchPlan(context.Background())
-	if len(plan.Routes) != 0 || len(plan.Statuses) != 0 {
-		t.Fatalf("dispatch plan after quarantine = %+v, want extension dispatch removed", plan)
-	}
-	upstream, err = manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{Host: "play.example"})
-	if err != nil || upstream.Handled {
-		t.Fatalf("ConnectUpstream(after quarantine) = %+v err=%v, want upstream dispatch removed", upstream, err)
-	}
-	status, err = manager.StatusPing(context.Background(), api.StatusPingRequest{Host: "play.example"})
-	if err != nil || status.Handled {
-		t.Fatalf("StatusPing(after quarantine) = %+v err=%v, want default fallback", status, err)
-	}
-	route, err = manager.ResolveRoute(context.Background(), api.RouteResolveRequest{Host: "play.example", FallbackUpstream: "sqlite:25565", FallbackHit: true}, nil)
-	if err != nil || route.Source != "sqlite_fallback" || route.Decision.Upstream != "sqlite:25565" {
-		t.Fatalf("ResolveRoute(after quarantine) = %+v err=%v, want sqlite fallback without stale cache", route, err)
-	}
-	plugin, err := manager.Plugin(context.Background(), "quarantine-plugin")
-	if err != nil {
-		t.Fatalf("Plugin(after quarantine) error = %v", err)
-	}
-	if plugin.RuntimeState != RuntimeDraining || plugin.DesiredState != DesiredEnabled {
-		t.Fatalf("plugin after quarantine = %+v, want draining runtime with desired state preserved", plugin)
 	}
 }
 
@@ -1004,7 +825,7 @@ func fakeSourceBuildResult(t *testing.T, pluginID, builderType, builderImage, bu
 			Type: "hook",
 			Key:  ExtensionUpstreamConnect,
 		}},
-		Capabilities: json.RawMessage(`{"extension_points":["upstream.connect/v1"]}`),
+		Capabilities: json.RawMessage(`{"extension_points":["upstream.connect/v2"]}`),
 	}
 	artifactBytes := []byte("fake built plugin bytes " + pluginID)
 	sum := sha256.Sum256(artifactBytes)

@@ -53,7 +53,7 @@ type SandboxConformanceScenario struct {
 	RouteDecisions         []string
 	RuleEvaluationOutcomes []string
 	StreamProxyScenarios   []StreamProxyFixture
-	ProtocolProxyScenarios []string
+	TakeoverScenarios      []string
 }
 
 // SandboxConformanceEvidence is serialized into generated conformance fixtures.
@@ -337,8 +337,8 @@ func runSandboxCrashLoopConformance(scenario SandboxConformanceScenario, evidenc
 }
 
 func runSandboxStreamConformance(scenario SandboxConformanceScenario, evidence SandboxConformanceEvidence) (SandboxConformanceEvidence, error) {
-	if len(scenario.StreamProxyScenarios) == 0 && len(scenario.ProtocolProxyScenarios) == 0 {
-		return evidence, fmt.Errorf("%s requires stream_proxy_scenarios or protocol_proxy_scenarios", evidence.Coverage)
+	if len(scenario.StreamProxyScenarios) == 0 && len(scenario.TakeoverScenarios) == 0 {
+		return evidence, fmt.Errorf("%s requires stream_proxy_scenarios or takeover_scenarios", evidence.Coverage)
 	}
 	var matched []string
 	for _, fixture := range scenario.StreamProxyScenarios {
@@ -349,9 +349,9 @@ func runSandboxStreamConformance(scenario SandboxConformanceScenario, evidence S
 			matched = append(matched, fixture.Name)
 		}
 	}
-	for _, item := range scenario.ProtocolProxyScenarios {
+	for _, item := range scenario.TakeoverScenarios {
 		if normalizeConformanceCoverage(item) == evidence.Coverage {
-			matched = append(matched, "protocol-proxy."+strings.TrimSpace(item))
+			matched = append(matched, "takeover."+strings.TrimSpace(item))
 		}
 	}
 	if len(matched) == 0 {

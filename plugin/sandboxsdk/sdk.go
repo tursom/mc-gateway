@@ -159,38 +159,39 @@ type InvokeResponse struct {
 }
 
 type StreamOpenRequest struct {
-	ExtensionPoint   string            `json:"extension_point"`
-	HandlerID        string            `json:"handler_id"`
-	FailPolicy       string            `json:"fail_policy,omitempty"`
-	Protocol         string            `json:"protocol"`
-	StreamID         string            `json:"stream_id"`
-	ConnectionID     string            `json:"connection_id,omitempty"`
-	TraceID          string            `json:"trace_id,omitempty"`
-	Host             string            `json:"host,omitempty"`
-	Upstream         string            `json:"upstream,omitempty"`
-	Metadata         map[string]string `json:"metadata,omitempty"`
-	SourceAddr       string            `json:"source_addr,omitempty"`
-	ServerHost       string            `json:"server_host,omitempty"`
-	RawServerHost    string            `json:"raw_server_host,omitempty"`
-	ProtocolVersion  int               `json:"protocol_version,omitempty"`
-	NextState        int               `json:"next_state,omitempty"`
-	RouteID          string            `json:"route_id,omitempty"`
-	RouteTags        []string          `json:"route_tags,omitempty"`
-	UpstreamRaw      string            `json:"upstream_raw,omitempty"`
-	UpstreamProtocol string            `json:"upstream_protocol,omitempty"`
-	UpstreamAddress  string            `json:"upstream_address,omitempty"`
-	Transport        string            `json:"transport,omitempty"`
-	ServiceName      string            `json:"service_name,omitempty"`
-	ListenerPort     int               `json:"listener_port,omitempty"`
-	DeadlineUnixMS   int64             `json:"deadline_unix_ms,omitempty"`
+	ExtensionPoint      string             `json:"extension_point"`
+	HandlerID           string             `json:"handler_id"`
+	FailPolicy          string             `json:"fail_policy,omitempty"`
+	Protocol            string             `json:"protocol"`
+	StreamID            string             `json:"stream_id"`
+	ConnectionID        string             `json:"connection_id,omitempty"`
+	TraceID             string             `json:"trace_id,omitempty"`
+	PeerAddr            string             `json:"peer_addr,omitempty"`
+	LocalAddr           string             `json:"local_addr,omitempty"`
+	EffectiveSourceAddr string             `json:"effective_source_addr,omitempty"`
+	Metadata            map[string]string  `json:"metadata,omitempty"`
+	Ingress             api.IngressContext `json:"ingress"`
+	DeadlineUnixMS      int64              `json:"deadline_unix_ms,omitempty"`
 }
 
+type TakeoverAction string
+
+const (
+	TakeoverActionHandled TakeoverAction = "handled"
+	TakeoverActionNext    TakeoverAction = "next"
+	TakeoverActionCore    TakeoverAction = "core"
+)
+
 type StreamOpenResponse struct {
-	Connected    bool   `json:"connected"`
-	Protocol     string `json:"protocol"`
-	StreamID     string `json:"stream_id"`
-	Endpoint     string `json:"endpoint"`
-	EndpointType string `json:"endpoint_type,omitempty"`
+	Connected           bool              `json:"connected"`
+	Protocol            string            `json:"protocol"`
+	StreamID            string            `json:"stream_id"`
+	Action              TakeoverAction    `json:"action,omitempty"`
+	Endpoint            string            `json:"endpoint"`
+	ReplacementEndpoint string            `json:"replacement_endpoint,omitempty"`
+	EndpointType        string            `json:"endpoint_type,omitempty"`
+	EffectiveSourceAddr string            `json:"effective_source_addr,omitempty"`
+	Metadata            map[string]string `json:"metadata,omitempty"`
 }
 
 type StreamCloseRequest struct {

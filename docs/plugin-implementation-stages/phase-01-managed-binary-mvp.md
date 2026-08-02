@@ -1,10 +1,12 @@
+> **Archived:** This document records the superseded pre-v2 plugin design. Current behavior is defined by `docs/plugin-development/extension-points.md`.
+
 # 阶段 1：Managed Binary Plugin MVP
 
 ## 目标
 
-交付最小可用的受管理插件系统：管理员可以上传二进制 `.mcgp`，gateway 能校验、登记、加载、启用、禁用和删除可信 Go plugin。第一阶段只要求 `upstream.connect/v1` 的 dialer mode 可用，用于替换上游拨号或实现简单 upstream rewrite。
+交付最小可用的受管理插件系统：管理员可以上传二进制 `.mcgp`，gateway 能校验、登记、加载、启用、禁用和删除可信 Go plugin。第一阶段只要求 `legacy upstream-connect contract` 的 route.resolve/v1 provider 可用，用于替换上游拨号或实现简单 upstream rewrite。
 
-本阶段完成后，插件系统已经从探索代码进入 SQLite/Admin 管理路径，但不承诺源码包构建、完整 protocol-proxy、复杂治理和 Admin 完整页面。
+本阶段完成后，插件系统已经从探索代码进入 SQLite/Admin 管理路径，但不承诺源码包构建、完整 connection takeover、复杂治理和 Admin 完整页面。
 
 ## 可用性检查点
 
@@ -51,7 +53,7 @@
 
 - 新增 Plugin Manager。
 - 保留现有 `api.Plugin` 和 `Gateway.Hook` 兼容层。
-- 将现有 `HookUpstream` 收敛为 `upstream.connect/v1` 注册路径。
+- 将现有 `HookUpstream` 收敛为 `legacy upstream-connect contract` 注册路径。
 - dispatch table 使用只读快照，更新时整体替换。
 - handler 排序规则：priority 升序，priority 相同按 plugin ID。
 - handler 返回 `ErrPass` 时继续后续 handler；返回 `net.Conn` 时停止；返回普通 error 时本次连接失败。
@@ -82,14 +84,14 @@ CLI 可以先作为开发工具，覆盖：
 提供 `examples/plugins/upstream-rewrite`：
 
 - 读取 `match_host` 和 `upstream` 配置。
-- 注册 `upstream.connect/v1`。
+- 注册 `legacy upstream-connect contract`。
 - 命中时 `net.Dial` 到 upstream 并返回连接。
 - 不命中时返回 pass。
 
 ## 明确不做
 
 - 不支持 source `.mcgp` 构建。
-- 不支持 protocol-proxy mode。
+- 不支持 connection takeover mode。
 - 不支持 SecretStore。
 - 不支持完整 Admin 页面。
 - 不支持准入 review、SBOM、license 策略和仓库。
@@ -104,7 +106,7 @@ CLI 可以先作为开发工具，覆盖：
 4. 增加 SQLite migration。
 5. 增加 desired state reconcile。
 6. 把连接路径接入 dispatch table snapshot。
-7. 实现 `upstream.connect/v1` dialer mode contract。
+7. 实现 `legacy upstream-connect contract` route.resolve/v1 provider contract。
 8. 实现 load/enable/disable/delete API。
 9. 增加基础审计事件。
 10. 增加 upstream-rewrite 示例插件。

@@ -1019,7 +1019,7 @@ func conformanceSummaryFromEntries(entries map[string]*zip.File, maxBytes int64)
 		RouteDecisions         []string             `json:"route_decisions"`
 		RuleEvaluationOutcomes []string             `json:"rule_evaluation_outcomes"`
 		StreamProxyScenarios   []StreamProxyFixture `json:"stream_proxy_scenarios"`
-		ProtocolProxyScenarios []string             `json:"protocol_proxy_scenarios"`
+		TakeoverScenarios      []string             `json:"takeover_scenarios"`
 	}
 	if err := json.Unmarshal(data, &fixtureFile); err != nil {
 		return ConformanceSummary{}, false, fmt.Errorf("invalid conformance.json: %w", err)
@@ -1146,15 +1146,12 @@ func conformanceFixtureStatusFailed(status, expected string) bool {
 }
 
 func capabilitiesSummaryJSON(raw json.RawMessage) ([]byte, error) {
-	summary := CapabilitySummary{
-		UpstreamConnect: UpstreamConnectCapability{Mode: UpstreamModeDialer},
-	}
+	summary := CapabilitySummary{}
 	if len(raw) == 0 {
 		return json.Marshal(summary)
 	}
 	summary.Raw = append(json.RawMessage(nil), raw...)
 	var caps struct {
-		UpstreamConnect UpstreamConnectCapability `json:"upstream_connect"`
 		Route           RouteCapability           `json:"route"`
 		Status          StatusCapability          `json:"status"`
 		Middleware      MiddlewareCapability      `json:"middleware"`
@@ -1163,12 +1160,10 @@ func capabilitiesSummaryJSON(raw json.RawMessage) ([]byte, error) {
 		Ingress         *IngressCapability        `json:"ingress"`
 		Minecraft       *MinecraftCapability      `json:"minecraft"`
 		Runtime         RuntimeCapability         `json:"runtime"`
+		ExtensionPoints []string                  `json:"extension_points"`
 	}
 	if err := json.Unmarshal(raw, &caps); err != nil {
 		return nil, fmt.Errorf("invalid capabilities: %w", err)
-	}
-	if caps.UpstreamConnect.Mode != "" {
-		summary.UpstreamConnect.Mode = caps.UpstreamConnect.Mode
 	}
 	summary.Route = caps.Route
 	summary.Status = caps.Status
@@ -1196,10 +1191,16 @@ func capabilitiesSummaryJSON(raw json.RawMessage) ([]byte, error) {
 			summary.Minecraft.UnsupportedPolicy = summary.Minecraft.ProtocolVersions.UnsupportedPolicy
 		}
 	}
-	switch summary.UpstreamConnect.Mode {
-	case UpstreamModeDialer, UpstreamModeProtocolProxy:
-	default:
-		return nil, fmt.Errorf("unsupported upstream_connect.mode %q", summary.UpstreamConnect.Mode)
+	var rawCaps map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &rawCaps); err == nil {
+		if upstreamRaw := rawCaps["upstream_connect"]; len(upstreamRaw) > 0 {
+			return nil, errors.New("capabilities.upstream_connect was removed; declare upstream.connect/v2 in capabilities.extension_points")
+		}
+	}
+	for _, key := range caps.ExtensionPoints {
+		if key == "upstream.connect/v1" || key == "upstream" {
+			return nil, fmt.Errorf("capabilities extension point %q was removed; use %s", key, ExtensionUpstreamConnect)
+		}
 	}
 	return json.Marshal(summary)
 }
@@ -1401,6 +1402,9 @@ func validateManifest(manifest Manifest) error {
 	if manifest.ArtifactType == ArtifactTypeBinary && manifest.Runtime.Type == RuntimeGoPlugin && manifest.GOARCH != "" && manifest.GOARCH != runtime.GOARCH {
 		return fmt.Errorf("go_arch %q does not match gateway %q", manifest.GOARCH, runtime.GOARCH)
 	}
+	if _, err := capabilitiesSummaryJSON(manifest.Capabilities); err != nil {
+		return err
+	}
 	if manifest.ArtifactType == ArtifactTypeBinary && manifest.Runtime.Type == RuntimeSandbox {
 		if _, err := cleanZipName(manifest.Runtime.Entry); err != nil {
 			return fmt.Errorf("invalid runtime.entry: %w", err)
@@ -1411,6 +1415,9 @@ func validateManifest(manifest Manifest) error {
 	}
 	found := false
 	for _, ep := range manifest.ExtensionPoints {
+		if ep.Key == "upstream.connect/v1" || ep.Key == "upstream" {
+			return fmt.Errorf("extension point %q was removed; use %s", ep.Key, ExtensionUpstreamConnect)
+		}
 		if supportedExtensionPoint(ep.Key) {
 			found = true
 		}

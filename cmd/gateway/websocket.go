@@ -12,6 +12,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/rs/zerolog/log"
+	"github.com/tursom/mc-gateway/plugin/api"
 )
 
 var upgrader = websocket.Upgrader{
@@ -25,7 +26,8 @@ type (
 	// WebSocket 连接适配器，实现 net.Conn 接口
 	webSocketConn struct {
 		*websocket.Conn
-		reader io.Reader
+		reader  io.Reader
+		ingress api.HTTPIngressContext
 	}
 )
 
@@ -41,7 +43,19 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	gatewayMetrics.WebSocketConnectionStarted()
 	// WebSocket 连接包装为 net.Conn 后进入同一个 handleRequest，复用插件、路由和转发逻辑。
-	handleRequest(&webSocketConn{Conn: conn})
+	handleRequest(&webSocketConn{Conn: conn, ingress: api.HTTPIngressContext{
+		Method: r.Method, Host: r.Host, Path: r.URL.RequestURI(), Headers: r.Header.Clone(),
+	}})
+}
+
+func (w *webSocketConn) HTTPIngressContext() *api.HTTPIngressContext {
+	ingress := w.ingress
+	ingress.Headers = ingress.Headers.Clone()
+	return &ingress
+}
+
+func (w *webSocketConn) IngressTransport() (string, string) {
+	return "websocket", serviceNameWebSocket
 }
 
 func (w *webSocketConn) Read(b []byte) (n int, err error) {

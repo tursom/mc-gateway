@@ -1,3 +1,5 @@
+> **Archived:** This document records the superseded pre-v2 plugin design. Current behavior is defined by `docs/plugin-development/extension-points.md`.
+
 # Sandbox Process 运行时生产可用化实施计划
 
 返回：[运行时和未来能力](plugin-development/runtimes-and-future.md)
@@ -36,7 +38,7 @@
 3. sandbox 插件通过独立进程承载，插件 crash 不导致 gateway 主进程退出。
 4. capabilities 从声明/审计变成强制权限边界；无法强制时继续 fail-closed。
 5. 支持 request/response 类 extension point 的真实 RPC 数据面。
-6. 支持 protocol-proxy 类场景时必须走 `stream.proxy/v1` 或新版本 extension point，不复用进程内 `net.Conn` 返回语义。
+6. 支持 connection takeover 类场景时必须走 `stream.proxy/v1` 或新版本 extension point，不复用进程内 `net.Conn` 返回语义。
 7. Secret、网络、文件、环境变量、CPU/memory、process 行为有可验证的隔离策略。
 8. Admin、CLI、API、schema export、文档和 `plugin features` 对 runtime 状态表达一致。
 
@@ -76,12 +78,12 @@ request/response 类 extension point 走 control/data RPC：
 - provider 类轻量查询
 - event subscriber 异步投递
 
-长连接或 protocol-proxy 类 extension point 走 stream relay：
+长连接或 connection takeover 类 extension point 走 stream relay：
 
 - `stream.proxy/v1`
-- 或未来 `upstream.connect/v2`
+- 或未来 `legacy upstream-connect contract`
 
-不能把 `upstream.connect/v1` 的 `(net.Conn, error)` 语义强行映射到 sandbox-process。
+不能把 `legacy upstream-connect contract` 的 `(net.Conn, error)` 语义强行映射到 sandbox-process。
 
 ### D3：能力强制失败必须阻断
 
@@ -225,9 +227,9 @@ manifest 中声明 required capability 后，gateway 必须能证明目标部署
 - 插件超时、返回 bad response、进程退出时按 fail policy 处理。
 - disable 后新请求不再进入 sandbox handler。
 
-### S4：Stream relay 和 protocol-proxy
+### S4：Stream relay 和 connection takeover
 
-目标：支持长连接代理类场景，但不改变 `upstream.connect/v1` 语义。
+目标：支持长连接代理类场景，但不改变 `legacy upstream-connect contract` 语义。
 
 工作：
 
@@ -247,7 +249,7 @@ manifest 中声明 required capability 后，gateway 必须能证明目标部署
 
 验收：
 
-- protocol-proxy sandbox 插件能通过 stream conformance fixture。
+- connection takeover sandbox 插件能通过 stream conformance fixture。
 - client close、endpoint close、timeout、backpressure、force close 都有测试。
 - 插件 crash 不影响 gateway 进程，已有连接按策略关闭或 fallback。
 
@@ -483,10 +485,10 @@ manifest 中声明 required capability 后，gateway 必须能证明目标部署
 7. S7 lifecycle/generation/restart recovery。
 8. S9 Admin/CLI/operations。
 9. S10 示例和 conformance。
-10. S4 stream relay/protocol-proxy。
+10. S4 stream relay/connection takeover。
 11. S8 promotion/supply-chain 的跨环境验收加固。
 
-这个顺序先让低风险结构化扩展点生产可用，再进入长连接 stream。不要先做 protocol-proxy，否则隔离、drain、backpressure 和故障处理会一次性耦合太多风险。
+这个顺序先让低风险结构化扩展点生产可用，再进入长连接 stream。不要先做 connection takeover，否则隔离、drain、backpressure 和故障处理会一次性耦合太多风险。
 
 ## 最小验收命令
 
@@ -541,11 +543,11 @@ go run ./cmd/gateway plugin test examples/plugins/<sandbox-example> --profile co
   "maturity": "partial",
   "data_plane": true,
   "requires_restart": true,
-  "unsupported_reason": "sandbox-process supports selected request/response extension points under Linux enforcement; protocol-proxy requires stream.proxy/v1 conformance and is not enabled by default"
+  "unsupported_reason": "sandbox-process supports selected request/response extension points under Linux enforcement; connection takeover requires stream.proxy/v1 conformance and is not enabled by default"
 }
 ```
 
-只有 stream relay、protocol-proxy、完整 isolation matrix、跨环境 promotion 和 DR 都通过后，才考虑提升到 `implemented`。
+只有 stream relay、connection takeover、完整 isolation matrix、跨环境 promotion 和 DR 都通过后，才考虑提升到 `implemented`。
 
 ## 回滚边界
 

@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	stdplugin "plugin"
 	"reflect"
@@ -21,6 +20,7 @@ import (
 
 	"github.com/tursom/mc-gateway/plugin/api"
 	"github.com/tursom/mc-gateway/plugin/official/rulepolicy"
+	"github.com/tursom/mc-gateway/plugin/official/trustedrealip"
 )
 
 type RuntimeAdapter interface {
@@ -84,7 +84,7 @@ func (a GoPluginAdapter) RunSelfTest(ctx context.Context, artifact ArtifactRecor
 
 func (a GoPluginAdapter) instantiate(ctx context.Context, artifact ArtifactRecord, pluginRecord PluginRecord, gateway *Gateway, init bool) (api.Plugin, error) {
 	_ = ctx
-	if artifact.RuntimeType == RuntimeBuiltin || artifact.PluginID == "official.rule-policy" {
+	if artifact.RuntimeType == RuntimeBuiltin {
 		return instantiateBuiltinPlugin(artifact, pluginRecord, gateway, init)
 	}
 	// Go plugin 只能加载与当前进程 Go 版本、架构和 ABI 匹配的 .so 文件。
@@ -131,13 +131,11 @@ func (a GoPluginAdapter) instantiate(ctx context.Context, artifact ArtifactRecor
 // instantiateBuiltinPlugin 让官方内置插件走同一套 Plugin 接口和配置流程，
 // 避免在调用路径上区分内置插件与外部上传插件。
 func instantiateBuiltinPlugin(artifact ArtifactRecord, pluginRecord PluginRecord, gateway *Gateway, init bool) (api.Plugin, error) {
-	var instance api.Plugin
-	switch artifact.PluginID {
-	case "official.rule-policy":
-		instance = rulepolicy.New()
-	default:
+	descriptor, ok := builtinPluginDescriptorByID(artifact.PluginID)
+	if !ok {
 		return nil, fmt.Errorf("unknown builtin plugin %q", artifact.PluginID)
 	}
+	instance := descriptor.factory()
 	cfg := instance.NewConfigObj()
 	if cfg != nil && pluginRecord.ConfigJSON != "" && canUnmarshalInto(cfg) {
 		if err := json.Unmarshal([]byte(pluginRecord.ConfigJSON), cfg); err != nil {
@@ -155,6 +153,70 @@ func instantiateBuiltinPlugin(artifact ArtifactRecord, pluginRecord PluginRecord
 	return instance, nil
 }
 
+type builtinPluginDescriptor struct {
+	manifest          Manifest
+	conformancePassed int
+	factory           func() api.Plugin
+}
+
+func builtinPluginDescriptors() []builtinPluginDescriptor {
+	return []builtinPluginDescriptor{
+		{
+			manifest: Manifest{
+				SchemaVersion: SchemaVersion,
+				ID:            "official.rule-policy",
+				Name:          "Official Rule Policy",
+				Version:       "0.1.0",
+				Description:   "Built-in official rule/policy extension for host rewrite, CIDR policy, rate limit, maintenance mode and upstream rewrite.",
+				ArtifactType:  ArtifactTypeBinary,
+				Runtime:       RuntimeManifest{Type: RuntimeBuiltin},
+				APIVersion:    APIVersion,
+				ExtensionPoints: []ExtensionPoint{
+					{Type: "middleware", Key: ExtensionConnectionFilter},
+					{Type: "middleware", Key: ExtensionHandshakeFilter},
+					{Type: "provider", Key: ExtensionRouteResolve},
+					{Type: "rule", Key: ExtensionRuleEvaluate},
+					{Type: "hook", Key: ExtensionStatusPing},
+				},
+				Capabilities:  json.RawMessage(`{"extension_points":["connection.filter/v1","handshake.filter/v1","route.resolve/v1","rule.evaluate/v1","status.ping/v1"],"middleware":{"fail_policy":"fail_open"},"route":{"cache_ttl_ms":60000},"status":{"hosts":["*"]}}`),
+				RuntimeLimits: RuntimeLimits{HandlerTimeoutMS: int(DefaultHandlerTimeout / time.Millisecond)},
+				ConfigSchema:  json.RawMessage(`{"type":"object","properties":{"host_rewrite":{"type":"object"},"upstream_rewrite":{"type":"object"},"source_allow_cidr":{"type":"array"},"source_deny_cidr":{"type":"array"},"rate_limit":{"type":"object"},"maintenance":{"type":"object","properties":{"enabled":{"type":"boolean"},"hosts":{"type":"array"},"motd":{"type":"string"},"favicon":{"type":"string"},"online_players":{"type":"integer"},"max_players":{"type":"integer"},"version":{"type":"string"},"window":{"type":"string"},"status_by_host":{"type":"object"}}}}}`),
+			},
+			conformancePassed: 5,
+			factory:           func() api.Plugin { return rulepolicy.New() },
+		},
+		{
+			manifest: Manifest{
+				SchemaVersion: SchemaVersion,
+				ID:            "official.trusted-real-ip",
+				Name:          "Official Trusted Real IP",
+				Version:       "0.1.0",
+				Description:   "Uses a trusted WebSocket proxy header as the effective Minecraft client address.",
+				ArtifactType:  ArtifactTypeBinary,
+				Runtime:       RuntimeManifest{Type: RuntimeBuiltin},
+				APIVersion:    APIVersion,
+				ExtensionPoints: []ExtensionPoint{
+					{Type: "hook", Key: ExtensionUpstreamConnect},
+				},
+				Capabilities:  json.RawMessage(`{"extension_points":["upstream.connect/v2"]}`),
+				RuntimeLimits: RuntimeLimits{HandlerTimeoutMS: int(DefaultHandlerTimeout / time.Millisecond)},
+				ConfigSchema:  json.RawMessage(`{"type":"object","properties":{"header":{"type":"string","minLength":1,"default":"X-Real-IP"},"trusted_peers":{"type":"array","minItems":1,"items":{"type":"string"},"default":["127.0.0.1/32"]}}}`),
+			},
+			conformancePassed: 1,
+			factory:           func() api.Plugin { return trustedrealip.New() },
+		},
+	}
+}
+
+func builtinPluginDescriptorByID(pluginID string) (builtinPluginDescriptor, bool) {
+	for _, descriptor := range builtinPluginDescriptors() {
+		if descriptor.manifest.ID == pluginID {
+			return descriptor, true
+		}
+	}
+	return builtinPluginDescriptor{}, false
+}
+
 func canUnmarshalInto(value any) bool {
 	if value == nil {
 		return false
@@ -169,7 +231,6 @@ type Manager struct {
 	adapter                   RuntimeAdapter
 	adapterManaged            bool
 	builders                  map[string]SourceBuilder
-	handleConn                func(net.Conn)
 	wg                        *sync.WaitGroup
 	policyProfile             string
 	requireConformanceFixture bool
@@ -190,12 +251,12 @@ type Manager struct {
 	routeCacheMu      sync.Mutex
 	routeCache        map[string]routeCacheEntry
 
-	// proxyConns 只跟踪由插件托管代理的连接，用于停用插件时的 drain 和强制关闭。
-	proxyMu     sync.Mutex
-	proxySeq    uint64
-	proxyConns  map[uint64]*proxyConnection
-	drainingIDs map[string]bool
-	operations  *Operations
+	// connectionSessions 跟踪接管链的根连接及全部参与插件，用于 drain 和强制关闭。
+	sessionMu          sync.Mutex
+	sessionSeq         uint64
+	connectionSessions map[uint64]*connectionSession
+	drainingIDs        map[string]bool
+	operations         *Operations
 
 	// serviceMode/hosts 预留给插件运行时从进程内迁移到独立宿主的服务模式。
 	serviceMode         string
@@ -261,70 +322,48 @@ type pluginExtensions struct {
 
 // upstreamHandler 包装一个上游连接钩子，并保存调用、错误、超时和代理流量指标。
 type upstreamHandler struct {
-	pluginID            string
-	artifactID          string
-	runtime             runtimeIdentity
-	priority            int
-	handlerID           string
-	mode                string
-	timeout             time.Duration
-	initialWriteTimeout time.Duration
-	accept              func(api.UpstreamConnectRequest) bool
-	handle              func(api.UpstreamConnectRequest) (net.Conn, error)
+	pluginID   string
+	artifactID string
+	runtime    runtimeIdentity
+	priority   int
+	handlerID  string
+	handle     api.UpstreamConnectHandlerV2
 
-	calls            atomic.Uint64
-	errors           atomic.Uint64
-	panics           atomic.Uint64
-	timeouts         atomic.Uint64
-	blocked          atomic.Uint64
-	activeProxy      atomic.Int64
-	drainingProxy    atomic.Int64
-	proxyStarted     atomic.Uint64
-	proxyCompleted   atomic.Uint64
-	proxyErrors      atomic.Uint64
-	proxyBytesIn     atomic.Uint64
-	proxyBytesOut    atomic.Uint64
-	proxyDuration    atomic.Uint64
-	proxyForceClosed atomic.Uint64
-	durationCount    atomic.Uint64
-	durationSumMS    atomic.Uint64
-	durationMaxMS    atomic.Uint64
-	lastProxyError   atomic.Value
-	draining         atomic.Bool
-	runtimeRefs      atomic.Int64
+	calls               atomic.Uint64
+	errors              atomic.Uint64
+	panics              atomic.Uint64
+	timeouts            atomic.Uint64
+	blocked             atomic.Uint64
+	activeSessions      atomic.Int64
+	drainingSessions    atomic.Int64
+	sessionsStarted     atomic.Uint64
+	sessionsCompleted   atomic.Uint64
+	sessionErrors       atomic.Uint64
+	sessionDuration     atomic.Uint64
+	sessionsForceClosed atomic.Uint64
+	durationCount       atomic.Uint64
+	durationSumMS       atomic.Uint64
+	durationMaxMS       atomic.Uint64
+	lastSessionError    atomic.Value
+	draining            atomic.Bool
+	runtimeRefs         atomic.Int64
 }
 
-type proxyConnection struct {
+type connectionSession struct {
 	id                  uint64
-	pluginID            string
-	artifactID          string
-	runtime             runtimeIdentity
-	handlerID           string
-	handler             *upstreamHandler
-	client              net.Conn
-	endpoint            net.Conn
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	streams             []net.Conn
 	startedAt           time.Time
-	draining            bool
+	participants        map[*upstreamHandler]bool
+	draining            map[string]bool
 	forceCloseRequested bool
-}
-
-type ProxyConnectionHandle struct {
-	manager *Manager
-	id      uint64
-}
-
-type ProxyConnectionStats struct {
-	BytesToPlugin int64
-	BytesToClient int64
-	Duration      time.Duration
-	Err           error
 }
 
 type Options struct {
 	DB                        *sql.DB
 	ArtifactRoot              string
 	Now                       func() time.Time
-	HandleConn                func(net.Conn)
 	WaitGroup                 *sync.WaitGroup
 	Adapter                   RuntimeAdapter
 	Builders                  map[string]SourceBuilder
@@ -359,7 +398,6 @@ func New(options Options) *Manager {
 		adapter:                   adapter,
 		adapterManaged:            adapterManaged,
 		builders:                  options.Builders,
-		handleConn:                options.HandleConn,
 		wg:                        options.WaitGroup,
 		policyProfile:             options.PolicyProfile,
 		requireConformanceFixture: options.RequireConformanceFixture,
@@ -370,7 +408,7 @@ func New(options Options) *Manager {
 		sandboxPolicy:             normalizeSandboxPolicy(options.SandboxPolicy),
 		sandboxSelfCheck:          options.SandboxSelfCheck,
 		routeCache:                make(map[string]routeCacheEntry),
-		proxyConns:                make(map[uint64]*proxyConnection),
+		connectionSessions:        make(map[uint64]*connectionSession),
 		drainingIDs:               make(map[string]bool),
 		hosts:                     make(map[string]*pluginHostProcess),
 		pendingRuntimeStops:       make(map[runtimeIdentity]*loadedPlugin),
@@ -405,61 +443,35 @@ func New(options Options) *Manager {
 // 配置和启停流程都可以复用同一套插件管理模型。
 func (m *Manager) EnsureOfficialPlugins(ctx context.Context, actor string) error {
 	now := time.Now().Unix()
-	manifest := Manifest{
-		SchemaVersion: SchemaVersion,
-		ID:            "official.rule-policy",
-		Name:          "Official Rule Policy",
-		Version:       "0.1.0",
-		Description:   "Built-in official rule/policy extension for host rewrite, CIDR policy, rate limit, maintenance mode and upstream rewrite.",
-		ArtifactType:  ArtifactTypeBinary,
-		Runtime: RuntimeManifest{
-			Type: RuntimeBuiltin,
-		},
-		APIVersion: APIVersion,
-		ExtensionPoints: []ExtensionPoint{
-			{Type: "middleware", Key: ExtensionConnectionFilter},
-			{Type: "middleware", Key: ExtensionHandshakeFilter},
-			{Type: "provider", Key: ExtensionRouteResolve},
-			{Type: "rule", Key: ExtensionRuleEvaluate},
-			{Type: "hook", Key: ExtensionStatusPing},
-		},
-		Capabilities:  json.RawMessage(`{"extension_points":["connection.filter/v1","handshake.filter/v1","route.resolve/v1","rule.evaluate/v1","status.ping/v1"],"middleware":{"fail_policy":"fail_open"},"route":{"cache_ttl_ms":60000},"status":{"hosts":["*"]}}`),
-		RuntimeLimits: RuntimeLimits{HandlerTimeoutMS: int(DefaultHandlerTimeout / time.Millisecond)},
-		ConfigSchema:  json.RawMessage(`{"type":"object","properties":{"host_rewrite":{"type":"object"},"upstream_rewrite":{"type":"object"},"source_allow_cidr":{"type":"array"},"source_deny_cidr":{"type":"array"},"rate_limit":{"type":"object"},"maintenance":{"type":"object","properties":{"enabled":{"type":"boolean"},"hosts":{"type":"array"},"motd":{"type":"string"},"favicon":{"type":"string"},"online_players":{"type":"integer"},"max_players":{"type":"integer"},"version":{"type":"string"},"window":{"type":"string"},"status_by_host":{"type":"object"}}}}}`),
+	for _, descriptor := range builtinPluginDescriptors() {
+		manifest := descriptor.manifest
+		source := "builtin:" + manifest.ID
+		metadata, err := artifactMetadataJSON(manifest, ConformanceSummary{
+			Source: source, OK: true, Total: descriptor.conformancePassed, Passed: descriptor.conformancePassed,
+		}, true, nil)
+		if err != nil {
+			return err
+		}
+		extensionPoints, err := json.Marshal(manifest.ExtensionPoints)
+		if err != nil {
+			return err
+		}
+		summaryJSON, err := manifestCapabilitiesSummaryJSON(manifest)
+		if err != nil {
+			return err
+		}
+		artifact := ArtifactRecord{
+			ID: "builtin-" + strings.ReplaceAll(manifest.ID, ".", "-") + "-" + manifest.Version, PluginID: manifest.ID, Version: manifest.Version,
+			FileName: source, SHA256: source + ":" + manifest.Version, PackageSHA256: source + ":" + manifest.Version,
+			ArtifactType: ArtifactTypeBinary, RuntimeType: RuntimeBuiltin, Status: ArtifactStatusLoadable,
+			MetadataJSON: string(metadata), CapabilitiesSummaryJSON: string(summaryJSON), ExtensionPointsJSON: string(extensionPoints),
+			APIVersion: APIVersion, UploadedBy: actor, CreatedAt: now, UpdatedAt: now,
+		}
+		if err := m.repo.SaveArtifact(ctx, artifact); err != nil {
+			return err
+		}
+		_ = m.repo.RecordOperation(ctx, manifest.ID, artifact.ID, "official_plugin_register", "succeeded", actor, "official builtin plugin registered", nil)
 	}
-	metadata, _ := artifactMetadataJSON(manifest, ConformanceSummary{
-		Source:  "builtin:official.rule-policy",
-		OK:      true,
-		Total:   5,
-		Passed:  5,
-		Skipped: 0,
-		Failed:  0,
-	}, true, nil)
-	extensionPoints, _ := json.Marshal(manifest.ExtensionPoints)
-	summaryJSON, _ := manifestCapabilitiesSummaryJSON(manifest)
-	artifact := ArtifactRecord{
-		ID:                      "builtin-official-rule-policy-0.1.0",
-		PluginID:                manifest.ID,
-		Version:                 manifest.Version,
-		FileName:                "builtin:official.rule-policy",
-		FilePath:                "",
-		SHA256:                  "builtin:official.rule-policy:0.1.0",
-		PackageSHA256:           "builtin:official.rule-policy:0.1.0",
-		ArtifactType:            ArtifactTypeBinary,
-		RuntimeType:             RuntimeBuiltin,
-		Status:                  ArtifactStatusLoadable,
-		MetadataJSON:            string(metadata),
-		CapabilitiesSummaryJSON: string(summaryJSON),
-		ExtensionPointsJSON:     string(extensionPoints),
-		APIVersion:              APIVersion,
-		UploadedBy:              actor,
-		CreatedAt:               now,
-		UpdatedAt:               now,
-	}
-	if err := m.repo.SaveArtifact(ctx, artifact); err != nil {
-		return err
-	}
-	_ = m.repo.RecordOperation(ctx, manifest.ID, artifact.ID, "official_plugin_register", "succeeded", actor, "official rule/policy plugin registered", nil)
 	return nil
 }
 
@@ -1092,7 +1104,7 @@ func (m *Manager) Enable(ctx context.Context, actor, pluginID string) (PluginRec
 }
 
 // Disable 从热路径移除插件并进入 drain。Go plugin 不能从进程卸载，
-// 因此这里停止任务、移除分发入口，并等待已有 protocol-proxy 连接结束。
+// 因此这里停止任务、移除分发入口，并等待已有连接接管 session 结束。
 func (m *Manager) Disable(ctx context.Context, actor, pluginID string) (PluginRecord, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1123,12 +1135,12 @@ func (m *Manager) Disable(ctx context.Context, actor, pluginID string) (PluginRe
 		}
 	}
 	runtimeState := RuntimeDisabled
-	if m.activeProxyCountLocked(pluginID) > 0 {
+	if m.activeConnectionSessionCountLocked(pluginID) > 0 {
 		runtimeState = RuntimeDraining
 	}
 	delete(m.loaded, pluginID)
 	if _, err := m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginID, pluginRecord.DesiredGeneration, runtimeState, "", "", pluginRecord.DesiredGeneration, "", map[string]any{
-		"active_proxy_connections": m.activeProxyCountLocked(pluginID),
+		"active_connection_sessions": m.activeConnectionSessionCountLocked(pluginID),
 	}, nil); err != nil {
 		return PluginRecord{}, err
 	}
@@ -1318,10 +1330,10 @@ func (m *Manager) retireLoadedPluginLocked(ctx context.Context, loaded *loadedPl
 	if err := m.stopLoadedPluginTasks(loaded); err != nil {
 		errs = append(errs, err)
 	}
-	errs = append(errs, m.drainAndDestroyRuntimeInstance(ctx, loaded)...)
-	if m.deferRuntimeStopIfActive(loaded) {
+	if m.deferRuntimeRetirementIfActive(loaded) {
 		return errs
 	}
+	errs = append(errs, m.drainAndDestroyRuntimeInstance(ctx, loaded)...)
 	if err := m.stopRuntimeAdapter(ctx, loaded); err != nil {
 		errs = append(errs, err)
 	}
@@ -1417,18 +1429,13 @@ func (m *Manager) rollbackLoadedCandidateLocked(ctx context.Context, pluginID st
 	}
 }
 
-func (m *Manager) deferRuntimeStopIfActive(loaded *loadedPlugin) bool {
+func (m *Manager) deferRuntimeRetirementIfActive(loaded *loadedPlugin) bool {
 	if loaded == nil {
 		return false
 	}
-	processRuntime := m.serviceMode == PluginServiceModeGoPluginProcess && loaded.runtime.HostProcess != nil
-	sandboxRuntime := m.serviceMode == PluginServiceModeSandboxProcess && sandboxHostedPluginFromInstance(loaded.instance).process != nil
-	if !processRuntime && !sandboxRuntime {
-		return false
-	}
 	key := loadedRuntimeIdentity(loaded)
-	m.proxyMu.Lock()
-	defer m.proxyMu.Unlock()
+	m.sessionMu.Lock()
+	defer m.sessionMu.Unlock()
 	if m.activeRuntimeReferencesWithoutLock(loaded, key) == 0 {
 		return false
 	}
@@ -1445,8 +1452,8 @@ func (m *Manager) reserveUpstreamHandler(handler *upstreamHandler) bool {
 	if handler == nil {
 		return false
 	}
-	m.proxyMu.Lock()
-	defer m.proxyMu.Unlock()
+	m.sessionMu.Lock()
+	defer m.sessionMu.Unlock()
 	if m.drainingIDs[handler.pluginID] || handler.draining.Load() {
 		return false
 	}
@@ -1454,161 +1461,191 @@ func (m *Manager) reserveUpstreamHandler(handler *upstreamHandler) bool {
 	return true
 }
 
-func (m *Manager) releaseUpstreamReservation(result UpstreamResult) {
-	if result.runtimeReserved {
-		m.releaseUpstreamHandler(result.handler)
-	}
-}
-
 func (m *Manager) releaseUpstreamHandler(handler *upstreamHandler) {
 	if handler == nil {
 		return
 	}
-	m.proxyMu.Lock()
+	m.sessionMu.Lock()
 	handler.runtimeRefs.Add(-1)
-	m.proxyMu.Unlock()
+	m.sessionMu.Unlock()
 	m.queuePendingRuntimeStopIfDrained(handler.runtime)
 }
 
-// ConnectUpstream 依次调用当前快照中的上游连接处理器。处理器返回 ErrPass
-// 表示让下一个插件继续尝试，返回连接则由网关使用插件提供的上游。
-func (m *Manager) ConnectUpstream(ctx context.Context, req api.UpstreamConnectRequest) (UpstreamResult, error) {
+// HandleConnection 在 core 读取任何 Minecraft 字节前把连接交给 v2 插件链。
+// 每个处理器可以处理到底、进入下一插件，或直接进入 core。
+func (m *Manager) HandleConnection(ctx context.Context, req api.UpstreamConnectRequestV2, core func(context.Context, api.ConnectionState) error) error {
 	value := m.snapshot.Load()
-	if value == nil {
-		return UpstreamResult{}, nil
-	}
-	handlers, ok := value.([]*upstreamHandler)
-	if !ok {
-		return UpstreamResult{}, nil
-	}
 	if req.Context == nil {
 		req.Context = ctx
 	}
-	req.Context = context.WithValue(req.Context, pluginHostCallerContextKey{}, req.Context)
-	req.InitialData = append([]byte(nil), req.InitialData...)
-	for _, handler := range handlers {
-		if !m.reserveUpstreamHandler(handler) {
+	handlers, _ := value.([]*upstreamHandler)
+	if core == nil {
+		return errors.New("upstream core continuation is nil")
+	}
+	if req.Connection.Stream == nil {
+		return errors.New("upstream connection stream is nil")
+	}
+	session := m.startConnectionSession(req.Context, req.Connection.Stream)
+	defer m.finishConnectionSession(session.id)
+	req.Context = session.ctx
+	dispatch := connectionDispatch{
+		manager:  m,
+		handlers: handlers,
+		base:     cloneTakeoverRequest(req),
+		core:     core,
+		session:  session,
+	}
+	return dispatch.run(0, req.Connection)
+}
+
+type connectionDispatch struct {
+	manager  *Manager
+	handlers []*upstreamHandler
+	base     api.UpstreamConnectRequestV2
+	core     func(context.Context, api.ConnectionState) error
+	session  *connectionSession
+}
+
+type connectionFlow struct {
+	dispatch *connectionDispatch
+	next     int
+	mu       sync.Mutex
+	state    connectionFlowState
+	done     chan struct{}
+}
+
+type connectionFlowState uint8
+
+const (
+	connectionFlowAvailable connectionFlowState = iota
+	connectionFlowRunning
+	connectionFlowRunningAfterHandlerReturn
+	connectionFlowUsed
+	connectionFlowExpired
+)
+
+func (d *connectionDispatch) run(index int, state api.ConnectionState) error {
+	if state.Stream == nil {
+		return errors.New("upstream connection stream is nil")
+	}
+	d.manager.trackConnectionSessionStream(d.session, state.Stream)
+	for index < len(d.handlers) {
+		handler := d.handlers[index]
+		index++
+		if !d.manager.reserveUpstreamHandler(handler) {
 			continue
 		}
-		// accept 阶段应尽量轻量，用于快速过滤不关心的主机或上游。
-		accepted, err := handler.accepts(req)
-		if err != nil {
-			m.releaseUpstreamHandler(handler)
-			return UpstreamResult{Handled: true}, err
-		}
-		if !accepted {
-			m.releaseUpstreamHandler(handler)
-			continue
-		}
+		d.manager.addConnectionParticipant(d.session, handler)
+		req := cloneTakeoverRequest(d.base)
+		req.Connection = cloneConnectionState(state)
 		req.Context = WithTraceContext(req.Context, handler.pluginID, req.TraceID, req.ConnectionID, handler.handlerID)
+		flow := &connectionFlow{dispatch: d, next: index, done: make(chan struct{})}
+		req.Flow = flow
 		start := time.Now()
-		conn, err := handler.invoke(req)
+		err := handler.invoke(req)
+		if flow.handlerReturned() {
+			d.manager.closeConnectionSessionStreams(d.session)
+			flow.wait()
+			if err == nil {
+				err = errors.New("upstream continuation outlived its handler invocation")
+			}
+		}
+		d.manager.releaseUpstreamHandler(handler)
 		status := "ok"
 		if err != nil {
 			status = "error"
+			handler.sessionErrors.Add(1)
+			handler.lastSessionError.Store(redactSensitive(sanitizeLog(err.Error())))
 		}
-		_ = m.repo.SaveTrace(context.Background(), TraceSummary{
-			PluginID:     handler.pluginID,
-			TraceID:      req.TraceID,
-			ConnectionID: req.ConnectionID,
-			HandlerID:    handler.handlerID,
-			Operation:    "plugin.handler." + handler.handlerID,
-			Status:       status,
-			DurationMS:   time.Since(start).Milliseconds(),
-		}, map[string]string{
-			"host":     req.ServerHost,
-			"upstream": req.UpstreamAddress,
-			"mode":     handler.mode,
-		})
-		if errors.Is(err, api.ErrPass) {
-			m.releaseUpstreamHandler(handler)
-			continue
-		}
-		if err != nil {
-			m.releaseUpstreamHandler(handler)
-			return UpstreamResult{Handled: true}, err
-		}
-		if conn != nil {
-			// protocol-proxy 模式由插件代理完整协议流；普通 dialer 模式只提供
-			// 已连接的上游 net.Conn，后续转发仍由网关主流程完成。
-			if handler.mode == UpstreamModeDialer {
-				_ = m.repo.SaveTrace(context.Background(), TraceSummary{
-					PluginID:     handler.pluginID,
-					TraceID:      req.TraceID,
-					ConnectionID: req.ConnectionID,
-					HandlerID:    handler.handlerID,
-					Operation:    "backend.dial",
-					Status:       "plugin_supplied",
-					DurationMS:   0,
-				}, map[string]string{"upstream": req.UpstreamAddress})
-			}
-			result := UpstreamResult{
-				Conn:      conn,
-				Handled:   true,
-				Mode:      handler.mode,
-				PluginID:  handler.pluginID,
-				HandlerID: handler.handlerID,
-				handler:   handler,
-			}
-			if handler.mode == UpstreamModeProtocolProxy {
-				result.runtimeReserved = true
-				return m.startProtocolProxy(ctx, handler, result, req)
-			}
-			m.releaseUpstreamHandler(handler)
-			return result, nil
-		}
-		m.releaseUpstreamHandler(handler)
+		_ = d.manager.repo.SaveTrace(context.Background(), TraceSummary{
+			PluginID: handler.pluginID, TraceID: req.TraceID, ConnectionID: req.ConnectionID,
+			HandlerID: handler.handlerID, Operation: "connection.takeover", Status: status,
+			DurationMS: time.Since(start).Milliseconds(),
+		}, map[string]string{"transport": req.Ingress.Transport})
+		return err
 	}
-	return UpstreamResult{}, nil
+	return d.core(d.base.Context, cloneConnectionState(state))
 }
 
-// startProtocolProxy 把客户端连接交给插件提供的协议代理端点。网关仍跟踪连接，
-// 以便停用插件时可以 drain 或强制关闭。
-func (m *Manager) startProtocolProxy(ctx context.Context, handler *upstreamHandler, result UpstreamResult, req api.UpstreamConnectRequest) (UpstreamResult, error) {
-	endpoint := result.Conn
-	initial := append([]byte(nil), req.InitialData...)
-	if len(initial) > 0 {
-		if handler.initialWriteTimeout > 0 {
-			_ = endpoint.SetWriteDeadline(time.Now().Add(handler.initialWriteTimeout))
-			defer endpoint.SetWriteDeadline(time.Time{})
-		}
-		if err := writeAll(endpoint, initial); err != nil {
-			handler.proxyErrors.Add(1)
-			_ = endpoint.Close()
-			m.releaseUpstreamHandler(handler)
-			return UpstreamResult{Handled: true, Mode: handler.mode, PluginID: handler.pluginID, HandlerID: handler.handlerID}, fmt.Errorf("plugin %s protocol-proxy initial replay failed: %w", handler.pluginID, err)
-		}
+func (f *connectionFlow) Next(state api.ConnectionState) error {
+	if err := f.claim(); err != nil {
+		return err
 	}
-
-	handle := m.TrackProxyConnection(result, req.Source, endpoint)
-	if handle == nil {
-		_ = endpoint.Close()
-		return UpstreamResult{Handled: true, Mode: handler.mode, PluginID: handler.pluginID, HandlerID: handler.handlerID}, fmt.Errorf("plugin %s protocol-proxy tracking failed", handler.pluginID)
-	}
-	runProtocolProxy(ctx, handle, req.Source, endpoint, int64(len(initial)))
-
-	return UpstreamResult{
-		Handled:         true,
-		Mode:            handler.mode,
-		PluginID:        handler.pluginID,
-		HandlerID:       handler.handlerID,
-		InitialDataSent: len(initial) > 0,
-		Proxied:         true,
-	}, nil
+	defer f.complete()
+	return f.dispatch.run(f.next, state)
 }
 
-func (h *upstreamHandler) accepts(req api.UpstreamConnectRequest) (accepted bool, err error) {
-	if h.accept == nil {
-		return true, nil
+func (f *connectionFlow) Core(state api.ConnectionState) error {
+	if err := f.claim(); err != nil {
+		return err
 	}
-	defer func() {
-		if rec := recover(); rec != nil {
-			h.panics.Add(1)
-			accepted = false
-			err = fmt.Errorf("plugin %s acceptor panic: %v", h.pluginID, rec)
+	defer f.complete()
+	if state.Stream == nil {
+		return errors.New("upstream connection stream is nil")
+	}
+	f.dispatch.manager.trackConnectionSessionStream(f.dispatch.session, state.Stream)
+	return f.dispatch.core(f.dispatch.base.Context, cloneConnectionState(state))
+}
+
+func (f *connectionFlow) claim() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	switch f.state {
+	case connectionFlowRunning, connectionFlowRunningAfterHandlerReturn, connectionFlowUsed:
+		return api.ErrContinuationUsed
+	case connectionFlowExpired:
+		return errors.New("upstream continuation is no longer available")
+	case connectionFlowAvailable:
+		f.state = connectionFlowRunning
+		return nil
+	default:
+		return errors.New("upstream continuation has invalid state")
+	}
+}
+
+func (f *connectionFlow) complete() {
+	f.mu.Lock()
+	if f.state == connectionFlowRunning || f.state == connectionFlowRunningAfterHandlerReturn {
+		f.state = connectionFlowUsed
+		close(f.done)
+	}
+	f.mu.Unlock()
+}
+
+func (f *connectionFlow) handlerReturned() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	switch f.state {
+	case connectionFlowAvailable:
+		f.state = connectionFlowExpired
+		return false
+	case connectionFlowRunning:
+		f.state = connectionFlowRunningAfterHandlerReturn
+		return true
+	default:
+		return false
+	}
+}
+
+func (f *connectionFlow) wait() {
+	<-f.done
+}
+
+func cloneConnectionState(state api.ConnectionState) api.ConnectionState {
+	if state.Metadata != nil {
+		metadata := make(map[string]string, len(state.Metadata))
+		for key, value := range state.Metadata {
+			metadata[key] = value
 		}
-	}()
-	return h.accept(req), nil
+		state.Metadata = metadata
+	}
+	return state
+}
+
+func cloneTakeoverRequest(req api.UpstreamConnectRequestV2) api.UpstreamConnectRequestV2 {
+	req.Connection = cloneConnectionState(req.Connection)
+	req.Ingress = req.Ingress.Clone()
+	return req
 }
 
 func (m *Manager) ListArtifacts(ctx context.Context, pluginID string) ([]ArtifactRecord, error) {
@@ -1875,31 +1912,25 @@ func (m *Manager) UpsertSecret(ctx context.Context, actor, pluginID, artifactID,
 	return secret, nil
 }
 
-func (m *Manager) ActiveProxyConnections(ctx context.Context, pluginID string) ([]ProxyConnectionSummary, error) {
+func (m *Manager) ActiveConnectionSessions(ctx context.Context, pluginID string) ([]ConnectionSessionSummary, error) {
 	_ = ctx
 	now := time.Now()
-	var summaries []ProxyConnectionSummary
-	m.proxyMu.Lock()
-	defer m.proxyMu.Unlock()
-	for _, conn := range m.proxyConns {
-		if pluginID != "" && conn.pluginID != pluginID {
-			continue
+	var summaries []ConnectionSessionSummary
+	m.sessionMu.Lock()
+	defer m.sessionMu.Unlock()
+	for _, session := range m.connectionSessions {
+		for handler := range session.participants {
+			if pluginID != "" && handler.pluginID != pluginID {
+				continue
+			}
+			lastError, _ := handler.lastSessionError.Load().(string)
+			summaries = append(summaries, ConnectionSessionSummary{
+				ID: session.id, PluginID: handler.pluginID, ArtifactID: handler.artifactID,
+				HandlerID: handler.handlerID, StartedAt: session.startedAt.Unix(),
+				DurationMS: now.Sub(session.startedAt).Milliseconds(), Draining: session.draining[handler.pluginID],
+				ForceCloseRequested: session.forceCloseRequested, LastSessionError: lastError,
+			})
 		}
-		lastProxyError := ""
-		if conn.handler != nil {
-			lastProxyError, _ = conn.handler.lastProxyError.Load().(string)
-		}
-		summaries = append(summaries, ProxyConnectionSummary{
-			ID:                  conn.id,
-			PluginID:            conn.pluginID,
-			ArtifactID:          conn.artifactID,
-			HandlerID:           conn.handlerID,
-			StartedAt:           conn.startedAt.Unix(),
-			DurationMS:          now.Sub(conn.startedAt).Milliseconds(),
-			Draining:            conn.draining,
-			ForceCloseRequested: conn.forceCloseRequested,
-			LastProxyError:      lastProxyError,
-		})
 	}
 	sort.Slice(summaries, func(i, j int) bool {
 		return summaries[i].StartedAt < summaries[j].StartedAt
@@ -2405,74 +2436,88 @@ func (m *Manager) RunOperationsGC(ctx context.Context, actor, pluginID string, d
 	return m.operations.RunGC(ctx, actor, pluginID, dryRun)
 }
 
-func (m *Manager) TrackProxyConnection(result UpstreamResult, client, endpoint net.Conn) *ProxyConnectionHandle {
-	if result.Mode != UpstreamModeProtocolProxy || client == nil || endpoint == nil {
-		m.releaseUpstreamReservation(result)
-		return nil
+func (m *Manager) startConnectionSession(ctx context.Context, root net.Conn) *connectionSession {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	handler := result.handler
-	if handler == nil {
-		handler = m.findHandler(result.PluginID, result.HandlerID)
+	sessionCtx, cancel := context.WithCancel(ctx)
+	session := &connectionSession{
+		id: atomic.AddUint64(&m.sessionSeq, 1), ctx: sessionCtx, cancel: cancel, startedAt: time.Now(),
+		streams: []net.Conn{root}, participants: make(map[*upstreamHandler]bool), draining: make(map[string]bool),
 	}
-	if handler == nil {
-		m.releaseUpstreamReservation(result)
-		return nil
-	}
-	id := atomic.AddUint64(&m.proxySeq, 1)
-	proxyConn := &proxyConnection{
-		id:         id,
-		pluginID:   result.PluginID,
-		artifactID: handler.artifactID,
-		runtime:    handler.runtime,
-		handlerID:  result.HandlerID,
-		handler:    handler,
-		client:     client,
-		endpoint:   endpoint,
-		startedAt:  time.Now(),
-	}
-	handler.activeProxy.Add(1)
-	handler.proxyStarted.Add(1)
-	m.proxyMu.Lock()
-	proxyConn.draining = m.drainingIDs[result.PluginID] || handler.draining.Load()
-	if proxyConn.draining {
-		handler.drainingProxy.Add(1)
-	}
-	m.proxyConns[id] = proxyConn
-	if result.runtimeReserved {
-		handler.runtimeRefs.Add(-1)
-	}
-	m.proxyMu.Unlock()
-	return &ProxyConnectionHandle{manager: m, id: id}
+	m.sessionMu.Lock()
+	m.connectionSessions[session.id] = session
+	m.sessionMu.Unlock()
+	return session
 }
 
-func (h *ProxyConnectionHandle) Finish(stats ProxyConnectionStats) {
-	if h == nil || h.manager == nil {
+func (m *Manager) trackConnectionSessionStream(session *connectionSession, stream net.Conn) {
+	if session == nil || stream == nil {
 		return
 	}
-	h.manager.finishProxyConnection(h.id, stats)
+	m.sessionMu.Lock()
+	session.streams = append(session.streams, stream)
+	forceClose := session.forceCloseRequested
+	m.sessionMu.Unlock()
+	if forceClose {
+		_ = stream.Close()
+	}
+}
+
+func (m *Manager) closeConnectionSessionStreams(session *connectionSession) {
+	if session == nil {
+		return
+	}
+	session.cancel()
+	m.sessionMu.Lock()
+	streams := append([]net.Conn(nil), session.streams...)
+	m.sessionMu.Unlock()
+	for _, stream := range streams {
+		_ = stream.Close()
+	}
+}
+
+func (m *Manager) addConnectionParticipant(session *connectionSession, handler *upstreamHandler) {
+	if session == nil || handler == nil {
+		return
+	}
+	m.sessionMu.Lock()
+	if !session.participants[handler] {
+		session.participants[handler] = true
+		handler.activeSessions.Add(1)
+		handler.sessionsStarted.Add(1)
+		if m.drainingIDs[handler.pluginID] || handler.draining.Load() {
+			session.draining[handler.pluginID] = true
+			handler.drainingSessions.Add(1)
+		}
+	}
+	m.sessionMu.Unlock()
 }
 
 func (m *Manager) ForceCloseDraining(ctx context.Context, actor, pluginID string) (int, error) {
-	var conns []*proxyConnection
-	m.proxyMu.Lock()
-	for _, conn := range m.proxyConns {
-		if conn.pluginID == pluginID && conn.draining {
-			if conn.handler != nil && !conn.forceCloseRequested {
-				conn.handler.proxyForceClosed.Add(1)
+	var sessions []*connectionSession
+	m.sessionMu.Lock()
+	for _, session := range m.connectionSessions {
+		if session.draining[pluginID] {
+			if !session.forceCloseRequested {
+				for handler := range session.participants {
+					if handler.pluginID == pluginID {
+						handler.sessionsForceClosed.Add(1)
+					}
+				}
 			}
-			conn.forceCloseRequested = true
-			conns = append(conns, conn)
+			session.forceCloseRequested = true
+			sessions = append(sessions, session)
 		}
 	}
-	m.proxyMu.Unlock()
-	for _, conn := range conns {
-		_ = conn.client.Close()
-		_ = conn.endpoint.Close()
+	m.sessionMu.Unlock()
+	for _, session := range sessions {
+		m.closeConnectionSessionStreams(session)
 	}
-	_ = m.repo.RecordOperation(ctx, pluginID, "", "force_close_draining", "succeeded", actor, "draining protocol-proxy connections force closed", map[string]any{
-		"closed": len(conns),
+	_ = m.repo.RecordOperation(ctx, pluginID, "", "force_close_draining", "succeeded", actor, "draining connection sessions force closed", map[string]any{
+		"closed": len(sessions),
 	})
-	return len(conns), nil
+	return len(sessions), nil
 }
 
 func (m *Manager) findHandler(pluginID, handlerID string) *upstreamHandler {
@@ -2496,34 +2541,36 @@ func (m *Manager) findHandler(pluginID, handlerID string) *upstreamHandler {
 	return nil
 }
 
-func (m *Manager) finishProxyConnection(id uint64, stats ProxyConnectionStats) {
-	// 代理连接结束时汇总字节数和耗时，供 Admin UI 展示插件代理健康情况。
-	m.proxyMu.Lock()
-	proxyConn := m.proxyConns[id]
-	delete(m.proxyConns, id)
-	m.proxyMu.Unlock()
-	if proxyConn == nil || proxyConn.handler == nil {
+func (m *Manager) finishConnectionSession(id uint64) {
+	m.sessionMu.Lock()
+	session := m.connectionSessions[id]
+	delete(m.connectionSessions, id)
+	var participants []*upstreamHandler
+	var draining map[string]bool
+	if session != nil {
+		participants = make([]*upstreamHandler, 0, len(session.participants))
+		for handler := range session.participants {
+			participants = append(participants, handler)
+		}
+		draining = make(map[string]bool, len(session.draining))
+		for pluginID, active := range session.draining {
+			draining[pluginID] = active
+		}
+	}
+	m.sessionMu.Unlock()
+	if session == nil {
 		return
 	}
-	proxyConn.handler.activeProxy.Add(-1)
-	if proxyConn.draining {
-		proxyConn.handler.drainingProxy.Add(-1)
+	session.cancel()
+	for _, handler := range participants {
+		handler.activeSessions.Add(-1)
+		if draining[handler.pluginID] {
+			handler.drainingSessions.Add(-1)
+		}
+		handler.sessionsCompleted.Add(1)
+		handler.sessionDuration.Add(uint64(time.Since(session.startedAt).Milliseconds()))
+		m.queuePendingRuntimeStopIfDrained(handler.runtime)
 	}
-	proxyConn.handler.proxyCompleted.Add(1)
-	if stats.Err != nil {
-		proxyConn.handler.proxyErrors.Add(1)
-		proxyConn.handler.lastProxyError.Store(stats.Err.Error())
-	}
-	if stats.BytesToPlugin > 0 {
-		proxyConn.handler.proxyBytesIn.Add(uint64(stats.BytesToPlugin))
-	}
-	if stats.BytesToClient > 0 {
-		proxyConn.handler.proxyBytesOut.Add(uint64(stats.BytesToClient))
-	}
-	if stats.Duration > 0 {
-		proxyConn.handler.proxyDuration.Add(uint64(stats.Duration.Milliseconds()))
-	}
-	m.queuePendingRuntimeStopIfDrained(proxyConn.runtime)
 }
 
 func (m *Manager) queuePendingRuntimeStopIfDrained(key runtimeIdentity) {
@@ -2543,8 +2590,8 @@ func (m *Manager) queuePendingRuntimeStopIfDrained(key runtimeIdentity) {
 }
 
 func (m *Manager) takePendingRuntimeStopIfDrained(key runtimeIdentity) *loadedPlugin {
-	m.proxyMu.Lock()
-	defer m.proxyMu.Unlock()
+	m.sessionMu.Lock()
+	defer m.sessionMu.Unlock()
 	m.hostMu.Lock()
 	defer m.hostMu.Unlock()
 	loaded := m.pendingRuntimeStops[key]
@@ -2558,7 +2605,7 @@ func (m *Manager) takePendingRuntimeStopIfDrained(key runtimeIdentity) *loadedPl
 func (m *Manager) stopPendingRuntime(loaded *loadedPlugin) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := m.stopRuntimeAdapter(ctx, loaded); err != nil {
+	if err := errors.Join(m.stopRuntimeInstance(ctx, loaded)...); err != nil {
 		_ = m.repo.RecordOperation(ctx, loaded.record.ID, loaded.artifact.ID, "runtime_cleanup", "warning", "system", err.Error(), map[string]any{
 			"runtime_instance_id": loaded.runtime.RuntimeInstanceID,
 		})
@@ -2605,7 +2652,7 @@ func (m *Manager) loadLocked(ctx context.Context, pluginRecord PluginRecord) (*l
 		return nil, nil, err
 	}
 	pluginOperations := m.operations.ForRuntime(pluginRecord.ID, artifact.ID, manifest)
-	gateway := NewGateway(pluginRecord.ID, m.handleConn, m.wg, pluginOperations)
+	gateway := NewGateway(pluginRecord.ID, m.wg, pluginOperations)
 	runtimeInstance, err := m.startRuntimeInstance(ctx, artifact, pluginRecord, gateway)
 	if err != nil {
 		_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginRecord.ID, pluginRecord.DesiredGeneration, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), runtimeFailureSummary(artifact, err), nil)
@@ -3220,14 +3267,17 @@ func (m *Manager) removeFromDispatchLocked(pluginID string) {
 }
 
 func (m *Manager) markDrainingLocked(pluginID string) {
-	m.proxyMu.Lock()
-	defer m.proxyMu.Unlock()
+	m.sessionMu.Lock()
+	defer m.sessionMu.Unlock()
 	m.drainingIDs[pluginID] = true
-	for _, conn := range m.proxyConns {
-		if conn.pluginID == pluginID && !conn.draining {
-			conn.draining = true
-			if conn.handler != nil {
-				conn.handler.drainingProxy.Add(1)
+	for _, session := range m.connectionSessions {
+		if session.draining[pluginID] {
+			continue
+		}
+		for handler := range session.participants {
+			if handler.pluginID == pluginID {
+				session.draining[pluginID] = true
+				handler.drainingSessions.Add(1)
 			}
 		}
 	}
@@ -3241,54 +3291,60 @@ func (m *Manager) markLoadedRuntimeDrainingLocked(loaded *loadedPlugin) {
 	for _, handler := range loaded.handlers {
 		handler.draining.Store(true)
 	}
-	m.proxyMu.Lock()
-	defer m.proxyMu.Unlock()
-	for _, conn := range m.proxyConns {
-		if conn.runtime == key && !conn.draining {
-			conn.draining = true
-			if conn.handler != nil {
-				conn.handler.drainingProxy.Add(1)
+	m.sessionMu.Lock()
+	defer m.sessionMu.Unlock()
+	for _, session := range m.connectionSessions {
+		for handler := range session.participants {
+			if handler.runtime == key && !session.draining[handler.pluginID] {
+				session.draining[handler.pluginID] = true
+				handler.drainingSessions.Add(1)
 			}
 		}
 	}
 }
 
 func (m *Manager) clearDrainingLocked(pluginID string) {
-	m.proxyMu.Lock()
+	m.sessionMu.Lock()
 	delete(m.drainingIDs, pluginID)
-	m.proxyMu.Unlock()
+	m.sessionMu.Unlock()
 }
 
-func (m *Manager) activeProxyCountLocked(pluginID string) int {
-	m.proxyMu.Lock()
-	defer m.proxyMu.Unlock()
+func (m *Manager) activeConnectionSessionCountLocked(pluginID string) int {
+	m.sessionMu.Lock()
+	defer m.sessionMu.Unlock()
 	count := 0
-	for _, conn := range m.proxyConns {
-		if conn.pluginID == pluginID {
-			count++
+	for _, session := range m.connectionSessions {
+		for handler := range session.participants {
+			if handler.pluginID == pluginID {
+				count++
+				break
+			}
 		}
 	}
 	return count
 }
 
-func (m *Manager) activeProxyCountForRuntimeLocked(key runtimeIdentity) int {
-	m.proxyMu.Lock()
-	defer m.proxyMu.Unlock()
-	return m.activeProxyCountForRuntimeWithoutLock(key)
+func (m *Manager) activeConnectionSessionCountForRuntimeLocked(key runtimeIdentity) int {
+	m.sessionMu.Lock()
+	defer m.sessionMu.Unlock()
+	return m.activeConnectionSessionCountForRuntimeWithoutLock(key)
 }
 
-func (m *Manager) activeProxyCountForRuntimeWithoutLock(key runtimeIdentity) int {
+func (m *Manager) activeConnectionSessionCountForRuntimeWithoutLock(key runtimeIdentity) int {
 	count := 0
-	for _, conn := range m.proxyConns {
-		if conn.runtime == key {
-			count++
+	for _, session := range m.connectionSessions {
+		for handler := range session.participants {
+			if handler.runtime == key {
+				count++
+				break
+			}
 		}
 	}
 	return count
 }
 
 func (m *Manager) activeRuntimeReferencesWithoutLock(loaded *loadedPlugin, key runtimeIdentity) int64 {
-	count := int64(m.activeProxyCountForRuntimeWithoutLock(key))
+	count := int64(m.activeConnectionSessionCountForRuntimeWithoutLock(key))
 	for _, handler := range loaded.handlers {
 		count += handler.runtimeRefs.Load()
 	}
@@ -3309,65 +3365,14 @@ func (m *Manager) publish(handlers []*upstreamHandler) {
 }
 
 func buildHandlers(pluginRecord PluginRecord, artifact ArtifactRecord, gateway *Gateway) []*upstreamHandler {
-	timeout := DefaultHandlerTimeout
-	initialWriteTimeout := DefaultInitialWriteTimeout
-	var manifest Manifest
-	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err == nil {
-		if manifest.RuntimeLimits.HandlerTimeoutMS > 0 {
-			timeout = time.Duration(manifest.RuntimeLimits.HandlerTimeoutMS) * time.Millisecond
-		}
-		if manifest.RuntimeLimits.InitialWriteTimeoutMS > 0 {
-			initialWriteTimeout = time.Duration(manifest.RuntimeLimits.InitialWriteTimeoutMS) * time.Millisecond
-		}
-	}
 	var handlers []*upstreamHandler
-	mode := upstreamModeFromArtifact(artifact)
-	if hook, ok := gateway.UpstreamConnectHandler(); ok {
+	if hook, ok := gateway.UpstreamConnectHandlerV2(); ok {
 		handlers = append(handlers, &upstreamHandler{
-			pluginID:            pluginRecord.ID,
-			artifactID:          artifact.ID,
-			priority:            pluginRecord.Priority,
-			handlerID:           "upstream.connect/v1",
-			mode:                mode,
-			timeout:             timeout,
-			initialWriteTimeout: initialWriteTimeout,
-			accept:              hook.Acceptor(),
-			handle:              hook.Handler(),
-		})
-	}
-	if hook, ok := gateway.LegacyUpstreamHandler(); ok {
-		acceptor := hook.Acceptor()
-		handler := hook.Handler()
-		handlers = append(handlers, &upstreamHandler{
-			pluginID:            pluginRecord.ID,
-			artifactID:          artifact.ID,
-			priority:            pluginRecord.Priority,
-			handlerID:           "legacy-upstream",
-			mode:                UpstreamModeDialer,
-			timeout:             timeout,
-			initialWriteTimeout: initialWriteTimeout,
-			accept: func(req api.UpstreamConnectRequest) bool {
-				return acceptor(req.Source, req.Upstream)
-			},
-			handle: func(req api.UpstreamConnectRequest) (net.Conn, error) {
-				return handler(req.Source, req.Upstream)
-			},
+			pluginID: pluginRecord.ID, artifactID: artifact.ID, priority: pluginRecord.Priority,
+			handlerID: "upstream.connect/v2", handle: hook,
 		})
 	}
 	return handlers
-}
-
-func upstreamModeFromArtifact(artifact ArtifactRecord) string {
-	var summary CapabilitySummary
-	if err := json.Unmarshal([]byte(artifact.CapabilitiesSummaryJSON), &summary); err == nil {
-		switch summary.UpstreamConnect.Mode {
-		case UpstreamModeProtocolProxy:
-			return UpstreamModeProtocolProxy
-		case UpstreamModeDialer:
-			return UpstreamModeDialer
-		}
-	}
-	return UpstreamModeDialer
 }
 
 func requiredRuntimeCapabilities(artifact ArtifactRecord) []string {
@@ -3442,7 +3447,7 @@ func stringSliceContainsValue(values []string, want string) bool {
 	return false
 }
 
-func (h *upstreamHandler) invoke(req api.UpstreamConnectRequest) (conn net.Conn, err error) {
+func (h *upstreamHandler) invoke(req api.UpstreamConnectRequestV2) (err error) {
 	h.calls.Add(1)
 	start := time.Now()
 	defer func() {
@@ -3456,176 +3461,16 @@ func (h *upstreamHandler) invoke(req api.UpstreamConnectRequest) (conn net.Conn,
 			}
 		}
 	}()
-	ctx := req.Context
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if h.timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, h.timeout)
-		defer cancel()
-	}
-	req.Context = ctx
-
-	done := make(chan result, 1)
-	go func() {
-		defer func() {
-			if rec := recover(); rec != nil {
-				h.panics.Add(1)
-				done <- result{err: fmt.Errorf("plugin %s panic: %v", h.pluginID, rec)}
-			}
-		}()
-		conn, err := h.handle(req)
-		done <- result{conn: conn, err: err}
-	}()
-
-	select {
-	case <-ctx.Done():
-		h.timeouts.Add(1)
-		go closeLateConn(done)
-		return nil, ctx.Err()
-	case result := <-done:
-		if errors.Is(result.err, api.ErrBlocked) {
-			h.blocked.Add(1)
-		}
-		if result.err != nil && !errors.Is(result.err, api.ErrPass) {
-			h.errors.Add(1)
-		}
-		return result.conn, result.err
-	}
-}
-
-type result struct {
-	conn net.Conn
-	err  error
-}
-
-func closeLateConn(done <-chan result) {
-	result := <-done
-	if result.conn != nil {
-		_ = result.conn.Close()
-	}
-}
-
-type proxyCopyResult struct {
-	toPlugin bool
-	bytes    int64
-	err      error
-}
-
-type closeWriter interface {
-	CloseWrite() error
-}
-
-type closeReader interface {
-	CloseRead() error
-}
-
-func runProtocolProxy(ctx context.Context, handle *ProxyConnectionHandle, client, endpoint net.Conn, initialBytesToPlugin int64) {
-	start := time.Now()
-	defer client.Close()
-	defer endpoint.Close()
-	done := make(chan proxyCopyResult, 2)
-	stopContext := make(chan struct{})
-	if ctx != nil {
-		go func() {
-			select {
-			case <-ctx.Done():
-				_ = client.Close()
-				_ = endpoint.Close()
-			case <-stopContext:
-			}
-		}()
-	}
-	if signaler, ok := endpoint.(interface{ ProxyCloseSignal() <-chan struct{} }); ok {
-		go func() {
-			select {
-			case <-signaler.ProxyCloseSignal():
-				_ = client.Close()
-				_ = endpoint.Close()
-			case <-stopContext:
-			}
-		}()
-	}
-
-	go copyProtocolProxy(endpoint, client, true, done)
-	go copyProtocolProxy(client, endpoint, false, done)
-
-	var stats ProxyConnectionStats
-	stats.BytesToPlugin = initialBytesToPlugin
-	for i := 0; i < 2; i++ {
-		result := <-done
-		if result.toPlugin {
-			stats.BytesToPlugin += result.bytes
-		} else {
-			stats.BytesToClient += result.bytes
-		}
-		if result.err != nil && !errors.Is(result.err, io.EOF) && stats.Err == nil {
-			stats.Err = result.err
-		}
-	}
-	close(stopContext)
-	stats.Duration = time.Since(start)
-	handle.Finish(stats)
-}
-
-func copyProtocolProxy(dst io.Writer, src io.Reader, toPlugin bool, done chan<- proxyCopyResult) {
-	result := proxyCopyResult{toPlugin: toPlugin}
 	defer func() {
 		if rec := recover(); rec != nil {
-			result.err = fmt.Errorf("protocol-proxy copy panic: %v", rec)
-		}
-		closeRead(src)
-		if toPlugin {
-			closeWriteOnly(dst)
-		} else {
-			closeWrite(dst)
-		}
-		done <- result
-	}()
-	result.bytes, result.err = copyForward(dst, src)
-}
-
-func copyForward(dst io.Writer, src io.Reader) (int64, error) {
-	return io.Copy(dst, src)
-}
-
-func writeAll(w io.Writer, buf []byte) error {
-	for len(buf) > 0 {
-		n, err := w.Write(buf)
-		if n > 0 {
-			buf = buf[n:]
+			h.panics.Add(1)
+			err = fmt.Errorf("plugin %s panic: %v", h.pluginID, rec)
 		}
 		if err != nil {
-			return err
+			h.errors.Add(1)
 		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
-	}
-	return nil
-}
-
-func closeWrite(conn any) {
-	if closer, ok := conn.(closeWriter); ok {
-		_ = closer.CloseWrite()
-		return
-	}
-	if closer, ok := conn.(io.Closer); ok {
-		_ = closer.Close()
-	}
-}
-
-func closeWriteOnly(conn any) {
-	if closer, ok := conn.(closeWriter); ok {
-		_ = closer.CloseWrite()
-	}
-}
-
-func closeRead(conn any) {
-	if closer, ok := conn.(closeReader); ok {
-		_ = closer.CloseRead()
-	}
+	}()
+	return h.handle(req)
 }
 
 func validateConfigSchema(schema json.RawMessage, configJSON string) error {
@@ -4031,33 +3876,31 @@ func flattenHandlers(byPlugin map[string][]*upstreamHandler) []*upstreamHandler 
 func handlerSummaries(handlers []*upstreamHandler) []DispatchHandlerSummary {
 	summaries := make([]DispatchHandlerSummary, 0, len(handlers))
 	for _, handler := range handlers {
-		lastProxyError, _ := handler.lastProxyError.Load().(string)
+		lastSessionError, _ := handler.lastSessionError.Load().(string)
 		summaries = append(summaries, DispatchHandlerSummary{
-			PluginID:         handler.pluginID,
-			ArtifactID:       handler.artifactID,
-			Priority:         handler.priority,
-			HandlerID:        handler.handlerID,
-			ExtensionPoint:   ExtensionUpstreamConnect,
-			Mode:             handler.mode,
-			TimeoutMS:        handler.timeout.Milliseconds(),
-			Calls:            handler.calls.Load(),
-			Errors:           handler.errors.Load(),
-			Panics:           handler.panics.Load(),
-			Timeouts:         handler.timeouts.Load(),
-			Blocked:          handler.blocked.Load(),
-			ActiveProxy:      handler.activeProxy.Load(),
-			DrainingProxy:    handler.drainingProxy.Load(),
-			ProxyStarted:     handler.proxyStarted.Load(),
-			ProxyCompleted:   handler.proxyCompleted.Load(),
-			ProxyForceClosed: handler.proxyForceClosed.Load(),
-			ProxyErrors:      handler.proxyErrors.Load(),
-			LastProxyError:   lastProxyError,
-			ProxyBytesIn:     handler.proxyBytesIn.Load(),
-			ProxyBytesOut:    handler.proxyBytesOut.Load(),
-			ProxyDurationMS:  handler.proxyDuration.Load(),
-			DurationCount:    handler.durationCount.Load(),
-			DurationSumMS:    handler.durationSumMS.Load(),
-			DurationMaxMS:    handler.durationMaxMS.Load(),
+			PluginID:                      handler.pluginID,
+			ArtifactID:                    handler.artifactID,
+			Priority:                      handler.priority,
+			HandlerID:                     handler.handlerID,
+			ExtensionPoint:                ExtensionUpstreamConnect,
+			Mode:                          "connection-takeover",
+			TimeoutMS:                     0,
+			Calls:                         handler.calls.Load(),
+			Errors:                        handler.errors.Load(),
+			Panics:                        handler.panics.Load(),
+			Timeouts:                      handler.timeouts.Load(),
+			Blocked:                       handler.blocked.Load(),
+			ActiveSessions:                handler.activeSessions.Load(),
+			DrainingSessions:              handler.drainingSessions.Load(),
+			ConnectionSessionsStarted:     handler.sessionsStarted.Load(),
+			ConnectionSessionsCompleted:   handler.sessionsCompleted.Load(),
+			ConnectionSessionsForceClosed: handler.sessionsForceClosed.Load(),
+			ConnectionSessionErrors:       handler.sessionErrors.Load(),
+			LastSessionError:              lastSessionError,
+			ConnectionSessionDurationMS:   handler.sessionDuration.Load(),
+			DurationCount:                 handler.durationCount.Load(),
+			DurationSumMS:                 handler.durationSumMS.Load(),
+			DurationMaxMS:                 handler.durationMaxMS.Load(),
 		})
 	}
 	return summaries

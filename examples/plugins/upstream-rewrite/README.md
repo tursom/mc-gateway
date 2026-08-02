@@ -1,9 +1,9 @@
 # Upstream Rewrite Plugin
 
-This example registers `upstream.connect/v1` in dialer mode. When `match_host`
-matches either the Minecraft hostname or the resolved upstream string, it dials
-the configured `upstream` and returns that connection. Non-matching connections
-return `api.ErrPass`.
+This example registers `route.resolve/v1`. When `match_host` matches the
+Minecraft hostname, it returns an override decision for the configured
+`upstream`. Non-matching requests return a pass decision so SQLite routing can
+continue.
 
 Build and package:
 

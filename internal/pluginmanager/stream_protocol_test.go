@@ -1,11 +1,15 @@
 package pluginmanager
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestStreamProxyV1ContractDeclaresRequiredSemantics(t *testing.T) {
@@ -23,6 +27,67 @@ func TestStreamProxyV1ContractDeclaresRequiredSemantics(t *testing.T) {
 		if !strings.Contains(capabilities, StreamProxyProtocolV1+"."+want) {
 			t.Fatalf("StreamProxyCapabilities() = %v, missing %s", capabilities, want)
 		}
+	}
+}
+
+func TestRelayTakeoverStreamPreservesHalfCloseAndBackpressure(t *testing.T) {
+	root, client := newTestTCPConnPair(t)
+	endpoint, plugin := newTestTCPConnPair(t)
+	defer client.Close()
+	defer plugin.Close()
+	done := make(chan struct{})
+	go func() {
+		relayTakeoverStream(root, endpoint)
+		close(done)
+	}()
+
+	payload := bytes.Repeat([]byte("x"), 512*1024)
+	received := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, 4096)
+		var out []byte
+		for {
+			n, err := plugin.Read(buf)
+			out = append(out, buf[:n]...)
+			if err != nil {
+				received <- out
+				return
+			}
+			time.Sleep(100 * time.Microsecond)
+		}
+	}()
+	if _, err := client.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-received:
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("relayed bytes = %d, want %d", len(got), len(payload))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("slow reader did not receive half-closed payload")
+	}
+
+	if _, err := plugin.Write([]byte("reply")); err != nil {
+		t.Fatal(err)
+	}
+	if err := plugin.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	reply, err := io.ReadAll(client)
+	if err != nil && !errors.Is(err, io.EOF) {
+		t.Fatal(err)
+	}
+	if string(reply) != "reply" {
+		t.Fatalf("reply = %q, want reply", reply)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("relay did not finish after both half-closes")
 	}
 }
 

@@ -1,3 +1,5 @@
+> **Archived:** This document records the superseded pre-v2 plugin design. Current behavior is defined by `docs/plugin-development/extension-points.md`.
+
 # 插件开发工具链设计
 
 本文定义插件开发工具链的功能需求和实现边界。目标是让插件作者从新建、开发、测试、打包到发布前检查都使用同一套 `gateway plugin` CLI，而不是在每个示例插件里维护重复脚本。
@@ -100,7 +102,7 @@
 ### 新插件开发
 
 ```sh
-gateway plugin init ./my-plugin --id my-plugin --template upstream-dialer --module example.com/my-plugin
+gateway plugin init ./my-plugin --id my-plugin --template takeover --module example.com/my-plugin
 cd ./my-plugin
 gateway plugin validate .
 gateway plugin test .
@@ -183,8 +185,7 @@ promotion bundle 默认不包含 secret 明文、secret 密文和 runtime state�
 
 | 模板 | runtime | extension point | 说明 |
 | --- | --- | --- | --- |
-| `upstream-dialer` | `go-plugin` | `upstream.connect/v1` | 最小 dialer mode 模板 |
-| `protocol-proxy` | `go-plugin` | `upstream.connect/v1` | 最小 Minecraft protocol-proxy 模板 |
+| `takeover` | `go-plugin` | `upstream.connect/v2` | 最小客户端连接接管模板 |
 | `empty-go` | `go-plugin` | 无默认 handler | 用于自定义实验 |
 
 预留模板：
@@ -313,8 +314,8 @@ type PluginBuildAdapter interface {
 
 第一版 harness 覆盖：
 
-- `upstream.connect/v1` dialer mode：匹配 host、返回 `api.ErrPass`、返回自管 conn、错误传播。
-- `upstream.connect/v1` protocol-proxy mode：initial data replay、handshake/login packet fixture、disconnect/kick 响应、读写关闭。
+- `route.resolve/v1` provider：匹配 host、返回 override/pass/reject 决策并验证错误传播。
+- `upstream.connect/v2` takeover：验证 Next/Core、替换流字节完整性、handshake/login packet、拒绝、panic、取消和半关闭。
 - config：`ReloadConfig()` 成功、失败、默认值和 schema 校验。
 - lifecycle：`Init()`、`Destroy()` 幂等、handler timeout、panic recover。
 
@@ -354,7 +355,7 @@ type PluginBuildAdapter interface {
 | `gateway plugin upload <artifact.mcgp>` | 上传 artifact/source package，返回 artifact ID、sha256 和校验摘要 |
 | `gateway plugin status [plugin-id]` | 展示 desired/runtime state、active/desired/loaded artifact、recent error 和 restart required |
 | `gateway plugin enable <plugin-id>` | 设置 desired enabled，支持 `--artifact`、`--config`、`--profile`、`--priority` |
-| `gateway plugin disable <plugin-id>` | 设置 desired disabled，protocol-proxy 连接按策略 drain 或 force close |
+| `gateway plugin disable <plugin-id>` | 设置 desired disabled，connection takeover 连接按策略 drain 或 force close |
 | `gateway plugin delete <plugin-id>` | 删除 desired state 或 artifact，支持保留/删除数据选项 |
 | `gateway plugin rollback <plugin-id>` | 回滚 artifact 或 config snapshot，并重新执行当前基础门禁 |
 | `gateway plugin config validate <plugin-id>` | 校验 config JSON、schema、secret ref 和 `ReloadConfig()` dry-run |
@@ -385,7 +386,7 @@ type PluginBuildAdapter interface {
 | --- | --- |
 | `gateway plugin logs <plugin-id>` | 查看插件日志摘要，支持 tail、时间范围、trace ID 和脱敏 |
 | `gateway plugin events <plugin-id>` | 查看插件业务事件、drop/dead-letter 摘要和 replay/drop 操作 |
-| `gateway plugin metrics <plugin-id>` | 查看 handler calls、duration、panic、timeout、active proxy connections 和 custom metrics |
+| `gateway plugin metrics <plugin-id>` | 查看 handler calls、duration、panic、connection sessions 和 custom metrics |
 | `gateway plugin diagnose <plugin-id>` | 生成诊断包，包含 manifest、state、recent logs/events/metrics/build summary，不含 secret 明文 |
 | `gateway plugin task list/run/cancel <plugin-id>` | 查看、手动触发或取消 background task |
 | `gateway plugin external list/health-check <plugin-id>` | 查看外部依赖状态，或触发单个声明依赖的受控健康检查 |
@@ -481,7 +482,7 @@ CI 产物应至少保存：
 
 建议按以下顺序实现：
 
-1. 增加 `gateway plugin init`，生成 `upstream-dialer` 和 `protocol-proxy` Go 模板。
+1. 增加 `gateway plugin init`，生成 `takeover` Go 模板。
 2. 增加 `gateway plugin build` 的 Go plugin binary/source 打包能力，复用现有 artifact 校验逻辑。
 3. 用 `gateway plugin build` 替换示例插件 `build.sh` 和 `cmd/render-manifest` 主路径。
 4. 增加 `gateway plugin test` 的 unit、manifest 和 upstream harness profile。
@@ -493,8 +494,8 @@ CI 产物应至少保存：
 
 ## 验收标准
 
-- 新建 `upstream-dialer` 模板后，不手写额外脚本即可 build/test/validate。
-- 新建 `protocol-proxy` 模板后，能跑通 Minecraft handshake/login smoke fixture。
+- 新建 `takeover` 模板后，不手写额外脚本即可 build/test/validate。
+- 新建 `connection takeover` 模板后，能跑通 Minecraft handshake/login smoke fixture。
 - `upstream-rewrite` 和 `mc-auth-proxy` 示例插件使用标准 CLI 生成 binary/source `.mcgp`。
 - 生成的 `.mcgp` 能通过现有上传和服务端校验。
 - manifest source 与 Go 代码不重复维护插件元数据。

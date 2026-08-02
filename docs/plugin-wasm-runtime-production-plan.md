@@ -1,3 +1,5 @@
+> **Archived:** This document records the superseded pre-v2 plugin design. Current behavior is defined by `docs/plugin-development/extension-points.md`.
+
 # WASM 运行时生产可用化实施计划
 
 返回：[运行时和未来能力](plugin-development/runtimes-and-future.md)
@@ -15,14 +17,14 @@
    - `implemented=true`
    - `maturity=partial`
    - `data_plane=true`
-   - `unsupported_reason` 明确列出不支持 protocol-proxy、任意网络、文件和高风险 extension point。
+   - `unsupported_reason` 明确列出不支持 connection takeover、任意网络、文件和高风险 extension point。
 3. WASM 插件能通过 manifest、preflight、governance、conformance、enable、disable、rollback、status、diagnostics 和 audit 的完整路径。
 4. WASM 的 failure containment 可验证：timeout、trap、memory exceeded、bad output、ABI mismatch 只影响当前调用或当前插件，不影响 gateway 主路径。
 5. 默认安全边界保持最小权限：无文件、无网络、无环境变量、无 secret value 注入。
 
 ## 非目标
 
-- 不支持 `upstream.connect/v1` protocol-proxy。
+- 不支持 `legacy upstream-connect contract` connection takeover。
 - 不支持直接返回或持有 Go `net.Conn`。
 - 不支持任意 TCP/UDP 网络访问。
 - 不支持任意文件系统访问。
@@ -56,7 +58,7 @@
    - 不再因为 service mode 不是 `sandbox-process` 阻断 WASM。
    - 继续阻断无法强制的 `runtime.required_capabilities`。
    - 继续阻断高风险 extension point。
-4. 确认 Admin runtime panel 和 CLI feature 输出不会把 WASM 说成支持网络、文件或 protocol-proxy。
+4. 确认 Admin runtime panel 和 CLI feature 输出不会把 WASM 说成支持网络、文件或 connection takeover。
 
 验收：
 
@@ -174,7 +176,7 @@
 
 1. extension point 白名单：
    - 第一版只允许 `config.validate/v1`、`rule.evaluate/v1`、`route.resolve/v1`。
-   - 阻断 `upstream.connect/v1`、`status.ping/v1`、provider、ingress、event subscriber。
+   - 阻断 `legacy upstream-connect contract`、`status.ping/v1`、provider、ingress、event subscriber。
 2. capability policy：
    - 任意文件、网络、env、secret env capability 均 blocking。
    - 未来 secret 只能通过显式 host ABI handle，并需要单独设计。

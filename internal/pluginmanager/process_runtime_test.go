@@ -3,6 +3,7 @@ package pluginmanager
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -18,117 +19,396 @@ import (
 	"github.com/tursom/mc-gateway/plugin/api"
 )
 
-func TestGoPluginProcessProtocolProxyBridgeDrainsAndStopsHost(t *testing.T) {
+func buildProcessTakeoverPlugin(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	repoRoot, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	goMod := "module example.com/process-takeover\n\ngo 1.24.0\n\nrequire github.com/tursom/mc-gateway v0.0.0\n\nreplace github.com/tursom/mc-gateway => " + filepath.ToSlash(repoRoot) + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(goMod), 0644); err != nil {
+		t.Fatal(err)
+	}
+	source := `package main
+import (
+	"errors"
+	"io"
+	"net"
+	"github.com/tursom/mc-gateway/plugin/api"
+)
+type pluginImpl struct{ api.AbstractPlugin }
+type replayConn struct { net.Conn; prefix []byte }
+func (c *replayConn) Read(p []byte) (int, error) {
+	n := copy(p, c.prefix)
+	c.prefix = c.prefix[n:]
+	if n > 0 { return n, nil }
+	r, err := c.Conn.Read(p[n:])
+	if n+r > 0 && errors.Is(err, io.EOF) { err = nil }
+	return n+r, err
+}
+func (c *replayConn) CloseWrite() error {
+	if closer, ok := c.Conn.(interface{ CloseWrite() error }); ok { return closer.CloseWrite() }
+	return c.Conn.Close()
+}
+func (c *replayConn) CloseRead() error {
+	if closer, ok := c.Conn.(interface{ CloseRead() error }); ok { return closer.CloseRead() }
+	return nil
+}
+func Plugin() api.Plugin { return &pluginImpl{} }
+func (p *pluginImpl) Init(g api.Gateway) error {
+	return api.RegisterUpstreamConnectHandlerV2(g, func(req api.UpstreamConnectRequestV2) error {
+		mode := make([]byte, 1)
+		if _, err := io.ReadFull(req.Connection.Stream, mode); err != nil { return err }
+		if mode[0] == 'H' {
+			_, err := req.Connection.Stream.Write([]byte("handled"))
+			return err
+		}
+		if mode[0] == 'F' {
+			if _, err := io.ReadAll(req.Connection.Stream); err != nil { return err }
+			_, err := req.Connection.Stream.Write([]byte("handled-half"))
+			return err
+		}
+		if mode[0] == 'B' {
+			_, err := io.ReadAll(req.Connection.Stream)
+			return err
+		}
+		state := req.Connection
+		state.Stream = &replayConn{Conn: req.Connection.Stream, prefix: mode}
+		state.EffectiveSourceAddr = "198.51.100.9:0"
+		state.Metadata = map[string]string{"runtime":"process"}
+		switch mode[0] {
+		case 'N': return req.Flow.Next(state)
+		case 'C': return req.Flow.Core(state)
+		default: return errors.New("unknown action")
+		}
+	})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(source), 0644); err != nil {
+		t.Fatal(err)
+	}
+	tidyProcessPluginModule(t, dir)
+	pluginPath := filepath.Join(dir, "plugin.so")
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "build", "-buildmode=plugin", "-o", pluginPath, ".")
+	cmd.Dir, cmd.Env = dir, append(os.Environ(), "GOWORK=off")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build process takeover plugin: %v\n%s", err, output)
+	}
+	return pluginPath
+}
+
+func TestGoPluginProcessTakeoverConformance(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		t.Skip("plugin-host stream bridge uses Unix-domain sockets")
+		t.Skip("plugin-host supervisor uses Unix-domain sockets")
 	}
 	gatewayBinary := buildGatewayProcessTestBinary(t)
-	pluginPath := buildProcessProtocolProxyPlugin(t)
-	pluginBytes, err := os.ReadFile(pluginPath)
+	pluginBytes, err := os.ReadFile(buildProcessTakeoverPlugin(t))
 	if err != nil {
-		t.Fatalf("ReadFile(plugin) error = %v", err)
+		t.Fatal(err)
 	}
-
 	manager := newManagerForTest(t, nil)
 	manager.serviceMode = PluginServiceModeGoPluginProcess
 	manager.adapter = GoPluginProcessAdapter{Supervisor: PluginHostSupervisor{
-		Executable:   gatewayBinary,
-		RuntimeDir:   shortProcessRuntimeDir(t),
-		Protocol:     PluginHostProtocol,
-		StartTimeout: 5 * time.Second,
+		Executable: gatewayBinary, RuntimeDir: shortProcessRuntimeDir(t), Protocol: PluginHostProtocol, StartTimeout: 5 * time.Second,
 	}}
 	manager.adapterManaged = true
-
-	artifact := uploadTestArtifactWithManifestBytes(t, manager, "process-proxy", pluginBytes, func(manifest *Manifest) {
-		manifest.Capabilities = testProtocolProxyCapabilities()
-	})
-	if _, err := manager.SetDesired(context.Background(), "admin", "process-proxy", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
-		t.Fatalf("SetDesired() error = %v", err)
+	artifact := uploadTestArtifactWithManifestBytes(t, manager, "process-takeover", pluginBytes, nil)
+	if _, err := manager.SetDesired(context.Background(), "admin", artifact.PluginID, artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatal(err)
 	}
-	approveGovernanceForTest(t, manager, "process-proxy", artifact.ID)
-	if _, err := manager.Enable(context.Background(), "admin", "process-proxy"); err != nil {
-		t.Fatalf("Enable() error = %v", err)
+	approveGovernanceForTest(t, manager, artifact.PluginID, artifact.ID)
+	if _, err := manager.Enable(context.Background(), "admin", artifact.PluginID); err != nil {
+		t.Fatal(err)
 	}
 
-	clientGateway, clientSide := net.Pipe()
-	defer clientSide.Close()
-	initial := []byte("initial")
-	errCh := make(chan error, 1)
-	go func() {
-		_, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{
-			Host:        "play.example",
-			Upstream:    "backend",
-			Source:      clientGateway,
-			InitialData: initial,
-			SourceAddr:  "client.example:25565",
+	value := manager.snapshot.Load()
+	processHandlers := value.([]*upstreamHandler)
+	if len(processHandlers) != 1 {
+		t.Fatalf("process handlers = %d, want 1", len(processHandlers))
+	}
+	secondCalled := false
+	second := &upstreamHandler{pluginID: "second", priority: 20, handlerID: "second", handle: func(req api.UpstreamConnectRequestV2) error {
+		secondCalled = true
+		return req.Flow.Next(req.Connection)
+	}}
+	manager.publish([]*upstreamHandler{processHandlers[0], second})
+
+	for _, test := range []struct {
+		name       string
+		payload    string
+		wantReply  string
+		wantSecond bool
+		wantCore   bool
+	}{
+		{name: "next replacement", payload: "Ndata", wantReply: "core", wantSecond: true, wantCore: true},
+		{name: "core bypass", payload: "Cdata", wantReply: "core", wantSecond: false, wantCore: true},
+		{name: "handled", payload: "H", wantReply: "handled", wantSecond: false, wantCore: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			secondCalled = false
+			root, client := net.Pipe()
+			defer root.Close()
+			defer client.Close()
+			coreCalled := false
+			done := make(chan error, 1)
+			go func() {
+				done <- manager.HandleConnection(context.Background(), takeoverRequest(root), func(_ context.Context, state api.ConnectionState) error {
+					coreCalled = true
+					if state.EffectiveSourceAddr != "198.51.100.9:0" || state.Metadata["runtime"] != "process" {
+						return fmt.Errorf("replacement state = %+v", state)
+					}
+					data := make([]byte, len(test.payload))
+					if _, err := io.ReadFull(state.Stream, data); err != nil {
+						return err
+					}
+					if string(data) != test.payload {
+						return fmt.Errorf("core bytes = %q, want %q", data, test.payload)
+					}
+					_, err := state.Stream.Write([]byte("core"))
+					return err
+				})
+			}()
+			if _, err := client.Write([]byte(test.payload)); err != nil {
+				t.Fatal(err)
+			}
+			reply := make([]byte, len(test.wantReply))
+			if _, err := io.ReadFull(client, reply); err != nil {
+				t.Fatal(err)
+			}
+			_ = client.Close()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("takeover chain did not finish")
+			}
+			if string(reply) != test.wantReply || secondCalled != test.wantSecond || coreCalled != test.wantCore {
+				t.Fatalf("reply=%q second=%v core=%v", reply, secondCalled, coreCalled)
+			}
 		})
-		errCh <- err
-	}()
+	}
 
-	writeDone := make(chan error, 1)
-	go func() {
-		_, err := clientSide.Write([]byte("next"))
-		writeDone <- err
-	}()
-	select {
-	case err := <-writeDone:
-		if err != nil {
-			t.Fatalf("client write error = %v", err)
+	t.Run("half-close backpressure and byte integrity", func(t *testing.T) {
+		root, client := newTestTCPConnPair(t)
+		defer root.Close()
+		defer client.Close()
+		payload := append([]byte{'N'}, bytes.Repeat([]byte("x"), 512*1024)...)
+		done := make(chan error, 1)
+		go func() {
+			done <- manager.HandleConnection(context.Background(), takeoverRequest(root), func(_ context.Context, state api.ConnectionState) error {
+				var received []byte
+				buf := make([]byte, 4096)
+				for {
+					n, err := state.Stream.Read(buf)
+					received = append(received, buf[:n]...)
+					if err != nil {
+						if !errors.Is(err, io.EOF) {
+							return err
+						}
+						break
+					}
+					time.Sleep(100 * time.Microsecond)
+				}
+				if !bytes.Equal(received, payload) {
+					return fmt.Errorf("core bytes = %d, want %d", len(received), len(payload))
+				}
+				if _, err := state.Stream.Write([]byte("reply")); err != nil {
+					return err
+				}
+				if closer, ok := state.Stream.(interface{ CloseWrite() error }); ok {
+					return closer.CloseWrite()
+				}
+				return nil
+			})
+		}()
+		if _, err := client.Write(payload); err != nil {
+			t.Fatal(err)
 		}
-	case err := <-errCh:
-		t.Fatalf("ConnectUpstream() returned before client write: %v", err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("client write timed out waiting for process protocol-proxy reader")
-	}
-	response := make([]byte, len("ok:client.example:25565"))
-	if _, err := io.ReadFull(clientSide, response); err != nil {
-		t.Fatalf("client read response error = %v", err)
-	}
-	if !bytes.Equal(response, []byte("ok:client.example:25565")) {
-		t.Fatalf("plugin response = %q, want source-address response", response)
-	}
-	waitForProcessRuntimeTest(t, func() bool {
-		return manager.activeProxyCountLocked("process-proxy") == 1
+		if err := client.CloseWrite(); err != nil {
+			t.Fatal(err)
+		}
+		reply, err := io.ReadAll(client)
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("takeover error = %v; reply = %q", err, reply)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("half-closed process takeover did not finish")
+		}
+		if string(reply) != "reply" {
+			t.Fatalf("reply = %q, want reply", reply)
+		}
 	})
-	handler := manager.findHandler("process-proxy", "upstream.connect/v1")
-	if handler == nil {
-		t.Fatal("process-proxy handler not found")
-	}
 
-	disabled, err := manager.Disable(context.Background(), "admin", "process-proxy")
-	if err != nil {
-		t.Fatalf("Disable() error = %v", err)
-	}
-	if disabled.RuntimeState != RuntimeDraining {
-		t.Fatalf("disabled runtime state = %q, want draining while process proxy is active", disabled.RuntimeState)
-	}
-	summary := manager.hostSummary("process-proxy")
-	if summary.State != RuntimeDraining || summary.ExitedAt != 0 {
-		t.Fatalf("host summary after disable = %+v, want active draining host", summary)
-	}
-	pass, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{Host: "play.example", Upstream: "backend"})
-	if err != nil {
-		t.Fatalf("ConnectUpstream(after disable) error = %v", err)
-	}
-	if pass.Handled {
-		t.Fatalf("ConnectUpstream(after disable) = %+v, want pass-through", pass)
-	}
-
-	_ = clientSide.Close()
-	if err := <-errCh; err != nil {
-		t.Fatalf("ConnectUpstream() error = %v", err)
-	}
-	if got, want := handler.proxyBytesIn.Load(), uint64(len(initial)+len("next")); got != want {
-		t.Fatalf("process proxy bytes in = %d, want %d", got, want)
-	}
-	if got, want := handler.proxyBytesOut.Load(), uint64(len(response)); got != want {
-		t.Fatalf("process proxy bytes out = %d, want %d", got, want)
-	}
-	waitForProcessRuntimeTest(t, func() bool {
-		summary := manager.hostSummary("process-proxy")
-		return summary.State == RuntimeDisabled && summary.ExitedAt != 0
+	t.Run("handled half-close", func(t *testing.T) {
+		root, client := newTestTCPConnPair(t)
+		defer root.Close()
+		defer client.Close()
+		done := make(chan error, 1)
+		go func() {
+			done <- manager.HandleConnection(context.Background(), takeoverRequest(root), func(context.Context, api.ConnectionState) error {
+				return errors.New("core unexpectedly called")
+			})
+		}()
+		if _, err := client.Write([]byte("Fpayload")); err != nil {
+			t.Fatal(err)
+		}
+		if err := client.CloseWrite(); err != nil {
+			t.Fatal(err)
+		}
+		reply, err := io.ReadAll(client)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		if string(reply) != "handled-half" {
+			t.Fatalf("reply = %q, want handled-half", reply)
+		}
 	})
-	assertProcessExited(t, summary.PID)
+
+	t.Run("disable and force close replacement", func(t *testing.T) {
+		root, client := net.Pipe()
+		defer client.Close()
+		coreEntered := make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			done <- manager.HandleConnection(context.Background(), takeoverRequest(root), func(_ context.Context, state api.ConnectionState) error {
+				if _, err := io.ReadFull(state.Stream, make([]byte, 1)); err != nil {
+					return err
+				}
+				close(coreEntered)
+				_, err := state.Stream.Read(make([]byte, 1))
+				return err
+			})
+		}()
+		if _, err := client.Write([]byte("N")); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-coreEntered:
+		case err := <-done:
+			t.Fatalf("takeover returned before core: %v", err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("replacement stream did not reach core")
+		}
+		disabled, err := manager.Disable(context.Background(), "admin", artifact.PluginID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if disabled.RuntimeState != RuntimeDraining {
+			t.Fatalf("disabled runtime state = %q, want draining", disabled.RuntimeState)
+		}
+		closed, err := manager.ForceCloseDraining(context.Background(), "admin", artifact.PluginID)
+		if err != nil || closed != 1 {
+			t.Fatalf("ForceCloseDraining() = %d, %v", closed, err)
+		}
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("force close did not unwind process takeover")
+		}
+	})
+
+	t.Run("host crash closes active takeover", func(t *testing.T) {
+		if _, err := manager.Enable(context.Background(), "admin", artifact.PluginID); err != nil {
+			t.Fatal(err)
+		}
+		manager.mu.Lock()
+		process := manager.loaded[artifact.PluginID].runtime.HostProcess
+		manager.mu.Unlock()
+		if process == nil {
+			t.Fatal("re-enabled takeover runtime has no host process")
+		}
+		root, client := net.Pipe()
+		defer client.Close()
+		coreCalled := false
+		done := make(chan error, 1)
+		go func() {
+			err := manager.HandleConnection(context.Background(), takeoverRequest(root), func(context.Context, api.ConnectionState) error {
+				coreCalled = true
+				return nil
+			})
+			_ = root.Close()
+			done <- err
+		}()
+		if _, err := client.Write([]byte("B")); err != nil {
+			t.Fatal(err)
+		}
+		waitForProcessRuntimeTest(t, func() bool {
+			sessions, err := manager.ActiveConnectionSessions(context.Background(), artifact.PluginID)
+			return err == nil && len(sessions) == 1
+		})
+		if err := process.Kill(); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatal("active takeover returned nil after host crash")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("host crash did not unwind active takeover")
+		}
+		if coreCalled {
+			t.Fatal("host crash entered core")
+		}
+		if _, err := client.Read(make([]byte, 1)); err == nil {
+			t.Fatal("client connection remained open after host crash")
+		}
+	})
+}
+
+func buildProcessPIDRecordingPlugin(t *testing.T, pidPath string) string {
+	t.Helper()
+	dir := t.TempDir()
+	repoRoot, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	goMod := "module example.com/process-pid\n\ngo 1.24.0\n\nrequire github.com/tursom/mc-gateway v0.0.0\n\nreplace github.com/tursom/mc-gateway => " + filepath.ToSlash(repoRoot) + "\n"
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(goMod), 0644); err != nil {
+		t.Fatal(err)
+	}
+	source := fmt.Sprintf(`package main
+import (
+	"fmt"
+	"os"
+	"github.com/tursom/mc-gateway/plugin/api"
+)
+func init() {
+	f, err := os.OpenFile(%q, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err == nil { _, _ = fmt.Fprintf(f, "%%d\n", os.Getpid()); _ = f.Close() }
+}
+type pluginImpl struct{ api.AbstractPlugin }
+func Plugin() api.Plugin { return &pluginImpl{} }
+func (p *pluginImpl) Init(g api.Gateway) error {
+	return api.RegisterUpstreamConnectHandlerV2(g, func(api.UpstreamConnectRequestV2) error { return nil })
+}
+`, pidPath)
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(source), 0644); err != nil {
+		t.Fatal(err)
+	}
+	tidyProcessPluginModule(t, dir)
+	pluginPath := filepath.Join(dir, "plugin.so")
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "go", "build", "-buildmode=plugin", "-o", pluginPath, ".")
+	cmd.Dir, cmd.Env = dir, append(os.Environ(), "GOWORK=off")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build process pid plugin: %v\n%s", err, output)
+	}
+	return pluginPath
 }
 
 func TestGoPluginProcessDoesNotOpenPluginInGatewayProcess(t *testing.T) {
@@ -195,175 +475,6 @@ func TestGoPluginProcessDoesNotOpenPluginInGatewayProcess(t *testing.T) {
 		return summary.State == RuntimeDisabled && summary.ExitedAt != 0
 	})
 	assertProcessExited(t, summary.PID)
-}
-
-func TestGoPluginProcessUpstreamDialerBridgeUsesHostProcess(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("plugin-host stream bridge uses Unix-domain sockets")
-	}
-	gatewayBinary := buildGatewayProcessTestBinary(t)
-	pluginPath := buildProcessDialerPlugin(t)
-	pluginBytes, err := os.ReadFile(pluginPath)
-	if err != nil {
-		t.Fatalf("ReadFile(plugin) error = %v", err)
-	}
-
-	manager := newManagerForTest(t, nil)
-	manager.serviceMode = PluginServiceModeGoPluginProcess
-	manager.adapter = GoPluginProcessAdapter{Supervisor: PluginHostSupervisor{
-		Executable:   gatewayBinary,
-		RuntimeDir:   shortProcessRuntimeDir(t),
-		Protocol:     PluginHostProtocol,
-		StartTimeout: 5 * time.Second,
-	}}
-	manager.adapterManaged = true
-
-	artifact := uploadTestArtifactWithManifestBytes(t, manager, "process-dialer", pluginBytes, nil)
-	if _, err := manager.SetDesired(context.Background(), "admin", "process-dialer", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
-		t.Fatalf("SetDesired() error = %v", err)
-	}
-	approveGovernanceForTest(t, manager, "process-dialer", artifact.ID)
-	if _, err := manager.Enable(context.Background(), "admin", "process-dialer"); err != nil {
-		t.Fatalf("Enable() error = %v", err)
-	}
-	summary := manager.hostSummary("process-dialer")
-	hostPID := summary.PID
-	if hostPID == 0 || hostPID == os.Getpid() {
-		t.Fatalf("host summary = %+v, want child plugin-host PID", summary)
-	}
-
-	result, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{
-		Host:       "play.example",
-		Upstream:   "backend",
-		SourceAddr: "client.example:25565",
-	})
-	if err != nil {
-		t.Fatalf("ConnectUpstream() error = %v", err)
-	}
-	if !result.Handled || result.Mode != UpstreamModeDialer || result.Conn == nil || result.Proxied {
-		t.Fatalf("ConnectUpstream() = %+v, want dialer bridge conn", result)
-	}
-	defer result.Conn.Close()
-	if _, err := result.Conn.Write([]byte("ping")); err != nil {
-		t.Fatalf("dialer bridge write error = %v", err)
-	}
-	response := make([]byte, len("pong:client.example:25565"))
-	if _, err := io.ReadFull(result.Conn, response); err != nil {
-		t.Fatalf("dialer bridge read error = %v", err)
-	}
-	if !bytes.Equal(response, []byte("pong:client.example:25565")) {
-		t.Fatalf("dialer bridge response = %q, want source-address response", response)
-	}
-
-	if _, err := manager.Disable(context.Background(), "admin", "process-dialer"); err != nil {
-		t.Fatalf("Disable() error = %v", err)
-	}
-	waitForProcessRuntimeTest(t, func() bool {
-		summary := manager.hostSummary("process-dialer")
-		return summary.State == RuntimeDisabled && summary.ExitedAt != 0
-	})
-	assertProcessExited(t, hostPID)
-}
-
-func TestGoPluginProcessProtocolProxyForceCloseStopsDrainingHost(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("plugin-host stream bridge uses Unix-domain sockets")
-	}
-	gatewayBinary := buildGatewayProcessTestBinary(t)
-	pluginPath := buildProcessProtocolProxyPlugin(t)
-	pluginBytes, err := os.ReadFile(pluginPath)
-	if err != nil {
-		t.Fatalf("ReadFile(plugin) error = %v", err)
-	}
-
-	manager := newManagerForTest(t, nil)
-	manager.serviceMode = PluginServiceModeGoPluginProcess
-	manager.adapter = GoPluginProcessAdapter{Supervisor: PluginHostSupervisor{
-		Executable:   gatewayBinary,
-		RuntimeDir:   shortProcessRuntimeDir(t),
-		Protocol:     PluginHostProtocol,
-		StartTimeout: 5 * time.Second,
-	}}
-	manager.adapterManaged = true
-
-	artifact := uploadTestArtifactWithManifestBytes(t, manager, "process-proxy-force", pluginBytes, func(manifest *Manifest) {
-		manifest.Capabilities = testProtocolProxyCapabilities()
-	})
-	if _, err := manager.SetDesired(context.Background(), "admin", "process-proxy-force", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
-		t.Fatalf("SetDesired() error = %v", err)
-	}
-	approveGovernanceForTest(t, manager, "process-proxy-force", artifact.ID)
-	if _, err := manager.Enable(context.Background(), "admin", "process-proxy-force"); err != nil {
-		t.Fatalf("Enable() error = %v", err)
-	}
-	summary := manager.hostSummary("process-proxy-force")
-	hostPID := summary.PID
-	if hostPID == 0 {
-		t.Fatalf("host summary before drain = %+v, want process pid", summary)
-	}
-
-	clientGateway, clientSide := net.Pipe()
-	defer clientSide.Close()
-	errCh := make(chan error, 1)
-	go func() {
-		_, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{
-			Host:        "play.example",
-			Upstream:    "backend",
-			Source:      clientGateway,
-			InitialData: []byte("initial"),
-			SourceAddr:  "client.example:25565",
-		})
-		errCh <- err
-	}()
-	if _, err := clientSide.Write([]byte("next")); err != nil {
-		t.Fatalf("client write error = %v", err)
-	}
-	response := make([]byte, len("ok:client.example:25565"))
-	if _, err := io.ReadFull(clientSide, response); err != nil {
-		t.Fatalf("client read response error = %v", err)
-	}
-	waitForProcessRuntimeTest(t, func() bool {
-		return manager.activeProxyCountLocked("process-proxy-force") == 1
-	})
-	handler := manager.findHandler("process-proxy-force", "upstream.connect/v1")
-	if handler == nil {
-		t.Fatal("process-proxy-force handler not found")
-	}
-	if _, err := manager.Disable(context.Background(), "admin", "process-proxy-force"); err != nil {
-		t.Fatalf("Disable() error = %v", err)
-	}
-	active, err := manager.ActiveProxyConnections(context.Background(), "process-proxy-force")
-	if err != nil {
-		t.Fatalf("ActiveProxyConnections() error = %v", err)
-	}
-	if len(active) != 1 || !active[0].Draining || active[0].ForceCloseRequested {
-		t.Fatalf("active proxy after disable = %+v, want one draining connection", active)
-	}
-	closed, err := manager.ForceCloseDraining(context.Background(), "admin", "process-proxy-force")
-	if err != nil {
-		t.Fatalf("ForceCloseDraining() error = %v", err)
-	}
-	if closed != 1 {
-		t.Fatalf("ForceCloseDraining() = %d, want 1", closed)
-	}
-	if err := <-errCh; err != nil {
-		t.Fatalf("ConnectUpstream() error = %v", err)
-	}
-	waitForProcessRuntimeTest(t, func() bool {
-		active, _ := manager.ActiveProxyConnections(context.Background(), "process-proxy-force")
-		return len(active) == 0 && manager.activeProxyCountLocked("process-proxy-force") == 0
-	})
-	waitForProcessRuntimeTest(t, func() bool {
-		summary := manager.hostSummary("process-proxy-force")
-		return summary.State == RuntimeDisabled && summary.ExitedAt != 0
-	})
-	if got := handler.proxyForceClosed.Load(); got != 1 {
-		t.Fatalf("proxy force-closed count = %d, want 1", got)
-	}
-	if got := handler.drainingProxy.Load(); got != 0 {
-		t.Fatalf("draining proxy count = %d, want 0", got)
-	}
-	assertProcessExited(t, hostPID)
 }
 
 func TestGoPluginProcessAdapterReportsRealHostCrashWithoutExitingGateway(t *testing.T) {
@@ -551,35 +662,6 @@ func TestGoPluginProcessCrashUpdatesManagerStateWithoutExitingGateway(t *testing
 	assertProcessExited(t, hostPID)
 }
 
-func TestPluginHostUpstreamRequestCarriesDeadline(t *testing.T) {
-	deadline := time.Now().Add(500 * time.Millisecond).Truncate(time.Millisecond)
-	ctx, cancel := context.WithDeadline(context.Background(), deadline)
-	defer cancel()
-	req := pluginHostUpstreamRequest(api.UpstreamConnectRequest{
-		Context: ctx,
-		Host:    "play.example",
-	})
-	if req.Host != "play.example" || req.DeadlineUnixMS != deadline.UnixMilli() {
-		t.Fatalf("pluginHostUpstreamRequest() = %+v, want deadline %d", req, deadline.UnixMilli())
-	}
-}
-
-func TestPluginHostUpstreamRequestUsesCallerDeadlineThroughHandlerTimeout(t *testing.T) {
-	callerDeadline := time.Now().Add(2 * time.Second).Truncate(time.Millisecond)
-	handlerDeadline := time.Now().Add(100 * time.Millisecond).Truncate(time.Millisecond)
-	callerCtx, callerCancel := context.WithDeadline(context.Background(), callerDeadline)
-	defer callerCancel()
-	handlerCtx, handlerCancel := context.WithDeadline(context.WithValue(callerCtx, pluginHostCallerContextKey{}, callerCtx), handlerDeadline)
-	defer handlerCancel()
-	req := pluginHostUpstreamRequest(api.UpstreamConnectRequest{
-		Context: handlerCtx,
-		Host:    "play.example",
-	})
-	if req.DeadlineUnixMS != callerDeadline.UnixMilli() {
-		t.Fatalf("pluginHostUpstreamRequest() deadline = %d, want caller deadline %d", req.DeadlineUnixMS, callerDeadline.UnixMilli())
-	}
-}
-
 func TestContextBoundConnClosesOnCancel(t *testing.T) {
 	local, remote := net.Pipe()
 	defer remote.Close()
@@ -628,221 +710,6 @@ func shortProcessRuntimeDir(t *testing.T) string {
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	return dir
-}
-
-func buildProcessProtocolProxyPlugin(t *testing.T) string {
-	t.Helper()
-	dir := t.TempDir()
-	repoRoot, err := filepath.Abs("../..")
-	if err != nil {
-		t.Fatalf("Abs(repo root) error = %v", err)
-	}
-	goMod := "module example.com/process-proxy\n\n" +
-		"go 1.24.0\n\n" +
-		"require github.com/tursom/mc-gateway v0.0.0\n\n" +
-		"replace github.com/tursom/mc-gateway => " + filepath.ToSlash(repoRoot) + "\n"
-	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(goMod), 0644); err != nil {
-		t.Fatalf("WriteFile(go.mod) error = %v", err)
-	}
-	source := `package main
-
-import (
-	"bytes"
-	"io"
-	"net"
-
-	"github.com/tursom/mc-gateway/plugin/api"
-)
-
-type pluginImpl struct {
-	api.AbstractPlugin
-}
-
-func Plugin() api.Plugin { return &pluginImpl{} }
-
-func (p *pluginImpl) Init(gateway api.Gateway) error {
-	return api.RegisterHookHandler(
-		gateway,
-		api.HookUpstreamConnect,
-		func(req api.UpstreamConnectRequest) bool { return req.Host == "play.example" },
-		func(req api.UpstreamConnectRequest) (net.Conn, error) {
-			gatewayEnd, pluginEnd := net.Pipe()
-			initial := append([]byte(nil), req.InitialData...)
-			sourceAddr := req.SourceAddr
-			go func() {
-				defer pluginEnd.Close()
-				buf := make([]byte, len(initial)+len("next"))
-				if _, err := io.ReadFull(pluginEnd, buf); err != nil {
-					return
-				}
-				if !bytes.Equal(buf[:len(initial)], initial) || string(buf[len(initial):]) != "next" {
-					_, _ = pluginEnd.Write([]byte("bad"))
-					return
-				}
-				_, _ = pluginEnd.Write([]byte("ok:" + sourceAddr))
-				_, _ = pluginEnd.Read(make([]byte, 1))
-			}()
-			return gatewayEnd, nil
-		},
-	)
-}
-`
-	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(source), 0644); err != nil {
-		t.Fatalf("WriteFile(main.go) error = %v", err)
-	}
-	tidyProcessPluginModule(t, dir)
-	pluginPath := filepath.Join(dir, "plugin.so")
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "build", "-buildmode=plugin", "-o", pluginPath, ".")
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GOWORK=off")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("go build process protocol proxy plugin error = %v\n%s", err, output)
-	}
-	return pluginPath
-}
-
-func buildProcessPIDRecordingPlugin(t *testing.T, pidPath string) string {
-	t.Helper()
-	dir := t.TempDir()
-	repoRoot, err := filepath.Abs("../..")
-	if err != nil {
-		t.Fatalf("Abs(repo root) error = %v", err)
-	}
-	goMod := "module example.com/process-pid\n\n" +
-		"go 1.24.0\n\n" +
-		"require github.com/tursom/mc-gateway v0.0.0\n\n" +
-		"replace github.com/tursom/mc-gateway => " + filepath.ToSlash(repoRoot) + "\n"
-	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(goMod), 0644); err != nil {
-		t.Fatalf("WriteFile(go.mod) error = %v", err)
-	}
-	source := fmt.Sprintf(`package main
-
-import (
-	"fmt"
-	"net"
-	"os"
-
-	"github.com/tursom/mc-gateway/plugin/api"
-)
-
-func init() {
-	file, err := os.OpenFile(%q, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err == nil {
-		_, _ = fmt.Fprintf(file, "%%d\n", os.Getpid())
-		_ = file.Close()
-	}
-}
-
-type pluginImpl struct {
-	api.AbstractPlugin
-}
-
-func Plugin() api.Plugin { return &pluginImpl{} }
-
-func (p *pluginImpl) Init(gateway api.Gateway) error {
-	return api.RegisterHookHandler(
-		gateway,
-		api.HookUpstreamConnect,
-		func(api.UpstreamConnectRequest) bool { return true },
-		func(api.UpstreamConnectRequest) (net.Conn, error) {
-			left, right := net.Pipe()
-			go func() {
-				_ = right.Close()
-			}()
-			return left, nil
-		},
-	)
-}
-`, pidPath)
-	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(source), 0644); err != nil {
-		t.Fatalf("WriteFile(main.go) error = %v", err)
-	}
-	tidyProcessPluginModule(t, dir)
-	pluginPath := filepath.Join(dir, "plugin.so")
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "build", "-buildmode=plugin", "-o", pluginPath, ".")
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GOWORK=off")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("go build process pid plugin error = %v\n%s", err, output)
-	}
-	return pluginPath
-}
-
-func buildProcessDialerPlugin(t *testing.T) string {
-	t.Helper()
-	dir := t.TempDir()
-	repoRoot, err := filepath.Abs("../..")
-	if err != nil {
-		t.Fatalf("Abs(repo root) error = %v", err)
-	}
-	goMod := "module example.com/process-dialer\n\n" +
-		"go 1.24.0\n\n" +
-		"require github.com/tursom/mc-gateway v0.0.0\n\n" +
-		"replace github.com/tursom/mc-gateway => " + filepath.ToSlash(repoRoot) + "\n"
-	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(goMod), 0644); err != nil {
-		t.Fatalf("WriteFile(go.mod) error = %v", err)
-	}
-	source := `package main
-
-import (
-	"io"
-	"net"
-
-	"github.com/tursom/mc-gateway/plugin/api"
-)
-
-type pluginImpl struct {
-	api.AbstractPlugin
-}
-
-func Plugin() api.Plugin { return &pluginImpl{} }
-
-func (p *pluginImpl) Init(gateway api.Gateway) error {
-	return api.RegisterHookHandler(
-		gateway,
-		api.HookUpstreamConnect,
-		func(req api.UpstreamConnectRequest) bool { return req.Host == "play.example" },
-		func(req api.UpstreamConnectRequest) (net.Conn, error) {
-			gatewayEnd, pluginEnd := net.Pipe()
-			sourceAddr := req.SourceAddr
-			go func() {
-				defer pluginEnd.Close()
-				buf := make([]byte, len("ping"))
-				if _, err := io.ReadFull(pluginEnd, buf); err != nil {
-					return
-				}
-				if string(buf) != "ping" {
-					_, _ = pluginEnd.Write([]byte("bad"))
-					return
-				}
-				_, _ = pluginEnd.Write([]byte("pong:" + sourceAddr))
-			}()
-			return gatewayEnd, nil
-		},
-	)
-}
-`
-	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(source), 0644); err != nil {
-		t.Fatalf("WriteFile(main.go) error = %v", err)
-	}
-	tidyProcessPluginModule(t, dir)
-	pluginPath := filepath.Join(dir, "plugin.so")
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "go", "build", "-buildmode=plugin", "-o", pluginPath, ".")
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "GOWORK=off")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("go build process dialer plugin error = %v\n%s", err, output)
-	}
-	return pluginPath
 }
 
 func containsProcessRuntimePID(pids []string, want string) bool {

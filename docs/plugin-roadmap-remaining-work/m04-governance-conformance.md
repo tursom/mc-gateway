@@ -9,7 +9,7 @@
 ## 完成状态
 
 1. 可执行 conformance 已落地：
-   - `go run ./cmd/gateway plugin conformance <target>` 会读取目录或包内 `conformance.json`，并对 protocol-proxy、route、status、rule、connection/handshake middleware、event/provider 和 governance gate 场景执行真实 harness 输入。
+   - `go run ./cmd/gateway plugin conformance <target>` 会读取目录或包内 `conformance.json`，并对 connection takeover、route、status、rule、connection/handshake middleware、event/provider 和 governance gate 场景执行真实 harness 输入。
    - `invalid_config` 和 `missing_secret` 使用 `Manager.DryRunConfig` 走运行时 dry-run，而不是只看 manifest 静态字段。
    - conformance CLI 使用固定测试时钟，`extension-ecosystem` M4 fixture 连续运行可得到字节一致 JSON，适合 CI golden 比对。
 2. missing fixture 策略已收紧但保留兼容窗口：

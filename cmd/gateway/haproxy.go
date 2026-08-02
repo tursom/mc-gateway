@@ -9,7 +9,7 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-func haProxyUpstream(source net.Conn, host string) net.Conn {
+func haProxyUpstream(effectiveSourceAddr, host string) net.Conn {
 	target, err := net.ResolveTCPAddr("tcp", host)
 	if err != nil {
 		gatewayMetrics.UpstreamDialError()
@@ -25,10 +25,7 @@ func haProxyUpstream(source net.Conn, host string) net.Conn {
 	}
 	setSocketOptions(conn)
 
-	sourceAddr, err := net.ResolveTCPAddr(
-		source.RemoteAddr().Network(),
-		source.RemoteAddr().String(),
-	)
+	sourceAddr, err := net.ResolveTCPAddr("tcp", effectiveSourceAddr)
 	if err != nil {
 		log.Err(err).Msg("failed to resolve TCP address")
 		conn.Close()

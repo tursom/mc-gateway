@@ -176,8 +176,8 @@ func TestFixtureAcceptRelaysMinecraftBackpressureToBackend(t *testing.T) {
 	assertAuthSignal(t, gateway, "auth.success", "fixture_accept")
 }
 
-func upstreamRequestForTest() api.UpstreamConnectRequest {
-	return api.UpstreamConnectRequest{}
+func upstreamRequestForTest() api.UpstreamConnectRequestV2 {
+	return api.UpstreamConnectRequestV2{Context: context.Background()}
 }
 
 type recordedEvent struct {
@@ -198,7 +198,6 @@ type recordingGateway struct {
 	wg             sync.WaitGroup
 }
 
-func (g *recordingGateway) HandleConn(net.Conn)            {}
 func (g *recordingGateway) ExitWaitGroup() *sync.WaitGroup { return &g.wg }
 func (g *recordingGateway) Hook(string, any) error         { return nil }
 func (g *recordingGateway) EmitEvent(_ context.Context, name string, fields map[string]string) error {

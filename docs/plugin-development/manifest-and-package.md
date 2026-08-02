@@ -25,10 +25,10 @@ Manifest 是插件开发、管理、治理和运行时调度的共同契约。�
 
 ```yaml
 schema_version: mc-gateway.plugin/v1
-id: upstream-rewrite
-name: Upstream Rewrite
+id: connection-inspector
+name: Connection Inspector
 version: 0.1.0
-description: Rewrite selected upstream targets before dialing.
+description: Inspect the untouched client stream before core processing.
 artifact_type: binary
 runtime:
   type: go-plugin
@@ -42,21 +42,17 @@ go_os: linux
 go_arch: amd64
 extension_points:
   - type: hook
-    key: upstream.connect/v1
+    key: upstream.connect/v2
 capabilities:
-  upstream_connect:
-    mode: dialer
+  extension_points:
+    - upstream.connect/v2
 runtime_limits:
   handler_timeout_ms: 3000
 config_schema:
   type: object
   properties:
-    match_host:
-      type: string
-    upstream:
-      type: string
-  required:
-    - upstream
+    enabled:
+      type: boolean
 ```
 
 ## 字段分组
@@ -70,7 +66,7 @@ config_schema:
 | SDK | `sdk_module`、`sdk_module_version`、`go_version`、`go_os`、`go_arch` | binary 包由 build 物化当前环境值 |
 | 扩展点 | `extension_points` | 声明要注册的 hook/provider/service |
 | 能力 | `capabilities` | 治理、冲突分析、Admin 展示和 conformance 使用 |
-| 限制 | `runtime_limits` | handler 超时、initial write 超时和未来资源限制 |
+| 限制 | `runtime_limits` | handler 超时和未来资源限制 |
 | 配置 | `config_schema` | Admin 表单、dry-run 和配置校验 |
 | 敏感信息 | `secrets` | secret 名称、必填性和轮换策略 |
 | 观测 | `events`、`custom_metrics` | 事件和指标白名单 |
@@ -87,8 +83,8 @@ config_schema:
 
 ```yaml
 capabilities:
-  upstream_connect:
-    mode: dialer
+  extension_points:
+    - upstream.connect/v2
   middleware:
     fail_policy: fail_open
   route:
@@ -120,8 +116,8 @@ capabilities:
 
 开发规则：
 
-- `extension_points` 是静态声明；`capabilities` 说明能力范围和运行模式。
-- protocol-proxy 插件必须声明 `capabilities.upstream_connect.mode: protocol-proxy`。
+- `extension_points` 是静态声明；`capabilities.extension_points` 应同步列出它们。
+- `upstream.connect/v2` 不再使用 `capabilities.upstream_connect` 或 mode 字段。
 - middleware 插件要声明 `fail_policy`，避免错误时行为不明确。
 - 事件和指标标签应保持低基数，不能把玩家名、UUID、token、session response、secret 或 packet payload 放进标签。
 - 未来 runtime 功能必须通过 `required_features` 或 future gate 体现，不要假装生产可用。

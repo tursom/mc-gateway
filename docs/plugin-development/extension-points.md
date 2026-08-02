@@ -6,7 +6,7 @@
 
 | 扩展点 | Hook | 状态 | 数据面 | 用途 |
 | --- | --- | --- | --- | --- |
-| `upstream.connect/v1` | `api.HookUpstreamConnect` | implemented | 是 | 替换上游连接创建，或返回 protocol-proxy stream endpoint |
+| `upstream.connect/v2` | `api.HookUpstreamConnectV2` | implemented | 是 | 在 core 读取 Minecraft 数据前接管客户端连接 |
 | `route.resolve/v1` | `api.HookRouteResolve` | implemented | 是 | 在 SQLite fallback 之外做动态路由决策 |
 | `route.resolver/v1` | `api.HookRouteResolver` | implemented | 是 | `route.resolve/v1` 的 provider/兼容表达 |
 | `rule.evaluate/v1` | `api.HookRuleEvaluate` | implemented | 是 | 独立策略/规则评估 |
@@ -20,66 +20,61 @@
 | `admin.auth.provider/v1` | `api.HookAdminAuthProvider` | reserved | 否 | 预留管理页外部身份 provider，本地 admin break-glass 仍是实现路径 |
 | `ingress.service/v1` | manifest service | partial | 是 | gateway-managed listener 生命周期已建模，受 future runtime gate 约束 |
 
-## `upstream.connect/v1`
+## `upstream.connect/v2`
 
-请求：
+该 hook 收到的是已经适配成 `net.Conn` 的原始客户端流。TCP/KCP/QUIC 在任何
+Minecraft 字节被 core 消费前进入；WebSocket 在 HTTP Upgrade 完成后进入，并
+携带 Upgrade 请求的完整 Header 副本。
 
 ```go
-type UpstreamConnectRequest struct {
-	Context          context.Context
-	Source           net.Conn
-	Host             string
-	Upstream         string
-	InitialData      []byte
-	Metadata         map[string]string
-	ConnectionID     string
-	TraceID          string
-	SourceAddr       string
-	ServerHost        string
-	RawServerHost    string
-	ProtocolVersion  int
-	NextState        int
-	RouteID          string
-	RouteTags        []string
-	UpstreamRaw      string
-	UpstreamProtocol string
-	UpstreamAddress  string
-	Transport        string
-	ServiceName      string
-	ListenerPort     int
+type UpstreamConnectRequestV2 struct {
+	Context      context.Context
+	ConnectionID string
+	TraceID      string
+	PeerAddr     string
+	LocalAddr    string
+	Connection   ConnectionState
+	Ingress      IngressContext
+	Flow         UpstreamConnectFlow
 }
 ```
 
-dialer mode：
+插件只能替换 `Connection.Stream`、`EffectiveSourceAddr` 和 `Metadata`。
+`PeerAddr`、`LocalAddr`、transport、listener、HTTP 和 QUIC facts 在整个链中
+保持入口原值。Header 只用于本次分发，不能写入日志、指标、trace、数据库或诊断包。
+
+注册和继续处理：
 
 ```go
-api.RegisterHookHandler(gateway, api.HookUpstreamConnect,
-	func(req api.UpstreamConnectRequest) bool {
-		return req.Host == "play.example"
-	},
-	func(req api.UpstreamConnectRequest) (net.Conn, error) {
-		return net.Dial("tcp", "127.0.0.1:25566")
-	},
-)
+return api.RegisterUpstreamConnectHandlerV2(gateway,
+	func(req api.UpstreamConnectRequestV2) error {
+		state := req.Connection
+		state.Metadata["checked"] = "true"
+		return req.Flow.Next(state)
+	})
 ```
 
-protocol-proxy mode：
+handler 有四种结束方式：
 
-- 插件返回自管 `net.Conn`。
-- gateway 会把已读取的初始数据写入该连接并做双向转发。
-- 插件必须在返回前启动读取端，避免初始写入阻塞。
-- Minecraft 登录、身份映射、forwarding、configuration/play 阶段都归插件内部所有。
-- gateway core 不消费玩家名、UUID、权限或认证结果。
+- 不调用 continuation，完整处理连接后返回 `nil`。
+- `Next(state)` 阻塞执行下一个插件；链尾进入 core。
+- `Core(state)` 跳过剩余插件，直接执行默认握手、路由和转发。
+- 关闭连接并返回，用于拒绝。
+
+`Next` 和 `Core` 在一次 handler 调用中合计只能调用一次；重复调用返回
+`api.ErrContinuationUsed`。handler error、panic 或 runtime 崩溃都会关闭连接，
+不会自动 fallback。插件读取过字节后若仍要继续，必须用能重放已读字节的
+`net.Conn` wrapper 作为 replacement stream 传给 continuation。
 
 manifest：
 
 ```yaml
 extension_points:
   - type: hook
-    key: upstream.connect/v1
+    key: upstream.connect/v2
 capabilities:
-  upstream_connect:
-    mode: protocol-proxy
+  extension_points:
+    - upstream.connect/v2
 ```
 
 ## `route.resolve/v1` 和 `route.resolver/v1`
@@ -153,7 +148,7 @@ api.RegisterHookHandler(gateway, api.HookStatusPing,
 )
 ```
 
-适合 MOTD、favicon、在线人数、维护窗口和版本提示。完整登录或 play 阶段逻辑仍应走 protocol-proxy。
+适合 MOTD、favicon、在线人数、维护窗口和版本提示。完整登录或 play 阶段逻辑仍应走 connection takeover。
 
 ## `connection.filter/v1`
 
@@ -244,7 +239,7 @@ api.RegisterHookHandler(gateway, api.HookProvider,
 )
 ```
 
-`auth.provider/v1` 只是 provider 注册和状态可见，不接入 gateway core 的 Minecraft 登录流水线。MC 登录应由 `upstream.connect/v1` protocol-proxy 插件完整实现。
+`auth.provider/v1` 只是 provider 注册和状态可见，不接入 gateway core 的 Minecraft 登录流水线。MC 登录应由 `upstream.connect/v2` connection takeover 插件完整实现。
 
 `admin.auth.provider/v1` 是预留能力。即使实现外部 OIDC/LDAP/SSO，也必须保留本地 admin break-glass 登录，且不能影响 Minecraft 连接路径。
 
@@ -264,7 +259,7 @@ api.RegisterHookHandler(gateway, api.HookProvider,
 - 插件不能自行任意监听生产端口。
 - listener 必须由 gateway/supervisor 管理。
 - 端口冲突、TLS secret refs、disable drain、reserved listener 冲突必须进入 preflight/governance。
-- 不要把 ingress 当作 `upstream.connect/v1` 的变体。
+- 不要把 ingress 当作 `upstream.connect/v2` 的变体。
 
 manifest 能力示例：
 

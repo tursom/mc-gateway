@@ -106,7 +106,6 @@ func initializeGatewayRuntime() error {
 	pluginsManager = pluginmanager.New(pluginmanager.Options{
 		DB:                        db,
 		ArtifactRoot:              filepath.Join(filepath.Dir(startup.DBPath), "plugins", "artifacts"),
-		HandleConn:                handleRequest,
 		WaitGroup:                 &pluginExitWaitGroup,
 		IngressReservedListeners:  reservedIngressListeners,
 		RequireConformanceFixture: startup.PluginRequireConformanceFixture,

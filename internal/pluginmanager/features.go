@@ -48,7 +48,7 @@ func RuntimeTypeFeaturesFor(options RuntimeFeatureFactsOptions) []RuntimeFeature
 			Maturity:          FeatureMaturityPartial,
 			DataPlane:         true,
 			RequiresRestart:   false,
-			UnsupportedReason: "wasm runtime only supports low-risk extension points; protocol-proxy, network, file, and high-risk extension points are not supported",
+			UnsupportedReason: "wasm runtime only supports low-risk extension points; upstream.connect/v2, network, file, and other high-risk extension points are not supported",
 			Entry:             RuntimeWASMEntry,
 		},
 	}
@@ -187,7 +187,7 @@ func sandboxRuntimeFeature(options RuntimeFeatureFactsOptions) sandboxProduction
 			serviceModeReason: reason,
 		}
 	}
-	reason := "sandbox-process data-plane is partial; selected request/response extension points and upstream.connect/v1 protocol-proxy use sandbox stream.proxy/v1 relay with drain-only lifecycle; broader isolation and governance hardening remain incomplete"
+	reason := "sandbox-process data-plane is partial; selected request/response extension points and upstream.connect/v2 takeover use the sandbox stream relay with drain-only lifecycle; broader isolation and governance hardening remain incomplete"
 	return sandboxProductionFeature{
 		implemented:       true,
 		maturity:          FeatureMaturityPartial,

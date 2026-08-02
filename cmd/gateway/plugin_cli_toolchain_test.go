@@ -535,6 +535,28 @@ func TestCapabilityContractChecksValidateIngressSchema(t *testing.T) {
 	}
 }
 
+func TestCapabilityContractChecksRejectRemovedAndUnsupportedExtensions(t *testing.T) {
+	manifest := pluginmanager.Manifest{
+		ExtensionPoints: []pluginmanager.ExtensionPoint{{Type: "hook", Key: pluginmanager.ExtensionUpstreamConnect}},
+		Capabilities:    json.RawMessage(`{"extension_points":["upstream.connect/v1","unknown.extension/v1"]}`),
+	}
+	checks := capabilityContractChecks(manifest)
+	want := map[string]bool{
+		"capability_extension_removed":     false,
+		"capability_extension_unsupported": false,
+	}
+	for _, check := range checks {
+		if _, ok := want[fmt.Sprint(check["code"])]; ok && check["severity"] == "blocking" {
+			want[fmt.Sprint(check["code"])] = true
+		}
+	}
+	for code, found := range want {
+		if !found {
+			t.Fatalf("capabilityContractChecks() = %+v, missing blocking %s", checks, code)
+		}
+	}
+}
+
 func TestPluginFeaturesAndManifestCommands(t *testing.T) {
 	output := captureStdout(t, func() {
 		handled, code := runPluginCLI([]string{"plugin", "features"})
@@ -718,7 +740,7 @@ func TestPluginFeaturesAndManifestCommands(t *testing.T) {
 			StreamProxyProtocol                  string   `json:"stream_proxy_protocol"`
 			StreamProxySemantics                 []string `json:"stream_proxy_semantics"`
 			SandboxRequiredCoverage              []string `json:"sandbox_required_coverage"`
-			ProtocolProxyScenarios               []string `json:"protocol_proxy_scenarios"`
+			TakeoverScenarios                    []string `json:"takeover_scenarios"`
 			RuleEvaluationOutcomes               []string `json:"rule_evaluation_outcomes"`
 			ConnectionFilterScenarios            []string `json:"connection_filter_scenarios"`
 			HandshakeFilterScenarios             []string `json:"handshake_filter_scenarios"`
@@ -756,16 +778,16 @@ func TestPluginFeaturesAndManifestCommands(t *testing.T) {
 	}
 	if !wasm.Implemented || wasm.Maturity != pluginmanager.FeatureMaturityPartial || !wasm.DataPlane ||
 		!strings.Contains(wasm.UnsupportedReason, "low-risk extension points") ||
-		!strings.Contains(wasm.UnsupportedReason, "protocol-proxy") ||
+		!strings.Contains(wasm.UnsupportedReason, "upstream.connect/v2") ||
 		!strings.Contains(wasm.UnsupportedReason, "network") ||
 		!strings.Contains(wasm.UnsupportedReason, "file") ||
-		!strings.Contains(wasm.UnsupportedReason, "high-risk extension points") {
+		!strings.Contains(wasm.UnsupportedReason, "other high-risk extension points") {
 		t.Fatalf("wasm feature = %+v, want partial low-risk data-plane runtime", wasm)
 	}
 	sandboxRuntime := findRuntimeFeature(features.RuntimeTypes, pluginmanager.RuntimeSandbox)
 	if !sandboxRuntime.Implemented || sandboxRuntime.Maturity != pluginmanager.FeatureMaturityPartial || !sandboxRuntime.DataPlane ||
 		sandboxRuntime.ReasonCode != "sandbox_data_plane_partial" ||
-		!strings.Contains(sandboxRuntime.UnsupportedReason, "stream.proxy/v1 relay") {
+		!strings.Contains(sandboxRuntime.UnsupportedReason, "sandbox stream relay") {
 		t.Fatalf("sandbox runtime feature = %+v, want partial sandbox data-plane runtime", sandboxRuntime)
 	}
 	inProcess := findCLIServiceModeFeature(features.ServiceModes, pluginmanager.PluginServiceModeInProcess)
@@ -773,13 +795,13 @@ func TestPluginFeaturesAndManifestCommands(t *testing.T) {
 		t.Fatalf("in-process feature = %+v, want implemented data-plane", inProcess)
 	}
 	processMode := findCLIServiceModeFeature(features.ServiceModes, pluginmanager.PluginServiceModeGoPluginProcess)
-	if !processMode.Implemented || processMode.Maturity != pluginmanager.FeatureMaturityPartial || !processMode.DataPlane || !strings.Contains(processMode.UnsupportedReason, "protocol-proxy drain-only") {
+	if !processMode.Implemented || processMode.Maturity != pluginmanager.FeatureMaturityPartial || !processMode.DataPlane || !strings.Contains(processMode.UnsupportedReason, "upstream.connect/v2 takeover") {
 		t.Fatalf("go-plugin-process feature = %+v, want partial process data plane", processMode)
 	}
 	sandboxMode := findCLIServiceModeFeature(features.ServiceModes, pluginmanager.PluginServiceModeSandboxProcess)
 	if !sandboxMode.Implemented || sandboxMode.Maturity != pluginmanager.FeatureMaturityPartial || !sandboxMode.DataPlane ||
 		sandboxMode.ReasonCode != "sandbox_data_plane_partial" ||
-		!strings.Contains(sandboxMode.UnsupportedReason, "stream.proxy/v1 relay") {
+		!strings.Contains(sandboxMode.UnsupportedReason, "sandbox stream relay") {
 		t.Fatalf("sandbox service mode = %+v, want partial sandbox data-plane service mode", sandboxMode)
 	}
 	inProcessAdapter := findRuntimeAdapterStatus(features.RuntimeAdapters, pluginmanager.PluginServiceModeInProcess, pluginmanager.RuntimeGoPlugin)
@@ -1056,8 +1078,8 @@ func TestPluginFeaturesAndManifestCommands(t *testing.T) {
 		!containsString(features.Conformance.StreamProxySemantics, "byte_accounting") ||
 		!containsString(features.Conformance.SandboxRequiredCoverage, pluginmanager.SandboxConformanceCrashLoop) ||
 		!containsString(features.Conformance.SandboxRequiredCoverage, pluginmanager.SandboxConformanceStreamCancel) ||
-		!containsString(features.Conformance.ProtocolProxyScenarios, "force_close_draining") ||
-		!containsString(features.Conformance.ProtocolProxyScenarios, "backpressure_large_packet") ||
+		!containsString(features.Conformance.TakeoverScenarios, "force_close_draining") ||
+		!containsString(features.Conformance.TakeoverScenarios, "backpressure_large_packet") ||
 		!containsString(features.Conformance.RuleEvaluationOutcomes, "timeout_fail_closed") ||
 		!containsString(features.Conformance.ConnectionFilterScenarios, "error_fail_closed") ||
 		!containsString(features.Conformance.HandshakeFilterScenarios, "rewrite_host") ||
@@ -1081,7 +1103,7 @@ func TestPluginFeaturesAndManifestCommands(t *testing.T) {
 		containsString(features.CLI.ReservedCommands, "sign key-rotation/revoke") {
 		t.Fatalf("cli feature = %+v, want implemented sign rotation/revoke without reserved marker", features.CLI)
 	}
-	handled, code := runPluginCLI([]string{"plugin", "manifest", "explain", "upstream.connect/v1"})
+	handled, code := runPluginCLI([]string{"plugin", "manifest", "explain", "upstream.connect/v2"})
 	if !handled {
 		t.Fatal("runPluginCLI() handled = false")
 	}
@@ -1183,7 +1205,7 @@ func TestPluginManifestFormatWrite(t *testing.T) {
 		t.Fatalf("runPluginCLI(init) = (%v, %d), want handled code 0", handled, code)
 	}
 	manifestPath := filepath.Join(dir, "manifest.json")
-	if err := os.WriteFile(manifestPath, []byte(`{"schema_version":"mc-gateway.plugin/v1","id":"format-plugin","name":"Format Plugin","version":"0.1.0","artifact_type":"source","runtime":{"type":"go-plugin","entry":"plugin.so","entry_symbol":"Plugin"},"build":{"type":"go","entry":".","output":"plugin.so"},"api_version":"plugin-api/v1","sdk_module":"github.com/tursom/mc-gateway/plugin/api","sdk_module_version":"v0.1.0","extension_points":[{"type":"hook","key":"upstream.connect/v1"}],"capabilities":{"upstream_connect":{"mode":"dialer"}},"runtime_limits":{"handler_timeout_ms":3000},"config_schema":{"type":"object"}}`), 0644); err != nil {
+	if err := os.WriteFile(manifestPath, []byte(`{"schema_version":"mc-gateway.plugin/v1","id":"format-plugin","name":"Format Plugin","version":"0.1.0","artifact_type":"source","runtime":{"type":"go-plugin","entry":"plugin.so","entry_symbol":"Plugin"},"build":{"type":"go","entry":".","output":"plugin.so"},"api_version":"plugin-api/v1","sdk_module":"github.com/tursom/mc-gateway/plugin/api","sdk_module_version":"v0.1.0","extension_points":[{"type":"hook","key":"upstream.connect/v2"}],"capabilities":{"extension_points":["upstream.connect/v2"]},"runtime_limits":{"handler_timeout_ms":3000},"config_schema":{"type":"object"}}`), 0644); err != nil {
 		t.Fatalf("WriteFile(manifest) error = %v", err)
 	}
 	handled, code = runPluginCLI([]string{"plugin", "manifest", "format", dir, "--write"})
@@ -1314,7 +1336,7 @@ func TestPluginSchemaContractAndConformanceCommands(t *testing.T) {
 	}
 	properties, ok := fixtureSchema["properties"].(map[string]any)
 	if !ok ||
-		properties["protocol_proxy_scenarios"] == nil ||
+		properties["takeover_scenarios"] == nil ||
 		properties["rule_evaluation_outcomes"] == nil ||
 		properties["connection_filter_scenarios"] == nil ||
 		properties["handshake_filter_scenarios"] == nil ||
@@ -1494,7 +1516,7 @@ func TestPluginConformanceExecutesGovernanceReviewFixture(t *testing.T) {
 		t.Fatalf("runPluginCLI(init) = (%v, %d), want handled code 0", handled, code)
 	}
 	manifestPath := filepath.Join(dir, "manifest.json")
-	if err := os.WriteFile(manifestPath, []byte(`{"schema_version":"mc-gateway.plugin/v1","id":"review-conformance-plugin","name":"Review Conformance Plugin","version":"0.1.0","artifact_type":"source","runtime":{"type":"go-plugin","entry":"plugin.so","entry_symbol":"Plugin"},"build":{"type":"go","entry":".","output":"plugin.so"},"api_version":"plugin-api/v1","sdk_module":"github.com/tursom/mc-gateway/plugin/api","sdk_module_version":"v0.1.0","extension_points":[{"type":"hook","key":"upstream.connect/v1"}],"capabilities":{"upstream_connect":{"mode":"protocol-proxy"},"scope":{"type":"host","values":["play.example"]},"rollout":{"mode":"canary"},"minecraft":{"protocol_versions":{"tested":[767]},"forwarding":{"supported":["none"],"default":"none"}}},"runtime_limits":{"handler_timeout_ms":3000},"config_schema":{"type":"object"}}`), 0644); err != nil {
+	if err := os.WriteFile(manifestPath, []byte(`{"schema_version":"mc-gateway.plugin/v1","id":"review-conformance-plugin","name":"Review Conformance Plugin","version":"0.1.0","artifact_type":"source","runtime":{"type":"go-plugin","entry":"plugin.so","entry_symbol":"Plugin"},"build":{"type":"go","entry":".","output":"plugin.so"},"api_version":"plugin-api/v1","sdk_module":"github.com/tursom/mc-gateway/plugin/api","sdk_module_version":"v0.1.0","extension_points":[{"type":"hook","key":"upstream.connect/v2"}],"capabilities":{"extension_points":["upstream.connect/v2"],"governance":{"risk_level":"high"},"scope":{"type":"host","values":["play.example"]},"rollout":{"mode":"canary"},"minecraft":{"protocol_versions":{"tested":[767]},"forwarding":{"supported":["none"],"default":"none"}}},"runtime_limits":{"handler_timeout_ms":3000},"config_schema":{"type":"object"}}`), 0644); err != nil {
 		t.Fatalf("WriteFile(manifest) error = %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "conformance.json"), []byte(`{"governance_gate_scenarios":["review_required"]}`), 0644); err != nil {
@@ -1921,20 +1943,20 @@ func TestPluginManifestFormatWritePreservesComments(t *testing.T) {
 		{
 			name:    "yaml",
 			file:    "manifest.yaml",
-			content: "# keep yaml comment\n" + manifestYAMLTemplate(pluginInitCLIOptions{ID: "comment-yaml", Name: "Comment YAML", Extension: "upstream.connect/v1"}),
+			content: "# keep yaml comment\n" + manifestYAMLTemplate(pluginInitCLIOptions{ID: "comment-yaml", Name: "Comment YAML", Extension: "upstream.connect/v2"}),
 			comment: "# keep yaml comment",
 		},
 		{
 			name:    "toml",
 			file:    "manifest.toml",
-			content: "# keep toml comment\n" + manifestTOMLTemplate(pluginInitCLIOptions{ID: "comment-toml", Name: "Comment TOML", Extension: "upstream.connect/v1"}),
+			content: "# keep toml comment\n" + manifestTOMLTemplate(pluginInitCLIOptions{ID: "comment-toml", Name: "Comment TOML", Extension: "upstream.connect/v2"}),
 			comment: "# keep toml comment",
 		},
 		{
 			name: "jsonc",
 			file: "manifest.jsonc",
 			content: strings.Replace(
-				"// keep jsonc comment\n"+strings.TrimSuffix(manifestSourceJSONTemplate(pluginInitCLIOptions{ID: "comment-jsonc", Name: "Comment JSONC", Extension: "upstream.connect/v1"}, true), "\n"),
+				"// keep jsonc comment\n"+strings.TrimSuffix(manifestSourceJSONTemplate(pluginInitCLIOptions{ID: "comment-jsonc", Name: "Comment JSONC", Extension: "upstream.connect/v2"}, true), "\n"),
 				"\n  }\n}",
 				"\n  },\n}",
 				1,
@@ -1984,7 +2006,7 @@ func TestPluginManifestMultipleSourcesRequireExplicitManifest(t *testing.T) {
 	if !handled || code != 0 {
 		t.Fatalf("runPluginCLI(init) = (%v, %d), want handled code 0", handled, code)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(manifestSourceJSONTemplate(pluginInitCLIOptions{ID: "multi-manifest", Name: "Multi Manifest", Extension: "upstream.connect/v1"}, false)), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(manifestSourceJSONTemplate(pluginInitCLIOptions{ID: "multi-manifest", Name: "Multi Manifest", Extension: "upstream.connect/v2"}, false)), 0644); err != nil {
 		t.Fatalf("WriteFile(manifest.json) error = %v", err)
 	}
 	handled, code = runPluginCLI([]string{"plugin", "validate", dir})

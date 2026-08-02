@@ -140,7 +140,7 @@
 
 - 不把 `go-plugin-process` 当成不可信 sandbox。
 - 不把 fd 迁移当成跨平台通用能力。
-- 不把 WASM 用于完整 MC protocol-proxy。
+- 不把 WASM 用于完整 MC connection takeover。
 - 不让仓库自动启用生产插件。
 - 不允许普通上传包携带插桩规则直接改 gateway binary。
 

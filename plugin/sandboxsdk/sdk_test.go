@@ -155,7 +155,7 @@ func TestServiceHandlesInvokeAndStreamCommands(t *testing.T) {
 	}
 
 	streamResp := service.HandleControlRequest(context.Background(), controlRequest(t, CommandStreamOpen, StreamOpenRequest{
-		ExtensionPoint: "upstream.connect/v1",
+		ExtensionPoint: "upstream.connect/v2",
 		HandlerID:      "stream-main",
 		Protocol:       "stream.proxy/v1",
 		StreamID:       "stream-1",

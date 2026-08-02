@@ -5,7 +5,7 @@ schema_version: mc-gateway.plugin/v1
 id: mc-auth-proxy
 name: Minecraft Auth Proxy
 version: 0.1.0
-description: Protocol-proxy example that owns Minecraft login handling and returns a stable fixture disconnect.
+description: Connection takeover example that owns Minecraft login handling and returns a stable fixture disconnect.
 artifact_type: binary
 runtime:
   type: go-plugin
@@ -19,10 +19,10 @@ go_os: linux
 go_arch: amd64
 extension_points:
   - type: hook
-    key: upstream.connect/v1
+    key: upstream.connect/v2
 capabilities:
-  upstream_connect:
-    mode: protocol-proxy
+  extension_points:
+    - upstream.connect/v2
   minecraft:
     protocol_versions:
       min: 47
@@ -54,7 +54,6 @@ capabilities:
       unknown: pass
 runtime_limits:
   handler_timeout_ms: 3000
-  initial_write_timeout_ms: 1000
 events:
   - name: auth.success
     fields:

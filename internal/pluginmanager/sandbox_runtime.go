@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/tursom/mc-gateway/plugin/api"
+	"github.com/tursom/mc-gateway/plugin/sandboxsdk"
 )
 
 const (
@@ -88,7 +89,6 @@ type SandboxProcess struct {
 	RuntimeInstanceID string
 	Generation        int64
 	Protocol          string
-	UpstreamMode      string
 	PID               int
 	StartedAt         int64
 	Policy            SandboxPolicy
@@ -333,46 +333,9 @@ type sandboxControlInvoker func(context.Context, string, SandboxControlRequest) 
 
 type sandboxStreamDialer func(context.Context, *SandboxProcess, SandboxStreamOpenResponse) (net.Conn, error)
 
-type SandboxStreamOpenRequest struct {
-	ExtensionPoint   string            `json:"extension_point"`
-	HandlerID        string            `json:"handler_id"`
-	FailPolicy       string            `json:"fail_policy,omitempty"`
-	Protocol         string            `json:"protocol"`
-	StreamID         string            `json:"stream_id"`
-	ConnectionID     string            `json:"connection_id,omitempty"`
-	TraceID          string            `json:"trace_id,omitempty"`
-	Host             string            `json:"host,omitempty"`
-	Upstream         string            `json:"upstream,omitempty"`
-	Metadata         map[string]string `json:"metadata,omitempty"`
-	SourceAddr       string            `json:"source_addr,omitempty"`
-	ServerHost       string            `json:"server_host,omitempty"`
-	RawServerHost    string            `json:"raw_server_host,omitempty"`
-	ProtocolVersion  int               `json:"protocol_version,omitempty"`
-	NextState        int               `json:"next_state,omitempty"`
-	RouteID          string            `json:"route_id,omitempty"`
-	RouteTags        []string          `json:"route_tags,omitempty"`
-	UpstreamRaw      string            `json:"upstream_raw,omitempty"`
-	UpstreamProtocol string            `json:"upstream_protocol,omitempty"`
-	UpstreamAddress  string            `json:"upstream_address,omitempty"`
-	Transport        string            `json:"transport,omitempty"`
-	ServiceName      string            `json:"service_name,omitempty"`
-	ListenerPort     int               `json:"listener_port,omitempty"`
-	DeadlineUnixMS   int64             `json:"deadline_unix_ms,omitempty"`
-}
-
-type SandboxStreamOpenResponse struct {
-	Connected    bool   `json:"connected"`
-	Protocol     string `json:"protocol"`
-	StreamID     string `json:"stream_id"`
-	Endpoint     string `json:"endpoint"`
-	EndpointType string `json:"endpoint_type,omitempty"`
-}
-
-type SandboxStreamCloseRequest struct {
-	Protocol string `json:"protocol"`
-	StreamID string `json:"stream_id"`
-	Reason   string `json:"reason,omitempty"`
-}
+type SandboxStreamOpenRequest = sandboxsdk.StreamOpenRequest
+type SandboxStreamOpenResponse = sandboxsdk.StreamOpenResponse
+type SandboxStreamCloseRequest = sandboxsdk.StreamCloseRequest
 
 func normalizeSandboxPolicy(policy SandboxPolicy) SandboxPolicy {
 	if policy.CPUSeconds <= 0 {
@@ -774,7 +737,6 @@ func (a SandboxProcessAdapter) Start(ctx context.Context, prepared RuntimePrepar
 	if err != nil {
 		return RuntimeInstance{}, err
 	}
-	process.UpstreamMode = upstreamModeFromArtifact(artifact)
 	plugin := sandboxHostedPlugin{process: process}
 	if err := plugin.Init(gateway); err != nil {
 		_ = process.Stop(ctx)
@@ -809,7 +771,7 @@ func (a SandboxProcessAdapter) DryRunConfig(ctx context.Context, artifact Artifa
 	if err != nil {
 		return err
 	}
-	instance, err := a.Start(ctx, prepared, artifact, pluginRecord, NewGateway(pluginRecord.ID, nil, nil, nil))
+	instance, err := a.Start(ctx, prepared, artifact, pluginRecord, NewGateway(pluginRecord.ID, nil, nil))
 	if err != nil {
 		return err
 	}
@@ -2195,17 +2157,9 @@ func (p sandboxHostedPlugin) Init(gateway api.Gateway) error {
 		reg := registration
 		switch reg.ExtensionPoint {
 		case ExtensionUpstreamConnect:
-			if p.process.UpstreamMode != UpstreamModeProtocolProxy {
-				return errors.New("sandbox-process upstream.connect/v1 requires stream.proxy/v1 protocol-proxy mode; dialer semantics are unsupported")
-			}
-			if err := api.RegisterHookHandler(
-				gateway,
-				api.HookUpstreamConnect,
-				func(api.UpstreamConnectRequest) bool { return true },
-				func(req api.UpstreamConnectRequest) (net.Conn, error) {
-					return p.openStream(req.Context, req, reg)
-				},
-			); err != nil {
+			if err := api.RegisterUpstreamConnectHandlerV2(gateway, func(req api.UpstreamConnectRequestV2) error {
+				return p.takeoverStream(req, reg)
+			}); err != nil {
 				return err
 			}
 		case ExtensionRouteResolve:
@@ -2448,12 +2402,60 @@ func (p sandboxHostedPlugin) deliverEvent(req api.EventDeliveryRequest, reg Sand
 	return *resp.EventResult, nil
 }
 
-func (p sandboxHostedPlugin) openStream(ctx context.Context, req api.UpstreamConnectRequest, reg SandboxHandlerRegistration) (net.Conn, error) {
-	if p.process == nil {
-		return nil, newSandboxInvocationError(sandboxControlErrorProcessExited, reg.FailPolicy, "sandbox process is nil")
+func (p sandboxHostedPlugin) takeoverStream(req api.UpstreamConnectRequestV2, reg SandboxHandlerRegistration) error {
+	endpoint, stream, err := p.openStream(req.Context, req, reg)
+	if err != nil {
+		return err
 	}
-	if p.process.UpstreamMode != UpstreamModeProtocolProxy {
-		return nil, newSandboxInvocationError(sandboxControlErrorNotImplemented, reg.FailPolicy, "sandbox-process only supports upstream.connect/v1 through stream.proxy/v1 protocol-proxy")
+	relayDone := make(chan struct{})
+	go func() { relayTakeoverStream(req.Connection.Stream, endpoint); close(relayDone) }()
+	action := TakeoverAction(strings.ToLower(strings.TrimSpace(string(stream.Action))))
+	if action == "" || action == TakeoverActionHandled {
+		<-relayDone
+		return nil
+	}
+	if action != TakeoverActionNext && action != TakeoverActionCore {
+		_ = endpoint.Close()
+		return fmt.Errorf("sandbox takeover action %q is invalid", stream.Action)
+	}
+	if strings.TrimSpace(stream.ReplacementEndpoint) == "" {
+		_ = endpoint.Close()
+		return errors.New("sandbox takeover continuation requires replacement_endpoint")
+	}
+	replacementSpec := stream
+	replacementSpec.Endpoint = stream.ReplacementEndpoint
+	replacement, err := dialSandboxStreamEndpoint(req.Context, p.process, replacementSpec)
+	if err != nil {
+		_ = endpoint.Close()
+		return err
+	}
+	state := api.ConnectionState{
+		Stream: replacement, EffectiveSourceAddr: stream.EffectiveSourceAddr,
+		Metadata: copyStringMap(stream.Metadata),
+	}
+	if state.EffectiveSourceAddr == "" {
+		state.EffectiveSourceAddr = req.Connection.EffectiveSourceAddr
+	}
+	if state.Metadata == nil {
+		state.Metadata = copyStringMap(req.Connection.Metadata)
+	}
+	if action == TakeoverActionNext {
+		err = req.Flow.Next(state)
+	} else {
+		err = req.Flow.Core(state)
+	}
+	_ = replacement.Close()
+	if closer, ok := endpoint.(interface{ CloseWrite() error }); ok {
+		_ = closer.CloseWrite()
+	}
+	<-relayDone
+	_ = endpoint.Close()
+	return err
+}
+
+func (p sandboxHostedPlugin) openStream(ctx context.Context, req api.UpstreamConnectRequestV2, reg SandboxHandlerRegistration) (net.Conn, SandboxStreamOpenResponse, error) {
+	if p.process == nil {
+		return nil, SandboxStreamOpenResponse{}, newSandboxInvocationError(sandboxControlErrorProcessExited, reg.FailPolicy, "sandbox process is nil")
 	}
 	callerCtx := pluginHostCallerContext(ctx)
 	if callerCtx == nil {
@@ -2468,24 +2470,24 @@ func (p sandboxHostedPlugin) openStream(ctx context.Context, req api.UpstreamCon
 	streamReq := sandboxStreamOpenRequest(req, reg)
 	payload, err := json.Marshal(streamReq)
 	if err != nil {
-		return nil, err
+		return nil, SandboxStreamOpenResponse{}, err
 	}
 	start := time.Now()
 	resp, err := p.process.sendControlRequest(controlCtx, sandboxControlCommandStreamOpen, reg.ExtensionPoint, payload)
 	duration := time.Since(start)
 	if err != nil {
 		p.process.recordSandboxTrace(callerCtx, reg, sandboxErrorCode(err), duration)
-		return nil, err
+		return nil, SandboxStreamOpenResponse{}, err
 	}
 	if !resp.OK {
 		err := sandboxResponseError(resp, reg.FailPolicy)
 		p.process.recordSandboxTrace(callerCtx, reg, sandboxErrorCode(err), duration)
-		return nil, err
+		return nil, SandboxStreamOpenResponse{}, err
 	}
 	if resp.Stream == nil {
 		err := newSandboxInvocationError(sandboxControlErrorBadResponse, reg.FailPolicy, "sandbox stream_open response missing stream payload")
 		p.process.recordSandboxTrace(callerCtx, reg, sandboxControlErrorBadResponse, duration)
-		return nil, err
+		return nil, SandboxStreamOpenResponse{}, err
 	}
 	stream := *resp.Stream
 	if stream.Protocol == "" {
@@ -2500,7 +2502,7 @@ func (p sandboxHostedPlugin) openStream(ctx context.Context, req api.UpstreamCon
 			status = "pass"
 		}
 		p.process.recordSandboxTrace(callerCtx, reg, status, duration)
-		return nil, err
+		return nil, SandboxStreamOpenResponse{}, err
 	}
 	dialer := p.process.streamDialer
 	if dialer == nil {
@@ -2509,45 +2511,30 @@ func (p sandboxHostedPlugin) openStream(ctx context.Context, req api.UpstreamCon
 	endpoint, err := dialer(controlCtx, p.process, stream)
 	if err != nil {
 		p.process.recordSandboxTrace(callerCtx, reg, sandboxErrorCode(err), duration)
-		return nil, err
+		return nil, SandboxStreamOpenResponse{}, err
 	}
 	if deadline, ok := callerCtx.Deadline(); ok {
 		_ = endpoint.SetDeadline(deadline)
 	}
 	endpoint = bindSandboxStreamEndpoint(callerCtx, p.process, stream.StreamID, endpoint)
 	p.process.recordSandboxTrace(callerCtx, reg, "ok", duration)
-	return endpoint, nil
+	return endpoint, stream, nil
 }
 
-func sandboxStreamOpenRequest(req api.UpstreamConnectRequest, reg SandboxHandlerRegistration) SandboxStreamOpenRequest {
-	sourceAddr := req.SourceAddr
-	if sourceAddr == "" && req.Source != nil && req.Source.RemoteAddr() != nil {
-		sourceAddr = req.Source.RemoteAddr().String()
-	}
+func sandboxStreamOpenRequest(req api.UpstreamConnectRequestV2, reg SandboxHandlerRegistration) SandboxStreamOpenRequest {
 	out := SandboxStreamOpenRequest{
-		ExtensionPoint:   reg.ExtensionPoint,
-		HandlerID:        reg.HandlerID,
-		FailPolicy:       reg.FailPolicy,
-		Protocol:         StreamProxyProtocolV1,
-		StreamID:         newSandboxStreamID(),
-		ConnectionID:     req.ConnectionID,
-		TraceID:          req.TraceID,
-		Host:             req.Host,
-		Upstream:         req.Upstream,
-		Metadata:         redactSandboxStreamMetadata(req.Metadata),
-		SourceAddr:       sourceAddr,
-		ServerHost:       req.ServerHost,
-		RawServerHost:    req.RawServerHost,
-		ProtocolVersion:  req.ProtocolVersion,
-		NextState:        req.NextState,
-		RouteID:          req.RouteID,
-		RouteTags:        append([]string(nil), req.RouteTags...),
-		UpstreamRaw:      req.UpstreamRaw,
-		UpstreamProtocol: req.UpstreamProtocol,
-		UpstreamAddress:  req.UpstreamAddress,
-		Transport:        req.Transport,
-		ServiceName:      req.ServiceName,
-		ListenerPort:     req.ListenerPort,
+		ExtensionPoint:      reg.ExtensionPoint,
+		HandlerID:           reg.HandlerID,
+		FailPolicy:          reg.FailPolicy,
+		Protocol:            StreamProxyProtocolV1,
+		StreamID:            newSandboxStreamID(),
+		ConnectionID:        req.ConnectionID,
+		TraceID:             req.TraceID,
+		PeerAddr:            req.PeerAddr,
+		LocalAddr:           req.LocalAddr,
+		EffectiveSourceAddr: req.Connection.EffectiveSourceAddr,
+		Metadata:            redactSandboxStreamMetadata(req.Connection.Metadata),
+		Ingress:             cloneTakeoverRequest(req).Ingress,
 	}
 	if ctx := pluginHostCallerContext(req.Context); ctx != nil {
 		if deadline, ok := ctx.Deadline(); ok {

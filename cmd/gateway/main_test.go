@@ -4,12 +4,9 @@ package main
 
 import (
 	"archive/zip"
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
-	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -20,226 +17,28 @@ import (
 	"github.com/tursom/mc-gateway/plugin/api"
 )
 
-func TestMapToHostManagedPluginDisableFallsBackToNativeUpstream(t *testing.T) {
-	defer saveGatewayState(t)()
-
-	packet := gatewayTestPacket("play.example")
-	source := newGatewayTestConn(packet)
-	managedUpstream := newGatewayTestConn(nil)
-	nativeAddress, nativeDone := startGatewayTestUpstream(t, len(packet), nil)
-	setGatewayTestRoutes(map[string]string{
-		"play.example": nativeAddress,
-	})
-	enableGatewayTestUpstreamPlugin(t, "managed-upstream", func(req api.UpstreamConnectRequest) (net.Conn, error) {
-		if req.Host != "play.example" || req.Upstream != nativeAddress || !bytes.Equal(req.InitialData, packet) {
-			t.Fatalf("managed request = %+v, initial=%v", req, req.InitialData)
-		}
-		return managedUpstream, nil
-	})
-
-	got := mapToHost(source)
-	if got != managedUpstream {
-		t.Fatalf("mapToHost() = %v, want managed upstream", got)
-	}
-	if !bytes.Equal(managedUpstream.writeBuf.Bytes(), packet) {
-		t.Fatalf("managed upstream initial packet = %v, want %v", managedUpstream.writeBuf.Bytes(), packet)
-	}
-	if _, err := pluginsManager.Disable(context.Background(), "admin", "managed-upstream"); err != nil {
-		t.Fatalf("Disable() error = %v", err)
-	}
-	nextSource := newGatewayTestConn(packet)
-	nativeUpstream := mapToHost(nextSource)
-	if nativeUpstream == nil {
-		t.Fatal("mapToHost() after disable = nil, want native upstream")
-	}
-	_ = nativeUpstream.Close()
-	if nativePacket := waitGatewayTestUpstream(t, nativeDone); !bytes.Equal(nativePacket, packet) {
-		t.Fatalf("native upstream initial packet = %v, want %v", nativePacket, packet)
-	}
-}
-
-func TestMapToHostRoutesThroughManagedHookAndForwardsInitialPacket(t *testing.T) {
-	defer saveGatewayState(t)()
-
-	packet := gatewayTestPacket("play.example", 0x63, 0x00)
-	source := newGatewayTestConn(packet)
-	upstream := newGatewayTestConn(nil)
-	setGatewayTestRoutes(map[string]string{
-		"play.example": "backend.example:25565",
-	})
-
-	var gotSource net.Conn
-	var gotHost string
-	enableGatewayTestUpstreamPlugin(t, "managed-upstream", func(req api.UpstreamConnectRequest) (net.Conn, error) {
-		gotSource = req.Source
-		gotHost = req.Upstream
-		return upstream, nil
-	})
-
-	got := mapToHost(source)
-	if got != upstream {
-		t.Fatalf("mapToHost() = %v, want upstream conn", got)
-	}
-	if gotSource != source {
-		t.Fatalf("hook source = %v, want original source", gotSource)
-	}
-	if gotHost != "backend.example:25565" {
-		t.Fatalf("hook host = %q, want backend.example:25565", gotHost)
-	}
-	if !bytes.Equal(upstream.writeBuf.Bytes(), packet) {
-		t.Fatalf("upstream initial packet = %v, want %v", upstream.writeBuf.Bytes(), packet)
-	}
-}
-
-func TestMapToHostUsesDefaultRoute(t *testing.T) {
-	defer saveGatewayState(t)()
-
-	packet := gatewayTestPacket("unknown.example")
-	source := newGatewayTestConn(packet)
-	upstreamAddress, upstreamDone := startGatewayTestUpstream(t, len(packet), nil)
-	setGatewayTestRoutes(map[string]string{
-		"default": upstreamAddress,
-	})
-
-	upstream := mapToHost(source)
-	if upstream == nil {
-		t.Fatal("mapToHost() = nil, want fallback upstream")
-	}
-	_ = upstream.Close()
-	if got := waitGatewayTestUpstream(t, upstreamDone); !bytes.Equal(got, packet) {
-		t.Fatalf("upstream initial packet = %v, want %v", got, packet)
-	}
-}
-
-func TestMapToHostRejectsInvalidOrUnroutedPackets(t *testing.T) {
-	tests := []struct {
-		name   string
-		packet []byte
-		hosts  map[string]string
-	}{
-		{
-			name:   "read error",
-			packet: nil,
-			hosts:  map[string]string{"default": "fallback.example:25565"},
-		},
-		{
-			name:   "malformed packet",
-			packet: []byte{0x01, 0x02, 0x03, 0x04, 0x08, 'a'},
-			hosts:  map[string]string{"default": "fallback.example:25565"},
-		},
-		{
-			name:   "missing route",
-			packet: gatewayTestPacket("unknown.example"),
-			hosts:  map[string]string{},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			defer saveGatewayState(t)()
-
-			source := newGatewayTestConn(tt.packet)
-			if tt.packet == nil {
-				source.readErr = errors.New("read failed")
-			}
-			setGatewayTestRoutes(tt.hosts)
-
-			if got := mapToHost(source); got != nil {
-				t.Fatalf("mapToHost() = %v, want nil", got)
-			}
-		})
-	}
-}
-
-func TestMapToHostReturnsNilWhenManagedHookFails(t *testing.T) {
-	defer saveGatewayState(t)()
-
-	source := newGatewayTestConn(gatewayTestPacket("play.example"))
-	setGatewayTestRoutes(map[string]string{
-		"play.example": "backend.example:25565",
-	})
-	wantErr := errors.New("hook failed")
-
-	enableGatewayTestUpstreamPlugin(t, "failing-upstream", func(api.UpstreamConnectRequest) (net.Conn, error) {
-		return nil, wantErr
-	})
-
-	if got := mapToHost(source); got != nil {
-		t.Fatalf("mapToHost() = %v, want nil", got)
-	}
-}
-
-func TestMapToHostClosesUpstreamWhenInitialWriteFails(t *testing.T) {
-	defer saveGatewayState(t)()
-
-	source := newGatewayTestConn(gatewayTestPacket("play.example"))
-	upstream := newGatewayTestConn(nil)
-	upstream.writeErr = errors.New("write failed")
-	setGatewayTestRoutes(map[string]string{
-		"play.example": "backend.example:25565",
-	})
-
-	enableGatewayTestUpstreamPlugin(t, "write-failure-upstream", func(api.UpstreamConnectRequest) (net.Conn, error) {
-		return upstream, nil
-	})
-
-	if got := mapToHost(source); got != nil {
-		t.Fatalf("mapToHost() = %v, want nil", got)
-	}
-	if !upstream.closed {
-		t.Fatal("upstream was not closed after write failure")
-	}
-}
+type gatewayPluginStub struct{}
 
 type gatewayTestPluginAdapter struct {
-	handler  api.UpstreamConnectHandler
 	initHook func(*pluginmanager.Gateway) error
 	plugin   api.Plugin
 }
 
-func enableGatewayTestUpstreamPlugin(t *testing.T, pluginID string, handler api.UpstreamConnectHandler) {
-	t.Helper()
-
-	pluginsManager = pluginmanager.New(pluginmanager.Options{
-		DB:           newGatewayTestPluginDB(t),
-		ArtifactRoot: t.TempDir(),
-		Adapter:      gatewayTestPluginAdapter{handler: handler},
-	})
-	artifact := uploadGatewayTestArtifact(t, pluginsManager, pluginID)
-	if _, err := pluginsManager.SetDesired(context.Background(), "admin", pluginID, artifact.ID, pluginmanager.DesiredEnabled, `{}`, 10); err != nil {
-		t.Fatalf("SetDesired() error = %v", err)
-	}
-	if _, err := pluginsManager.Enable(context.Background(), "admin", pluginID); err != nil {
-		t.Fatalf("Enable() error = %v", err)
-	}
-}
-
 func (a gatewayTestPluginAdapter) Load(_ context.Context, _ pluginmanager.ArtifactRecord, _ pluginmanager.PluginRecord, gateway *pluginmanager.Gateway) (api.Plugin, error) {
-	handler := a.handler
-	if handler == nil {
-		handler = func(api.UpstreamConnectRequest) (net.Conn, error) {
-			return nil, api.ErrPass
-		}
-	}
-	if a.initHook == nil {
-		if err := api.RegisterHookHandler(
-			gateway,
-			api.HookUpstreamConnect,
-			func(api.UpstreamConnectRequest) bool { return true },
-			handler,
-		); err != nil {
+	if a.initHook != nil {
+		if err := a.initHook(gateway); err != nil {
 			return nil, err
 		}
-	} else if err := a.initHook(gateway); err != nil {
-		return nil, err
+	} else {
+		if err := api.RegisterUpstreamConnectHandlerV2(gateway, func(req api.UpstreamConnectRequestV2) error { return req.Flow.Next(req.Connection) }); err != nil {
+			return nil, err
+		}
 	}
 	if a.plugin != nil {
 		return a.plugin, nil
 	}
 	return &gatewayPluginStub{}, nil
 }
-
-type gatewayPluginStub struct{}
 
 func (*gatewayPluginStub) Init(api.Gateway) error { return nil }
 func (*gatewayPluginStub) Destroy() error         { return nil }
@@ -359,22 +158,14 @@ func gatewayTestManifest(t *testing.T, pluginID string) []byte {
 	return gatewayTestManifestWithCapabilities(t, pluginID, "")
 }
 
-func gatewayProtocolProxyCapabilities() string {
-	return `{
-		"upstream_connect":{"mode":"protocol-proxy"},
-		"scope":{"type":"host","values":["play.example"]},
-		"rollout":{"mode":"canary"},
-		"minecraft":{
-			"protocol_versions":{"tested":[767]},
-			"forwarding":{"supported":["none"],"default":"none"}
-		}
-	}`
+func gatewayTakeoverCapabilities() string {
+	return `{"extension_points":["upstream.connect/v2"]}`
 }
 
 func gatewayTestManifestWithCapabilities(t *testing.T, pluginID string, capabilities string) []byte {
 	t.Helper()
 	if capabilities == "" {
-		capabilities = `{"extension_points":["upstream.connect/v1"]}`
+		capabilities = `{"extension_points":["upstream.connect/v2"]}`
 	}
 	manifest := pluginmanager.Manifest{
 		SchemaVersion: pluginmanager.SchemaVersion,

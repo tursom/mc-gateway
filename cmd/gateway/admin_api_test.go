@@ -225,7 +225,7 @@ func TestAdminPluginServiceStatusReportsSandboxDataPlane(t *testing.T) {
 	if processMode["implemented"] != true ||
 		processMode["data_plane"] != true ||
 		processMode["maturity"] != pluginmanager.FeatureMaturityPartial ||
-		!strings.Contains(processMode["unsupported_reason"].(string), "protocol-proxy drain-only") ||
+		!strings.Contains(processMode["unsupported_reason"].(string), "upstream.connect/v2 takeover") ||
 		!strings.Contains(processMode["unsupported_reason"].(string), "per-node crash isolation") ||
 		strings.Contains(processMode["unsupported_reason"].(string), "cross-node crash policy coordination are not implemented") {
 		t.Fatalf("go-plugin-process mode = %#v, want partial process data plane", processMode)
@@ -243,7 +243,7 @@ func TestAdminPluginServiceStatusReportsSandboxDataPlane(t *testing.T) {
 		sandboxMode["data_plane"] != true ||
 		sandboxMode["maturity"] != pluginmanager.FeatureMaturityPartial ||
 		sandboxMode["reason_code"] != "sandbox_data_plane_partial" ||
-		!strings.Contains(sandboxMode["unsupported_reason"].(string), "stream.proxy/v1 relay") {
+		!strings.Contains(sandboxMode["unsupported_reason"].(string), "sandbox stream relay") {
 		t.Fatalf("sandbox service mode = %#v, want partial sandbox data-plane mode", sandboxMode)
 	}
 	wasmSandboxAdapter := findAdminRuntimeAdapterStatus(t, status["runtime_adapters"].([]any), pluginmanager.PluginServiceModeSandboxProcess, pluginmanager.RuntimeWASM)
@@ -353,10 +353,10 @@ func TestAdminPluginFeaturesExposeSharedFactSource(t *testing.T) {
 		wasm["maturity"] != pluginmanager.FeatureMaturityPartial ||
 		wasm["data_plane"] != true ||
 		!strings.Contains(wasm["unsupported_reason"].(string), "low-risk extension points") ||
-		!strings.Contains(wasm["unsupported_reason"].(string), "protocol-proxy") ||
+		!strings.Contains(wasm["unsupported_reason"].(string), "upstream.connect/v2") ||
 		!strings.Contains(wasm["unsupported_reason"].(string), "network") ||
 		!strings.Contains(wasm["unsupported_reason"].(string), "file") ||
-		!strings.Contains(wasm["unsupported_reason"].(string), "high-risk extension points") {
+		!strings.Contains(wasm["unsupported_reason"].(string), "other high-risk extension points") {
 		t.Fatalf("wasm feature = %#v, want partial low-risk data-plane runtime", wasm)
 	}
 	sandboxRuntime := findAdminRuntimeFeature(t, runtimeTypes, pluginmanager.RuntimeSandbox)
@@ -364,7 +364,7 @@ func TestAdminPluginFeaturesExposeSharedFactSource(t *testing.T) {
 		sandboxRuntime["maturity"] != pluginmanager.FeatureMaturityPartial ||
 		sandboxRuntime["data_plane"] != true ||
 		sandboxRuntime["reason_code"] != "sandbox_data_plane_partial" ||
-		!strings.Contains(sandboxRuntime["unsupported_reason"].(string), "stream.proxy/v1 relay") {
+		!strings.Contains(sandboxRuntime["unsupported_reason"].(string), "sandbox stream relay") {
 		t.Fatalf("sandbox runtime = %#v, want partial sandbox data-plane runtime", sandboxRuntime)
 	}
 	extensionPoints := features["extension_points"].([]any)
@@ -869,7 +869,7 @@ func TestAdminPluginPhase5GovernanceAPI(t *testing.T) {
 	}
 	memberToken := adminTestLogin(t, handler, "member", "member-secret")
 
-	artifact := uploadGatewayPhase5ProtocolProxyArtifact(t, "phase5-proxy")
+	artifact := uploadGatewayPhase5TakeoverArtifact(t, "phase5-proxy")
 	if _, err := pluginsManager.SetDesired(context.Background(), "admin", "phase5-proxy", artifact.ID, pluginmanager.DesiredEnabled, `{}`, 10); err != nil {
 		t.Fatalf("SetDesired() error = %v", err)
 	}
@@ -1539,10 +1539,10 @@ func uploadGatewayExternalDependencyArtifact(t *testing.T, pluginID, endpoint st
 	return artifact
 }
 
-func uploadGatewayPhase5ProtocolProxyArtifact(t *testing.T, pluginID string) pluginmanager.ArtifactRecord {
+func uploadGatewayPhase5TakeoverArtifact(t *testing.T, pluginID string) pluginmanager.ArtifactRecord {
 	t.Helper()
 	var manifest pluginmanager.Manifest
-	if err := json.Unmarshal(gatewayTestManifestWithCapabilities(t, pluginID, gatewayProtocolProxyCapabilities()), &manifest); err != nil {
+	if err := json.Unmarshal(gatewayTestManifestWithCapabilities(t, pluginID, gatewayTakeoverCapabilities()), &manifest); err != nil {
 		t.Fatalf("Unmarshal manifest error = %v", err)
 	}
 	manifest.RuntimeLimits = pluginmanager.RuntimeLimits{HandlerTimeoutMS: 3000}

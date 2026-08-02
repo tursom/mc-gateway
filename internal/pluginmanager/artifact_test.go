@@ -13,6 +13,34 @@ import (
 	"time"
 )
 
+func TestManifestRejectsRemovedUpstreamConnectContracts(t *testing.T) {
+	for _, key := range []string{"upstream.connect/v1", "upstream"} {
+		t.Run(key, func(t *testing.T) {
+			var manifest Manifest
+			if err := json.Unmarshal(testManifestBytes(t, "legacy-contract"), &manifest); err != nil {
+				t.Fatal(err)
+			}
+			manifest.ExtensionPoints[0].Key = key
+			if err := validateManifest(manifest); err == nil || !strings.Contains(err.Error(), "was removed") {
+				t.Fatalf("validateManifest(%q) error = %v, want explicit removal error", key, err)
+			}
+		})
+	}
+	if _, err := capabilitiesSummaryJSON(json.RawMessage(`{"extension_points":["upstream.connect/v2"],"upstream_connect":{"mode":"dialer"}}`)); err == nil || !strings.Contains(err.Error(), "was removed") {
+		t.Fatalf("legacy capabilities error = %v, want explicit removal error", err)
+	}
+	for _, key := range []string{"upstream.connect/v1", "upstream"} {
+		var manifest Manifest
+		if err := json.Unmarshal(testManifestBytes(t, "legacy-capability"), &manifest); err != nil {
+			t.Fatal(err)
+		}
+		manifest.Capabilities = json.RawMessage(`{"extension_points":["` + key + `"]}`)
+		if err := validateManifest(manifest); err == nil || !strings.Contains(err.Error(), "was removed") {
+			t.Fatalf("validateManifest(capabilities %q) error = %v, want explicit removal error", key, err)
+		}
+	}
+}
+
 func TestArtifactStoreValidateAndStore(t *testing.T) {
 	packagePath := writeTestMCGP(t, map[string][]byte{
 		"manifest.json": testManifestBytes(t, "test-plugin"),
@@ -73,7 +101,7 @@ func TestArtifactStoreStoresConformanceSummary(t *testing.T) {
 			"fixtures":[
 				{"name":"contract","status":"pass"},
 				{"name":"optional","status":"skip"},
-				{"name":"protocol-proxy.panic","status":"fail","extension":"upstream.connect/v1","expected":"panic_recovered"}
+				{"name":"takeover.panic","status":"fail","extension":"upstream.connect/v2","expected":"panic_recovered"}
 			]
 		}`),
 	})
@@ -102,7 +130,7 @@ func TestArtifactStoreStoresConformanceSummary(t *testing.T) {
 		metadata.Conformance.Skipped != 1 ||
 		metadata.Conformance.Failed != 1 ||
 		len(metadata.Conformance.FailedFixtures) != 1 ||
-		metadata.Conformance.FailedFixtures[0].Name != "protocol-proxy.panic" {
+		metadata.Conformance.FailedFixtures[0].Name != "takeover.panic" {
 		t.Fatalf("conformance summary = %+v, want one failed fixture", metadata.Conformance)
 	}
 }
@@ -316,9 +344,9 @@ func TestArtifactStoreDoesNotCountRawSandboxConformanceDeclarations(t *testing.T
 			{"name": "contract", "status": "pass"},
 			{"name": "sandbox.self_declared", "status": "pass", "coverage": SandboxConformanceRequiredCoverage()},
 		},
-		"sandbox_fixtures":         SandboxConformanceRequiredCoverage(),
-		"stream_proxy_scenarios":   []StreamProxyFixture{{Name: "cancel", Protocol: StreamProxyProtocolV1, Expected: "cancel", Frames: []StreamProxyFrame{{Type: StreamFrameCancel}}}},
-		"protocol_proxy_scenarios": []string{"endpoint_close", "backpressure_large_packet"},
+		"sandbox_fixtures":       SandboxConformanceRequiredCoverage(),
+		"stream_proxy_scenarios": []StreamProxyFixture{{Name: "cancel", Protocol: StreamProxyProtocolV1, Expected: "cancel", Frames: []StreamProxyFrame{{Type: StreamFrameCancel}}}},
+		"takeover_scenarios":     []string{"endpoint_close", "backpressure_large_packet"},
 	})
 	if err != nil {
 		t.Fatalf("Marshal raw sandbox conformance declarations error = %v", err)
@@ -583,7 +611,7 @@ func testSourceManifestBytes(t *testing.T, pluginID string) []byte {
 			Type: "hook",
 			Key:  ExtensionUpstreamConnect,
 		}},
-		Capabilities: json.RawMessage(`{"extension_points":["upstream.connect/v1"]}`),
+		Capabilities: json.RawMessage(`{"extension_points":["upstream.connect/v2"]}`),
 	}
 	data, err := json.Marshal(manifest)
 	if err != nil {
@@ -593,13 +621,13 @@ func testSourceManifestBytes(t *testing.T, pluginID string) []byte {
 }
 
 func testManifestBytes(t *testing.T, pluginID string) []byte {
-	return testManifestBytesWithCapabilities(t, pluginID, json.RawMessage(`{"extension_points":["upstream.connect/v1"]}`))
+	return testManifestBytesWithCapabilities(t, pluginID, json.RawMessage(`{"extension_points":["upstream.connect/v2"]}`))
 }
 
 func testManifestBytesWithCapabilities(t *testing.T, pluginID string, capabilities json.RawMessage) []byte {
 	t.Helper()
 	if len(capabilities) == 0 {
-		capabilities = json.RawMessage(`{"extension_points":["upstream.connect/v1"]}`)
+		capabilities = json.RawMessage(`{"extension_points":["upstream.connect/v2"]}`)
 	}
 	manifest := Manifest{
 		SchemaVersion: SchemaVersion,

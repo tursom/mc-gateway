@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"net"
 	"time"
 
 	"github.com/tursom/mc-gateway/plugin/api"
@@ -36,11 +34,6 @@ func (a GoPluginProcessAdapter) Load(ctx context.Context, artifact ArtifactRecor
 func (a GoPluginProcessAdapter) ValidateArtifact(ctx context.Context, artifact ArtifactRecord) error {
 	if err := (GoPluginAdapter{}).ValidateArtifact(ctx, artifact); err != nil {
 		return err
-	}
-	switch upstreamModeFromArtifact(artifact) {
-	case UpstreamModeDialer, UpstreamModeProtocolProxy:
-	default:
-		return errors.New("go-plugin-process supports upstream.connect/v1 dialer mode and protocol-proxy drain-only")
 	}
 	return nil
 }
@@ -90,41 +83,12 @@ func (a GoPluginProcessAdapter) Start(ctx context.Context, prepared RuntimePrepa
 		}
 		return RuntimeInstance{}, errors.New("plugin-host init failed")
 	}
-	mode := upstreamModeFromArtifact(artifact)
-	hasUpstreamConnect := pluginHostHasHook(resp.Lifecycle.RegisteredHooks, api.HookUpstreamConnect.Key())
-	hasLegacyUpstream := pluginHostHasHook(resp.Lifecycle.RegisteredHooks, api.HookUpstream.Key())
-	switch mode {
-	case UpstreamModeDialer:
-		if hasUpstreamConnect || hasLegacyUpstream {
-			if err := api.RegisterHookHandler(
-				gateway,
-				api.HookUpstreamConnect,
-				func(api.UpstreamConnectRequest) bool { return true },
-				func(req api.UpstreamConnectRequest) (net.Conn, error) {
-					return DialPluginHostUpstream(pluginHostCallerContext(req.Context), process.SocketPath, pluginHostUpstreamRequest(req))
-				},
-			); err != nil {
-				return RuntimeInstance{}, err
-			}
+	if pluginHostHasHook(resp.Lifecycle.RegisteredHooks, api.HookUpstreamConnectV2.Key()) {
+		if err := api.RegisterUpstreamConnectHandlerV2(gateway, func(req api.UpstreamConnectRequestV2) error {
+			return RunPluginHostTakeover(pluginHostCallerContext(req.Context), process.SocketPath, req)
+		}); err != nil {
+			return RuntimeInstance{}, err
 		}
-	case UpstreamModeProtocolProxy:
-		if hasUpstreamConnect {
-			if err := api.RegisterHookHandler(
-				gateway,
-				api.HookUpstreamConnect,
-				func(api.UpstreamConnectRequest) bool { return true },
-				func(req api.UpstreamConnectRequest) (net.Conn, error) {
-					return DialPluginHostStreamProxy(pluginHostCallerContext(req.Context), process.SocketPath, pluginHostUpstreamRequest(req))
-				},
-			); err != nil {
-				return RuntimeInstance{}, err
-			}
-		}
-	default:
-		return RuntimeInstance{}, pluginHostModeUnsupported(mode)
-	}
-	if mode == UpstreamModeProtocolProxy && !hasUpstreamConnect && hasLegacyUpstream {
-		return RuntimeInstance{}, errors.New("go-plugin-process protocol-proxy requires upstream.connect/v1 hook; legacy upstream hook is dialer-only")
 	}
 	cleanup = false
 	return RuntimeInstance{
@@ -261,31 +225,16 @@ func pluginHostHasHook(hooks []string, want string) bool {
 	return false
 }
 
-func pluginHostUpstreamRequest(req api.UpstreamConnectRequest) PluginHostUpstreamConnectRequest {
-	sourceAddr := req.SourceAddr
-	if sourceAddr == "" && req.Source != nil && req.Source.RemoteAddr() != nil {
-		sourceAddr = req.Source.RemoteAddr().String()
-	}
-	out := PluginHostUpstreamConnectRequest{
-		Host:             req.Host,
-		Upstream:         req.Upstream,
-		InitialData:      append([]byte(nil), req.InitialData...),
-		Metadata:         req.Metadata,
-		ConnectionID:     req.ConnectionID,
-		TraceID:          req.TraceID,
-		SourceAddr:       sourceAddr,
-		ServerHost:       req.ServerHost,
-		RawServerHost:    req.RawServerHost,
-		ProtocolVersion:  req.ProtocolVersion,
-		NextState:        req.NextState,
-		RouteID:          req.RouteID,
-		RouteTags:        append([]string(nil), req.RouteTags...),
-		UpstreamRaw:      req.UpstreamRaw,
-		UpstreamProtocol: req.UpstreamProtocol,
-		UpstreamAddress:  req.UpstreamAddress,
-		Transport:        req.Transport,
-		ServiceName:      req.ServiceName,
-		ListenerPort:     req.ListenerPort,
+func pluginHostTakeoverRequest(req api.UpstreamConnectRequestV2) PluginHostTakeoverRequest {
+	out := PluginHostTakeoverRequest{
+		SessionID:           newSandboxStreamID(),
+		ConnectionID:        req.ConnectionID,
+		TraceID:             req.TraceID,
+		PeerAddr:            req.PeerAddr,
+		LocalAddr:           req.LocalAddr,
+		EffectiveSourceAddr: req.Connection.EffectiveSourceAddr,
+		Metadata:            copyStringMap(req.Connection.Metadata),
+		Ingress:             req.Ingress,
 	}
 	if ctx := pluginHostCallerContext(req.Context); ctx != nil {
 		if deadline, ok := ctx.Deadline(); ok {
@@ -303,8 +252,4 @@ func pluginHostCallerContext(ctx context.Context) context.Context {
 		return caller
 	}
 	return ctx
-}
-
-func pluginHostModeUnsupported(mode string) error {
-	return fmt.Errorf("go-plugin-process does not support upstream.connect/v1 %s mode", mode)
 }

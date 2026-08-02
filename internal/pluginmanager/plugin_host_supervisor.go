@@ -1,12 +1,14 @@
 package pluginmanager
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -575,25 +577,101 @@ func SendPluginHostControlRequest(ctx context.Context, socketPath string, req Pl
 	if err := json.NewEncoder(conn).Encode(req); err != nil {
 		return PluginHostControlResponse{}, err
 	}
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadBytes('\n')
+	if err != nil {
+		return PluginHostControlResponse{}, err
+	}
 	var resp PluginHostControlResponse
-	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+	if err := json.Unmarshal(line, &resp); err != nil {
 		return PluginHostControlResponse{}, err
 	}
 	return resp, nil
 }
 
-func DialPluginHostUpstream(ctx context.Context, socketPath string, req PluginHostUpstreamConnectRequest) (net.Conn, error) {
-	return dialPluginHostStream(ctx, socketPath, PluginHostCommandUpstream, req)
-}
-
-func DialPluginHostStreamProxy(ctx context.Context, socketPath string, req PluginHostUpstreamConnectRequest) (net.Conn, error) {
-	return dialPluginHostStream(ctx, socketPath, PluginHostCommandStreamProxy, req)
-}
-
-func dialPluginHostStream(ctx context.Context, socketPath, command string, req PluginHostUpstreamConnectRequest) (net.Conn, error) {
+func RunPluginHostTakeover(ctx context.Context, socketPath string, req api.UpstreamConnectRequestV2) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	payload := pluginHostTakeoverRequest(req)
+	stream, err := dialPluginHostTakeoverStream(ctx, socketPath, payload)
+	if err != nil {
+		return err
+	}
+	toEndpointDone, toRootDone := startTakeoverStreamRelay(req.Connection.Stream, stream)
+
+	waitPayload, err := json.Marshal(PluginHostTakeoverSessionRequest{SessionID: payload.SessionID})
+	if err != nil {
+		_ = stream.Close()
+		return err
+	}
+	waitResp, err := SendPluginHostControlRequest(ctx, socketPath, PluginHostControlRequest{
+		Command: PluginHostCommandTakeoverWait, Protocol: PluginHostProtocol, Payload: waitPayload,
+	})
+	if err != nil {
+		_ = stream.Close()
+		return err
+	}
+	if !waitResp.OK || waitResp.Takeover == nil {
+		_ = stream.Close()
+		if waitResp.Error != "" {
+			return errors.New(waitResp.Error)
+		}
+		return errors.New("plugin-host takeover wait returned no action")
+	}
+	action := waitResp.Takeover
+	if action.Action == TakeoverActionHandled {
+		if closer, ok := stream.(interface{ CloseWrite() error }); ok {
+			_ = closer.CloseWrite()
+		}
+		<-toRootDone
+		_ = stream.Close()
+		if action.Error != "" {
+			return errors.New(action.Error)
+		}
+		return nil
+	}
+	if action.Action != TakeoverActionNext && action.Action != TakeoverActionCore {
+		_ = stream.Close()
+		return fmt.Errorf("plugin-host returned invalid takeover action %q", action.Action)
+	}
+	replacement, err := (&net.Dialer{}).DialContext(ctx, "unix", action.Endpoint)
+	if err == nil {
+		state := api.ConnectionState{
+			Stream: replacement, EffectiveSourceAddr: action.EffectiveSourceAddr,
+			Metadata: copyStringMap(action.Metadata),
+		}
+		if action.Action == TakeoverActionNext {
+			err = req.Flow.Next(state)
+		} else {
+			err = req.Flow.Core(state)
+		}
+		_ = replacement.Close()
+	}
+	complete := PluginHostTakeoverSessionRequest{SessionID: payload.SessionID}
+	if err != nil {
+		complete.Error = err.Error()
+	}
+	completePayload, marshalErr := json.Marshal(complete)
+	if marshalErr == nil {
+		completeCtx, cancelComplete := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelComplete()
+		completeResp, completeErr := SendPluginHostControlRequest(completeCtx, socketPath, PluginHostControlRequest{
+			Command: PluginHostCommandTakeoverComplete, Protocol: PluginHostProtocol, Payload: completePayload,
+		})
+		if err == nil && completeErr != nil {
+			err = completeErr
+		} else if err == nil && completeResp.Takeover != nil && completeResp.Takeover.Error != "" {
+			err = errors.New(completeResp.Takeover.Error)
+		}
+	}
+	_ = stream.Close()
+	<-toEndpointDone
+	<-toRootDone
+	return err
+}
+
+func dialPluginHostTakeoverStream(ctx context.Context, socketPath string, req PluginHostTakeoverRequest) (net.Conn, error) {
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
@@ -607,7 +685,7 @@ func dialPluginHostStream(ctx context.Context, socketPath, command string, req P
 		_ = conn.SetDeadline(deadline)
 	}
 	if err := json.NewEncoder(conn).Encode(PluginHostControlRequest{
-		Command:  command,
+		Command:  PluginHostCommandTakeoverOpen,
 		Protocol: PluginHostProtocol,
 		Payload:  payload,
 	}); err != nil {
@@ -615,8 +693,15 @@ func dialPluginHostStream(ctx context.Context, socketPath, command string, req P
 		_ = conn.Close()
 		return nil, err
 	}
+	reader := bufio.NewReader(conn)
+	line, err := reader.ReadBytes('\n')
+	if err != nil {
+		stopContextClose()
+		_ = conn.Close()
+		return nil, err
+	}
 	var resp PluginHostControlResponse
-	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+	if err := json.Unmarshal(line, &resp); err != nil {
 		stopContextClose()
 		_ = conn.Close()
 		return nil, err
@@ -624,29 +709,15 @@ func dialPluginHostStream(ctx context.Context, socketPath, command string, req P
 	if !resp.OK {
 		stopContextClose()
 		_ = conn.Close()
-		switch resp.Code {
-		case "pass":
-			return nil, api.ErrPass
-		case "blocked":
-			return nil, api.ErrBlocked
-		default:
-			if resp.Error != "" {
-				return nil, errors.New(resp.Error)
-			}
-			return nil, fmt.Errorf("plugin-host upstream failed with code %q", resp.Code)
+		if resp.Error != "" {
+			return nil, errors.New(resp.Error)
 		}
+		return nil, fmt.Errorf("plugin-host takeover failed with code %q", resp.Code)
 	}
-	connected := false
-	switch command {
-	case PluginHostCommandStreamProxy:
-		connected = resp.Stream != nil && resp.Stream.Connected
-	default:
-		connected = resp.Upstream != nil && resp.Upstream.Connected
-	}
-	if !connected {
+	if resp.Takeover == nil || !resp.Takeover.Connected || resp.Takeover.SessionID != req.SessionID {
 		stopContextClose()
 		_ = conn.Close()
-		return nil, api.ErrPass
+		return nil, errors.New("plugin-host takeover stream was not connected")
 	}
 	if _, err := conn.Write([]byte{1}); err != nil {
 		stopContextClose()
@@ -654,7 +725,64 @@ func dialPluginHostStream(ctx context.Context, socketPath, command string, req P
 		return nil, err
 	}
 	_ = conn.SetDeadline(time.Time{})
-	return &contextBoundConn{Conn: conn, stop: stopContextClose}, nil
+	return &contextBoundConn{Conn: &bufferedConn{Conn: conn, reader: reader}, stop: stopContextClose}, nil
+}
+
+type bufferedConn struct {
+	net.Conn
+	reader io.Reader
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) {
+	if c.reader != nil {
+		n, err := c.reader.Read(p)
+		if n > 0 {
+			return n, nil
+		}
+		if !errors.Is(err, io.EOF) {
+			return n, err
+		}
+		c.reader = nil
+	}
+	return c.Conn.Read(p)
+}
+
+func (c *bufferedConn) CloseWrite() error {
+	if closer, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return closer.CloseWrite()
+	}
+	return c.Conn.Close()
+}
+
+func (c *bufferedConn) CloseRead() error {
+	if closer, ok := c.Conn.(interface{ CloseRead() error }); ok {
+		return closer.CloseRead()
+	}
+	return nil
+}
+
+func relayTakeoverStream(root, endpoint net.Conn) {
+	toEndpointDone, toRootDone := startTakeoverStreamRelay(root, endpoint)
+	<-toEndpointDone
+	<-toRootDone
+	_ = endpoint.Close()
+}
+
+func startTakeoverStreamRelay(root, endpoint net.Conn) (<-chan struct{}, <-chan struct{}) {
+	copyOne := func(dst, src net.Conn, done chan<- struct{}) {
+		_, _ = io.Copy(dst, src)
+		if closer, ok := dst.(interface{ CloseWrite() error }); ok {
+			_ = closer.CloseWrite()
+		} else {
+			_ = dst.Close()
+		}
+		close(done)
+	}
+	toEndpointDone := make(chan struct{})
+	toRootDone := make(chan struct{})
+	go copyOne(endpoint, root, toEndpointDone)
+	go copyOne(root, endpoint, toRootDone)
+	return toEndpointDone, toRootDone
 }
 
 func bindConnToContext(ctx context.Context, conn net.Conn) func() {

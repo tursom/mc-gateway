@@ -180,12 +180,12 @@ func (c *gatewayTestConn) SetWriteDeadline(time.Time) error {
 	return nil
 }
 
-type gatewayTestUpstreamResult struct {
+type gatewayTestBackendResult struct {
 	packet []byte
 	err    error
 }
 
-func startGatewayTestUpstream(t testing.TB, packetLen int, reply []byte) (string, <-chan gatewayTestUpstreamResult) {
+func startGatewayTestUpstream(t testing.TB, packetLen int, reply []byte) (string, <-chan gatewayTestBackendResult) {
 	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -194,11 +194,11 @@ func startGatewayTestUpstream(t testing.TB, packetLen int, reply []byte) (string
 	}
 	t.Cleanup(func() { _ = listener.Close() })
 
-	done := make(chan gatewayTestUpstreamResult, 1)
+	done := make(chan gatewayTestBackendResult, 1)
 	go func() {
 		conn, err := listener.Accept()
 		if err != nil {
-			done <- gatewayTestUpstreamResult{err: err}
+			done <- gatewayTestBackendResult{err: err}
 			return
 		}
 		defer conn.Close()
@@ -206,22 +206,22 @@ func startGatewayTestUpstream(t testing.TB, packetLen int, reply []byte) (string
 
 		packet := make([]byte, packetLen)
 		if _, err := io.ReadFull(conn, packet); err != nil {
-			done <- gatewayTestUpstreamResult{err: err}
+			done <- gatewayTestBackendResult{err: err}
 			return
 		}
 		if len(reply) > 0 {
 			if _, err := conn.Write(reply); err != nil {
-				done <- gatewayTestUpstreamResult{err: err}
+				done <- gatewayTestBackendResult{err: err}
 				return
 			}
 		}
-		done <- gatewayTestUpstreamResult{packet: packet}
+		done <- gatewayTestBackendResult{packet: packet}
 	}()
 
 	return listener.Addr().String(), done
 }
 
-func waitGatewayTestUpstream(t testing.TB, done <-chan gatewayTestUpstreamResult) []byte {
+func waitGatewayTestUpstream(t testing.TB, done <-chan gatewayTestBackendResult) []byte {
 	t.Helper()
 
 	select {
@@ -236,27 +236,27 @@ func waitGatewayTestUpstream(t testing.TB, done <-chan gatewayTestUpstreamResult
 	}
 }
 
-func readGatewayTestPacketOnce(reader io.Reader, conn net.Conn, packetLen int, isTransportTimeout func(error) bool) gatewayTestUpstreamResult {
+func readGatewayTestPacketOnce(reader io.Reader, conn net.Conn, packetLen int, isTransportTimeout func(error) bool) gatewayTestBackendResult {
 	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		return gatewayTestUpstreamResult{err: err}
+		return gatewayTestBackendResult{err: err}
 	}
 	packet := make([]byte, packetLen)
 	if _, err := io.ReadFull(reader, packet); err != nil {
-		return gatewayTestUpstreamResult{err: err}
+		return gatewayTestBackendResult{err: err}
 	}
 
 	if err := conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
-		return gatewayTestUpstreamResult{err: err}
+		return gatewayTestBackendResult{err: err}
 	}
 	extra := make([]byte, 1)
 	n, err := reader.Read(extra)
 	if n > 0 || err == nil {
-		return gatewayTestUpstreamResult{err: errors.New("upstream received duplicate initial packet data")}
+		return gatewayTestBackendResult{err: errors.New("upstream received duplicate initial packet data")}
 	}
 	var netErr net.Error
 	transportTimedOut := isTransportTimeout != nil && isTransportTimeout(err)
 	if !errors.Is(err, io.EOF) && (!errors.As(err, &netErr) || !netErr.Timeout()) && !transportTimedOut {
-		return gatewayTestUpstreamResult{err: err}
+		return gatewayTestBackendResult{err: err}
 	}
-	return gatewayTestUpstreamResult{packet: packet}
+	return gatewayTestBackendResult{packet: packet}
 }

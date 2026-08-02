@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,9 +21,9 @@ func TestManagerExternalClientOperationsAcceptanceRedactsErrors(t *testing.T) {
 	manager := newManagerForTest(t, &fakeAdapter{init: func(g *Gateway) {
 		gateway = g
 	}})
-	var attempts int
+	var attempts atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attempts++
+		attempts.Add(1)
 		switch r.URL.Path {
 		case "/flaky":
 			http.Error(w, "session response token=server-secret full packet payload", http.StatusBadGateway)
@@ -63,8 +63,8 @@ func TestManagerExternalClientOperationsAcceptanceRedactsErrors(t *testing.T) {
 	if _, err := gateway.ExternalClient("session").DoHTTP(context.Background(), api.ExternalRequest{}); err == nil {
 		t.Fatal("ExternalClient.DoHTTP(session) error = nil, want upstream failure")
 	}
-	if attempts != 2 {
-		t.Fatalf("attempts = %d, want one retry after initial failure", attempts)
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("attempts = %d, want one retry after initial failure", got)
 	}
 	if _, err := gateway.ExternalClient("slow").DoHTTP(context.Background(), api.ExternalRequest{}); err == nil {
 		t.Fatal("ExternalClient.DoHTTP(slow) error = nil, want timeout")
@@ -122,79 +122,67 @@ func TestManagerExternalClientOperationsAcceptanceRedactsErrors(t *testing.T) {
 
 func TestOperationsExporterBoundaryFailsOpenAndValidatesOutput(t *testing.T) {
 	var gateway *Gateway
-	manager := newManagerForTest(t, &fakeAdapter{
-		init: func(g *Gateway) {
-			gateway = g
-		},
-		handlers: map[string]api.UpstreamConnectHandler{
-			"plugin-a": func(req api.UpstreamConnectRequest) (net.Conn, error) {
-				_ = gateway.EmitEvent(req.Context, "auth.success", map[string]string{"result": "ok"})
-				_ = gateway.ObserveMetric(req.Context, "auth.attempts", 1, map[string]string{"result": "ok"})
-				return newMemoryConn(), nil
-			},
-		},
-	})
+	manager := newManagerForTest(t, &fakeAdapter{init: func(g *Gateway) { gateway = g }})
 	artifact := uploadTestArtifactWithManifest(t, manager, "plugin-a", func(manifest *Manifest) {
 		manifest.Events = []EventSpec{{Name: "auth.success", Fields: []string{"result"}}}
 		manifest.CustomMetrics = []MetricSpec{{Name: "auth.attempts", Type: "counter", Labels: []string{"result"}}}
 	})
-	if _, err := manager.SetDesired(context.Background(), "admin", "plugin-a", artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
-		t.Fatalf("SetDesired() error = %v", err)
+	if _, err := manager.SetDesired(context.Background(), "admin", artifact.PluginID, artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := manager.Enable(context.Background(), "admin", "plugin-a"); err != nil {
-		t.Fatalf("Enable() error = %v", err)
+	if _, err := manager.Enable(context.Background(), "admin", artifact.PluginID); err != nil {
+		t.Fatal(err)
 	}
 
 	failing := &recordingOperationsExporterSink{err: errors.New("prometheus push failed token=secret")}
-	manager.operations.ConfigureExporter(OperationsExporterConfig{Type: OperationsExporterPrometheus, Enabled: true, Endpoint: "http://user:pass@example.test/metrics?token=secret"}, failing)
-	if _, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{Host: "play.example", Upstream: "backend"}); err != nil {
-		t.Fatalf("ConnectUpstream() with failing exporter error = %v", err)
+	manager.operations.ConfigureExporter(OperationsExporterConfig{
+		Type: OperationsExporterPrometheus, Enabled: true,
+		Endpoint: "http://user:pass@example.test/metrics?token=secret",
+	}, failing)
+	if err := gateway.EmitEvent(context.Background(), "auth.success", map[string]string{"result": "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.ObserveMetric(context.Background(), "auth.attempts", 1, map[string]string{"result": "ok"}); err != nil {
+		t.Fatal(err)
 	}
 	waitForPluginManagerTest(t, func() bool {
-		snap, err := manager.OperationsSnapshot(context.Background(), "plugin-a")
+		snapshot, err := manager.OperationsSnapshot(context.Background(), artifact.PluginID)
 		if err != nil {
 			return false
 		}
-		for _, exporter := range snap.Exporters {
+		for _, exporter := range snapshot.Exporters {
 			if exporter.Type == OperationsExporterPrometheus {
 				return exporter.Degraded && exporter.FailureCount > 0 && strings.Contains(exporter.LastError, "[REDACTED]") && !strings.Contains(exporter.Endpoint, "secret")
 			}
 		}
 		return false
 	})
-	if _, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{Host: "play.example", Upstream: "backend"}); err != nil {
-		t.Fatalf("ConnectUpstream() after degraded exporter error = %v", err)
+	if err := gateway.EmitEvent(context.Background(), "auth.success", map[string]string{"result": "ok"}); err != nil {
+		t.Fatalf("degraded exporter affected plugin event: %v", err)
 	}
 
 	success := &recordingOperationsExporterSink{}
 	manager.operations.ConfigureExporter(OperationsExporterConfig{Type: OperationsExporterOTel, Enabled: true}, success)
-	snap, err := manager.OperationsSnapshot(context.Background(), "plugin-a")
+	snapshot, err := manager.OperationsSnapshot(context.Background(), artifact.PluginID)
 	if err != nil {
-		t.Fatalf("OperationsSnapshot() error = %v", err)
+		t.Fatal(err)
 	}
 	if len(success.batches()) == 0 {
 		t.Fatal("otel exporter received no batches")
 	}
-	for _, exporter := range snap.Exporters {
+	for _, exporter := range snapshot.Exporters {
 		if exporter.Type == OperationsExporterOTel && (exporter.Status != "enabled" || !exporter.LowCardinalityGate || !exporter.SensitiveFieldGate || !exporter.FailOpen) {
-			t.Fatalf("otel exporter status = %+v, want enabled fail-open boundary with gates", exporter)
+			t.Fatalf("otel exporter status = %+v", exporter)
 		}
 	}
 
-	badSnapshot := OperationsSnapshot{
-		Events: []EventSummary{{
-			PluginID: "plugin-a",
-			Name:     "auth.bad",
-			Count:    1,
-			Fields:   map[string]string{"token": "secret"},
-		}},
-	}
+	badSnapshot := OperationsSnapshot{Events: []EventSummary{{PluginID: artifact.PluginID, Name: "auth.bad", Count: 1, Fields: map[string]string{"token": "secret"}}}}
 	if _, err := operationsExportBatch(OperationsExporterPrometheus, badSnapshot); err == nil {
-		t.Fatal("operationsExportBatch(sensitive label) error = nil")
+		t.Fatal("sensitive exporter label was accepted")
 	}
 	badSnapshot.Events[0].Fields = map[string]string{"result": strings.Repeat("x", DefaultLabelValueMaxBytes+1)}
 	if _, err := operationsExportBatch(OperationsExporterPrometheus, badSnapshot); err == nil {
-		t.Fatal("operationsExportBatch(high-cardinality value) error = nil")
+		t.Fatal("high-cardinality exporter value was accepted")
 	}
 	tooManyLabels := make(map[string]string)
 	for i := 0; i < 13; i++ {
@@ -202,12 +190,11 @@ func TestOperationsExporterBoundaryFailsOpenAndValidatesOutput(t *testing.T) {
 	}
 	badSnapshot.Events[0].Fields = tooManyLabels
 	if _, err := operationsExportBatch(OperationsExporterPrometheus, badSnapshot); err == nil {
-		t.Fatal("operationsExportBatch(too many labels) error = nil")
+		t.Fatal("too many exporter labels were accepted")
 	}
-
 	rolledBack := manager.operations.RollbackExporter(OperationsExporterPrometheus)
 	if rolledBack.Enabled || rolledBack.Status != "disabled" || rolledBack.RollbackCount == 0 {
-		t.Fatalf("RollbackExporter() = %+v, want disabled rollback state", rolledBack)
+		t.Fatalf("RollbackExporter() = %+v", rolledBack)
 	}
 }
 
