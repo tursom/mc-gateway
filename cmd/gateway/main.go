@@ -106,6 +106,9 @@ func runEnabledServices(ctx context.Context) error {
 	// 的首包判断它是 HTTP 还是 Minecraft 协议数据，因此不需要额外维护
 	// 一个手动模式开关。
 	startService(runTcpWebPortReuse)
+	if adminStartup.PrometheusMode == prometheusModeDedicated {
+		startService(runPrometheus)
+	}
 
 	// 可选传输最终仍进入 handleRequest，这让插件过滤、路由解析和上游拨号
 	// 在 TCP、KCP、QUIC 和 WebSocket 入口之间保持一致。

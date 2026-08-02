@@ -191,6 +191,29 @@ func TestAdminServiceUpdateMarksRestartRequired(t *testing.T) {
 	}
 }
 
+func TestAdminRejectsSharedPrometheusWebSocketPathConflict(t *testing.T) {
+	handler := newAdminTestHandlerWithAdmin(t)
+	token := adminTestLogin(t, handler, "admin", "secret")
+
+	resp := adminTestRequest(t, handler, http.MethodPut, "/admin/api/services/websocket", token, map[string]any{
+		"enabled": true,
+		"port":    adminStartup.TCPAdminPort,
+		"options": map[string]any{"path": prometheusMetricsPath},
+	})
+	if resp.Code != http.StatusBadRequest || !strings.Contains(resp.Body.String(), "Prometheus") {
+		t.Fatalf("conflicting WebSocket update status=%d body=%s", resp.Code, resp.Body.String())
+	}
+
+	resp = adminTestRequest(t, handler, http.MethodPut, "/admin/api/services/websocket", token, map[string]any{
+		"enabled": true,
+		"port":    adminStartup.TCPAdminPort + 1,
+		"options": map[string]any{"path": prometheusMetricsPath},
+	})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("separate-port WebSocket update status=%d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
 func TestAdminPluginServiceStatusReportsSandboxDataPlane(t *testing.T) {
 	handler := newAdminTestHandlerWithAdmin(t)
 	token := adminTestLogin(t, handler, "admin", "secret")

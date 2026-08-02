@@ -5,18 +5,28 @@ package adminconfig
 import (
 	"errors"
 	"fmt"
+	"net"
 	"path"
 	"strconv"
 	"strings"
 	"time"
 )
 
+type PrometheusMode string
+
 const (
-	DefaultDBPath         = "mc-gateway.sqlite3"
-	DefaultTCPAdminPort   = 25565
-	DefaultAdminPath      = "/admin/"
-	DefaultAdminAPIPrefix = "/admin/api"
-	DefaultSessionTTL     = 8 * time.Hour
+	DefaultDBPath               = "mc-gateway.sqlite3"
+	DefaultTCPAdminPort         = 25565
+	DefaultAdminPath            = "/admin/"
+	DefaultAdminAPIPrefix       = "/admin/api"
+	DefaultSessionTTL           = 8 * time.Hour
+	DefaultPrometheusMode       = PrometheusModeShared
+	DefaultPrometheusListenAddr = "127.0.0.1:9101"
+	PrometheusMetricsPath       = "/metrics"
+
+	PrometheusModeShared    PrometheusMode = "shared"
+	PrometheusModeDedicated PrometheusMode = "dedicated"
+	PrometheusModeDisabled  PrometheusMode = "disabled"
 
 	EnvDB                              = "MC_GATEWAY_DB"
 	EnvTCPAdminPort                    = "MC_GATEWAY_TCP_ADMIN_PORT"
@@ -24,6 +34,9 @@ const (
 	EnvAPIPrefix                       = "MC_GATEWAY_ADMIN_API_PREFIX"
 	EnvInitialPassword                 = "MC_GATEWAY_ADMIN_PASSWORD"
 	EnvPluginRequireConformanceFixture = "MC_GATEWAY_PLUGIN_REQUIRE_CONFORMANCE_FIXTURE"
+	EnvPrometheusMode                  = "MC_GATEWAY_PROMETHEUS_MODE"
+	EnvPrometheusListenAddr            = "MC_GATEWAY_PROMETHEUS_LISTEN_ADDR"
+	EnvPrometheusBearerToken           = "MC_GATEWAY_PROMETHEUS_BEARER_TOKEN"
 )
 
 type Config struct {
@@ -33,15 +46,20 @@ type Config struct {
 	AdminAPIPrefix                  string
 	SessionTTL                      time.Duration
 	PluginRequireConformanceFixture bool
+	PrometheusMode                  PrometheusMode
+	PrometheusListenAddr            string
+	PrometheusBearerToken           string
 }
 
 func Default() Config {
 	return Config{
-		DBPath:         DefaultDBPath,
-		TCPAdminPort:   DefaultTCPAdminPort,
-		AdminPath:      DefaultAdminPath,
-		AdminAPIPrefix: DefaultAdminAPIPrefix,
-		SessionTTL:     DefaultSessionTTL,
+		DBPath:               DefaultDBPath,
+		TCPAdminPort:         DefaultTCPAdminPort,
+		AdminPath:            DefaultAdminPath,
+		AdminAPIPrefix:       DefaultAdminAPIPrefix,
+		SessionTTL:           DefaultSessionTTL,
+		PrometheusMode:       DefaultPrometheusMode,
+		PrometheusListenAddr: DefaultPrometheusListenAddr,
 	}
 }
 
@@ -80,7 +98,46 @@ func Parse(getenv func(string) string) (Config, error) {
 	}
 	cfg.PluginRequireConformanceFixture = requireConformance
 
+	mode := PrometheusMode(strings.ToLower(strings.TrimSpace(getenv(EnvPrometheusMode))))
+	if mode == "" {
+		mode = DefaultPrometheusMode
+	}
+	switch mode {
+	case PrometheusModeShared, PrometheusModeDedicated, PrometheusModeDisabled:
+		cfg.PrometheusMode = mode
+	default:
+		return Config{}, fmt.Errorf("%s must be one of shared, dedicated, or disabled", EnvPrometheusMode)
+	}
+	if cfg.PrometheusMode == PrometheusModeShared {
+		adminRoot := strings.TrimRight(cfg.AdminPath, "/")
+		if adminRoot == PrometheusMetricsPath || cfg.AdminAPIPrefix == PrometheusMetricsPath {
+			return Config{}, fmt.Errorf("shared Prometheus path %s conflicts with Admin HTTP paths", PrometheusMetricsPath)
+		}
+	}
+
+	if listenAddr := strings.TrimSpace(getenv(EnvPrometheusListenAddr)); listenAddr != "" {
+		cfg.PrometheusListenAddr = listenAddr
+	}
+	if cfg.PrometheusMode == PrometheusModeDedicated {
+		if err := validateListenAddr(cfg.PrometheusListenAddr, EnvPrometheusListenAddr); err != nil {
+			return Config{}, err
+		}
+	}
+	cfg.PrometheusBearerToken = getenv(EnvPrometheusBearerToken)
+
 	return cfg, nil
+}
+
+func validateListenAddr(value, name string) error {
+	_, portValue, err := net.SplitHostPort(value)
+	if err != nil {
+		return fmt.Errorf("%s must be a host:port address: %w", name, err)
+	}
+	port, err := strconv.Atoi(portValue)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("%s port must be an integer from 1 to 65535", name)
+	}
+	return nil
 }
 
 func parseOptionalPort(value string, fallback int, name string) (int, error) {

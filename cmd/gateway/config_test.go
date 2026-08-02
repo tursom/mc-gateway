@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -176,4 +177,27 @@ func TestLoadConfigReturnsEnvErrors(t *testing.T) {
 			t.Fatal("loadConfig() error = nil, want error")
 		}
 	})
+}
+
+func TestLoadConfigRejectsSharedPrometheusWebSocketPathConflict(t *testing.T) {
+	defer saveGatewayState(t)()
+	dbPath := filepath.Join(t.TempDir(), "gateway.sqlite3")
+	t.Setenv(adminEnvDB, dbPath)
+	if err := loadConfig(); err != nil {
+		t.Fatalf("initial loadConfig() error = %v", err)
+	}
+	if _, err := adminDB.Exec(`
+UPDATE services
+SET enabled = 1, port = ?, options_json = ?
+WHERE name = ?`, adminStartup.TCPAdminPort, `{"path":"/metrics"}`, serviceNameWebSocket); err != nil {
+		t.Fatalf("seed conflicting WebSocket service: %v", err)
+	}
+	if err := closeGatewayRuntime(context.Background()); err != nil {
+		t.Fatalf("closeGatewayRuntime() error = %v", err)
+	}
+
+	err := loadConfig()
+	if err == nil || !strings.Contains(err.Error(), "Prometheus") {
+		t.Fatalf("loadConfig() error = %v, want Prometheus WebSocket conflict", err)
+	}
 }

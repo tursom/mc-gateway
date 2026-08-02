@@ -31,6 +31,8 @@ const (
 	serviceNameKCP                          = adminservice.NameKCP
 	serviceNameQUIC                         = adminservice.NameQUIC
 	serviceNameWebSocket                    = adminservice.NameWebSocket
+	prometheusModeShared                    = adminconfig.PrometheusModeShared
+	prometheusModeDedicated                 = adminconfig.PrometheusModeDedicated
 	adminEnvDB                              = adminconfig.EnvDB
 	adminEnvTCPAdminPort                    = adminconfig.EnvTCPAdminPort
 	adminEnvPath                            = adminconfig.EnvPath
@@ -48,6 +50,8 @@ var (
 		AdminAPIPrefix:                  defaultAdminAPIPrefix,
 		SessionTTL:                      defaultAdminSessionTTL,
 		PluginRequireConformanceFixture: false,
+		PrometheusMode:                  adminconfig.DefaultPrometheusMode,
+		PrometheusListenAddr:            adminconfig.DefaultPrometheusListenAddr,
 	}
 
 	adminDB        *sql.DB

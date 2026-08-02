@@ -62,10 +62,16 @@ func runTcpWebPortReuse(ctx context.Context) error {
 	stop := context.AfterFunc(ctx, func() { _ = listener.Close() })
 	defer stop()
 
-	log.Info().
+	logEvent := log.Info().
 		Int("port", port).
 		Str("admin_path", adminStartup.AdminPath).
-		Msg("Listening for shared TCP and Admin connections")
+		Str("prometheus_mode", string(adminStartup.PrometheusMode))
+	if adminStartup.PrometheusMode == prometheusModeShared {
+		logEvent = logEvent.
+			Str("prometheus_path", prometheusMetricsPath).
+			Bool("prometheus_authentication_enabled", adminStartup.PrometheusBearerToken != "")
+	}
+	logEvent.Msg("Listening for shared TCP and Admin connections")
 
 	if err := serveTcpWebPortReuse(listener, newGatewayHTTPHandler(), handleRequest); err != nil && !errors.Is(err, net.ErrClosed) {
 		return fmt.Errorf("serve shared TCP/Admin port %d: %w", port, err)

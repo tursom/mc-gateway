@@ -18,18 +18,22 @@ const (
 )
 
 type GatewayHandlerOptions struct {
-	AdminPath        string
-	AdminAPIPrefix   string
-	StaticDir        string
-	APIHandler       http.HandlerFunc
-	WebSocketEnabled bool
-	WebSocketPath    string
-	WebSocketHandler http.HandlerFunc
+	AdminPath         string
+	AdminAPIPrefix    string
+	StaticDir         string
+	APIHandler        http.HandlerFunc
+	WebSocketEnabled  bool
+	WebSocketPath     string
+	WebSocketHandler  http.HandlerFunc
+	PrometheusHandler http.Handler
 }
 
 func NewGatewayHandler(opts GatewayHandlerOptions) http.Handler {
 	mux := http.NewServeMux()
 	registerAdminHandlers(mux, opts)
+	if opts.PrometheusHandler != nil {
+		mux.Handle("/metrics", opts.PrometheusHandler)
+	}
 
 	if opts.WebSocketEnabled &&
 		opts.WebSocketHandler != nil &&

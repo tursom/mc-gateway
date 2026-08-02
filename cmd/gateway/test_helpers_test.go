@@ -39,11 +39,13 @@ func saveGatewayState(t *testing.T) func() {
 	currentPidFile = ""
 	currentLogFile = ""
 	adminStartup = adminconfig.Config{
-		DBPath:         defaultAdminDBPath,
-		TCPAdminPort:   defaultTCPPort,
-		AdminPath:      defaultAdminPath,
-		AdminAPIPrefix: defaultAdminAPIPrefix,
-		SessionTTL:     defaultAdminSessionTTL,
+		DBPath:               defaultAdminDBPath,
+		TCPAdminPort:         defaultTCPPort,
+		AdminPath:            defaultAdminPath,
+		AdminAPIPrefix:       defaultAdminAPIPrefix,
+		SessionTTL:           defaultAdminSessionTTL,
+		PrometheusMode:       adminconfig.DefaultPrometheusMode,
+		PrometheusListenAddr: adminconfig.DefaultPrometheusListenAddr,
 	}
 	adminDB = nil
 	adminDBPath = ""

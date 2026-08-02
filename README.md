@@ -22,6 +22,9 @@ mc-gateway 默认不依赖配置文件。直接启动后会在 `25565` 端口同
 | `MC_GATEWAY_ADMIN_STATIC_DIR` | `cmd/gateway/admin_static` | Admin 前端静态文件目录；Docker 镜像中为 `/usr/share/mc-gateway/admin_static` |
 | `MC_GATEWAY_DB` | `mc-gateway.sqlite3` | SQLite 数据库路径 |
 | `MC_GATEWAY_ADMIN_PASSWORD` | 空 | 首次启动时创建默认管理员密码 |
+| `MC_GATEWAY_PROMETHEUS_MODE` | `shared` | Prometheus 监听模式：`shared`、`dedicated` 或 `disabled` |
+| `MC_GATEWAY_PROMETHEUS_LISTEN_ADDR` | `127.0.0.1:9101` | `dedicated` 模式的监听地址 |
+| `MC_GATEWAY_PROMETHEUS_BEARER_TOKEN` | 空 | Prometheus 抓取使用的可选 Bearer Token |
 
 服务启停、KCP/QUIC/WebSocket 参数、用户、权限和路由都通过后台管理写入 SQLite，不再使用 `config.toml` 作为启动配置或路由来源。
 
@@ -74,7 +77,55 @@ MC_GATEWAY_ADMIN_PATH=/admin/
 MC_GATEWAY_ADMIN_API_PREFIX=/admin/api
 MC_GATEWAY_ADMIN_STATIC_DIR=/usr/share/mc-gateway/admin_static
 MC_GATEWAY_DB=/data/mc-gateway.sqlite3
+MC_GATEWAY_PROMETHEUS_MODE=shared
+MC_GATEWAY_PROMETHEUS_LISTEN_ADDR=127.0.0.1:9101
+MC_GATEWAY_PROMETHEUS_BEARER_TOKEN=
 ```
+
+### Prometheus
+
+默认 `shared` 模式复用 TCP/Admin 监听端口，在以下地址提供标准 Prometheus 和 OpenMetrics 输出：
+
+```text
+http://<host>:25565/metrics
+```
+
+共享端口的抓取配置示例：
+
+```yaml
+scrape_configs:
+  - job_name: mc-gateway
+    static_configs:
+      - targets: ["gateway.example:25565"]
+```
+
+需要隔离监听器时，将模式改为 `dedicated`；默认只绑定本机 `127.0.0.1:9101`：
+
+```env
+MC_GATEWAY_PROMETHEUS_MODE=dedicated
+MC_GATEWAY_PROMETHEUS_LISTEN_ADDR=127.0.0.1:9101
+```
+
+```yaml
+scrape_configs:
+  - job_name: mc-gateway
+    static_configs:
+      - targets: ["127.0.0.1:9101"]
+```
+
+配置 `MC_GATEWAY_PROMETHEUS_BEARER_TOKEN` 后，Prometheus 必须携带相同的 Bearer Token。推荐通过凭据文件提供：
+
+```yaml
+scrape_configs:
+  - job_name: mc-gateway
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/secrets/mc-gateway-token
+    static_configs:
+      - targets: ["gateway.example:25565"]
+```
+
+当前抓取端点导出网关连接、路由、上游拨号错误及 Go runtime/process 指标。插件系统中的 external Prometheus exporter 仍为 reserved/disabled，插件 custom metrics 不会由该端点导出。
 
 ### Admin 前端开发
 

@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
 
 	"github.com/tursom/mc-gateway/internal/adminservice"
 	"github.com/tursom/mc-gateway/internal/pluginmanager"
@@ -52,6 +53,9 @@ func applyServiceConfig(ctx context.Context, db *sql.DB) error {
 	}
 	if config.WebSocket.Path == "" {
 		config.WebSocket.Path = defaultWebSocketPath
+	}
+	if err := validatePrometheusWebSocketPath(config.WebSocket.Enable, config.WebSocket.Port, config.WebSocket.Path); err != nil {
+		return err
 	}
 
 	return nil
@@ -114,5 +118,29 @@ func serviceIsRunning(service adminservice.Record) bool {
 }
 
 func updateServiceConfig(ctx context.Context, actor, name string, enabled bool, port int, options map[string]any) error {
+	options = adminservice.NormalizeOptions(name, options)
+	if name == serviceNameWebSocket {
+		if err := validatePrometheusWebSocketPath(
+			enabled,
+			port,
+			adminservice.StringOption(options, "path", defaultWebSocketPath),
+		); err != nil {
+			return err
+		}
+	}
 	return adminservice.NewRepository(adminDB).Update(ctx, actor, name, enabled, port, options)
+}
+
+func validatePrometheusWebSocketPath(enabled bool, port int, path string) error {
+	if adminStartup.PrometheusMode == prometheusModeShared &&
+		enabled &&
+		port == adminStartup.TCPAdminPort &&
+		path == prometheusMetricsPath {
+		return fmt.Errorf(
+			"WebSocket path %s conflicts with shared Prometheus endpoint on TCP/Admin port %d",
+			prometheusMetricsPath,
+			adminStartup.TCPAdminPort,
+		)
+	}
+	return nil
 }

@@ -21,6 +21,15 @@ func TestParseDefaultsAndEnv(t *testing.T) {
 	if cfg.AdminAPIPrefix != DefaultAdminAPIPrefix {
 		t.Fatalf("AdminAPIPrefix = %q, want %q", cfg.AdminAPIPrefix, DefaultAdminAPIPrefix)
 	}
+	if cfg.PrometheusMode != PrometheusModeShared {
+		t.Fatalf("PrometheusMode = %q, want %q", cfg.PrometheusMode, PrometheusModeShared)
+	}
+	if cfg.PrometheusListenAddr != DefaultPrometheusListenAddr {
+		t.Fatalf("PrometheusListenAddr = %q, want %q", cfg.PrometheusListenAddr, DefaultPrometheusListenAddr)
+	}
+	if cfg.PrometheusBearerToken != "" {
+		t.Fatalf("PrometheusBearerToken = %q, want empty", cfg.PrometheusBearerToken)
+	}
 
 	env := map[string]string{
 		EnvDB:                              "/tmp/mc.db",
@@ -28,13 +37,30 @@ func TestParseDefaultsAndEnv(t *testing.T) {
 		EnvPath:                            "/ops",
 		EnvAPIPrefix:                       "/ops/api/",
 		EnvPluginRequireConformanceFixture: "true",
+		EnvPrometheusMode:                  string(PrometheusModeDedicated),
+		EnvPrometheusListenAddr:            "[::1]:9201",
+		EnvPrometheusBearerToken:           "metrics-secret",
 	}
 	cfg, err = Parse(func(key string) string { return env[key] })
 	if err != nil {
 		t.Fatalf("Parse(env) error = %v", err)
 	}
-	if cfg.DBPath != "/tmp/mc.db" || cfg.TCPAdminPort != 25575 || cfg.AdminPath != "/ops/" || cfg.AdminAPIPrefix != "/ops/api" || !cfg.PluginRequireConformanceFixture {
+	if cfg.DBPath != "/tmp/mc.db" || cfg.TCPAdminPort != 25575 || cfg.AdminPath != "/ops/" || cfg.AdminAPIPrefix != "/ops/api" || !cfg.PluginRequireConformanceFixture ||
+		cfg.PrometheusMode != PrometheusModeDedicated || cfg.PrometheusListenAddr != "[::1]:9201" || cfg.PrometheusBearerToken != "metrics-secret" {
 		t.Fatalf("config = %+v", cfg)
+	}
+
+	cfg, err = Parse(func(key string) string {
+		if key == EnvPrometheusMode {
+			return string(PrometheusModeDisabled)
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("Parse(disabled) error = %v", err)
+	}
+	if cfg.PrometheusMode != PrometheusModeDisabled {
+		t.Fatalf("PrometheusMode = %q, want %q", cfg.PrometheusMode, PrometheusModeDisabled)
 	}
 }
 
@@ -73,6 +99,25 @@ func TestParseReturnsErrors(t *testing.T) {
 		{
 			name: "invalid plugin conformance gate",
 			env:  map[string]string{EnvPluginRequireConformanceFixture: "maybe"},
+		},
+		{
+			name: "invalid prometheus mode",
+			env:  map[string]string{EnvPrometheusMode: "public"},
+		},
+		{
+			name: "invalid prometheus listen address",
+			env: map[string]string{
+				EnvPrometheusMode:       string(PrometheusModeDedicated),
+				EnvPrometheusListenAddr: "not-an-address",
+			},
+		},
+		{
+			name: "shared prometheus conflicts with admin path",
+			env:  map[string]string{EnvPath: "/metrics"},
+		},
+		{
+			name: "shared prometheus conflicts with admin API prefix",
+			env:  map[string]string{EnvAPIPrefix: "/metrics"},
 		},
 	}
 
