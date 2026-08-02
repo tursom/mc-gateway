@@ -463,7 +463,7 @@ func TestPluginHostCrashBackoffPreventsDeadHostReuse(t *testing.T) {
 		artifact: artifact,
 		runtime:  RuntimeInstance{HostProcess: process},
 	}
-	_, err = manager.loadLocked(context.Background(), pluginRecord)
+	_, _, err = manager.loadLocked(context.Background(), pluginRecord)
 	_, stillLoaded := manager.loaded["plugin-a"]
 	manager.mu.Unlock()
 

@@ -18,6 +18,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -2489,6 +2490,455 @@ func TestManagerReconcileRestoresEnabledPlugin(t *testing.T) {
 	}
 }
 
+func TestManagerReconcileStopsRuntimeRemovedFromDesiredSet(t *testing.T) {
+	recorder := &reconcileLifecycleRecorder{}
+	manager := newManagerForTest(t, &reconcileLifecycleAdapter{recorder: recorder})
+	artifact := uploadTestArtifact(t, manager, "reconcile-remove")
+	if _, err := manager.SetDesired(context.Background(), "admin", artifact.PluginID, artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired(enabled) error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", artifact.PluginID); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	if _, err := manager.SetDesired(context.Background(), "admin", artifact.PluginID, artifact.ID, DesiredDisabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired(disabled) error = %v", err)
+	}
+
+	if err := manager.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	result, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{Host: "play.example", Upstream: "backend"})
+	if err != nil || result.Handled {
+		t.Fatalf("ConnectUpstream(after reconcile) = %+v err=%v, want pass-through", result, err)
+	}
+	if got, want := recorder.snapshot(), []string{"drain:reconcile-remove:1", "destroy:reconcile-remove:1", "stop:reconcile-remove:1"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("runtime lifecycle after reconcile = %v, want %v", got, want)
+	}
+	if err := manager.Reconcile(context.Background()); err != nil {
+		t.Fatalf("second Reconcile() error = %v", err)
+	}
+	if err := manager.Close(context.Background()); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if got, want := recorder.snapshot(), []string{"drain:reconcile-remove:1", "destroy:reconcile-remove:1", "stop:reconcile-remove:1"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("runtime lifecycle after close = %v, want no second stop", got)
+	}
+}
+
+func TestManagerReconcileStopsInvalidReplacementCandidate(t *testing.T) {
+	recorder := &reconcileLifecycleRecorder{}
+	adapter := &reconcileLifecycleAdapter{
+		recorder:     recorder,
+		skipHandlers: make(map[string]bool),
+	}
+	manager := newManagerForTest(t, adapter)
+	first := uploadTestArtifact(t, manager, "reconcile-invalid-replacement")
+	second := uploadTestArtifactWithManifestBytes(t, manager, "reconcile-invalid-replacement", []byte("replacement without extensions"), func(manifest *Manifest) {
+		manifest.Version = "0.2.0"
+	})
+	adapter.skipHandlers[second.ID] = true
+	if _, err := manager.SetDesired(context.Background(), "admin", first.PluginID, first.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired(first) error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", first.PluginID); err != nil {
+		t.Fatalf("Enable(first) error = %v", err)
+	}
+	if _, err := manager.SetDesired(context.Background(), "admin", second.PluginID, second.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired(second) error = %v", err)
+	}
+	if err := manager.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	want := []string{
+		"drain:reconcile-invalid-replacement:1",
+		"destroy:reconcile-invalid-replacement:1",
+		"stop:reconcile-invalid-replacement:1",
+		"drain:reconcile-invalid-replacement:2",
+		"destroy:reconcile-invalid-replacement:2",
+		"stop:reconcile-invalid-replacement:2",
+	}
+	if got := recorder.snapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("runtime lifecycle after invalid replacement = %v, want %v", got, want)
+	}
+	result, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{Host: "play.example", Upstream: "backend"})
+	if err != nil || result.Handled {
+		t.Fatalf("ConnectUpstream(after invalid replacement) = %+v err=%v, want pass-through", result, err)
+	}
+	if err := manager.Close(context.Background()); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if got := recorder.snapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("runtime lifecycle after close = %v, want no second stop", got)
+	}
+}
+
+func TestManagerReconcileCleanupErrorsDoNotRestoreRemovedRuntime(t *testing.T) {
+	recorder := &reconcileLifecycleRecorder{}
+	adapter := &reconcileLifecycleAdapter{
+		recorder:   recorder,
+		drainErr:   errors.New("drain failed"),
+		destroyErr: errors.New("destroy failed"),
+		stopErr:    errors.New("stop failed"),
+	}
+	manager := newManagerForTest(t, adapter)
+	artifact := uploadTestArtifact(t, manager, "reconcile-cleanup-errors")
+	if _, err := manager.SetDesired(context.Background(), "admin", artifact.PluginID, artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired(enabled) error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", artifact.PluginID); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	if _, err := manager.SetDesired(context.Background(), "admin", artifact.PluginID, artifact.ID, DesiredDisabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired(disabled) error = %v", err)
+	}
+	if err := manager.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error = %v, want cleanup warnings only", err)
+	}
+	want := []string{
+		"drain:reconcile-cleanup-errors:1",
+		"destroy:reconcile-cleanup-errors:1",
+		"stop:reconcile-cleanup-errors:1",
+	}
+	if got := recorder.snapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("runtime lifecycle with cleanup errors = %v, want %v", got, want)
+	}
+	result, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{Host: "play.example", Upstream: "backend"})
+	if err != nil || result.Handled {
+		t.Fatalf("ConnectUpstream(after cleanup errors) = %+v err=%v, want pass-through", result, err)
+	}
+}
+
+func TestManagerReconcileStopsRuntimeBlockedByReleaseGate(t *testing.T) {
+	recorder := &reconcileLifecycleRecorder{}
+	manager := newManagerForTest(t, &reconcileLifecycleAdapter{recorder: recorder})
+	artifact := uploadTestArtifact(t, manager, "reconcile-gate-block")
+	if _, err := manager.SetDesired(context.Background(), "admin", artifact.PluginID, artifact.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired() error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", artifact.PluginID); err != nil {
+		t.Fatalf("Enable() error = %v", err)
+	}
+	if _, err := manager.UpsertAdvisory(context.Background(), "security", AdvisoryRequest{
+		AdvisoryID:     "MCG-RECONCILE-GATE-BLOCK",
+		Status:         AdvisoryStatusRevoked,
+		Action:         AdvisoryActionRevoke,
+		ArtifactSHA256: artifact.SHA256,
+	}); err != nil {
+		t.Fatalf("UpsertAdvisory() error = %v", err)
+	}
+	if err := manager.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	want := []string{
+		"drain:reconcile-gate-block:1",
+		"destroy:reconcile-gate-block:1",
+		"stop:reconcile-gate-block:1",
+	}
+	if got := recorder.snapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("runtime lifecycle after gate block = %v, want %v", got, want)
+	}
+	plugin, err := manager.Plugin(context.Background(), artifact.PluginID)
+	if err != nil {
+		t.Fatalf("Plugin() error = %v", err)
+	}
+	if plugin.DesiredState != DesiredEnabled || plugin.RuntimeState != RuntimeFailed {
+		t.Fatalf("plugin after gate block = %+v, want desired enabled and runtime failed", plugin)
+	}
+}
+
+func TestManagerReconcileStopsRuntimeReplacedByNewArtifact(t *testing.T) {
+	recorder := &reconcileLifecycleRecorder{}
+	manager := newManagerForTest(t, &reconcileLifecycleAdapter{recorder: recorder})
+	first := uploadTestArtifact(t, manager, "reconcile-replace")
+	second := uploadTestArtifactWithManifestBytes(t, manager, "reconcile-replace", []byte("replacement plugin bytes"), func(manifest *Manifest) {
+		manifest.Version = "0.2.0"
+	})
+	if _, err := manager.SetDesired(context.Background(), "admin", first.PluginID, first.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired(first) error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", first.PluginID); err != nil {
+		t.Fatalf("Enable(first) error = %v", err)
+	}
+	if _, err := manager.SetDesired(context.Background(), "admin", second.PluginID, second.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired(second) error = %v", err)
+	}
+
+	if err := manager.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	result, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{Host: "play.example", Upstream: "backend"})
+	if err != nil || !result.Handled {
+		t.Fatalf("ConnectUpstream(after replacement) = %+v err=%v, want replacement runtime", result, err)
+	}
+	oldStopped := []string{"drain:reconcile-replace:1", "destroy:reconcile-replace:1", "stop:reconcile-replace:1"}
+	if got := recorder.snapshot(); !reflect.DeepEqual(got, oldStopped) {
+		t.Fatalf("runtime lifecycle after replacement = %v, want %v", got, oldStopped)
+	}
+	if err := manager.Close(context.Background()); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	want := append(oldStopped,
+		"drain:reconcile-replace:2",
+		"destroy:reconcile-replace:2",
+		"stop:reconcile-replace:2",
+	)
+	if got := recorder.snapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("runtime lifecycle after close = %v, want %v", got, want)
+	}
+}
+
+func TestManagerReconcileRetiresPublishedRuntimeDisplacedByLoad(t *testing.T) {
+	recorder := &reconcileLifecycleRecorder{}
+	manager := newManagerForTest(t, &reconcileLifecycleAdapter{recorder: recorder})
+	defer manager.Close(context.Background())
+	first := uploadTestArtifact(t, manager, "reconcile-loaded-replacement")
+	second := uploadTestArtifactWithManifestBytes(t, manager, "reconcile-loaded-replacement", []byte("loaded replacement"), func(manifest *Manifest) {
+		manifest.Version = "0.2.0"
+	})
+	if _, err := manager.SetDesired(context.Background(), "admin", first.PluginID, first.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired(first) error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", first.PluginID); err != nil {
+		t.Fatalf("Enable(first) error = %v", err)
+	}
+	if _, err := manager.SetDesired(context.Background(), "admin", second.PluginID, second.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired(second) error = %v", err)
+	}
+	if _, err := manager.Load(context.Background(), "admin", second.PluginID); err != nil {
+		t.Fatalf("Load(second) error = %v", err)
+	}
+	if got := recorder.snapshot(); len(got) != 0 {
+		t.Fatalf("lifecycle after Load = %v, want published runtime retained", got)
+	}
+	before := currentDispatchSnapshotForTest(t, manager)
+	if len(before) != 1 || before[0].artifactID != first.ID {
+		t.Fatalf("dispatch after Load = %+v, want first artifact", before)
+	}
+	if err := manager.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	want := []string{
+		"drain:reconcile-loaded-replacement:1",
+		"destroy:reconcile-loaded-replacement:1",
+		"stop:reconcile-loaded-replacement:1",
+	}
+	if got := recorder.snapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("runtime lifecycle after Reconcile = %v, want %v", got, want)
+	}
+	after := currentDispatchSnapshotForTest(t, manager)
+	if len(after) != 1 || after[0].artifactID != second.ID {
+		t.Fatalf("dispatch after Reconcile = %+v, want second artifact", after)
+	}
+	if len(manager.displaced) != 0 {
+		t.Fatalf("displaced runtimes = %d, want 0", len(manager.displaced))
+	}
+}
+
+func TestManagerReconcileWaitsForOldHandlerReservationBeforeRuntimeStop(t *testing.T) {
+	recorder := &reconcileLifecycleRecorder{}
+	invoking := make(chan struct{})
+	release := make(chan struct{})
+	adapter := &reconcileLifecycleAdapter{
+		recorder: recorder,
+		handlers: map[int64]api.UpstreamConnectHandler{
+			1: func(api.UpstreamConnectRequest) (net.Conn, error) {
+				close(invoking)
+				<-release
+				return newMemoryConn(), nil
+			},
+		},
+	}
+	manager := newManagerForTest(t, adapter)
+	defer manager.Close(context.Background())
+	first := uploadTestArtifact(t, manager, "reconcile-handler-reservation")
+	second := uploadTestArtifactWithManifestBytes(t, manager, "reconcile-handler-reservation", []byte("handler replacement"), func(manifest *Manifest) {
+		manifest.Version = "0.2.0"
+	})
+	if _, err := manager.SetDesired(context.Background(), "admin", first.PluginID, first.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired(first) error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", first.PluginID); err != nil {
+		t.Fatalf("Enable(first) error = %v", err)
+	}
+	manager.serviceMode = PluginServiceModeGoPluginProcess
+	process := &PluginHostSupervisorProcess{PluginID: first.PluginID, ArtifactID: first.ID}
+	process.exitedAt = 1
+	manager.loaded[first.PluginID].runtime.HostProcess = process
+	connectDone := make(chan error, 1)
+	go func() {
+		result, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{})
+		if result.Conn != nil {
+			_ = result.Conn.Close()
+		}
+		connectDone <- err
+	}()
+	select {
+	case <-invoking:
+	case <-time.After(2 * time.Second):
+		t.Fatal("old handler did not start")
+	}
+	if _, err := manager.SetDesired(context.Background(), "admin", second.PluginID, second.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired(second) error = %v", err)
+	}
+	if err := manager.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	wantBeforeRelease := []string{
+		"drain:reconcile-handler-reservation:1",
+		"destroy:reconcile-handler-reservation:1",
+	}
+	if got := recorder.snapshot(); !reflect.DeepEqual(got, wantBeforeRelease) {
+		t.Fatalf("lifecycle while old handler runs = %v, want %v", got, wantBeforeRelease)
+	}
+	close(release)
+	select {
+	case err := <-connectDone:
+		if err != nil {
+			t.Fatalf("ConnectUpstream() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("old handler did not finish")
+	}
+	waitForPluginManagerTest(t, func() bool {
+		return reflect.DeepEqual(recorder.snapshot(), append(wantBeforeRelease, "stop:reconcile-handler-reservation:1"))
+	})
+}
+
+func TestManagerReconcileStopsOldRuntimeWhenReplacementFails(t *testing.T) {
+	recorder := &reconcileLifecycleRecorder{}
+	adapter := &reconcileLifecycleAdapter{
+		recorder:            recorder,
+		startErrsByArtifact: make(map[string]error),
+	}
+	manager := newManagerForTest(t, adapter)
+	first := uploadTestArtifact(t, manager, "reconcile-failed-replacement")
+	second := uploadTestArtifactWithManifestBytes(t, manager, "reconcile-failed-replacement", []byte("failed replacement plugin bytes"), func(manifest *Manifest) {
+		manifest.Version = "0.2.0"
+	})
+	adapter.startErrsByArtifact[second.ID] = errors.New("replacement start failed")
+	if _, err := manager.SetDesired(context.Background(), "admin", first.PluginID, first.ID, DesiredEnabled, `{"revision":1}`, 10); err != nil {
+		t.Fatalf("SetDesired(first) error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", first.PluginID); err != nil {
+		t.Fatalf("Enable(first) error = %v", err)
+	}
+	if _, err := manager.SetDesired(context.Background(), "admin", second.PluginID, second.ID, DesiredEnabled, `{"revision":2}`, 10); err != nil {
+		t.Fatalf("SetDesired(replacement) error = %v", err)
+	}
+
+	if err := manager.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	result, err := manager.ConnectUpstream(context.Background(), api.UpstreamConnectRequest{Host: "play.example", Upstream: "backend"})
+	if err != nil || result.Handled {
+		t.Fatalf("ConnectUpstream(after failed replacement) = %+v err=%v, want pass-through", result, err)
+	}
+	want := []string{
+		"drain:reconcile-failed-replacement:1",
+		"destroy:reconcile-failed-replacement:1",
+		"stop:reconcile-failed-replacement:1",
+	}
+	if got := recorder.snapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("runtime lifecycle after failed replacement = %v, want %v", got, want)
+	}
+	plugin, err := manager.Plugin(context.Background(), first.PluginID)
+	if err != nil {
+		t.Fatalf("Plugin() error = %v", err)
+	}
+	if plugin.RuntimeState != RuntimeFailed || !strings.Contains(plugin.LastError, "replacement start failed") {
+		t.Fatalf("plugin after failed replacement = %+v, want failed runtime", plugin)
+	}
+	if err := manager.Close(context.Background()); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if got := recorder.snapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("runtime lifecycle after close = %v, want no second stop", got)
+	}
+}
+
+func TestManagerReconcileReplacementCancelsRemovedBackgroundTask(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	newStarted := make(chan struct{})
+	var overlapped atomic.Bool
+	adapter := &reconcileLifecycleAdapter{
+		recorder: &reconcileLifecycleRecorder{},
+		tasks: map[int64]api.BackgroundTask{
+			1: {
+				ID:         "old-sync",
+				RunOnStart: true,
+				Timeout:    30 * time.Second,
+				Run: func(ctx context.Context) error {
+					close(started)
+					<-ctx.Done()
+					close(canceled)
+					return ctx.Err()
+				},
+			},
+			2: {
+				ID:         "new-sync",
+				RunOnStart: true,
+				Timeout:    30 * time.Second,
+				Run: func(context.Context) error {
+					select {
+					case <-canceled:
+					default:
+						overlapped.Store(true)
+					}
+					close(newStarted)
+					return nil
+				},
+			},
+		},
+	}
+	manager := newManagerForTest(t, adapter)
+	defer manager.Close(context.Background())
+	first := uploadTestArtifactWithManifest(t, manager, "reconcile-task-replacement", func(manifest *Manifest) {
+		manifest.BackgroundTasks = []TaskSpec{{ID: "old-sync", RunOnStart: true, Timeout: "30s"}}
+	})
+	second := uploadTestArtifactWithManifestBytes(t, manager, "reconcile-task-replacement", []byte("replacement with new task"), func(manifest *Manifest) {
+		manifest.Version = "0.2.0"
+		manifest.BackgroundTasks = []TaskSpec{{ID: "new-sync", RunOnStart: true, Timeout: "30s"}}
+	})
+	if _, err := manager.SetDesired(context.Background(), "admin", first.PluginID, first.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired(first) error = %v", err)
+	}
+	if _, err := manager.Enable(context.Background(), "admin", first.PluginID); err != nil {
+		t.Fatalf("Enable(first) error = %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("old background task did not start")
+	}
+	if _, err := manager.SetDesired(context.Background(), "admin", second.PluginID, second.ID, DesiredEnabled, `{}`, 10); err != nil {
+		t.Fatalf("SetDesired(second) error = %v", err)
+	}
+	if err := manager.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	select {
+	case <-canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("old background task was not canceled after replacement")
+	}
+	select {
+	case <-newStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("new background task did not start after replacement")
+	}
+	if overlapped.Load() {
+		t.Fatal("new background task started before old generation was canceled")
+	}
+	snapshot, err := manager.OperationsSnapshot(context.Background(), first.PluginID)
+	if err != nil {
+		t.Fatalf("OperationsSnapshot() error = %v", err)
+	}
+	if len(snapshot.BackgroundTasks) != 1 || snapshot.BackgroundTasks[0].TaskID != "new-sync" {
+		t.Fatalf("background tasks after replacement = %+v, want only new-sync", snapshot.BackgroundTasks)
+	}
+}
+
 func TestAcceptorPanicIsRecovered(t *testing.T) {
 	handler := &upstreamHandler{
 		pluginID: "acceptor",
@@ -2620,6 +3070,157 @@ func TestProtocolProxyTrackDrainAndForceClose(t *testing.T) {
 	}
 	if got := handler.lastProxyError.Load(); got == nil {
 		t.Fatal("last proxy error = nil, want force-close copy error summary")
+	}
+}
+
+func TestPendingRuntimeStopIgnoresReplacementConnections(t *testing.T) {
+	manager := newManagerForTest(t, &fakeAdapter{})
+	oldRuntime := runtimeIdentity{pluginID: "proxy-replacement", artifactID: "artifact-old", desiredGeneration: 1}
+	newRuntime := runtimeIdentity{pluginID: "proxy-replacement", artifactID: "artifact-new", desiredGeneration: 2}
+	oldHandler := &upstreamHandler{
+		pluginID:   "proxy-replacement",
+		artifactID: "artifact-old",
+		runtime:    oldRuntime,
+		handlerID:  "old-handler",
+		mode:       UpstreamModeProtocolProxy,
+	}
+	newHandler := &upstreamHandler{
+		pluginID:   "proxy-replacement",
+		artifactID: "artifact-new",
+		runtime:    newRuntime,
+		handlerID:  "new-handler",
+		mode:       UpstreamModeProtocolProxy,
+	}
+	manager.snapshot.Store([]*upstreamHandler{oldHandler, newHandler})
+	oldClient, oldClientPeer := net.Pipe()
+	oldEndpoint, oldEndpointPeer := net.Pipe()
+	newClient, newClientPeer := net.Pipe()
+	newEndpoint, newEndpointPeer := net.Pipe()
+	for _, conn := range []net.Conn{oldClient, oldClientPeer, oldEndpoint, oldEndpointPeer, newClient, newClientPeer, newEndpoint, newEndpointPeer} {
+		defer conn.Close()
+	}
+	oldHandle := manager.TrackProxyConnection(UpstreamResult{
+		Mode:      UpstreamModeProtocolProxy,
+		PluginID:  "proxy-replacement",
+		HandlerID: "old-handler",
+	}, oldClient, oldEndpoint)
+	newHandle := manager.TrackProxyConnection(UpstreamResult{
+		Mode:      UpstreamModeProtocolProxy,
+		PluginID:  "proxy-replacement",
+		HandlerID: "new-handler",
+	}, newClient, newEndpoint)
+	if oldHandle == nil || newHandle == nil {
+		t.Fatal("TrackProxyConnection() returned nil handle")
+	}
+	process := &PluginHostSupervisorProcess{PluginID: "proxy-replacement", ArtifactID: "artifact-old"}
+	process.exitedAt = 1
+	loaded := &loadedPlugin{
+		record:   PluginRecord{ID: "proxy-replacement", DesiredGeneration: 1},
+		artifact: ArtifactRecord{ID: "artifact-old"},
+		runtime:  RuntimeInstance{HostProcess: process},
+	}
+	manager.hostMu.Lock()
+	manager.pendingRuntimeStops[oldRuntime] = loaded
+	manager.hostMu.Unlock()
+
+	oldHandle.Finish(ProxyConnectionStats{})
+	waitForPluginManagerTest(t, func() bool {
+		manager.hostMu.Lock()
+		defer manager.hostMu.Unlock()
+		return len(manager.pendingRuntimeStops) == 0
+	})
+	newHandle.Finish(ProxyConnectionStats{})
+}
+
+func TestDeferredRuntimeRetirementCompletesAfterOwnConnectionsDrain(t *testing.T) {
+	recorder := &reconcileLifecycleRecorder{}
+	stopStarted := make(chan struct{})
+	stopRelease := make(chan struct{})
+	manager := newManagerForTest(t, &reconcileLifecycleAdapter{
+		recorder: recorder,
+		onStop: func(RuntimeInstance) {
+			close(stopStarted)
+			<-stopRelease
+		},
+	})
+	manager.serviceMode = PluginServiceModeGoPluginProcess
+	key := runtimeIdentity{pluginID: "deferred-retirement", artifactID: "artifact-old", desiredGeneration: 1, runtimeInstanceID: "runtime-old"}
+	handler := &upstreamHandler{
+		pluginID:   key.pluginID,
+		artifactID: key.artifactID,
+		runtime:    key,
+		handlerID:  "old-handler",
+		mode:       UpstreamModeProtocolProxy,
+	}
+	manager.snapshot.Store([]*upstreamHandler{handler})
+	client, clientPeer := net.Pipe()
+	endpoint, endpointPeer := net.Pipe()
+	for _, conn := range []net.Conn{client, clientPeer, endpoint, endpointPeer} {
+		defer conn.Close()
+	}
+	handle := manager.TrackProxyConnection(UpstreamResult{
+		Mode:      UpstreamModeProtocolProxy,
+		PluginID:  key.pluginID,
+		HandlerID: handler.handlerID,
+		handler:   handler,
+	}, client, endpoint)
+	if handle == nil {
+		t.Fatal("TrackProxyConnection() returned nil handle")
+	}
+	process := &PluginHostSupervisorProcess{PluginID: key.pluginID, ArtifactID: key.artifactID}
+	loaded := &loadedPlugin{
+		record:   PluginRecord{ID: key.pluginID, DesiredGeneration: key.desiredGeneration},
+		artifact: ArtifactRecord{ID: key.artifactID, PluginID: key.pluginID},
+		instance: &reconcileLifecyclePlugin{pluginID: key.pluginID, generation: key.desiredGeneration, recorder: recorder},
+		runtime: RuntimeInstance{
+			RuntimePrepared: RuntimePrepared{PluginID: key.pluginID, ArtifactID: key.artifactID, DesiredGeneration: key.desiredGeneration, RuntimeInstanceID: key.runtimeInstanceID},
+			HostProcess:     process,
+		},
+	}
+	manager.mu.Lock()
+	errList := manager.retireLoadedPluginLocked(context.Background(), loaded)
+	manager.mu.Unlock()
+	if len(errList) != 0 {
+		t.Fatalf("retireLoadedPluginLocked() errors = %v", errList)
+	}
+	wantBeforeDrain := []string{
+		"drain:deferred-retirement:1",
+		"destroy:deferred-retirement:1",
+	}
+	if got := recorder.snapshot(); !reflect.DeepEqual(got, wantBeforeDrain) {
+		t.Fatalf("lifecycle before connection drain = %v, want %v", got, wantBeforeDrain)
+	}
+	manager.hostMu.Lock()
+	pending := len(manager.pendingRuntimeStops)
+	manager.hostMu.Unlock()
+	if pending != 1 {
+		t.Fatalf("pending runtime stops = %d, want 1", pending)
+	}
+	handle.Finish(ProxyConnectionStats{})
+	select {
+	case <-stopStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("deferred runtime stop did not start")
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- manager.Close(context.Background()) }()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close() returned before deferred stop completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(stopRelease)
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close() did not wait for deferred stop")
+	}
+	want := append(wantBeforeDrain, "stop:deferred-retirement:1")
+	if got := recorder.snapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("completed lifecycle = %v, want %v", got, want)
 	}
 }
 
@@ -4043,6 +4644,119 @@ type fakeAdapter struct {
 	loadErrs   map[string]error
 	dryRunErr  error
 	dryRunErrs map[string]error
+}
+
+type reconcileLifecycleRecorder struct {
+	mu     sync.Mutex
+	events []string
+}
+
+func (r *reconcileLifecycleRecorder) add(event string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, event)
+}
+
+func (r *reconcileLifecycleRecorder) snapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.events...)
+}
+
+type reconcileLifecycleAdapter struct {
+	recorder            *reconcileLifecycleRecorder
+	startErrsByArtifact map[string]error
+	handlers            map[int64]api.UpstreamConnectHandler
+	tasks               map[int64]api.BackgroundTask
+	skipHandlers        map[string]bool
+	drainErr            error
+	destroyErr          error
+	stopErr             error
+	onStop              func(RuntimeInstance)
+}
+
+func (a *reconcileLifecycleAdapter) Load(context.Context, ArtifactRecord, PluginRecord, *Gateway) (api.Plugin, error) {
+	return nil, errors.New("legacy Load must not be called for lifecycle adapter")
+}
+
+func (a *reconcileLifecycleAdapter) DryRunConfig(context.Context, ArtifactRecord, PluginRecord) error {
+	return nil
+}
+
+func (a *reconcileLifecycleAdapter) ValidateArtifact(context.Context, ArtifactRecord) error {
+	return nil
+}
+
+func (a *reconcileLifecycleAdapter) Prepare(_ context.Context, artifact ArtifactRecord, plugin PluginRecord) (RuntimePrepared, error) {
+	return runtimePreparedFor(artifact, plugin, PluginServiceModeInProcess), nil
+}
+
+func (a *reconcileLifecycleAdapter) Start(_ context.Context, prepared RuntimePrepared, artifact ArtifactRecord, _ PluginRecord, gateway *Gateway) (RuntimeInstance, error) {
+	if err := a.startErrsByArtifact[artifact.ID]; err != nil {
+		return RuntimeInstance{}, err
+	}
+	if task, ok := a.tasks[prepared.DesiredGeneration]; ok {
+		if err := gateway.RegisterBackgroundTask(task); err != nil {
+			return RuntimeInstance{}, err
+		}
+	}
+	if !a.skipHandlers[artifact.ID] {
+		handler := api.UpstreamConnectHandler(func(api.UpstreamConnectRequest) (net.Conn, error) { return newMemoryConn(), nil })
+		if configured := a.handlers[prepared.DesiredGeneration]; configured != nil {
+			handler = configured
+		}
+		if err := api.RegisterHookHandler(
+			gateway,
+			api.HookUpstreamConnect,
+			func(api.UpstreamConnectRequest) bool { return true },
+			handler,
+		); err != nil {
+			return RuntimeInstance{}, err
+		}
+	}
+	return RuntimeInstance{
+		RuntimePrepared: prepared,
+		Plugin:          &reconcileLifecyclePlugin{pluginID: artifact.PluginID, generation: prepared.DesiredGeneration, recorder: a.recorder, destroyErr: a.destroyErr},
+		StartedAt:       time.Now().Unix(),
+	}, nil
+}
+
+func (a *reconcileLifecycleAdapter) HealthCheck(context.Context, RuntimeInstance) RuntimeHealth {
+	return RuntimeHealth{OK: true, Status: RuntimeEnabled, CheckedAt: time.Now().Unix()}
+}
+
+func (a *reconcileLifecycleAdapter) ReloadConfig(context.Context, RuntimeInstance, string) error {
+	return nil
+}
+
+func (a *reconcileLifecycleAdapter) Drain(_ context.Context, instance RuntimeInstance) error {
+	a.recorder.add(fmt.Sprintf("drain:%s:%d", instance.PluginID, instance.DesiredGeneration))
+	return a.drainErr
+}
+
+func (a *reconcileLifecycleAdapter) Stop(_ context.Context, instance RuntimeInstance) error {
+	a.recorder.add(fmt.Sprintf("stop:%s:%d", instance.PluginID, instance.DesiredGeneration))
+	if a.onStop != nil {
+		a.onStop(instance)
+	}
+	return a.stopErr
+}
+
+func (a *reconcileLifecycleAdapter) Diagnostics(context.Context, RuntimeInstance) RuntimeAdapterDiagnostics {
+	return RuntimeAdapterDiagnostics{}
+}
+
+type reconcileLifecyclePlugin struct {
+	api.AbstractPlugin
+	pluginID   string
+	generation int64
+	recorder   *reconcileLifecycleRecorder
+	destroyErr error
+}
+
+func (p *reconcileLifecyclePlugin) Destroy() error {
+	p.recorder.add(fmt.Sprintf("destroy:%s:%d", p.pluginID, p.generation))
+	return p.destroyErr
 }
 
 func (a *fakeAdapter) Load(_ context.Context, artifact ArtifactRecord, _ PluginRecord, gateway *Gateway) (api.Plugin, error) {

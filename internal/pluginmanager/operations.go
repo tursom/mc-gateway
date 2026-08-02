@@ -139,6 +139,11 @@ type PluginOperations struct {
 	metricSummaries map[string]*CustomMetricSummary
 	externals       map[string]*externalRuntime
 	tasks           map[string]*taskRuntime
+	stopped         atomic.Bool
+	taskLifecycleMu sync.Mutex
+	taskCtx         context.Context
+	taskCancel      context.CancelFunc
+	taskWG          sync.WaitGroup
 }
 
 type externalRuntime struct {
@@ -412,20 +417,50 @@ func (o *Operations) ForPlugin(pluginID, artifactID string, manifest Manifest) *
 	defer o.mu.Unlock()
 	po := o.plugins[pluginID]
 	if po == nil {
-		// 首次看到插件时创建运维上下文；后续版本切换会复用它的近期统计。
-		po = &PluginOperations{
-			parent:          o,
-			pluginID:        pluginID,
-			eventValues:     make(map[string]map[string]map[string]struct{}),
-			eventSummaries:  make(map[string]*EventSummary),
-			metricSummaries: make(map[string]*CustomMetricSummary),
-			externals:       make(map[string]*externalRuntime),
-			tasks:           make(map[string]*taskRuntime),
-		}
+		po = newPluginOperations(o, pluginID)
 		o.plugins[pluginID] = po
 	}
 	po.configure(artifactID, manifest)
 	return po
+}
+
+func (o *Operations) ForRuntime(pluginID, artifactID string, manifest Manifest) *PluginOperations {
+	po := newPluginOperations(o, pluginID)
+	po.configure(artifactID, manifest)
+	return po
+}
+
+func newPluginOperations(parent *Operations, pluginID string) *PluginOperations {
+	taskCtx, taskCancel := context.WithCancel(parent.lifecycleCtx)
+	return &PluginOperations{
+		parent:          parent,
+		pluginID:        pluginID,
+		taskCtx:         taskCtx,
+		taskCancel:      taskCancel,
+		eventValues:     make(map[string]map[string]map[string]struct{}),
+		eventSummaries:  make(map[string]*EventSummary),
+		metricSummaries: make(map[string]*CustomMetricSummary),
+		externals:       make(map[string]*externalRuntime),
+		tasks:           make(map[string]*taskRuntime),
+	}
+}
+
+func (o *Operations) ActivateRuntime(po *PluginOperations) {
+	if po == nil {
+		return
+	}
+	o.mu.Lock()
+	o.plugins[po.pluginID] = po
+	o.mu.Unlock()
+	po.resetTaskLifecycle()
+	po.StartTasks(po.pluginID)
+}
+
+func (o *Operations) StopRuntime(po *PluginOperations) error {
+	if po != nil {
+		return po.stopTasks()
+	}
+	return nil
 }
 
 func (o *Operations) StopPlugin(pluginID string) {
@@ -433,7 +468,7 @@ func (o *Operations) StopPlugin(pluginID string) {
 	po := o.plugins[pluginID]
 	o.mu.RUnlock()
 	if po != nil {
-		po.stopTasks()
+		_ = po.stopTasks()
 	}
 }
 
@@ -1082,7 +1117,11 @@ func (po *PluginOperations) StartTasks(pluginID string) {
 }
 
 // stopTasks 停止所有后台任务调度器。已经在执行的任务通过 cancel 感知停用。
-func (po *PluginOperations) stopTasks() {
+func (po *PluginOperations) stopTasks() error {
+	po.taskLifecycleMu.Lock()
+	po.stopped.Store(true)
+	po.taskCancel()
+	po.taskLifecycleMu.Unlock()
 	po.mu.Lock()
 	tasks := make([]*taskRuntime, 0, len(po.tasks))
 	for _, task := range po.tasks {
@@ -1099,6 +1138,39 @@ func (po *PluginOperations) stopTasks() {
 		task.nextRunAt = 0
 		task.mu.Unlock()
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultHandlerTimeout)
+	defer cancel()
+	if err := waitGroupContext(ctx, &po.taskWG); err != nil {
+		return fmt.Errorf("stop background tasks for plugin %q: %w", po.pluginID, err)
+	}
+	return nil
+}
+
+func (po *PluginOperations) resetTaskLifecycle() {
+	po.taskLifecycleMu.Lock()
+	defer po.taskLifecycleMu.Unlock()
+	if !po.stopped.Load() {
+		return
+	}
+	po.taskCtx, po.taskCancel = context.WithCancel(po.parent.lifecycleCtx)
+	po.stopped.Store(false)
+}
+
+func (po *PluginOperations) launchTask(run func()) bool {
+	po.taskLifecycleMu.Lock()
+	defer po.taskLifecycleMu.Unlock()
+	if po.stopped.Load() {
+		return false
+	}
+	po.taskWG.Add(1)
+	if po.parent.launch(func() {
+		defer po.taskWG.Done()
+		run()
+	}) {
+		return true
+	}
+	po.taskWG.Done()
+	return false
 }
 
 func (po *PluginOperations) startTask(task *taskRuntime) {
@@ -1116,12 +1188,12 @@ func (po *PluginOperations) startTask(task *taskRuntime) {
 	task.mu.Unlock()
 
 	if runOnStart {
-		po.parent.launch(func() { po.runTask(task) })
+		po.launchTask(func() { po.runTask(task) })
 	}
 	if interval <= 0 || task.task.Manual {
 		return
 	}
-	if !po.parent.launch(func() {
+	if !po.launchTask(func() {
 		for {
 			// 抖动值按任务 ID 确定，避免多个网关实例同一时间集中触发相同任务。
 			delay := interval + deterministicJitter(task.task.Jitter, task.task.ID)
@@ -1134,7 +1206,7 @@ func (po *PluginOperations) startTask(task *taskRuntime) {
 			task.mu.Unlock()
 			timer := time.NewTimer(delay)
 			select {
-			case <-po.parent.lifecycleCtx.Done():
+			case <-po.taskCtx.Done():
 				timer.Stop()
 				return
 			case <-timer.C:
@@ -1157,6 +1229,10 @@ func (po *PluginOperations) startTask(task *taskRuntime) {
 
 func (po *PluginOperations) runTask(task *taskRuntime) {
 	task.mu.Lock()
+	if po.stopped.Load() {
+		task.mu.Unlock()
+		return
+	}
 	if task.running {
 		// 同一任务不并发执行；调度周期追上时只记录跳过次数。
 		task.skipped++
@@ -1190,14 +1266,14 @@ func (po *PluginOperations) runTask(task *taskRuntime) {
 		task.leaseExpiresAt = record.ExpiresAt
 		task.leaseAcquired = acquired
 		if err != nil {
-			task.running = false
+			finishTaskRunLocked(task)
 			task.consecutiveFailures++
 			task.lastError = redactSensitive(err.Error())
 			task.mu.Unlock()
 			return
 		}
 		if !acquired {
-			task.running = false
+			finishTaskRunLocked(task)
 			task.skipped++
 			task.leaseSkipped++
 			task.lastError = fmt.Sprintf("task lease held by node %s until %d", record.OwnerNodeID, record.ExpiresAt)
@@ -1208,7 +1284,7 @@ func (po *PluginOperations) runTask(task *taskRuntime) {
 		leaseOwned = true
 	}
 
-	runCtx, cancel := context.WithCancel(po.parent.lifecycleCtx)
+	runCtx, cancel := context.WithCancel(po.taskCtx)
 	task.mu.Lock()
 	task.cancel = cancel
 	task.mu.Unlock()
@@ -1246,7 +1322,7 @@ func (po *PluginOperations) runTask(task *taskRuntime) {
 	}
 
 	task.mu.Lock()
-	task.running = false
+	finishTaskRunLocked(task)
 	task.cancel = nil
 	if leaseOwned {
 		task.leaseAcquired = false
@@ -1269,6 +1345,10 @@ func (po *PluginOperations) runTask(task *taskRuntime) {
 		task.lastError = ""
 	}
 	task.mu.Unlock()
+}
+
+func finishTaskRunLocked(task *taskRuntime) {
+	task.running = false
 }
 
 func (po *PluginOperations) renewTaskLease(ctx context.Context, task *taskRuntime, shardKey string, ttl time.Duration, cancel context.CancelFunc, stop <-chan struct{}, done chan<- struct{}, leaseLost chan<- string) {
@@ -1403,7 +1483,7 @@ func (po *PluginOperations) TriggerTask(taskID, confirmToken string) (Background
 	if expected == "" || confirmToken != expected {
 		return BackgroundTaskSummary{}, errors.New("confirm_token is required")
 	}
-	if !po.parent.launch(func() { po.runTask(task) }) {
+	if !po.launchTask(func() { po.runTask(task) }) {
 		return BackgroundTaskSummary{}, ErrManagerClosed
 	}
 	return task.summary(), nil

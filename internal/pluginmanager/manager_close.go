@@ -42,12 +42,16 @@ func (m *Manager) close(ctx context.Context) error {
 	if m.ingressLifecycle != nil {
 		m.ingressLifecycle.Close()
 	}
-	loaded := make([]*loadedPlugin, 0, len(m.loaded))
+	loaded := make([]*loadedPlugin, 0, len(m.loaded)+len(m.displaced))
 	for pluginID, plugin := range m.loaded {
 		m.markDrainingLocked(pluginID)
 		m.markHostDraining(pluginID)
 		loaded = append(loaded, plugin)
 		delete(m.loaded, pluginID)
+	}
+	for key, plugin := range m.displaced {
+		loaded = appendUniqueLoadedPlugin(loaded, plugin)
+		delete(m.displaced, key)
 	}
 	m.mu.Unlock()
 
@@ -61,7 +65,9 @@ func (m *Manager) close(ctx context.Context) error {
 		return nil
 	})...)
 	for _, plugin := range loaded {
-		m.operations.StopPlugin(plugin.record.ID)
+		if err := m.stopLoadedPluginTasks(plugin); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	if err := m.operations.Close(ctx); err != nil {
 		errs = append(errs, fmt.Errorf("stop plugin operations: %w", err))
@@ -84,6 +90,9 @@ func (m *Manager) close(ctx context.Context) error {
 		return nil
 	})...)
 	errs = append(errs, m.stopPendingRuntimeProcesses(ctx)...)
+	if err := waitGroupContext(ctx, &m.runtimeCleanupWG); err != nil {
+		errs = append(errs, fmt.Errorf("wait for pending runtime cleanup: %w", err))
+	}
 
 	if err := waitGroupContext(ctx, m.wg); err != nil {
 		m.forceCloseProxyConnections()
@@ -93,46 +102,26 @@ func (m *Manager) close(ctx context.Context) error {
 }
 
 func (m *Manager) stopPendingRuntimeProcesses(ctx context.Context) []error {
+	m.runtimeCleanupMu.Lock()
 	m.hostMu.Lock()
-	pendingHosts := m.pendingHostStops
-	pendingSandboxes := m.pendingSandboxStops
-	m.pendingHostStops = make(map[string]*PluginHostSupervisorProcess)
-	m.pendingSandboxStops = make(map[string]*SandboxProcess)
+	pendingRuntimes := m.pendingRuntimeStops
+	m.pendingRuntimeStops = make(map[runtimeIdentity]*loadedPlugin)
 	m.hostMu.Unlock()
+	m.runtimeCleanupMu.Unlock()
 
-	type pendingStop struct {
-		name string
-		stop func() error
-	}
-	stops := make([]pendingStop, 0, len(pendingHosts)+len(pendingSandboxes))
-	for pluginID, process := range pendingHosts {
-		pluginID, process := pluginID, process
-		stops = append(stops, pendingStop{
-			name: pluginID,
-			stop: func() error {
-				err := process.Stop(ctx)
-				m.markHostStopped(pluginID, process.ArtifactID, process)
-				return err
-			},
-		})
-	}
-	for pluginID, process := range pendingSandboxes {
-		process := process
-		stops = append(stops, pendingStop{name: pluginID, stop: func() error { return process.Stop(ctx) }})
-	}
-	if len(stops) == 0 {
+	if len(pendingRuntimes) == 0 {
 		return nil
 	}
 
-	errCh := make(chan error, len(stops))
+	errCh := make(chan error, len(pendingRuntimes))
 	var wg sync.WaitGroup
-	for _, pending := range stops {
-		pending := pending
+	for _, loaded := range pendingRuntimes {
+		loaded := loaded
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := pending.stop(); err != nil {
-				errCh <- fmt.Errorf("stop pending runtime for plugin %q: %w", pending.name, err)
+			if err := m.stopRuntimeAdapter(ctx, loaded); err != nil {
+				errCh <- fmt.Errorf("stop pending runtime for plugin %q: %w", loaded.record.ID, err)
 			}
 		}()
 	}

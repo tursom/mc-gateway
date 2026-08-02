@@ -1792,6 +1792,8 @@ type UpstreamResult struct {
 	HandlerID       string
 	InitialDataSent bool
 	Proxied         bool
+	handler         *upstreamHandler
+	runtimeReserved bool
 }
 
 type Gateway struct {

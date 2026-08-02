@@ -184,6 +184,7 @@ type Manager struct {
 
 	mu                sync.Mutex
 	loaded            map[string]*loadedPlugin
+	displaced         map[runtimeIdentity]*loadedPlugin
 	snapshot          atomic.Value
 	extensionSnapshot atomic.Value
 	routeCacheMu      sync.Mutex
@@ -200,8 +201,9 @@ type Manager struct {
 	serviceMode         string
 	hostMu              sync.Mutex
 	hosts               map[string]*pluginHostProcess
-	pendingHostStops    map[string]*PluginHostSupervisorProcess
-	pendingSandboxStops map[string]*SandboxProcess
+	pendingRuntimeStops map[runtimeIdentity]*loadedPlugin
+	runtimeCleanupMu    sync.Mutex
+	runtimeCleanupWG    sync.WaitGroup
 
 	feedSchedulerMu     sync.Mutex
 	feedSchedulerCancel context.CancelFunc
@@ -216,13 +218,35 @@ type Manager struct {
 // loadedPlugin 是内存中的插件实例和它注册的扩展快照。数据库记录说明期望状态，
 // loadedPlugin 说明当前进程实际已经加载了什么。
 type loadedPlugin struct {
-	record     PluginRecord
-	artifact   ArtifactRecord
-	instance   api.Plugin
-	runtime    RuntimeInstance
-	gateway    *Gateway
-	handlers   []*upstreamHandler
-	extensions pluginExtensions
+	record       PluginRecord
+	artifact     ArtifactRecord
+	instance     api.Plugin
+	runtime      RuntimeInstance
+	gateway      *Gateway
+	operations   *PluginOperations
+	handlers     []*upstreamHandler
+	extensions   pluginExtensions
+	taskStopOnce sync.Once
+	taskStopErr  error
+}
+
+type runtimeIdentity struct {
+	pluginID          string
+	artifactID        string
+	desiredGeneration int64
+	runtimeInstanceID string
+}
+
+func loadedRuntimeIdentity(loaded *loadedPlugin) runtimeIdentity {
+	if loaded == nil {
+		return runtimeIdentity{}
+	}
+	return runtimeIdentity{
+		pluginID:          loaded.record.ID,
+		artifactID:        loaded.artifact.ID,
+		desiredGeneration: loaded.record.DesiredGeneration,
+		runtimeInstanceID: loaded.runtime.RuntimeInstanceID,
+	}
 }
 
 // pluginExtensions 按扩展类型拆分注册结果，便于发布不可变快照给不同热路径使用。
@@ -239,6 +263,7 @@ type pluginExtensions struct {
 type upstreamHandler struct {
 	pluginID            string
 	artifactID          string
+	runtime             runtimeIdentity
 	priority            int
 	handlerID           string
 	mode                string
@@ -265,12 +290,15 @@ type upstreamHandler struct {
 	durationSumMS    atomic.Uint64
 	durationMaxMS    atomic.Uint64
 	lastProxyError   atomic.Value
+	draining         atomic.Bool
+	runtimeRefs      atomic.Int64
 }
 
 type proxyConnection struct {
 	id                  uint64
 	pluginID            string
 	artifactID          string
+	runtime             runtimeIdentity
 	handlerID           string
 	handler             *upstreamHandler
 	client              net.Conn
@@ -336,6 +364,7 @@ func New(options Options) *Manager {
 		policyProfile:             options.PolicyProfile,
 		requireConformanceFixture: options.RequireConformanceFixture,
 		loaded:                    make(map[string]*loadedPlugin),
+		displaced:                 make(map[runtimeIdentity]*loadedPlugin),
 		ingressReservedListeners:  append([]IngressReservedListener(nil), options.IngressReservedListeners...),
 		futureGates:               normalizeFutureRuntimeGates(options.FutureRuntimeGates),
 		sandboxPolicy:             normalizeSandboxPolicy(options.SandboxPolicy),
@@ -344,8 +373,7 @@ func New(options Options) *Manager {
 		proxyConns:                make(map[uint64]*proxyConnection),
 		drainingIDs:               make(map[string]bool),
 		hosts:                     make(map[string]*pluginHostProcess),
-		pendingHostStops:          make(map[string]*PluginHostSupervisorProcess),
-		pendingSandboxStops:       make(map[string]*SandboxProcess),
+		pendingRuntimeStops:       make(map[runtimeIdentity]*loadedPlugin),
 	}
 	if manager.sandboxSelfCheck == nil {
 		manager.sandboxSelfCheck = defaultSandboxEnvironmentSelfCheck
@@ -954,10 +982,19 @@ func (m *Manager) Load(ctx context.Context, actor, pluginID string) (PluginRecor
 	if err != nil {
 		return PluginRecord{}, err
 	}
-	loaded, err := m.loadLocked(ctx, pluginRecord)
+	loaded, replaced, err := m.loadLocked(ctx, pluginRecord)
 	if err != nil {
 		_ = m.repo.RecordOperation(ctx, pluginID, pluginRecord.DesiredArtifactID, "load", "failed", actor, err.Error(), map[string]any{"reason_code": reasonCodeFromError(err)})
 		return PluginRecord{}, err
+	}
+	if replaced != nil {
+		if m.pluginPublishedLocked(pluginID) && len(m.displacedPluginsLocked(pluginID)) == 0 {
+			m.displaced[loadedRuntimeIdentity(replaced)] = replaced
+		} else {
+			for _, cleanupErr := range m.retireLoadedPluginLocked(ctx, replaced) {
+				_ = m.repo.RecordOperation(ctx, pluginID, replaced.artifact.ID, "load_cleanup", "warning", actor, cleanupErr.Error(), nil)
+			}
+		}
 	}
 	_ = m.repo.RecordOperation(ctx, pluginID, loaded.artifact.ID, "load", "succeeded", actor, "plugin loaded", nil)
 	return m.repo.Plugin(ctx, pluginID)
@@ -998,7 +1035,8 @@ func (m *Manager) Enable(ctx context.Context, actor, pluginID string) (PluginRec
 
 	// 真正加载与发布都在同一把锁内完成，保证 snapshot、extensions 和 loaded
 	// 三类内存状态不会被并发读到半更新结果。
-	loaded, err := m.loadLocked(ctx, pluginRecord)
+	previous := m.loaded[pluginID]
+	loaded, replaced, err := m.loadLocked(ctx, pluginRecord)
 	if err != nil {
 		_ = m.repo.RecordOperation(ctx, pluginID, pluginRecord.DesiredArtifactID, "enable", "failed", actor, err.Error(), map[string]any{"reason_code": reasonCodeFromError(err)})
 		return PluginRecord{}, err
@@ -1008,6 +1046,7 @@ func (m *Manager) Enable(ctx context.Context, actor, pluginID string) (PluginRec
 		_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginID, pluginRecord.DesiredGeneration, RuntimeFailed, "", loaded.artifact.ID, pluginRecord.AppliedGeneration, err.Error(), map[string]any{"error": err.Error()}, nil)
 		m.recordPluginNodeRuntimeStateLocked(ctx, pluginID)
 		_ = m.repo.RecordOperation(ctx, pluginID, pluginRecord.DesiredArtifactID, "enable", "failed", actor, err.Error(), nil)
+		m.rollbackLoadedCandidateLocked(ctx, pluginID, loaded, previous, replaced)
 		return PluginRecord{}, err
 	}
 
@@ -1017,13 +1056,28 @@ func (m *Manager) Enable(ctx context.Context, actor, pluginID string) (PluginRec
 	extensions := m.currentExtensionsLocked()
 	extensions[pluginID] = loaded.extensions
 	if err := m.markEnabled(ctx, loaded); err != nil {
+		m.rollbackLoadedCandidateLocked(ctx, pluginID, loaded, previous, replaced)
 		return PluginRecord{}, err
 	}
 	// 数据库运行态先写成功，再发布内存快照；这样 UI 看到 enabled 时，
 	// 连接热路径也已经具备对应处理器。
 	m.clearDrainingLocked(pluginID)
+	retiring := m.takeDisplacedPluginsLocked(pluginID)
+	retiring = appendUniqueLoadedPlugin(retiring, replaced)
+	for _, old := range retiring {
+		m.markLoadedRuntimeDrainingLocked(old)
+	}
 	m.publish(next)
 	m.publishExtensionsLocked(extensions)
+	for _, old := range retiring {
+		_ = m.stopLoadedPluginTasks(old)
+	}
+	m.operations.ActivateRuntime(loaded.operations)
+	for _, old := range retiring {
+		for _, cleanupErr := range m.retireLoadedPluginLocked(ctx, old) {
+			_ = m.repo.RecordOperation(ctx, pluginID, old.artifact.ID, "enable_cleanup", "warning", actor, cleanupErr.Error(), nil)
+		}
+	}
 	_ = m.repo.UpdateArtifactStatus(ctx, loaded.artifact.ID, ArtifactStatusLoaded, "")
 	enableMetadata := map[string]any{
 		"desired_generation":  loaded.record.DesiredGeneration,
@@ -1057,23 +1111,14 @@ func (m *Manager) Disable(ctx context.Context, actor, pluginID string) (PluginRe
 	// 转发中的插件代理连接。
 	m.markDrainingLocked(pluginID)
 	m.markHostDraining(pluginID)
-	m.operations.StopPlugin(pluginID)
+	retiring := m.takeDisplacedPluginsLocked(pluginID)
+	retiring = appendUniqueLoadedPlugin(retiring, m.loaded[pluginID])
 	disableMetadata := map[string]any{}
-	if loaded := m.loaded[pluginID]; loaded != nil {
+	for _, loaded := range retiring {
 		for key, value := range wasmLifecycleMetadata(loaded) {
 			disableMetadata[key] = value
 		}
-		var errs []error
-		if m.shouldDeferProcessHostStop(pluginID, loaded) {
-			errs = m.drainRuntimeInstance(ctx, loaded)
-			m.deferProcessHostStop(pluginID, loaded.runtime.HostProcess)
-		} else if m.shouldDeferSandboxProcessStop(pluginID, loaded) {
-			errs = m.drainRuntimeInstance(ctx, loaded)
-			m.deferSandboxProcessStop(pluginID, sandboxHostedPluginFromInstance(loaded.instance).process)
-		} else {
-			errs = m.stopRuntimeInstance(ctx, loaded)
-		}
-		for _, err := range errs {
+		for _, err := range m.retireLoadedPluginLocked(ctx, loaded) {
 			_ = m.repo.RecordOperation(ctx, pluginID, loaded.artifact.ID, "disable", "warning", actor, err.Error(), nil)
 		}
 	}
@@ -1109,9 +1154,10 @@ func (m *Manager) Delete(ctx context.Context, actor, pluginID string) error {
 	m.removeExtensionsLocked(pluginID)
 	m.markDrainingLocked(pluginID)
 	m.markHostDraining(pluginID)
-	m.operations.StopPlugin(pluginID)
-	if loaded := m.loaded[pluginID]; loaded != nil {
-		_ = m.stopRuntimeInstance(ctx, loaded)
+	retiring := m.takeDisplacedPluginsLocked(pluginID)
+	retiring = appendUniqueLoadedPlugin(retiring, m.loaded[pluginID])
+	for _, loaded := range retiring {
+		_ = m.retireLoadedPluginLocked(ctx, loaded)
 	}
 	delete(m.loaded, pluginID)
 	if _, err := m.repo.UpsertDesired(ctx, actor, pluginRecord.ID, pluginRecord.DesiredArtifactID, DesiredDeleted, pluginRecord.ConfigJSON, pluginRecord.Priority); err != nil && !errors.Is(err, ErrPluginNotFound) {
@@ -1125,6 +1171,14 @@ func (m *Manager) Delete(ctx context.Context, actor, pluginID string) error {
 }
 
 func (m *Manager) stopRuntimeInstance(ctx context.Context, loaded *loadedPlugin) []error {
+	errs := m.drainAndDestroyRuntimeInstance(ctx, loaded)
+	if err := m.stopRuntimeAdapter(ctx, loaded); err != nil {
+		errs = append(errs, err)
+	}
+	return errs
+}
+
+func (m *Manager) drainAndDestroyRuntimeInstance(ctx context.Context, loaded *loadedPlugin) []error {
 	var errs []error
 	errs = append(errs, m.drainRuntimeInstance(ctx, loaded)...)
 	if loaded.instance != nil {
@@ -1132,15 +1186,19 @@ func (m *Manager) stopRuntimeInstance(ctx context.Context, loaded *loadedPlugin)
 			errs = append(errs, err)
 		}
 	}
+	return errs
+}
+
+func (m *Manager) stopRuntimeAdapter(ctx context.Context, loaded *loadedPlugin) error {
 	if lifecycle, ok := m.runtimeAdapterForArtifact(loaded.artifact).(RuntimeAdapterLifecycle); ok {
 		if err := lifecycle.Stop(ctx, loaded.runtime); err != nil {
-			errs = append(errs, err)
+			return err
 		}
 	}
 	if loaded.runtime.HostProcess != nil {
 		m.markHostStopped(loaded.record.ID, loaded.artifact.ID, loaded.runtime.HostProcess)
 	}
-	return errs
+	return nil
 }
 
 func (m *Manager) drainRuntimeInstance(ctx context.Context, loaded *loadedPlugin) []error {
@@ -1150,44 +1208,6 @@ func (m *Manager) drainRuntimeInstance(ctx context.Context, loaded *loadedPlugin
 		}
 	}
 	return nil
-}
-
-func (m *Manager) shouldDeferProcessHostStop(pluginID string, loaded *loadedPlugin) bool {
-	return m.serviceMode == PluginServiceModeGoPluginProcess &&
-		loaded != nil &&
-		loaded.runtime.HostProcess != nil &&
-		m.activeProxyCountLocked(pluginID) > 0
-}
-
-func (m *Manager) shouldDeferSandboxProcessStop(pluginID string, loaded *loadedPlugin) bool {
-	if m.serviceMode != PluginServiceModeSandboxProcess || loaded == nil || m.activeProxyCountLocked(pluginID) == 0 {
-		return false
-	}
-	return sandboxHostedPluginFromInstance(loaded.instance).process != nil
-}
-
-func (m *Manager) deferProcessHostStop(pluginID string, process *PluginHostSupervisorProcess) {
-	if process == nil {
-		return
-	}
-	m.hostMu.Lock()
-	if m.pendingHostStops == nil {
-		m.pendingHostStops = make(map[string]*PluginHostSupervisorProcess)
-	}
-	m.pendingHostStops[pluginID] = process
-	m.hostMu.Unlock()
-}
-
-func (m *Manager) deferSandboxProcessStop(pluginID string, process *SandboxProcess) {
-	if process == nil {
-		return
-	}
-	m.hostMu.Lock()
-	if m.pendingSandboxStops == nil {
-		m.pendingSandboxStops = make(map[string]*SandboxProcess)
-	}
-	m.pendingSandboxStops[pluginID] = process
-	m.hostMu.Unlock()
 }
 
 // Reconcile 根据数据库中的期望启用列表重建内存分发快照，主要用于进程启动
@@ -1205,6 +1225,8 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 	}
 	nextByPlugin := make(map[string][]*upstreamHandler)
 	extensionsByPlugin := make(map[string]pluginExtensions)
+	var replacedPlugins []*loadedPlugin
+	var enabledPlugins []*loadedPlugin
 	for _, pluginRecord := range desired {
 		// 单个插件失败不阻断其他插件收敛；失败会记录到 runtime_state 和操作日志。
 		decision, err := m.EvaluateReleaseGate(ctx, pluginRecord.ID, pluginRecord.DesiredArtifactID, GovernanceActionEnable, m.currentPolicyProfile(), pluginRecord.ConfigJSON)
@@ -1217,13 +1239,16 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 			_ = m.repo.RecordOperation(ctx, pluginRecord.ID, pluginRecord.DesiredArtifactID, "reconcile_gate", "failed", "system", err.Error(), map[string]any{"decision": decision, "reason_code": reasonCodeFromError(err)})
 			continue
 		}
-		loaded, err := m.loadLocked(ctx, pluginRecord)
+		loaded, replaced, err := m.loadLocked(ctx, pluginRecord)
 		if err != nil {
 			artifact, _ := m.repo.Artifact(ctx, pluginRecord.DesiredArtifactID)
 			_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginRecord.ID, pluginRecord.DesiredGeneration, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), runtimeFailureSummary(artifact, err), nil)
 			m.recordPluginNodeRuntimeStateLocked(ctx, pluginRecord.ID)
 			_ = m.repo.RecordOperation(ctx, pluginRecord.ID, pluginRecord.DesiredArtifactID, "reconcile", "failed", "system", err.Error(), map[string]any{"reason_code": reasonCodeFromError(err)})
 			continue
+		}
+		if replaced != nil {
+			replacedPlugins = appendUniqueLoadedPlugin(replacedPlugins, replaced)
 		}
 		if len(loaded.handlers) == 0 && loaded.extensions.empty() {
 			err := fmt.Errorf("plugin %q did not register any supported extension point", pluginRecord.ID)
@@ -1232,15 +1257,217 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 			_ = m.repo.RecordOperation(ctx, pluginRecord.ID, pluginRecord.DesiredArtifactID, "reconcile", "failed", "system", err.Error(), nil)
 			continue
 		}
+		if err := m.markEnabled(ctx, loaded); err != nil {
+			_ = m.repo.RecordOperation(ctx, pluginRecord.ID, pluginRecord.DesiredArtifactID, "reconcile", "failed", "system", err.Error(), map[string]any{"reason_code": reasonCodeFromError(err)})
+			continue
+		}
 		nextByPlugin[pluginRecord.ID] = loaded.handlers
 		extensionsByPlugin[pluginRecord.ID] = loaded.extensions
-		_ = m.markEnabled(ctx, loaded)
+		enabledPlugins = append(enabledPlugins, loaded)
 		m.clearDrainingLocked(pluginRecord.ID)
+	}
+	for _, displaced := range m.takeAllDisplacedPluginsLocked() {
+		replacedPlugins = appendUniqueLoadedPlugin(replacedPlugins, displaced)
+	}
+	for _, replaced := range replacedPlugins {
+		m.markLoadedRuntimeDrainingLocked(replaced)
+	}
+	var removedPlugins []*loadedPlugin
+	for pluginID, loaded := range m.loaded {
+		if _, retained := nextByPlugin[pluginID]; retained {
+			continue
+		}
+		m.markDrainingLocked(pluginID)
+		m.markHostDraining(pluginID)
+		removedPlugins = append(removedPlugins, loaded)
 	}
 	// 所有插件都处理完后一次性发布快照，避免热路径在收敛过程中看到部分插件。
 	m.publish(flattenHandlers(nextByPlugin))
 	m.publishExtensionsLocked(extensionsByPlugin)
+	for _, replaced := range replacedPlugins {
+		_ = m.stopLoadedPluginTasks(replaced)
+	}
+	for _, removed := range removedPlugins {
+		_ = m.stopLoadedPluginTasks(removed)
+	}
+	for _, loaded := range enabledPlugins {
+		m.operations.ActivateRuntime(loaded.operations)
+	}
+	for _, replaced := range replacedPlugins {
+		for _, cleanupErr := range m.retireLoadedPluginLocked(ctx, replaced) {
+			_ = m.repo.RecordOperation(ctx, replaced.record.ID, replaced.artifact.ID, "reconcile_cleanup", "warning", "system", cleanupErr.Error(), nil)
+		}
+	}
+	for _, loaded := range removedPlugins {
+		pluginID := loaded.record.ID
+		for _, cleanupErr := range m.retireLoadedPluginLocked(ctx, loaded) {
+			_ = m.repo.RecordOperation(ctx, pluginID, loaded.artifact.ID, "reconcile_cleanup", "warning", "system", cleanupErr.Error(), nil)
+		}
+		if m.loaded[pluginID] == loaded {
+			delete(m.loaded, pluginID)
+		}
+	}
 	return nil
+}
+
+func (m *Manager) retireLoadedPluginLocked(ctx context.Context, loaded *loadedPlugin) []error {
+	if loaded == nil {
+		return nil
+	}
+	var errs []error
+	if err := m.stopLoadedPluginTasks(loaded); err != nil {
+		errs = append(errs, err)
+	}
+	errs = append(errs, m.drainAndDestroyRuntimeInstance(ctx, loaded)...)
+	if m.deferRuntimeStopIfActive(loaded) {
+		return errs
+	}
+	if err := m.stopRuntimeAdapter(ctx, loaded); err != nil {
+		errs = append(errs, err)
+	}
+	return errs
+}
+
+func (m *Manager) stopLoadedPluginTasks(loaded *loadedPlugin) error {
+	if loaded == nil {
+		return nil
+	}
+	loaded.taskStopOnce.Do(func() {
+		loaded.taskStopErr = m.operations.StopRuntime(loaded.operations)
+	})
+	return loaded.taskStopErr
+}
+
+func (m *Manager) pluginPublishedLocked(pluginID string) bool {
+	if _, ok := m.currentHandlersLocked()[pluginID]; ok {
+		return true
+	}
+	_, ok := m.currentExtensionsLocked()[pluginID]
+	return ok
+}
+
+func (m *Manager) displacedPluginsLocked(pluginID string) []*loadedPlugin {
+	plugins := make([]*loadedPlugin, 0, 1)
+	for _, loaded := range m.displaced {
+		if loaded.record.ID == pluginID {
+			plugins = append(plugins, loaded)
+		}
+	}
+	return plugins
+}
+
+func (m *Manager) takeDisplacedPluginsLocked(pluginID string) []*loadedPlugin {
+	plugins := make([]*loadedPlugin, 0, 1)
+	for key, loaded := range m.displaced {
+		if loaded.record.ID == pluginID {
+			plugins = append(plugins, loaded)
+			delete(m.displaced, key)
+		}
+	}
+	return plugins
+}
+
+func (m *Manager) takeAllDisplacedPluginsLocked() []*loadedPlugin {
+	plugins := make([]*loadedPlugin, 0, len(m.displaced))
+	for key, loaded := range m.displaced {
+		plugins = appendUniqueLoadedPlugin(plugins, loaded)
+		delete(m.displaced, key)
+	}
+	return plugins
+}
+
+func appendUniqueLoadedPlugin(plugins []*loadedPlugin, candidate *loadedPlugin) []*loadedPlugin {
+	if candidate == nil {
+		return plugins
+	}
+	for _, loaded := range plugins {
+		if loaded == candidate {
+			return plugins
+		}
+	}
+	return append(plugins, candidate)
+}
+
+func (m *Manager) rollbackLoadedCandidateLocked(ctx context.Context, pluginID string, candidate, previous, replaced *loadedPlugin) {
+	displaced := m.takeDisplacedPluginsLocked(pluginID)
+	if len(displaced) == 0 && candidate == previous && m.pluginPublishedLocked(pluginID) {
+		return
+	}
+	restore := replaced
+	if len(displaced) > 0 {
+		restore = displaced[0]
+	}
+	if restore != nil {
+		m.loaded[pluginID] = restore
+	} else {
+		delete(m.loaded, pluginID)
+	}
+	var stale []*loadedPlugin
+	if len(displaced) > 1 {
+		stale = append(stale, displaced[1:]...)
+	}
+	stale = appendUniqueLoadedPlugin(stale, replaced)
+	for _, loaded := range stale {
+		if loaded != restore {
+			_ = m.retireLoadedPluginLocked(ctx, loaded)
+		}
+	}
+	if candidate != restore {
+		_ = m.retireLoadedPluginLocked(ctx, candidate)
+	}
+}
+
+func (m *Manager) deferRuntimeStopIfActive(loaded *loadedPlugin) bool {
+	if loaded == nil {
+		return false
+	}
+	processRuntime := m.serviceMode == PluginServiceModeGoPluginProcess && loaded.runtime.HostProcess != nil
+	sandboxRuntime := m.serviceMode == PluginServiceModeSandboxProcess && sandboxHostedPluginFromInstance(loaded.instance).process != nil
+	if !processRuntime && !sandboxRuntime {
+		return false
+	}
+	key := loadedRuntimeIdentity(loaded)
+	m.proxyMu.Lock()
+	defer m.proxyMu.Unlock()
+	if m.activeRuntimeReferencesWithoutLock(loaded, key) == 0 {
+		return false
+	}
+	m.hostMu.Lock()
+	if m.pendingRuntimeStops == nil {
+		m.pendingRuntimeStops = make(map[runtimeIdentity]*loadedPlugin)
+	}
+	m.pendingRuntimeStops[key] = loaded
+	m.hostMu.Unlock()
+	return true
+}
+
+func (m *Manager) reserveUpstreamHandler(handler *upstreamHandler) bool {
+	if handler == nil {
+		return false
+	}
+	m.proxyMu.Lock()
+	defer m.proxyMu.Unlock()
+	if m.drainingIDs[handler.pluginID] || handler.draining.Load() {
+		return false
+	}
+	handler.runtimeRefs.Add(1)
+	return true
+}
+
+func (m *Manager) releaseUpstreamReservation(result UpstreamResult) {
+	if result.runtimeReserved {
+		m.releaseUpstreamHandler(result.handler)
+	}
+}
+
+func (m *Manager) releaseUpstreamHandler(handler *upstreamHandler) {
+	if handler == nil {
+		return
+	}
+	m.proxyMu.Lock()
+	handler.runtimeRefs.Add(-1)
+	m.proxyMu.Unlock()
+	m.queuePendingRuntimeStopIfDrained(handler.runtime)
 }
 
 // ConnectUpstream 依次调用当前快照中的上游连接处理器。处理器返回 ErrPass
@@ -1260,12 +1487,17 @@ func (m *Manager) ConnectUpstream(ctx context.Context, req api.UpstreamConnectRe
 	req.Context = context.WithValue(req.Context, pluginHostCallerContextKey{}, req.Context)
 	req.InitialData = append([]byte(nil), req.InitialData...)
 	for _, handler := range handlers {
+		if !m.reserveUpstreamHandler(handler) {
+			continue
+		}
 		// accept 阶段应尽量轻量，用于快速过滤不关心的主机或上游。
 		accepted, err := handler.accepts(req)
 		if err != nil {
+			m.releaseUpstreamHandler(handler)
 			return UpstreamResult{Handled: true}, err
 		}
 		if !accepted {
+			m.releaseUpstreamHandler(handler)
 			continue
 		}
 		req.Context = WithTraceContext(req.Context, handler.pluginID, req.TraceID, req.ConnectionID, handler.handlerID)
@@ -1289,9 +1521,11 @@ func (m *Manager) ConnectUpstream(ctx context.Context, req api.UpstreamConnectRe
 			"mode":     handler.mode,
 		})
 		if errors.Is(err, api.ErrPass) {
+			m.releaseUpstreamHandler(handler)
 			continue
 		}
 		if err != nil {
+			m.releaseUpstreamHandler(handler)
 			return UpstreamResult{Handled: true}, err
 		}
 		if conn != nil {
@@ -1314,12 +1548,16 @@ func (m *Manager) ConnectUpstream(ctx context.Context, req api.UpstreamConnectRe
 				Mode:      handler.mode,
 				PluginID:  handler.pluginID,
 				HandlerID: handler.handlerID,
+				handler:   handler,
 			}
 			if handler.mode == UpstreamModeProtocolProxy {
+				result.runtimeReserved = true
 				return m.startProtocolProxy(ctx, handler, result, req)
 			}
+			m.releaseUpstreamHandler(handler)
 			return result, nil
 		}
+		m.releaseUpstreamHandler(handler)
 	}
 	return UpstreamResult{}, nil
 }
@@ -1337,6 +1575,7 @@ func (m *Manager) startProtocolProxy(ctx context.Context, handler *upstreamHandl
 		if err := writeAll(endpoint, initial); err != nil {
 			handler.proxyErrors.Add(1)
 			_ = endpoint.Close()
+			m.releaseUpstreamHandler(handler)
 			return UpstreamResult{Handled: true, Mode: handler.mode, PluginID: handler.pluginID, HandlerID: handler.handlerID}, fmt.Errorf("plugin %s protocol-proxy initial replay failed: %w", handler.pluginID, err)
 		}
 	}
@@ -2168,10 +2407,15 @@ func (m *Manager) RunOperationsGC(ctx context.Context, actor, pluginID string, d
 
 func (m *Manager) TrackProxyConnection(result UpstreamResult, client, endpoint net.Conn) *ProxyConnectionHandle {
 	if result.Mode != UpstreamModeProtocolProxy || client == nil || endpoint == nil {
+		m.releaseUpstreamReservation(result)
 		return nil
 	}
-	handler := m.findHandler(result.PluginID, result.HandlerID)
+	handler := result.handler
 	if handler == nil {
+		handler = m.findHandler(result.PluginID, result.HandlerID)
+	}
+	if handler == nil {
+		m.releaseUpstreamReservation(result)
 		return nil
 	}
 	id := atomic.AddUint64(&m.proxySeq, 1)
@@ -2179,6 +2423,7 @@ func (m *Manager) TrackProxyConnection(result UpstreamResult, client, endpoint n
 		id:         id,
 		pluginID:   result.PluginID,
 		artifactID: handler.artifactID,
+		runtime:    handler.runtime,
 		handlerID:  result.HandlerID,
 		handler:    handler,
 		client:     client,
@@ -2188,11 +2433,14 @@ func (m *Manager) TrackProxyConnection(result UpstreamResult, client, endpoint n
 	handler.activeProxy.Add(1)
 	handler.proxyStarted.Add(1)
 	m.proxyMu.Lock()
-	proxyConn.draining = m.drainingIDs[result.PluginID]
+	proxyConn.draining = m.drainingIDs[result.PluginID] || handler.draining.Load()
 	if proxyConn.draining {
 		handler.drainingProxy.Add(1)
 	}
 	m.proxyConns[id] = proxyConn
+	if result.runtimeReserved {
+		handler.runtimeRefs.Add(-1)
+	}
 	m.proxyMu.Unlock()
 	return &ProxyConnectionHandle{manager: m, id: id}
 }
@@ -2275,70 +2523,53 @@ func (m *Manager) finishProxyConnection(id uint64, stats ProxyConnectionStats) {
 	if stats.Duration > 0 {
 		proxyConn.handler.proxyDuration.Add(uint64(stats.Duration.Milliseconds()))
 	}
-	if process := m.takePendingHostStopIfDrained(proxyConn.pluginID); process != nil {
-		go m.stopPendingProcessHost(proxyConn.pluginID, process)
-	}
-	if process := m.takePendingSandboxStopIfDrained(proxyConn.pluginID); process != nil {
-		go m.stopPendingSandboxProcess(proxyConn.pluginID, process)
-	}
+	m.queuePendingRuntimeStopIfDrained(proxyConn.runtime)
 }
 
-func (m *Manager) takePendingHostStopIfDrained(pluginID string) *PluginHostSupervisorProcess {
+func (m *Manager) queuePendingRuntimeStopIfDrained(key runtimeIdentity) {
+	m.runtimeCleanupMu.Lock()
+	loaded := m.takePendingRuntimeStopIfDrained(key)
+	if loaded != nil {
+		m.runtimeCleanupWG.Add(1)
+	}
+	m.runtimeCleanupMu.Unlock()
+	if loaded == nil {
+		return
+	}
+	go func() {
+		defer m.runtimeCleanupWG.Done()
+		m.stopPendingRuntime(loaded)
+	}()
+}
+
+func (m *Manager) takePendingRuntimeStopIfDrained(key runtimeIdentity) *loadedPlugin {
 	m.proxyMu.Lock()
-	active := 0
-	for _, conn := range m.proxyConns {
-		if conn.pluginID == pluginID {
-			active++
-		}
-	}
-	m.proxyMu.Unlock()
-	if active > 0 {
-		return nil
-	}
+	defer m.proxyMu.Unlock()
 	m.hostMu.Lock()
 	defer m.hostMu.Unlock()
-	process := m.pendingHostStops[pluginID]
-	delete(m.pendingHostStops, pluginID)
-	return process
-}
-
-func (m *Manager) takePendingSandboxStopIfDrained(pluginID string) *SandboxProcess {
-	m.proxyMu.Lock()
-	active := 0
-	for _, conn := range m.proxyConns {
-		if conn.pluginID == pluginID {
-			active++
-		}
-	}
-	m.proxyMu.Unlock()
-	if active > 0 {
+	loaded := m.pendingRuntimeStops[key]
+	if loaded == nil || m.activeRuntimeReferencesWithoutLock(loaded, key) > 0 {
 		return nil
 	}
-	m.hostMu.Lock()
-	defer m.hostMu.Unlock()
-	process := m.pendingSandboxStops[pluginID]
-	delete(m.pendingSandboxStops, pluginID)
-	return process
+	delete(m.pendingRuntimeStops, key)
+	return loaded
 }
 
-func (m *Manager) stopPendingProcessHost(pluginID string, process *PluginHostSupervisorProcess) {
+func (m *Manager) stopPendingRuntime(loaded *loadedPlugin) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = process.Stop(ctx)
-	m.markHostStopped(pluginID, process.ArtifactID, process)
-}
-
-func (m *Manager) stopPendingSandboxProcess(_ string, process *SandboxProcess) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = process.Stop(ctx)
+	if err := m.stopRuntimeAdapter(ctx, loaded); err != nil {
+		_ = m.repo.RecordOperation(ctx, loaded.record.ID, loaded.artifact.ID, "runtime_cleanup", "warning", "system", err.Error(), map[string]any{
+			"runtime_instance_id": loaded.runtime.RuntimeInstanceID,
+		})
+	}
 }
 
 // loadLocked 加载或复用插件实例。调用方必须持有 m.mu，确保 loaded 缓存和
 // 运行态标记不会与 Enable/Disable/Reconcile 并发冲突。
-func (m *Manager) loadLocked(ctx context.Context, pluginRecord PluginRecord) (*loadedPlugin, error) {
+func (m *Manager) loadLocked(ctx context.Context, pluginRecord PluginRecord) (*loadedPlugin, *loadedPlugin, error) {
 	if m.closing.Load() {
-		return nil, ErrManagerClosed
+		return nil, nil, ErrManagerClosed
 	}
 	if loaded := m.loaded[pluginRecord.ID]; loaded != nil &&
 		loaded.artifact.ID == pluginRecord.DesiredArtifactID &&
@@ -2350,38 +2581,48 @@ func (m *Manager) loadLocked(ctx context.Context, pluginRecord PluginRecord) (*l
 			} else {
 				// 同一制品、同一期望代数已经加载且 host 仍健康时直接复用，
 				// 避免重复 Init 和重复注册任务。
-				return loaded, nil
+				return loaded, nil, nil
 			}
 		} else {
 			// 同一制品、同一期望代数已经加载时直接复用，避免重复 Init 和重复注册任务。
-			return loaded, nil
+			return loaded, nil, nil
 		}
 	}
 	artifact, err := m.repo.Artifact(ctx, pluginRecord.DesiredArtifactID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := m.validateArtifactGate(artifact); err != nil {
 		_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginRecord.ID, pluginRecord.DesiredGeneration, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), runtimeFailureSummary(artifact, err), nil)
 		m.recordPluginNodeRuntimeStateLocked(ctx, pluginRecord.ID)
-		return nil, err
+		return nil, nil, err
 	}
 
 	var manifest Manifest
 	if err := json.Unmarshal([]byte(artifact.MetadataJSON), &manifest); err != nil {
 		_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginRecord.ID, pluginRecord.DesiredGeneration, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), runtimeFailureSummary(artifact, err), nil)
 		m.recordPluginNodeRuntimeStateLocked(ctx, pluginRecord.ID)
-		return nil, err
+		return nil, nil, err
 	}
-	gateway := NewGateway(pluginRecord.ID, m.handleConn, m.wg, m.operations.ForPlugin(pluginRecord.ID, artifact.ID, manifest))
+	pluginOperations := m.operations.ForRuntime(pluginRecord.ID, artifact.ID, manifest)
+	gateway := NewGateway(pluginRecord.ID, m.handleConn, m.wg, pluginOperations)
 	runtimeInstance, err := m.startRuntimeInstance(ctx, artifact, pluginRecord, gateway)
 	if err != nil {
 		_, _ = m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginRecord.ID, pluginRecord.DesiredGeneration, RuntimeFailed, "", "", pluginRecord.AppliedGeneration, err.Error(), runtimeFailureSummary(artifact, err), nil)
 		m.recordPluginNodeRuntimeStateLocked(ctx, pluginRecord.ID)
-		return nil, err
+		return nil, nil, err
 	}
 	instance := runtimeInstance.Plugin
 	handlers := buildHandlers(pluginRecord, artifact, gateway)
+	runtimeKey := runtimeIdentity{
+		pluginID:          pluginRecord.ID,
+		artifactID:        artifact.ID,
+		desiredGeneration: pluginRecord.DesiredGeneration,
+		runtimeInstanceID: runtimeInstance.RuntimeInstanceID,
+	}
+	for _, handler := range handlers {
+		handler.runtime = runtimeKey
+	}
 	extensions := buildExtensions(pluginRecord, artifact, gateway)
 	// 钩子和扩展是从 gateway 注册记录中构建出来的；插件 Init 期间完成注册。
 	loaded := &loadedPlugin{
@@ -2390,25 +2631,36 @@ func (m *Manager) loadLocked(ctx context.Context, pluginRecord PluginRecord) (*l
 		instance:   instance,
 		runtime:    runtimeInstance,
 		gateway:    gateway,
+		operations: pluginOperations,
 		handlers:   handlers,
 		extensions: extensions,
 	}
 	if wasmPlugin, ok := instance.(*wasmHostedPlugin); ok && wasmPlugin != nil {
 		wasmPlugin.onRepeatedTrapQuarantine = m.handleWASMRepeatedTrapQuarantine
 	}
+	previous := m.loaded[pluginRecord.ID]
 	m.loaded[pluginRecord.ID] = loaded
 	updated, err := m.repo.MarkRuntimeIfDesiredGeneration(ctx, pluginRecord.ID, pluginRecord.DesiredGeneration, RuntimeLoaded, "", artifact.ID, pluginRecord.AppliedGeneration, "", m.loadedRuntimeSummary(loaded), loaded.dispatchSummaries())
 	if err != nil {
-		return nil, err
+		if previous != nil {
+			m.loaded[pluginRecord.ID] = previous
+		} else {
+			delete(m.loaded, pluginRecord.ID)
+		}
+		_ = m.stopRuntimeInstance(ctx, loaded)
+		return nil, nil, err
 	}
 	if !updated {
-		delete(m.loaded, pluginRecord.ID)
+		if previous != nil {
+			m.loaded[pluginRecord.ID] = previous
+		} else {
+			delete(m.loaded, pluginRecord.ID)
+		}
 		_ = m.stopRuntimeInstance(ctx, loaded)
-		return nil, errors.New("runtime desired generation changed before load completed")
+		return nil, nil, errors.New("runtime desired generation changed before load completed")
 	}
 	m.recordPluginNodeRuntimeStateLocked(ctx, pluginRecord.ID)
-	m.operations.StartTasks(pluginRecord.ID)
-	return loaded, nil
+	return loaded, previous, nil
 }
 
 func (m *Manager) startRuntimeInstance(ctx context.Context, artifact ArtifactRecord, pluginRecord PluginRecord, gateway *Gateway) (RuntimeInstance, error) {
@@ -2712,7 +2964,6 @@ func reloadErrorMessage(artifact ArtifactRecord, configJSON string, err error) s
 }
 
 func (m *Manager) markEnabled(ctx context.Context, loaded *loadedPlugin) error {
-	m.operations.StartTasks(loaded.record.ID)
 	m.markHostStarted(loaded.record.ID, loaded.artifact.ID, loaded.runtime.HostProcess)
 	summary := m.loadedRuntimeSummary(loaded)
 	summary["plugin_host"] = m.hostSummary(loaded.record.ID)
@@ -2982,6 +3233,26 @@ func (m *Manager) markDrainingLocked(pluginID string) {
 	}
 }
 
+func (m *Manager) markLoadedRuntimeDrainingLocked(loaded *loadedPlugin) {
+	if loaded == nil {
+		return
+	}
+	key := loadedRuntimeIdentity(loaded)
+	for _, handler := range loaded.handlers {
+		handler.draining.Store(true)
+	}
+	m.proxyMu.Lock()
+	defer m.proxyMu.Unlock()
+	for _, conn := range m.proxyConns {
+		if conn.runtime == key && !conn.draining {
+			conn.draining = true
+			if conn.handler != nil {
+				conn.handler.drainingProxy.Add(1)
+			}
+		}
+	}
+}
+
 func (m *Manager) clearDrainingLocked(pluginID string) {
 	m.proxyMu.Lock()
 	delete(m.drainingIDs, pluginID)
@@ -2996,6 +3267,30 @@ func (m *Manager) activeProxyCountLocked(pluginID string) int {
 		if conn.pluginID == pluginID {
 			count++
 		}
+	}
+	return count
+}
+
+func (m *Manager) activeProxyCountForRuntimeLocked(key runtimeIdentity) int {
+	m.proxyMu.Lock()
+	defer m.proxyMu.Unlock()
+	return m.activeProxyCountForRuntimeWithoutLock(key)
+}
+
+func (m *Manager) activeProxyCountForRuntimeWithoutLock(key runtimeIdentity) int {
+	count := 0
+	for _, conn := range m.proxyConns {
+		if conn.runtime == key {
+			count++
+		}
+	}
+	return count
+}
+
+func (m *Manager) activeRuntimeReferencesWithoutLock(loaded *loadedPlugin, key runtimeIdentity) int64 {
+	count := int64(m.activeProxyCountForRuntimeWithoutLock(key))
+	for _, handler := range loaded.handlers {
+		count += handler.runtimeRefs.Load()
 	}
 	return count
 }
