@@ -3,8 +3,10 @@ package sandboxsdk
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -162,6 +164,137 @@ func TestServiceHandlesInvokeAndStreamCommands(t *testing.T) {
 	}))
 	if !streamResp.OK || streamResp.Stream == nil || !streamResp.Stream.Connected || streamResp.Stream.EndpointType != "unix" {
 		t.Fatalf("stream_open response = %+v, want unix stream endpoint", streamResp)
+	}
+}
+
+func TestClientRunRegistersServiceAndStopsOnCancellation(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "control.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer listener.Close()
+
+	registered := make(chan RegisterRequest, 1)
+	serverErr := make(chan error, 1)
+	go func() {
+		for _, command := range []string{CommandHandshake, CommandInit, CommandRegister} {
+			conn, err := listener.Accept()
+			if err != nil {
+				serverErr <- err
+				return
+			}
+			var req ControlRequest
+			if err := json.NewDecoder(conn).Decode(&req); err != nil {
+				_ = conn.Close()
+				serverErr <- err
+				return
+			}
+			if req.Command != command {
+				_ = conn.Close()
+				serverErr <- &unexpectedControlRequestError{request: req, command: command}
+				return
+			}
+			if command == CommandRegister {
+				var register RegisterRequest
+				if err := json.Unmarshal(req.Payload, &register); err != nil {
+					_ = conn.Close()
+					serverErr <- err
+					return
+				}
+				registered <- register
+			}
+			if err := json.NewEncoder(conn).Encode(ControlResponse{
+				RequestID: req.RequestID,
+				Command:   command,
+				Protocol:  Protocol,
+				OK:        true,
+			}); err != nil {
+				_ = conn.Close()
+				serverErr <- err
+				return
+			}
+			_ = conn.Close()
+		}
+		serverErr <- nil
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- (Client{SocketPath: socketPath, Timeout: time.Second}).Run(ctx, Service{
+			Registrations: []HandlerRegistration{{ExtensionPoint: "status.ping/v1", HandlerID: "status-main"}},
+			Capabilities:  []string{"runtime.cpu_memory"},
+		})
+	}()
+
+	select {
+	case register := <-registered:
+		if len(register.Handlers) != 1 || register.Handlers[0].HandlerID != "status-main" {
+			t.Fatalf("register request = %+v, want status-main handler", register)
+		}
+		cancel()
+	case <-time.After(2 * time.Second):
+		t.Fatal("Client.Run() did not register service")
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatalf("control server error = %v", err)
+	}
+	if err := <-runErr; err != nil {
+		t.Fatalf("Client.Run() error = %v, want clean cancellation", err)
+	}
+}
+
+func TestServiceHandlesStatusCloseAndProtocolErrors(t *testing.T) {
+	closedStream := ""
+	service := Service{
+		StatusPing: func(_ context.Context, req api.StatusPingRequest) (api.StatusPingResponse, error) {
+			return api.StatusPingResponse{MOTD: "ready:" + req.Host}, nil
+		},
+		StreamClose: func(_ context.Context, req StreamCloseRequest) error {
+			closedStream = req.StreamID
+			return nil
+		},
+	}
+
+	status := service.HandleControlRequest(nil, controlRequest(t, CommandInvoke, InvokeRequest{
+		ExtensionPoint: "status.ping/v1",
+		HandlerID:      "status-main",
+		StatusPing:     &api.StatusPingRequest{Host: "probe.example"},
+	}))
+	if !status.OK || status.Invoke == nil || status.Invoke.StatusResponse == nil || status.Invoke.StatusResponse.MOTD != "ready:probe.example" {
+		t.Fatalf("status response = %+v, want ready:probe.example", status)
+	}
+
+	closed := service.HandleControlRequest(context.Background(), controlRequest(t, CommandStreamClose, StreamCloseRequest{
+		Protocol: "stream.proxy/v1",
+		StreamID: "stream-7",
+		Reason:   "completed",
+	}))
+	if !closed.OK || closedStream != "stream-7" {
+		t.Fatalf("close response = %+v, closed stream = %q", closed, closedStream)
+	}
+
+	for name, testCase := range map[string]struct {
+		request ControlRequest
+		code    string
+	}{
+		"unknown command": {request: controlRequest(t, "unsupported", struct{}{}), code: "unknown_command"},
+		"invalid invoke":  {request: controlRequest(t, CommandInvoke, struct{}{}), code: "schema_invalid"},
+		"missing handler": {request: controlRequest(t, CommandStreamOpen, StreamOpenRequest{}), code: "not_implemented"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := (Service{}).HandleControlRequest(context.Background(), testCase.request)
+			if response.OK || response.ErrorCode != testCase.code || strings.TrimSpace(response.Error) == "" {
+				t.Fatalf("response = %+v, want %s error", response, testCase.code)
+			}
+		})
+	}
+
+	failing := Service{StreamClose: func(context.Context, StreamCloseRequest) error { return errors.New("close failed") }}
+	response := failing.HandleControlRequest(context.Background(), controlRequest(t, CommandStreamClose, StreamCloseRequest{StreamID: "stream-8"}))
+	if response.OK || response.ErrorCode != "handler_failed" || !strings.Contains(response.Error, "close failed") {
+		t.Fatalf("failed close response = %+v, want handler_failed", response)
 	}
 }
 

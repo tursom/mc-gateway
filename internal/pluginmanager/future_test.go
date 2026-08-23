@@ -99,6 +99,47 @@ func TestSandboxFeatureFactsGateStates(t *testing.T) {
 	}
 }
 
+func TestPublicFeatureFactsDescribeRuntimeCapabilities(t *testing.T) {
+	runtimeTypes := RuntimeTypeFeatures()
+	serviceModes := PluginServiceModeFeatures()
+	extensionPoints := ExtensionPointFeatures()
+	if len(runtimeTypes) < 4 || len(serviceModes) < 3 || len(extensionPoints) < 10 {
+		t.Fatalf("feature facts runtime=%d modes=%d extensions=%d, want complete public catalogs", len(runtimeTypes), len(serviceModes), len(extensionPoints))
+	}
+	if feature := RuntimeTypeFeature(RuntimeGoPlugin); !feature.Implemented || !feature.DataPlane || feature.RequiresRestart {
+		t.Fatalf("go-plugin feature = %+v, want implemented in-process data plane", feature)
+	}
+	if feature := PluginServiceModeFeatureFor(PluginServiceModeGoPluginProcess); !feature.Implemented || !feature.DataPlane || !feature.RequiresRestart {
+		t.Fatalf("go-plugin-process feature = %+v, want restart-required process data plane", feature)
+	}
+	if feature := RuntimeTypeFeature("unknown-runtime"); feature.Implemented || feature.Maturity != FeatureMaturityStub {
+		t.Fatalf("unknown runtime feature = %+v, want explicit stub", feature)
+	}
+
+	gates := FutureRuntimeGates{SandboxProcess: true, WASM: true, Ingress: true}
+	if !gates.SandboxEnabled() || !gates.WASMEnabled() || !gates.IngressEnabled() {
+		t.Fatalf("future gates = %+v, want all enabled", gates)
+	}
+	var manager *Manager
+	if got := manager.FutureRuntimeGates(); got != (FutureRuntimeGates{}) {
+		t.Fatalf("nil manager gates = %+v, want zero value", got)
+	}
+	if got := manager.RuntimeFeatureFactsOptions(); got.FutureRuntimeGates != (FutureRuntimeGates{}) {
+		t.Fatalf("nil manager feature options = %+v, want zero gates", got)
+	}
+	if WASMHostABIVersion() == "" {
+		t.Fatal("WASMHostABIVersion() returned empty version")
+	}
+	hostFeature := PluginHostProtocolFeature()
+	if !hostFeature.Handshake || !hostFeature.DataPlane || len(hostFeature.LifecycleCommands) == 0 {
+		t.Fatalf("plugin host feature = %+v, want handshake data plane lifecycle", hostFeature)
+	}
+	order := PluginHostOrphanDiscoveryOrder()
+	if len(order) != 4 || order[0] != "metadata-backed sweep" {
+		t.Fatalf("orphan discovery order = %v, want metadata-first four-step order", order)
+	}
+}
+
 func TestSandboxAdapterFactoryCarriesPolicyAndSelfCheck(t *testing.T) {
 	called := false
 	policy := SandboxPolicy{CPUSeconds: 7, MemoryBytes: 32 * 1024 * 1024, ExternalIsolation: true}

@@ -217,6 +217,10 @@ func startGatewayTestUpstream(t testing.TB, packetLen int, reply []byte) (string
 				return
 			}
 		}
+		if err := conn.Close(); err != nil {
+			done <- gatewayTestBackendResult{err: err}
+			return
+		}
 		done <- gatewayTestBackendResult{packet: packet}
 	}()
 

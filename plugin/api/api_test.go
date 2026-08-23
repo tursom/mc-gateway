@@ -32,6 +32,9 @@ func TestHookTypesAndHandlers(t *testing.T) {
 	if got := HookUpstreamConnectV2.Key(); got != "upstream.connect/v2" {
 		t.Fatalf("HookUpstreamConnectV2.Key() = %q, want upstream.connect/v2", got)
 	}
+	if got := HookRouteResolve.AsAny().Key(); got != HookRouteResolve.Key() {
+		t.Fatalf("HookRouteResolve.AsAny().Key() = %q, want %q", got, HookRouteResolve.Key())
+	}
 
 	acceptor := func(net.Conn, string) bool { return true }
 	handler := func(net.Conn, string) (net.Conn, error) { return nil, nil }
@@ -66,6 +69,22 @@ func TestRegisterHookHandler(t *testing.T) {
 	}
 	if registered == nil {
 		t.Fatal("registered handler is nil")
+	}
+
+	acceptStatus := StatusPingAcceptor(func(StatusPingRequest) bool { return true })
+	answerStatus := StatusPingHandler(func(StatusPingRequest) (StatusPingResponse, error) {
+		return StatusPingResponse{MOTD: "ready"}, nil
+	})
+	if err := RegisterHookHandler(gateway, HookStatusPing, acceptStatus, answerStatus); err != nil {
+		t.Fatalf("RegisterHookHandler() error = %v", err)
+	}
+	statusHook, ok := gateway.hooks[HookStatusPing.Key()].(HookHandler[StatusPingAcceptor, StatusPingHandler])
+	if !ok || !statusHook.Acceptor()(StatusPingRequest{Host: "play.example"}) {
+		t.Fatalf("registered status hook = %T, want accepting status hook", gateway.hooks[HookStatusPing.Key()])
+	}
+	status, err := statusHook.Handler()(StatusPingRequest{Host: "play.example"})
+	if err != nil || status.MOTD != "ready" {
+		t.Fatalf("status handler response = %+v err=%v, want ready", status, err)
 	}
 }
 

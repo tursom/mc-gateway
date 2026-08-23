@@ -64,6 +64,7 @@ func handlerConn(client net.Conn) {
 	if err != nil {
 		log.Error().Err(err).
 			Msg("Failed to dial KCP server")
+		return
 	}
 	defer conn.Close()
 
@@ -102,6 +103,7 @@ func handlerConn(client net.Conn) {
 	wg.Add(1)
 	go copyData(conn, client, &wg)
 	copyData(client, conn, nil)
+	_ = conn.Close()
 	wg.Wait()
 }
 

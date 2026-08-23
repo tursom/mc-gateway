@@ -75,8 +75,12 @@ func TestReplayConnForwardsCloseWrite(t *testing.T) {
 }
 
 func TestChanListenerAcceptCloseAndDeliver(t *testing.T) {
-	listener := NewChanListener(muxTestAddr("listener"), DefaultHTTPConnBacklog)
+	addr := muxTestAddr("listener")
+	listener := NewChanListener(addr, DefaultHTTPConnBacklog)
 	conn := newMuxTestConn(nil)
+	if listener.Addr() != addr {
+		t.Fatalf("Addr() = %v, want %v", listener.Addr(), addr)
+	}
 
 	if !listener.Deliver(conn) {
 		t.Fatal("Deliver() = false, want true")

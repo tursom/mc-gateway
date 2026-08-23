@@ -66,7 +66,7 @@ func (m *Manager) Get(token string) (Session, bool) {
 	if !ok {
 		return Session{}, false
 	}
-	if m.now().After(session.ExpiresAt) {
+	if !m.now().Before(session.ExpiresAt) {
 		// 读取时顺手清理过期会话，避免后台清理 goroutine。
 		delete(m.sessions, token)
 		return Session{}, false

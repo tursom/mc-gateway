@@ -6,10 +6,31 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync"
 	"testing"
 
 	"github.com/tursom/mc-gateway/plugin/api"
 )
+
+type recordingGateway struct {
+	hooks map[string]any
+	wg    sync.WaitGroup
+}
+
+func (g *recordingGateway) ExitWaitGroup() *sync.WaitGroup { return &g.wg }
+func (g *recordingGateway) Hook(key string, handler any) error {
+	g.hooks[key] = handler
+	return nil
+}
+func (*recordingGateway) EmitEvent(context.Context, string, map[string]string) error { return nil }
+func (*recordingGateway) ObserveMetric(context.Context, string, float64, map[string]string) error {
+	return nil
+}
+func (*recordingGateway) Logger() api.Logger                              { return nil }
+func (*recordingGateway) DataStore() api.DataStore                        { return nil }
+func (*recordingGateway) FileStore() api.FileStore                        { return nil }
+func (*recordingGateway) ExternalClient(string) api.ExternalClient        { return nil }
+func (*recordingGateway) RegisterBackgroundTask(api.BackgroundTask) error { return nil }
 
 type testFlow struct {
 	state api.ConnectionState
@@ -119,5 +140,26 @@ func TestTrustedRealIPRejectsUntrustedPeer(t *testing.T) {
 	}
 	if _, err := right.Write([]byte("x")); !errors.Is(err, io.ErrClosedPipe) {
 		t.Fatalf("write after rejection error = %v, want closed pipe", err)
+	}
+}
+
+func TestTrustedRealIPPublicLifecycleRegistersHook(t *testing.T) {
+	plugin, ok := New().(*Plugin)
+	if !ok {
+		t.Fatalf("New() = %T, want *Plugin", New())
+	}
+	config, ok := plugin.NewConfigObj().(*Config)
+	if !ok || config.Header != "X-Real-IP" || len(config.TrustedPeers) != 1 {
+		t.Fatalf("NewConfigObj() = %#v, want secure loopback defaults", config)
+	}
+	if err := plugin.ReloadConfig(config); err != nil {
+		t.Fatalf("ReloadConfig(defaults) error = %v", err)
+	}
+	gateway := &recordingGateway{hooks: map[string]any{}}
+	if err := plugin.Init(gateway); err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+	if gateway.hooks[api.HookUpstreamConnectV2.Key()] == nil {
+		t.Fatalf("Init() did not register %s", api.HookUpstreamConnectV2.Key())
 	}
 }

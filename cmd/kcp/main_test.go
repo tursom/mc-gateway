@@ -5,12 +5,17 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/tursom/mc-gateway/protocol"
+	"github.com/tursom/mc-gateway/protocol/smoke"
+	"github.com/xtaci/kcp-go"
 )
 
 func TestCopyData(t *testing.T) {
@@ -46,6 +51,115 @@ func TestSetSocketOptionsTCPConn(t *testing.T) {
 
 	setSocketOptions(client)
 	setSocketOptions(server)
+}
+
+func TestHandlerConnReturnsWhenKCPDialFails(t *testing.T) {
+	oldHost, oldPort := mcHost, mcPort
+	t.Cleanup(func() {
+		mcHost = oldHost
+		mcPort = oldPort
+	})
+	mcHost = "invalid\x00host"
+	mcPort = 25565
+	client, server := net.Pipe()
+	defer server.Close()
+
+	panicResult := make(chan any, 1)
+	go func() {
+		defer func() { panicResult <- recover() }()
+		handlerConn(client)
+	}()
+	select {
+	case recovered := <-panicResult:
+		if recovered != nil {
+			t.Fatalf("handlerConn() panic = %v, want clean dial failure", recovered)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handlerConn() did not return after KCP dial failure")
+	}
+}
+
+func TestHandlerConnProxiesMinecraftOverKCP(t *testing.T) {
+	listener, err := kcp.ListenWithOptions("127.0.0.1:0", nil, 10, 5)
+	if err != nil {
+		t.Fatalf("ListenWithOptions() error = %v", err)
+	}
+	defer listener.Close()
+
+	oldHost, oldPort := mcHost, mcPort
+	t.Cleanup(func() {
+		mcHost = oldHost
+		mcPort = oldPort
+	})
+	host, portText, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatalf("SplitHostPort(%q) error = %v", listener.Addr(), err)
+	}
+	if _, err := fmt.Sscanf(portText, "%d", &mcPort); err != nil {
+		t.Fatalf("parse KCP port %q error = %v", portText, err)
+	}
+	mcHost = host
+
+	upstreamPacket := make(chan []byte, 1)
+	releaseUpstream := make(chan struct{})
+	upstreamErr := make(chan error, 1)
+	go func() {
+		conn, err := listener.AcceptKCP()
+		if err != nil {
+			upstreamErr <- err
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+		packet, err := smoke.ReadPacketFromConn(conn)
+		if err != nil {
+			upstreamErr <- err
+			return
+		}
+		upstreamPacket <- packet
+		if _, err := conn.Write([]byte("kcp-reply")); err != nil {
+			upstreamErr <- err
+			return
+		}
+		<-releaseUpstream
+		upstreamErr <- nil
+	}()
+
+	client, caller := net.Pipe()
+	deadline := time.Now().Add(3 * time.Second)
+	_ = caller.SetDeadline(deadline)
+	handlerDone := make(chan struct{})
+	go func() {
+		handlerConn(client)
+		close(handlerDone)
+	}()
+
+	initial := smoke.MinecraftHandshakePacket("original.example")
+	if _, err := caller.Write(initial); err != nil {
+		t.Fatalf("write handshake error = %v", err)
+	}
+	reply := make([]byte, len("kcp-reply"))
+	if _, err := io.ReadFull(caller, reply); err != nil {
+		t.Fatalf("read KCP reply error = %v", err)
+	}
+	if string(reply) != "kcp-reply" {
+		t.Fatalf("reply = %q, want kcp-reply", reply)
+	}
+	packet := <-upstreamPacket
+	if handshake := protocol.ParseHandshake(packet); handshake.ServerHost != mcHost {
+		t.Fatalf("upstream host = %q, want %q", handshake.ServerHost, mcHost)
+	}
+
+	_ = caller.Close()
+	close(releaseUpstream)
+	if err := <-upstreamErr; err != nil {
+		t.Fatalf("KCP upstream error = %v", err)
+	}
+	select {
+	case <-handlerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handlerConn() did not stop after both peers closed")
+	}
 }
 
 type errorReader struct {

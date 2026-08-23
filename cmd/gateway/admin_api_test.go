@@ -7,14 +7,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/tursom/mc-gateway/internal/adminservice"
+	"github.com/tursom/mc-gateway/internal/adminsession"
 	"github.com/tursom/mc-gateway/internal/pluginmanager"
 )
 
@@ -77,6 +82,80 @@ func TestAdminSetupLoginAndPermissions(t *testing.T) {
 	resp = adminTestRequest(t, handler, http.MethodGet, "/admin/api/users", guestToken, nil)
 	if resp.Code != http.StatusForbidden {
 		t.Fatalf("guest users status = %d, want %d", resp.Code, http.StatusForbidden)
+	}
+}
+
+func TestAdminSessionIsRejectedAtExactExpiry(t *testing.T) {
+	handler := newAdminTestHandlerWithAdmin(t)
+
+	now := time.Date(2026, time.August, 23, 12, 0, 0, 0, time.UTC)
+	adminSessionManager = adminsession.NewManagerWithClock(func() time.Time { return now })
+	adminStartup.SessionTTL = time.Minute
+	token := adminTestLogin(t, handler, "admin", "secret")
+
+	now = now.Add(time.Minute)
+	resp := adminTestRequest(t, handler, http.MethodGet, "/admin/api/me", token, nil)
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /me at session expiry status = %d, want %d", resp.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestAdminSessionIdentityAndLogout(t *testing.T) {
+	handler := newAdminTestHandlerWithAdmin(t)
+	token := adminTestLogin(t, handler, "admin", "secret")
+
+	resp := adminTestRequest(t, handler, http.MethodGet, "/admin/api/me", token, nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("GET /me status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	identity := adminTestJSON(t, resp)
+	permissions, ok := identity["permissions"].(map[string]any)
+	if !ok || identity["username"] != "admin" || identity["role"] != adminRoleAdmin ||
+		permissions["manage_users"] != true || permissions["read_routes"] != true {
+		t.Fatalf("GET /me identity = %#v, want admin permissions", identity)
+	}
+
+	resp = adminTestRequest(t, handler, http.MethodPost, "/admin/api/auth/logout", token, nil)
+	if resp.Code != http.StatusOK || adminTestJSON(t, resp)["ok"] != true {
+		t.Fatalf("POST logout status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	resp = adminTestRequest(t, handler, http.MethodGet, "/admin/api/me", token, nil)
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /me after logout status = %d, want %d", resp.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestAdminMetricsRespectReadStatusPermission(t *testing.T) {
+	handler := newAdminTestHandlerWithAdmin(t)
+	adminToken := adminTestLogin(t, handler, "admin", "secret")
+	gatewayMetrics.ConnectionStarted()
+	gatewayMetrics.RouteHit("metrics.example")
+
+	resp := adminTestRequest(t, handler, http.MethodGet, "/admin/api/metrics", adminToken, nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("admin GET metrics status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	metrics := adminTestJSON(t, resp)
+	if metrics["total_connections"] != float64(1) {
+		t.Fatalf("total_connections = %#v, want 1", metrics["total_connections"])
+	}
+	routeHits, ok := metrics["route_hits"].(map[string]any)
+	if !ok || routeHits["metrics.example"] != float64(1) {
+		t.Fatalf("route_hits = %#v, want metrics.example=1", metrics["route_hits"])
+	}
+
+	resp = adminTestRequest(t, handler, http.MethodPost, "/admin/api/users", adminToken, map[string]any{
+		"username": "guest",
+		"role":     adminRoleGuest,
+		"password": "guest-secret",
+	})
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("create guest status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	guestToken := adminTestLogin(t, handler, "guest", "guest-secret")
+	resp = adminTestRequest(t, handler, http.MethodGet, "/admin/api/metrics", guestToken, nil)
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("guest GET metrics status = %d, want %d", resp.Code, http.StatusForbidden)
 	}
 }
 
@@ -188,6 +267,85 @@ func TestAdminServiceUpdateMarksRestartRequired(t *testing.T) {
 	}
 	if found["enabled"] != true || found["restart_required"] != true || found["running"] != false {
 		t.Fatalf("kcp service = %#v, want enabled restart_required and not running", found)
+	}
+}
+
+func TestAdminServiceUpdateUsesProtocolDefaultPort(t *testing.T) {
+	handler := newAdminTestHandlerWithAdmin(t)
+	token := adminTestLogin(t, handler, "admin", "secret")
+
+	resp := adminTestRequest(t, handler, http.MethodPut, "/admin/api/services/quic", token, map[string]any{
+		"enabled": true,
+		"options": map[string]any{"application_protocols": []string{"minecraft"}},
+	})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("service update status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+
+	resp = adminTestRequest(t, handler, http.MethodGet, "/admin/api/services", token, nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("services status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	services := adminTestJSON(t, resp)["services"].([]any)
+	for _, item := range services {
+		service := item.(map[string]any)
+		if service["name"] != adminservice.NameQUIC {
+			continue
+		}
+		if service["port"] != float64(adminservice.DefaultQUICPort) {
+			t.Fatalf("QUIC port = %#v, want %d", service["port"], adminservice.DefaultQUICPort)
+		}
+		return
+	}
+	t.Fatal("QUIC service not found")
+}
+
+func TestAdminUserInventoryAndDeleteInvalidatesSession(t *testing.T) {
+	handler := newAdminTestHandlerWithAdmin(t)
+	adminToken := adminTestLogin(t, handler, "admin", "secret")
+
+	resp := adminTestRequest(t, handler, http.MethodPost, "/admin/api/users", adminToken, map[string]any{
+		"username": "operator",
+		"role":     adminRoleMember,
+		"password": "operator-secret",
+	})
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("create operator status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	operatorToken := adminTestLogin(t, handler, "operator", "operator-secret")
+
+	resp = adminTestRequest(t, handler, http.MethodGet, "/admin/api/users", adminToken, nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("list users status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	users := adminTestJSON(t, resp)["users"].([]any)
+	foundOperator := false
+	for _, item := range users {
+		user := item.(map[string]any)
+		if _, leaked := user["password_hash"]; leaked {
+			t.Fatalf("user response leaked password_hash: %#v", user)
+		}
+		if user["username"] == "operator" {
+			foundOperator = user["role"] == adminRoleMember && user["disabled"] == false
+		}
+	}
+	if !foundOperator {
+		t.Fatalf("users = %#v, want enabled member operator", users)
+	}
+
+	resp = adminTestRequest(t, handler, http.MethodDelete, "/admin/api/users/operator", adminToken, nil)
+	if resp.Code != http.StatusOK || adminTestJSON(t, resp)["ok"] != true {
+		t.Fatalf("delete operator status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	resp = adminTestRequest(t, handler, http.MethodGet, "/admin/api/me", operatorToken, nil)
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("deleted user's session status = %d, want %d", resp.Code, http.StatusUnauthorized)
+	}
+	resp = adminTestRequest(t, handler, http.MethodGet, "/admin/api/users", adminToken, nil)
+	for _, item := range adminTestJSON(t, resp)["users"].([]any) {
+		if item.(map[string]any)["username"] == "operator" {
+			t.Fatalf("deleted operator still listed: %#v", item)
+		}
 	}
 }
 
@@ -1497,6 +1655,371 @@ func TestAdminPluginArtifactPackageDownload(t *testing.T) {
 	}
 }
 
+func TestAdminPluginArtifactUploadInventoryAndPermissions(t *testing.T) {
+	handler := newAdminTestHandlerWithAdmin(t)
+	adminToken := adminTestLogin(t, handler, "admin", "secret")
+	resp := adminTestRequest(t, handler, http.MethodPost, "/admin/api/users", adminToken, map[string]any{
+		"username": "member",
+		"role":     adminRoleMember,
+		"password": "member-secret",
+	})
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("create member status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	memberToken := adminTestLogin(t, handler, "member", "member-secret")
+	packagePath := writeGatewayTestMCGPEntries(t, map[string][]byte{
+		"manifest.json": gatewayTestManifest(t, "upload-api-plugin"),
+		"plugin.so":     []byte("upload api plugin bytes"),
+	})
+	packageBytes, err := os.ReadFile(packagePath)
+	if err != nil {
+		t.Fatalf("ReadFile(package) error = %v", err)
+	}
+
+	resp = adminTestMultipartRequest(t, handler, "/admin/api/plugin-artifacts", memberToken, "artifact", "upload-api-plugin.mcgp", packageBytes)
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("member artifact upload status = %d, want %d", resp.Code, http.StatusForbidden)
+	}
+	resp = adminTestMultipartRequest(t, handler, "/admin/api/plugin-artifacts", adminToken, "artifact", "upload-api-plugin.mcgp", packageBytes)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("admin artifact upload status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	uploaded := adminTestJSON(t, resp)["artifact"].(map[string]any)
+	artifactID, ok := uploaded["id"].(string)
+	if !ok || artifactID == "" || uploaded["plugin_id"] != "upload-api-plugin" {
+		t.Fatalf("uploaded artifact = %#v, want upload-api-plugin identity", uploaded)
+	}
+
+	resp = adminTestRequest(t, handler, http.MethodGet, "/admin/api/plugin-artifacts?plugin_id=upload-api-plugin", memberToken, nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("artifact inventory status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	artifacts := adminTestJSON(t, resp)["artifacts"].([]any)
+	if len(artifacts) != 1 || artifacts[0].(map[string]any)["id"] != artifactID {
+		t.Fatalf("artifact inventory = %#v, want uploaded artifact %s", artifacts, artifactID)
+	}
+	resp = adminTestRequest(t, handler, http.MethodGet, "/admin/api/plugin-artifacts/"+artifactID, memberToken, nil)
+	if resp.Code != http.StatusOK || adminTestJSON(t, resp)["artifact"].(map[string]any)["id"] != artifactID {
+		t.Fatalf("artifact detail status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestAdminPluginSourceUploadQueuesAndControlsBuild(t *testing.T) {
+	handler := newAdminTestHandlerWithAdmin(t)
+	pluginsManager = pluginmanager.New(pluginmanager.Options{
+		DB:           adminDB,
+		ArtifactRoot: filepath.Join(filepath.Dir(adminDBPath), "plugins", "artifacts"),
+		Adapter:      gatewayTestPluginAdapter{},
+		Builders: map[string]pluginmanager.SourceBuilder{
+			pluginmanager.BuilderTypeLocalProcess: adminTestSourceBuilder{err: errors.New("controlled build failure")},
+		},
+		PolicyProfile: pluginmanager.PolicyProfileDev,
+	})
+	adminToken := adminTestLogin(t, handler, "admin", "secret")
+	resp := adminTestRequest(t, handler, http.MethodPost, "/admin/api/users", adminToken, map[string]any{
+		"username": "member",
+		"role":     adminRoleMember,
+		"password": "member-secret",
+	})
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("create member status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	memberToken := adminTestLogin(t, handler, "member", "member-secret")
+	manifest := pluginmanager.Manifest{
+		SchemaVersion: pluginmanager.SchemaVersion,
+		ID:            "source-api-plugin",
+		Name:          "Source API Plugin",
+		Version:       "0.1.0",
+		ArtifactType:  pluginmanager.ArtifactTypeSource,
+		Runtime: pluginmanager.RuntimeManifest{
+			Type:        pluginmanager.RuntimeGoPlugin,
+			EntrySymbol: "Plugin",
+		},
+		Build: pluginmanager.BuildManifest{
+			Type:      pluginmanager.BuildTypeGo,
+			Entry:     ".",
+			GoVersion: runtime.Version(),
+			Output:    pluginmanager.RuntimeEntry,
+		},
+		APIVersion: pluginmanager.APIVersion,
+		GoVersion:  runtime.Version(),
+		GOOS:       runtime.GOOS,
+		GOARCH:     runtime.GOARCH,
+		ExtensionPoints: []pluginmanager.ExtensionPoint{{
+			Type: "hook",
+			Key:  pluginmanager.ExtensionUpstreamConnect,
+		}},
+		Capabilities: json.RawMessage(`{"extension_points":["upstream.connect/v2"]}`),
+	}
+	manifestBytes, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("Marshal(source manifest) error = %v", err)
+	}
+	packagePath := writeGatewayTestMCGPEntries(t, map[string][]byte{
+		"manifest.json": manifestBytes,
+		"go.mod":        []byte("module example.com/source-api-plugin\n\ngo 1.25.0\n"),
+		"main.go":       []byte("package main\n"),
+	})
+	packageBytes, err := os.ReadFile(packagePath)
+	if err != nil {
+		t.Fatalf("ReadFile(source package) error = %v", err)
+	}
+
+	resp = adminTestMultipartRequest(t, handler, "/admin/api/plugin-sources", adminToken, "source", "source-api-plugin.mcgp", packageBytes)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("source upload status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	source := adminTestJSON(t, resp)["source"].(map[string]any)
+	if source["plugin_id"] != "source-api-plugin" || source["artifact_type"] != pluginmanager.ArtifactTypeSource {
+		t.Fatalf("source response = %#v, want source-api-plugin source artifact", source)
+	}
+
+	resp = adminTestRequest(t, handler, http.MethodGet, "/admin/api/plugin-sources?plugin_id=source-api-plugin", memberToken, nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("source inventory status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	sources := adminTestJSON(t, resp)["sources"].([]any)
+	if len(sources) != 1 || sources[0].(map[string]any)["id"] != source["id"] {
+		t.Fatalf("source inventory = %#v, want uploaded source", sources)
+	}
+
+	resp = adminTestRequest(t, handler, http.MethodGet, "/admin/api/plugin-builds?plugin_id=source-api-plugin", memberToken, nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("build inventory status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	builds := adminTestJSON(t, resp)["builds"].([]any)
+	if len(builds) != 1 {
+		t.Fatalf("queued builds = %#v, want one", builds)
+	}
+	build := builds[0].(map[string]any)
+	buildID := int64(build["id"].(float64))
+	if build["status"] != pluginmanager.BuildStatusQueued || build["source_id"] != source["id"] {
+		t.Fatalf("queued build = %#v, want source queued", build)
+	}
+
+	resp = adminTestRequest(t, handler, http.MethodPost, "/admin/api/plugin-builds/"+strconv.FormatInt(buildID, 10)+"/cancel", memberToken, nil)
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("member build cancel status = %d, want %d", resp.Code, http.StatusForbidden)
+	}
+	resp = adminTestRequest(t, handler, http.MethodPost, "/admin/api/plugin-builds/"+strconv.FormatInt(buildID, 10)+"/cancel", adminToken, nil)
+	if resp.Code != http.StatusOK || adminTestJSON(t, resp)["build"].(map[string]any)["status"] != pluginmanager.BuildStatusCanceled {
+		t.Fatalf("admin build cancel status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	resp = adminTestRequest(t, handler, http.MethodPost, "/admin/api/plugin-builds/"+strconv.FormatInt(buildID, 10)+"/retry", adminToken, nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("admin build retry status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	retried := adminTestJSON(t, resp)["build"].(map[string]any)
+	if int64(retried["id"].(float64)) == buildID || retried["status"] != pluginmanager.BuildStatusFailed ||
+		!strings.Contains(retried["error"].(string), "controlled build failure") {
+		t.Fatalf("retried build = %#v, want new controlled failure", retried)
+	}
+}
+
+func TestAdminPluginRuntimeActionDiagnosticAndDeleteLifecycle(t *testing.T) {
+	handler := newAdminTestHandlerWithAdmin(t)
+	pluginsManager = pluginmanager.New(pluginmanager.Options{
+		DB:           adminDB,
+		ArtifactRoot: filepath.Join(filepath.Dir(adminDBPath), "plugins", "artifacts"),
+		Adapter:      gatewayTestPluginAdapter{},
+	})
+	adminToken := adminTestLogin(t, handler, "admin", "secret")
+	resp := adminTestRequest(t, handler, http.MethodPost, "/admin/api/users", adminToken, map[string]any{
+		"username": "member",
+		"role":     adminRoleMember,
+		"password": "member-secret",
+	})
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("create member status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	memberToken := adminTestLogin(t, handler, "member", "member-secret")
+	artifact := uploadGatewayTestArtifact(t, pluginsManager, "runtime-api-plugin")
+
+	resp = adminTestRequest(t, handler, http.MethodPut, "/admin/api/plugins/runtime-api-plugin", adminToken, map[string]any{
+		"artifact_id":   artifact.ID,
+		"desired_state": pluginmanager.DesiredDisabled,
+		"config":        map[string]any{},
+		"priority":      10,
+	})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("set desired status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	resp = adminTestRequest(t, handler, http.MethodPost, "/admin/api/plugins/runtime-api-plugin/enable", memberToken, nil)
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("member enable status = %d, want %d", resp.Code, http.StatusForbidden)
+	}
+
+	resp = adminTestRequest(t, handler, http.MethodPost, "/admin/api/plugins/runtime-api-plugin/load", adminToken, nil)
+	if resp.Code != http.StatusOK || adminTestJSON(t, resp)["plugin"].(map[string]any)["runtime_state"] != pluginmanager.RuntimeLoaded {
+		t.Fatalf("plugin load status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	resp = adminTestRequest(t, handler, http.MethodPost, "/admin/api/plugins/runtime-api-plugin/enable", adminToken, nil)
+	if resp.Code != http.StatusOK || adminTestJSON(t, resp)["plugin"].(map[string]any)["runtime_state"] != pluginmanager.RuntimeEnabled {
+		t.Fatalf("plugin enable status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	resp = adminTestRequest(t, handler, http.MethodGet, "/admin/api/plugins/runtime-api-plugin/connection-sessions", memberToken, nil)
+	if resp.Code != http.StatusOK || len(adminTestJSON(t, resp)["connection_sessions"].([]any)) != 0 {
+		t.Fatalf("connection sessions status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+
+	resp = adminTestRequest(t, handler, http.MethodPost, "/admin/api/plugins/runtime-api-plugin/disable", adminToken, nil)
+	if resp.Code != http.StatusOK || adminTestJSON(t, resp)["plugin"].(map[string]any)["runtime_state"] != pluginmanager.RuntimeDisabled {
+		t.Fatalf("plugin disable status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	resp = adminTestRequest(t, handler, http.MethodPost, "/admin/api/plugins/runtime-api-plugin/draining/force-close", memberToken, nil)
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("member force close status = %d, want %d", resp.Code, http.StatusForbidden)
+	}
+	resp = adminTestRequest(t, handler, http.MethodPost, "/admin/api/plugins/runtime-api-plugin/draining/force-close", adminToken, nil)
+	if resp.Code != http.StatusOK || adminTestJSON(t, resp)["closed"] != float64(0) {
+		t.Fatalf("admin force close status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	resp = adminTestRequest(t, handler, http.MethodGet, "/admin/api/plugins/runtime-api-plugin/diagnostics", memberToken, nil)
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("member diagnostics status = %d, want %d", resp.Code, http.StatusForbidden)
+	}
+	resp = adminTestRequest(t, handler, http.MethodGet, "/admin/api/plugins/runtime-api-plugin/diagnostics", adminToken, nil)
+	if resp.Code != http.StatusOK || adminTestJSON(t, resp)["summary"] == nil {
+		t.Fatalf("admin diagnostics status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+
+	resp = adminTestRequest(t, handler, http.MethodPost, "/admin/api/plugins/runtime-api-plugin/delete", adminToken, nil)
+	if resp.Code != http.StatusOK || adminTestJSON(t, resp)["ok"] != true {
+		t.Fatalf("plugin delete status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	resp = adminTestRequest(t, handler, http.MethodGet, "/admin/api/plugins/runtime-api-plugin", memberToken, nil)
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("plugin detail after delete status = %d, want %d", resp.Code, http.StatusNotFound)
+	}
+}
+
+func TestAdminPluginGarbageCollectionDryRunAndPermissions(t *testing.T) {
+	handler := newAdminTestHandlerWithAdmin(t)
+	adminToken := adminTestLogin(t, handler, "admin", "secret")
+	resp := adminTestRequest(t, handler, http.MethodPost, "/admin/api/users", adminToken, map[string]any{
+		"username": "member",
+		"role":     adminRoleMember,
+		"password": "member-secret",
+	})
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("create member status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	memberToken := adminTestLogin(t, handler, "member", "member-secret")
+
+	for _, endpoint := range []string{"/admin/api/plugin-gc", "/admin/api/plugin-operations-gc"} {
+		resp = adminTestRequest(t, handler, http.MethodGet, endpoint, memberToken, nil)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("member GET %s status = %d, body=%s", endpoint, resp.Code, resp.Body.String())
+		}
+		body := adminTestJSON(t, resp)
+		if body["dry_run"] != true {
+			t.Fatalf("member GET %s dry_run = %#v, want true", endpoint, body["dry_run"])
+		}
+		if _, ok := body["candidates"].([]any); !ok {
+			t.Fatalf("member GET %s candidates = %#v, want JSON array", endpoint, body["candidates"])
+		}
+
+		resp = adminTestRequest(t, handler, http.MethodPost, endpoint, memberToken, nil)
+		if resp.Code != http.StatusForbidden {
+			t.Fatalf("member POST %s status = %d, want %d", endpoint, resp.Code, http.StatusForbidden)
+		}
+		resp = adminTestRequest(t, handler, http.MethodPost, endpoint, adminToken, nil)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("admin POST %s status = %d, body=%s", endpoint, resp.Code, resp.Body.String())
+		}
+		body = adminTestJSON(t, resp)
+		if body["dry_run"] != false {
+			t.Fatalf("admin POST %s dry_run = %#v, want false", endpoint, body["dry_run"])
+		}
+		if _, ok := body["candidates"].([]any); !ok {
+			t.Fatalf("admin POST %s candidates = %#v, want JSON array", endpoint, body["candidates"])
+		}
+	}
+}
+
+func TestAdminPluginEmptyInventoriesReturnArrays(t *testing.T) {
+	handler := newAdminTestHandlerWithAdmin(t)
+	adminToken := adminTestLogin(t, handler, "admin", "secret")
+	tests := []struct {
+		endpoint string
+		field    string
+	}{
+		{endpoint: "/admin/api/plugin-artifacts", field: "artifacts"},
+		{endpoint: "/admin/api/plugin-sources", field: "sources"},
+		{endpoint: "/admin/api/plugin-builds", field: "builds"},
+		{endpoint: "/admin/api/plugins", field: "plugins"},
+		{endpoint: "/admin/api/plugin-supply-chain", field: "assessments"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.field, func(t *testing.T) {
+			resp := adminTestRequest(t, handler, http.MethodGet, tt.endpoint, adminToken, nil)
+			if resp.Code != http.StatusOK {
+				t.Fatalf("GET %s status = %d, body=%s", tt.endpoint, resp.Code, resp.Body.String())
+			}
+			if _, ok := adminTestJSON(t, resp)[tt.field].([]any); !ok {
+				t.Fatalf("GET %s field %s = %#v, want JSON array", tt.endpoint, tt.field, adminTestJSON(t, resp)[tt.field])
+			}
+		})
+	}
+}
+
+func TestAdminPluginSupplyChainAssessmentPermissionsAndInventory(t *testing.T) {
+	handler := newAdminTestHandlerWithAdmin(t)
+	pluginsManager = pluginmanager.New(pluginmanager.Options{
+		DB:           adminDB,
+		ArtifactRoot: filepath.Join(filepath.Dir(adminDBPath), "plugins", "artifacts"),
+		Adapter:      gatewayTestPluginAdapter{},
+	})
+	adminToken := adminTestLogin(t, handler, "admin", "secret")
+	resp := adminTestRequest(t, handler, http.MethodPost, "/admin/api/users", adminToken, map[string]any{
+		"username": "member",
+		"role":     adminRoleMember,
+		"password": "member-secret",
+	})
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("create member status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	memberToken := adminTestLogin(t, handler, "member", "member-secret")
+	artifact := uploadGatewayTestArtifact(t, pluginsManager, "supply-chain-api-plugin")
+	request := map[string]any{
+		"plugin_id":   artifact.PluginID,
+		"artifact_id": artifact.ID,
+		"metadata":    map[string]any{"release_channel": "test"},
+	}
+
+	resp = adminTestRequest(t, handler, http.MethodPost, "/admin/api/plugin-supply-chain", memberToken, request)
+	if resp.Code != http.StatusForbidden {
+		t.Fatalf("member supply-chain assessment status = %d, want %d", resp.Code, http.StatusForbidden)
+	}
+	resp = adminTestRequest(t, handler, http.MethodPost, "/admin/api/plugin-supply-chain", adminToken, request)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("admin supply-chain assessment status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	assessment := adminTestJSON(t, resp)["assessment"].(map[string]any)
+	assessmentID := int64(assessment["id"].(float64))
+	if assessmentID <= 0 || assessment["plugin_id"] != artifact.PluginID || assessment["artifact_id"] != artifact.ID {
+		t.Fatalf("assessment = %#v, want artifact identity", assessment)
+	}
+
+	target := "/admin/api/plugin-supply-chain?plugin_id=" + artifact.PluginID + "&artifact_id=" + artifact.ID
+	resp = adminTestRequest(t, handler, http.MethodGet, target, memberToken, nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("supply-chain inventory status = %d, body=%s", resp.Code, resp.Body.String())
+	}
+	assessments := adminTestJSON(t, resp)["assessments"].([]any)
+	if len(assessments) != 1 || int64(assessments[0].(map[string]any)["id"].(float64)) != assessmentID {
+		t.Fatalf("supply-chain inventory = %#v, want assessment %d", assessments, assessmentID)
+	}
+}
+
+type adminTestSourceBuilder struct {
+	err error
+}
+
+func (b adminTestSourceBuilder) Build(context.Context, pluginmanager.ArtifactRecord, pluginmanager.BuildRequest, pluginmanager.BuildRecord) (pluginmanager.BuildResult, error) {
+	return pluginmanager.BuildResult{}, b.err
+}
+
 func uploadGatewayPhase4Artifact(t *testing.T, pluginID string) pluginmanager.ArtifactRecord {
 	t.Helper()
 	var manifest pluginmanager.Manifest
@@ -1652,6 +2175,31 @@ func adminTestRequest(t *testing.T, handler http.Handler, method, target, token 
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	return resp
+}
+
+func adminTestMultipartRequest(t *testing.T, handler http.Handler, target, token, field, filename string, content []byte) *httptest.ResponseRecorder {
+	t.Helper()
+
+	var payload bytes.Buffer
+	writer := multipart.NewWriter(&payload)
+	part, err := writer.CreateFormFile(field, filename)
+	if err != nil {
+		t.Fatalf("CreateFormFile() error = %v", err)
+	}
+	if _, err := part.Write(content); err != nil {
+		t.Fatalf("Write(multipart file) error = %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close(multipart writer) error = %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, target, &payload)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}

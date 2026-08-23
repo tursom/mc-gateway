@@ -1,10 +1,32 @@
 package rulepolicy
 
 import (
+	"context"
+	"sync"
 	"testing"
 
 	"github.com/tursom/mc-gateway/plugin/api"
 )
+
+type recordingGateway struct {
+	hooks map[string]any
+	wg    sync.WaitGroup
+}
+
+func (g *recordingGateway) ExitWaitGroup() *sync.WaitGroup { return &g.wg }
+func (g *recordingGateway) Hook(key string, handler any) error {
+	g.hooks[key] = handler
+	return nil
+}
+func (*recordingGateway) EmitEvent(context.Context, string, map[string]string) error { return nil }
+func (*recordingGateway) ObserveMetric(context.Context, string, float64, map[string]string) error {
+	return nil
+}
+func (*recordingGateway) Logger() api.Logger                              { return nil }
+func (*recordingGateway) DataStore() api.DataStore                        { return nil }
+func (*recordingGateway) FileStore() api.FileStore                        { return nil }
+func (*recordingGateway) ExternalClient(string) api.ExternalClient        { return nil }
+func (*recordingGateway) RegisterBackgroundTask(api.BackgroundTask) error { return nil }
 
 func TestRulePolicyFiltersRewritesAndStatus(t *testing.T) {
 	plugin := New()
@@ -70,5 +92,27 @@ func TestRulePolicyFiltersRewritesAndStatus(t *testing.T) {
 		!status.Maintenance ||
 		status.MaintenanceWindow != "02:00-03:00 UTC" {
 		t.Fatalf("status response = %+v, want configured maintenance status", status)
+	}
+}
+
+func TestRulePolicyPublicLifecycleRegistersHooks(t *testing.T) {
+	plugin := New()
+	if _, ok := plugin.NewConfigObj().(*Config); !ok {
+		t.Fatalf("NewConfigObj() = %T, want *Config", plugin.NewConfigObj())
+	}
+	gateway := &recordingGateway{hooks: map[string]any{}}
+	if err := plugin.Init(gateway); err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+	for _, hook := range []string{
+		api.HookConnectionFilter.Key(),
+		api.HookHandshakeFilter.Key(),
+		api.HookRouteResolve.Key(),
+		api.HookRuleEvaluate.Key(),
+		api.HookStatusPing.Key(),
+	} {
+		if gateway.hooks[hook] == nil {
+			t.Fatalf("Init() did not register %s", hook)
+		}
 	}
 }

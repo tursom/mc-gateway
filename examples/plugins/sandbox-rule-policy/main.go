@@ -18,7 +18,13 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
-	service := sandboxsdk.Service{
+	if err := client.Run(ctx, newService()); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func newService() sandboxsdk.Service {
+	return sandboxsdk.Service{
 		Registrations: []sandboxsdk.HandlerRegistration{
 			{
 				ExtensionPoint: "rule.evaluate/v1",
@@ -51,8 +57,5 @@ func main() {
 			}
 			return api.RuleEvaluateDecision{Allow: true, Reason: "allowed by sandbox rule example"}, nil
 		},
-	}
-	if err := client.Run(ctx, service); err != nil {
-		log.Fatal(err)
 	}
 }

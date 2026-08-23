@@ -34,6 +34,9 @@ func handleAdminPluginArtifacts(w http.ResponseWriter, r *http.Request) {
 			adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		if artifacts == nil {
+			artifacts = []pluginmanager.ArtifactRecord{}
+		}
 		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"artifacts": artifacts})
 	case http.MethodPost:
 		if session.Role != adminRoleAdmin {
@@ -74,7 +77,7 @@ func handleAdminPluginSources(w http.ResponseWriter, r *http.Request) {
 			adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		var sources []pluginmanager.ArtifactRecord
+		sources := make([]pluginmanager.ArtifactRecord, 0)
 		for _, artifact := range artifacts {
 			if artifact.ArtifactType == pluginmanager.ArtifactTypeSource {
 				sources = append(sources, artifact)
@@ -224,6 +227,9 @@ func handleAdminPluginGC(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if candidates == nil {
+		candidates = []pluginmanager.GCCandidate{}
 	}
 	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{
 		"dry_run":    dryRun,
@@ -379,6 +385,9 @@ func handleAdminPluginConnectionSessions(w http.ResponseWriter, r *http.Request,
 	if err != nil {
 		adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if sessions == nil {
+		sessions = []pluginmanager.ConnectionSessionSummary{}
 	}
 	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"connection_sessions": sessions})
 }
@@ -741,6 +750,9 @@ func handleAdminPluginOperations(w http.ResponseWriter, r *http.Request, rawSegm
 			adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		if candidates == nil {
+			candidates = []pluginmanager.GCCandidate{}
+		}
 		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"dry_run": dryRun, "candidates": candidates})
 	default:
 		adminhttp.WriteAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -765,6 +777,9 @@ func handleAdminPluginOperationsGC(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if candidates == nil {
+		candidates = []pluginmanager.GCCandidate{}
 	}
 	adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"dry_run": dryRun, "candidates": candidates})
 }
@@ -1902,6 +1917,9 @@ func handleAdminPluginSupplyChain(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			adminhttp.WriteAPIError(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+		if assessments == nil {
+			assessments = []pluginmanager.SupplyChainAssessment{}
 		}
 		adminhttp.WriteJSON(w, http.StatusOK, map[string]any{"assessments": assessments})
 	case http.MethodPost:

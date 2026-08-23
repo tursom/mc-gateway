@@ -22,7 +22,13 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
-	service := sandboxsdk.Service{
+	if err := client.Run(ctx, newService()); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func newService() sandboxsdk.Service {
+	return sandboxsdk.Service{
 		Registrations: []sandboxsdk.HandlerRegistration{
 			{
 				ExtensionPoint: "upstream.connect/v2",
@@ -55,6 +61,9 @@ func main() {
 			}
 			go func() {
 				defer listener.Close()
+				defer os.Remove(endpoint)
+				stop := context.AfterFunc(ctx, func() { _ = listener.Close() })
+				defer stop()
 				conn, err := listener.Accept()
 				if err != nil {
 					return
@@ -85,8 +94,5 @@ func main() {
 			}
 			return nil
 		},
-	}
-	if err := client.Run(ctx, service); err != nil {
-		log.Fatal(err)
 	}
 }

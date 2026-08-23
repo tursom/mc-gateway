@@ -5,6 +5,7 @@ package smoke
 import (
 	"bytes"
 	"io"
+	"net"
 	"testing"
 	"time"
 
@@ -34,6 +35,33 @@ func TestMinecraftSmokePacketsAreParseable(t *testing.T) {
 	}
 	if packetID != 0 || username != "Steve" {
 		t.Fatalf("login packet id=%d username=%q, want id=0 username=Steve", packetID, username)
+	}
+}
+
+func TestRunTakeoverFixtureExchangesTraffic(t *testing.T) {
+	initial := MinecraftHandshakePacket("fixture.example")
+	result, err := RunTakeoverFixture(initial, func(conn net.Conn) {
+		defer conn.Close()
+		request := make([]byte, len(initial))
+		if _, err := io.ReadFull(conn, request); err != nil {
+			t.Errorf("plugin read error = %v", err)
+			return
+		}
+		if !bytes.Equal(request, initial) {
+			t.Errorf("plugin request = %v, want %v", request, initial)
+			return
+		}
+		_, _ = conn.Write(MinecraftPayloadPacket(0, []byte("accepted")))
+	})
+	if err != nil {
+		t.Fatalf("RunTakeoverFixture() error = %v", err)
+	}
+	if !bytes.Equal(result.Request, initial) {
+		t.Fatalf("fixture request = %v, want initial packet", result.Request)
+	}
+	wantResponse := MinecraftPayloadPacket(0, []byte("accepted"))
+	if !bytes.Equal(result.Response, wantResponse) {
+		t.Fatalf("fixture response = %v, want %v", result.Response, wantResponse)
 	}
 }
 

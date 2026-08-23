@@ -18,7 +18,13 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
-	service := sandboxsdk.Service{
+	if err := client.Run(ctx, newService()); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func newService() sandboxsdk.Service {
+	return sandboxsdk.Service{
 		Registrations: []sandboxsdk.HandlerRegistration{
 			{
 				ExtensionPoint: "route.resolve/v1",
@@ -57,8 +63,5 @@ func main() {
 			}
 			return api.RouteDecision{Action: api.RouteDecisionOverride, Upstream: "sandbox-route:25565", Host: req.Host, Reason: "sandbox route override"}, nil
 		},
-	}
-	if err := client.Run(ctx, service); err != nil {
-		log.Fatal(err)
 	}
 }

@@ -164,7 +164,7 @@ func readVarInt(buf []byte) (int, int, error) {
 		// 每个字节低 7 位是数值，高位为 1 表示后面还有字节。
 		value |= int(b&0x7f) << (7 * i)
 		if b&0x80 == 0 {
-			return value, i + 1, nil
+			return int(int32(uint32(value))), i + 1, nil
 		}
 	}
 	return 0, 0, errors.New("varint too long")
